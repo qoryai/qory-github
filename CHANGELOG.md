@@ -1,0 +1,62 @@
+# Changelog
+
+Every release of `qory-github`, newest first, in the shape of
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html); before 1.0 a minor release may
+change what the program does, and notes it under Upgrading.
+
+## [Unreleased]
+
+### Added
+
+- `qory-github`, the runner's credential adapter for GitHub. `qory-github credential
+  --settings <json> -- owner/name[,owner/name...]` mints a GitHub App installation token
+  for one owner's repositories and prints the runner's credential document: basic with
+  `x-access-token` on `github.com` for git over HTTPS under `/owner/name` and
+  `/owner/name.git`, bearer on `api.github.com` for `/repos/owner/name` and `/graphql`,
+  and the placeholders `GH_TOKEN` and `GITHUB_TOKEN`. The token goes to those paths
+  alone, and under the runner's `enforce` they are the run's whole reach on the two
+  hosts; under `observe` the runner sends a request to any other path there on without
+  the token and records it. The installation is looked up from the repositories unless
+  the settings contain it.
+- A run's token gets the permissions the settings allow, `read` or `write`, of
+  `actions`, `checks`, `contents`, `deployments`, `issues`, `metadata`, `pages`,
+  `pull_requests`, `statuses` and `workflows`, and no other: `administration`,
+  `secrets`, `environments`, every `organization_*` permission and `members` are
+  refused by the settings schema and again when the token is minted, and so is an
+  empty `permissions`, which GitHub reads as every permission the installation has.
+  Absent, it is contents and pull requests `write`.
+- Settings the schema refuses are refused, and so is the private key itself on the
+  command line, and an `http` API unless its host is loopback, since over `http` the
+  token crosses the network in the clear. The private key file is opened once and
+  refused when it is a symbolic link; it is also refused unless it is a regular file of
+  the user the program runs as that group and others may not read.
+- `qory-github setup`, which creates the App with GitHub's manifest flow, a person
+  approving it in the browser, and writes its private key to a file only its owner
+  reads, only where no file exists yet; when that file cannot be written, beside it, and
+  when that fails too, its error identifies the App and the page where you generate
+  another key. Its loopback listener answers a request for its own address alone. It
+  refuses a key file's path that is not UTF-8 or that contains a control character. It
+  prints the `integrations` declaration `qory` reads, and a policy that allows GitHub's
+  hosts and selects the credential the declaration expands into.
+- `qory-github describe`, the integration's description under the
+  [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1),
+  the domain `software`, the private key marked `writeOnly`. Its `program_version` is the
+  version set with `-ldflags "-X main.version=..."`, which a release sets to its own, or
+  else the module's version Go records in the build, `v0.1.0` for `go install ...@v0.1.0`
+  or the pseudo-version of a commit, or else `dev`.
+- Each command prints a short help with examples and a link to its section of the
+  README, and `qory-github` alone lists the commands. `-h` prints the help and exits 2; a
+  flag a command refuses prints its usage and flags before the error line.
+- Releases for Linux and macOS, amd64 and arm64, published by the workflow every
+  integration calls, as `qory-github_<version>_<os>_<arch>.tar.gz` with `checksums.txt`.
+
+### Moved
+
+- `qory-github` has a repository of its own, moved from `github/` of
+  [qoryai/integrations](https://github.com/qoryai/integrations), which keeps the
+  integration contract. Its module is `github.com/qoryai/qory-github`, and
+  `go install github.com/qoryai/qory-github/cmd/qory-github@latest` installs it. The App
+  `setup` creates links to this repository.
+
+[Unreleased]: https://github.com/qoryai/qory-github/commits/main

@@ -1,0 +1,222 @@
+# qory-github
+
+Gives a Qory run a GitHub token for the repositories it works on, without the agent ever
+holding the token.
+
+`qory-github` is a credential adapter for the [Qory runner](https://github.com/qoryai/runner).
+For each run it mints a
+[GitHub App installation token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
+limited to the run's repositories and to the permissions you allow. The runner keeps the
+token outside the agent's container and adds it to the agent's requests to GitHub. Inside
+the container, `GH_TOKEN` and `GITHUB_TOKEN` hold a placeholder, so `git` and `gh` work.
+
+## Quick start
+
+### 1. Install
+
+On the machine that runs `qory run`, on its `PATH`. Download
+`qory-github_<version>_<os>_<arch>.tar.gz` from
+[Releases](https://github.com/qoryai/qory-github/releases) (Linux and macOS, amd64 and
+arm64) and verify it against `checksums.txt`, or:
+
+```sh
+go install github.com/qoryai/qory-github/cmd/qory-github@latest
+```
+
+### 2. Create the GitHub App
+
+```sh
+qory-github setup                 # under your account
+qory-github setup --org acme      # under an organisation
+```
+
+Your browser opens with the App filled in. Approve it. `setup` writes the App's private
+key to `~/.config/qory/github-app.pem` (mode 0600) and prints the next steps.
+
+### 3. Install the App
+
+Install it on the repositories your agents work on, at the URL `setup` prints.
+
+### 4. Declare the integration
+
+In `~/.config/qory/runner.yaml`. `setup` prints this block with your App's id and key
+file:
+
+```yaml
+integrations:
+  github:
+    settings: {"app_id":123456,"private_key_file":"/home/dev/.config/qory/github-app.pem"}
+```
+
+### 5. Select it in a run's policy
+
+List the repositories the run works on, one owner's. Add the other hosts the run needs,
+such as the model's API, to `allow`:
+
+```yaml
+egress:
+  mode: enforce
+  allow: [github.com, api.github.com]
+credentials:
+  - {name: github, argument: acme/shop}
+```
+
+## Commands
+
+`qory-github` alone lists the commands; `qory-github <command> -h` prints a command's help.
+
+### setup
+
+```sh
+qory-github setup [--org ORG] [--name NAME] [--key-file FILE]
+```
+
+Creates the GitHub App (private, no webhook, contents and pull requests `write`, metadata
+`read`) and writes its private key. Waits up to ten minutes for your approval.
+
+| Flag | Default |
+|---|---|
+| `--org` | your account |
+| `--name` | `qory-github-` and six random hex digits; must be unique on GitHub |
+| `--key-file` | `~/.config/qory/github-app.pem` |
+
+- The key file is written with mode 0600. An existing file is never overwritten.
+- GitHub hands out the key once. If the file cannot be written, the key goes to
+  `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
+  App and the page where you generate a new key.
+- The key is never printed.
+
+### credential
+
+```sh
+qory-github credential --settings JSON -- owner/name[,owner/name...]
+```
+
+The runner calls this for each run; you normally don't. It mints a token for the listed
+repositories, all of one owner, and prints the runner's credential document: the token,
+`expires_at`, the hosts and paths it applies to, and the placeholders `GH_TOKEN` and
+`GITHUB_TOKEN`. Each call mints a new token; nothing is kept.
+
+### describe
+
+```sh
+qory-github describe
+```
+
+Prints the integration's description: the settings as a JSON Schema and the credential
+role. `qory` calls it to check a declaration. No settings, no network.
+
+### Exit status
+
+- `0`: success. `describe` and `credential` print one JSON document on standard output.
+- `1`: failure. One line on standard error that says what failed, never the token or the
+  key.
+- `2`: no command, an unknown one, `-h`, or a refused flag. Usage or help on standard
+  error.
+
+## Settings
+
+Passed as one JSON document in `--settings`, or under `settings:` in `runner.yaml`.
+
+| Setting | Required | Meaning |
+|---|---|---|
+| `app_id` | yes | The App's numeric id, or its client id as a string |
+| `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
+| `installation_id` | no | The App's installation on the repositories' owner. Looked up from the repositories when absent. |
+| `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
+| `api_url` | no | GitHub's API, for tests. Default `https://api.github.com`. Plain `http` is accepted only for loopback. |
+
+The private key itself (`private_key`) is refused on the command line; use
+`private_key_file`.
+
+## Permissions
+
+A token can get these permissions, `read` or `write`: `actions`, `checks`, `contents`,
+`deployments`, `issues`, `metadata`, `pages`, `pull_requests`, `statuses`, `workflows`.
+
+Refused: `administration`, `secrets`, `environments`, `repository_hooks`, every
+`organization_*` permission, `members`, the level `admin`, and an empty `permissions`
+(GitHub reads it as "all").
+
+A token never gets more than the App has. The App `setup` creates has contents and pull
+requests `write` and metadata `read`. For more, for example `issues`, change the App's
+permissions on GitHub and accept the change on the installation.
+
+## What the token reaches
+
+| Host | Auth | Paths, per repository |
+|---|---|---|
+| `github.com` | basic, username `x-access-token` | `/owner/name.git/*`, `/owner/name/*` (clone, fetch, push, Git LFS batch) |
+| `api.github.com` | bearer | `/repos/owner/name`, `/repos/owner/name/*`, `/graphql` |
+
+- Under `enforce`, these paths are the run's only access to the two hosts. Every other
+  path, for example `/user`, `/search` or another repository, is refused before the
+  request leaves the machine. Under `observe`, such a request goes out without the token
+  and is recorded.
+- `/graphql` has no repository in its path. The token limits it: GitHub answers only for
+  the repositories the token covers.
+- To allow fetch but not push, use `"permissions": {"contents": "read"}`, or limit the
+  host to the fetch paths in the policy
+  ([runner contract](https://github.com/qoryai/runner/tree/main/contracts/runner/v1#the-policy)).
+
+### What the agent sees
+
+- `GH_TOKEN` and `GITHUB_TOKEN` hold `qory-sets-the-credential-outside-the-enclosure`, a
+  placeholder so `gh` starts.
+- The runner's proxy terminates TLS for `github.com` and `api.github.com` with a
+  certificate the container trusts, and sets the token on requests to the paths above.
+- Under `enforce`, a request to another path gets `403` and a line such as:
+
+  ```text
+  qory: GET api.github.com/user denied by policy (mode enforce): no path rule of the run's covers it
+  ```
+
+### Push and pull requests
+
+The agent pushes and opens pull requests itself with `git` and `gh`; the default
+permissions allow it. Tested with git 2.39 and gh 2.100:
+
+| Command | Calls | Needs |
+|---|---|---|
+| `git clone`, `git fetch` | `info/refs`, `git-upload-pack` on `github.com` | `contents: read` |
+| `git push` | `info/refs`, `git-receive-pack` on `github.com` | `contents: write` |
+| `gh pr create`, `gh pr edit`, `gh pr comment`, `gh pr view` | `/graphql` on `api.github.com` | `pull_requests: write` to create or change |
+
+- The remote must be HTTPS. A remote over SSH gets no token.
+- The pull request must be in a repository the policy lists. A pull request from a fork
+  into another owner's repository needs two owners; a run has one.
+
+### Token expiry
+
+GitHub's installation tokens expire after an hour. The runner calls `credential` again
+five minutes before `expires_at`, and after a `401`, at most once every 30 seconds. The
+hosts and paths stay the same; only the token changes.
+
+## Limits
+
+- One owner per run: an installation token belongs to one account.
+- github.com only; GitHub Enterprise Server is not supported.
+- Paths are compared as spelled. Write repositories in the policy exactly as the remotes
+  and API calls spell them (`acme/lib`, not `ACME/lib`).
+- The argument is refused when a name is `.` or `..` or ends in `.git`, when it names two
+  owners, or when it lists a repository twice.
+- Git LFS objects are served from other hosts through signed URLs; allow those hosts in
+  the policy.
+- Errors are one line on standard error and never contain the token or the key.
+
+## Development
+
+```sh
+mise install                    # Go 1.27.1
+go build ./cmd/qory-github
+go test ./...
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the full checks and the release process. The
+integration contract is in
+[qoryai/integrations](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1).
+
+## Licence
+
+Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). *Qory* is a trademark of
+8wonders GmbH.
