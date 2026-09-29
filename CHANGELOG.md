@@ -7,6 +7,8 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-30
+
 ### Added
 
 - `qory-github`, the runner's credential adapter for GitHub. `qory-github credential
@@ -59,4 +61,5 @@ change what the program does, and notes it under Upgrading.
   `go install github.com/qoryai/qory-github/cmd/qory-github@latest` installs it. The App
   `setup` creates links to this repository.
 
-[Unreleased]: https://github.com/qoryai/qory-github/commits/main
+[Unreleased]: https://github.com/qoryai/qory-github/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/qoryai/qory-github/releases/tag/v0.1.0
