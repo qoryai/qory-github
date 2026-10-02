@@ -90,6 +90,7 @@
         "description": "The App's private key, the PEM GitHub hands out. Secret: written, never read back, and never on a command line.",
         "type": "string",
         "writeOnly": true,
+        "x-secret-name": "GITHUB_APP_PRIVATE_KEY",
         "minLength": 1
       }
     }

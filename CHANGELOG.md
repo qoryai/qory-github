@@ -7,6 +7,11 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
+  name a control plane suggests for storing the key.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added
