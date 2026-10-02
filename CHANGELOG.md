@@ -13,10 +13,10 @@ change what the program does, and notes it under Upgrading.
   from standard input, as the
   [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#settings)
   defines it: one JSON document and nothing after it but white space, 64 KiB at most,
-  read to its end before the key is read and before any network call. Empty input is
-  refused. It is the one way to hand in `private_key` itself, which the command line
-  still refuses; `--settings <json>` stays as it is. The package reads them with
-  `ReadSettingsInput`.
+  read to its end, or until it has more than 64 KiB, before the key is read and before
+  any network call. Empty input is refused. It is the one way to hand in `private_key`
+  itself, which the command line still refuses; `--settings <json>` stays as it is. The
+  package reads them with `ReadSettingsInput`.
 - The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
   name a control plane suggests for storing the key.
 
@@ -26,6 +26,8 @@ change what the program does, and notes it under Upgrading.
   the schema is checked, with an error that names the two: a secret has one source.
 - An error about settings that are not one JSON document says at which byte the document
   breaks, never the character there.
+- The description of `private_key_file` says it is the one way to hand the key in on a
+  command line, no longer the way a machine hands it in.
 
 ## [0.1.0] - 2026-09-30
 

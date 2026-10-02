@@ -114,12 +114,12 @@ func ReadSettings(arg string) (Settings, error) {
 }
 
 // ReadSettingsInput reads the settings document on standard input, --settings -, the
-// one place the settings may contain a secret. It reads r to its end before anything
-// else, so a caller has read the settings before it acts, and refuses more than 64 KiB,
-// input with no document, and anything after the first document but white space; then
-// a secret <name> together with <name>_file, before the schema does, and a document the
-// schema refuses. An error identifies a setting and what is wrong with it, never a value
-// or any other part of the input.
+// one place the settings may contain a secret. It reads r to its end, or until it has
+// more than 64 KiB, before anything else, so a caller has read the settings before it
+// acts. It refuses more than 64 KiB, input with no document, and anything after the
+// first document but white space; then a secret <name> together with <name>_file,
+// before the schema does, and a document the schema refuses. An error identifies a
+// setting and what is wrong with it, never a value or any other part of the input.
 func ReadSettingsInput(r io.Reader) (Settings, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxSettingsInput+1))
 	if err != nil {

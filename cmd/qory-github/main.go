@@ -141,9 +141,10 @@ writes that adapter from the integrations: section of runner.yaml.
 The settings are one JSON document; qory-github describe lists what it contains. On a
 command line, --settings JSON, a secret is refused, since the machine's other processes
 see it: set private_key_file there, never private_key. --settings - reads the settings
-from standard input instead, to its end and before any network call: one JSON document,
-nothing after it but white space, 64 KiB at most. It is the one way to hand in
-private_key itself. private_key and private_key_file together are refused.
+from standard input instead, to its end, or until it has more than 64 KiB, and before
+any network call: one JSON document, nothing after it but white space, 64 KiB at most.
+It is the one way to hand in private_key itself. private_key and private_key_file
+together are refused.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,

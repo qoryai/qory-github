@@ -144,6 +144,25 @@ func TestCredentialReadsTheSettingsOnStandardInput(t *testing.T) {
 	}
 }
 
+// TestCredentialReadsStandardInputBeforeItChecksTheArgument checks that a refused
+// argument, here none, is refused after standard input is read to its end, so the
+// writer is never cut off and a failure is the same whatever the settings' source.
+func TestCredentialReadsStandardInputBeforeItChecksTheArgument(t *testing.T) {
+	_, pemBytes := keyFile(t)
+	in := &eofReader{r: strings.NewReader(settings(t, map[string]any{"private_key": string(pemBytes)}))}
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", "-", "--"}, in, &out, &errs)
+	if !in.eof.Load() {
+		t.Error("the argument is refused before standard input is read to its end")
+	}
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if line := errs.String(); !strings.HasPrefix(line, "qory-github credential: want one argument") {
+		t.Errorf("stderr %q", line)
+	}
+}
+
 // eofReader is standard input that records when it has been read to its end.
 type eofReader struct {
 	r   io.Reader

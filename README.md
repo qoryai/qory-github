@@ -102,7 +102,8 @@ With `--settings -`, the settings come on standard input:
 
 - One JSON document, nothing after it but white space, 64 KiB (65536 bytes) at most.
   Empty input is refused.
-- Standard input is read to its end before the key is read and before any network call.
+- Standard input is read to its end, or until it has more than 64 KiB, before the key is
+  read and before any network call.
 - It is the only way to pass `private_key` itself; the command line refuses it.
 
 ### describe
