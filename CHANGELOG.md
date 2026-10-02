@@ -31,6 +31,10 @@ change what the program does, and notes it under Upgrading.
 - An error about settings quotes a name the document chose, such as a permission's, where
   it says where the settings are wrong, when the name contains a control character, a
   line or paragraph separator, a quote or a backslash, so the error stays one line.
+- The line a failure writes on standard error escapes every control character but a line
+  break, which it writes as a space, and the Unicode line and paragraph separators, as Go
+  escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
+  from GitHub's API among them: before, a line break alone was replaced.
 
 ## [0.1.0] - 2026-09-30
 

@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/qoryai/integrations/conformance"
 	"github.com/qoryai/integrations/contracts"
@@ -230,6 +231,53 @@ func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 				t.Errorf("stderr contains a secret: %q", line)
 			}
 		})
+	}
+}
+
+// TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
+// contains control characters and Unicode line separators, and checks that the failure
+// is still one line on standard error, with each of them escaped.
+func TestAFailureFromGitHubIsOneLine(t *testing.T) {
+	file, _ := keyFile(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/installation") {
+			io.WriteString(w, `{"id":42}`)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni"}`)
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": srv.URL}), "--", "acme/shop"}, nil, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	line := strings.TrimSuffix(errs.String(), "\n")
+	if i := strings.IndexFunc(line, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' }); i >= 0 {
+		t.Errorf("stderr contains %q: %q", []rune(line[i:])[0], errs.String())
+	}
+	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i` + "\n"; !strings.HasSuffix(errs.String(), want) {
+		t.Errorf("stderr %q, want it to end in %q", errs.String(), want)
+	}
+}
+
+// TestOneLine pins how an error's text is written on its line: a line break as a space,
+// every other control character, a line or paragraph separator and a byte that is not
+// UTF-8 escaped, and the rest as it is.
+func TestOneLine(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
+		{`/permissions/"a\u2028b": a quote " and a backslash \ stay`, `/permissions/"a\u2028b": a quote " and a backslash \ stay`},
+		{"one\ntwo\r\nthree", "one two three"},
+		{"a\rb\tc\x00d\x1be\x7ff", `a\rb\tc\x00d\x1be\x7ff`},
+		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
+		{"a\x85b\xffc", `a\x85b\xffc`},
+		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
+	} {
+		if got := oneLine(tc.in); got != tc.want {
+			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

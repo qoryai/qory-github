@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode"
@@ -199,10 +200,36 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], strings.ReplaceAll(err.Error(), "\n", " "))
+		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], oneLine(err.Error()))
 		return 1
 	}
 	return 0
+}
+
+// oneLine is an error's text as the one line it is written on: a line break, \n or
+// \r\n, is a space, and every other control character, C0, DEL or C1, and the Unicode
+// line and paragraph separators are escaped as Go escapes them in a string, \r, \x7f,
+// \u2028, and so is a byte that is not UTF-8, wherever the text comes from, GitHub's
+// answer among them. The rest is left as it is, a quote or a backslash too, so a name
+// the settings' error already quoted reads the same.
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	var b strings.Builder
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[0])
+		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029':
+			q := strconv.QuoteRune(r)
+			b.WriteString(q[1 : len(q)-1])
+		default:
+			b.WriteString(s[:size])
+		}
+		s = s[size:]
+	}
+	return b.String()
 }
 
 // describe prints the integration's description, one JSON document. It takes no

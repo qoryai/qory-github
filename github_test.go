@@ -566,7 +566,7 @@ func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
 		"the command line": ReadSettings,
 		"standard input":   func(doc string) (Settings, error) { return ReadSettingsInput(strings.NewReader(doc)) },
 	}
-	for _, name := range []string{`a\nb`, `a\rb`, `a\tb`, `a\u007fb`, `a\u0085b`, `a b`, `a b`} {
+	for _, name := range []string{`a\nb`, `a\rb`, `a\tb`, `a\u007fb`, `a\u0085b`, `a\u2028b`, `a\u2029b`} {
 		for doc, want := range map[string]string{
 			`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + name + `":"admin"}}`: `/permissions/"a\`,
 			`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + name + `":"read"}}`:  `invalid propertyName 'a\`,
@@ -579,7 +579,7 @@ func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
 					continue
 				}
 				if i := strings.IndexFunc(err.Error(), func(r rune) bool {
-					return unicode.IsControl(r) || r == ' ' || r == ' '
+					return unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
 				}); i >= 0 {
 					t.Errorf("%s: %s: the error contains %q: %q", where, doc, []rune(err.Error()[i:])[0], err)
 				}
