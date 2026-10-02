@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/qoryai/runner/contracts"
 )
@@ -552,6 +553,37 @@ func TestReadSettingsInputRefusesAndNeverSaysAValue(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), "secretvalue") || strings.Contains(err.Error(), "\n") {
 			t.Errorf("%s: the error contains a value: %v", tc.name, err)
+		}
+	}
+}
+
+// TestASettingsErrorEscapesTheNamesItReports hands in settings whose names contain a
+// line break, a tab, DEL, C1 or a Unicode line or paragraph separator, on the command
+// line and on standard input. A name an error reports is escaped, so the error is one
+// line with none of those characters in it.
+func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
+	read := map[string]func(string) (Settings, error){
+		"the command line": ReadSettings,
+		"standard input":   func(doc string) (Settings, error) { return ReadSettingsInput(strings.NewReader(doc)) },
+	}
+	for _, name := range []string{`a\nb`, `a\rb`, `a\tb`, `a\u007fb`, `a\u0085b`, `a b`, `a b`} {
+		for doc, want := range map[string]string{
+			`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + name + `":"admin"}}`: `/permissions/"a\`,
+			`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + name + `":"read"}}`:  `invalid propertyName 'a\`,
+			`{"app_id":123456,"private_key_file":"/k.pem","` + name + `":1}`:                       `additional properties 'a\`,
+		} {
+			for where, read := range read {
+				_, err := read(doc)
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Errorf("%s: %s: %v", where, doc, err)
+					continue
+				}
+				if i := strings.IndexFunc(err.Error(), func(r rune) bool {
+					return unicode.IsControl(r) || r == ' ' || r == ' '
+				}); i >= 0 {
+					t.Errorf("%s: %s: the error contains %q: %q", where, doc, []rune(err.Error()[i:])[0], err)
+				}
+			}
 		}
 	}
 }

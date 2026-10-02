@@ -28,6 +28,9 @@ change what the program does, and notes it under Upgrading.
   breaks, never the character there.
 - The description of `private_key_file` says it is the one way to hand the key in on a
   command line, no longer the way a machine hands it in.
+- An error about settings quotes a name the document chose, such as a permission's, where
+  it says where the settings are wrong, when the name contains a control character, a
+  line or paragraph separator, a quote or a backslash, so the error stays one line.
 
 ## [0.1.0] - 2026-09-30
 

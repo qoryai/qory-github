@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -230,6 +231,23 @@ func explain(err error) string {
 	return strings.Join(reasons(v, message.NewPrinter(language.English)), "; ")
 }
 
+// location is where in the settings a refusal is, a JSON pointer such as
+// /permissions/contents. A name the document chose is quoted, as Go quotes a string,
+// when it contains what quoting escapes, a control character, a line or paragraph
+// separator, a quote or a backslash among them, so the location stays on one line and
+// reads as it is spelled. The schema's own names never need it.
+func location(names []string) string {
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString("/")
+		if q := strconv.Quote(name); q[1:len(q)-1] != name {
+			name = q
+		}
+		b.WriteString(name)
+	}
+	return b.String()
+}
+
 func reasons(v *jsonschema.ValidationError, p *message.Printer) []string {
 	if _, ok := v.ErrorKind.(*kind.OneOf); ok && len(v.Causes) > 0 {
 		var alts []string
@@ -240,7 +258,7 @@ func reasons(v *jsonschema.ValidationError, p *message.Printer) []string {
 	}
 	at := ""
 	if len(v.InstanceLocation) > 0 {
-		at = "/" + strings.Join(v.InstanceLocation, "/") + ": "
+		at = location(v.InstanceLocation) + ": "
 	}
 	if len(v.Causes) > 0 {
 		var out []string
