@@ -81,7 +81,7 @@
       },
       "private_key_file": {
         "title": "Private key file",
-        "description": "A file that contains the App's private key and that only its owner reads: how a machine hands the key in.",
+        "description": "A file that contains the App's private key and that only its owner reads: how settings on a command line hand the key in.",
         "type": "string",
         "minLength": 1
       },

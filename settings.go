@@ -4,7 +4,9 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -85,27 +87,74 @@ type Settings struct {
 	APIURL string
 	// PrivateKeyFile is a file that contains the App's private key.
 	PrivateKeyFile string
-	// PrivateKey is the App's private key itself, the secret.
+	// PrivateKey is the App's private key itself, the secret, which only the settings on
+	// standard input contain.
 	PrivateKey string
 }
 
-// ReadSettings reads the settings document passed on a command line. It refuses a
-// secret, a setting the schema marks writeOnly, before anything else, because a command
-// line is visible to the machine's other processes; then a document the schema refuses.
-// An error identifies a setting and what is wrong with it, never a value.
+// maxSettingsInput is the most the settings on standard input may be, 64 KiB, as the
+// integration contract defines it.
+const maxSettingsInput = 64 << 10
+
+// source is where a settings document comes from, as an error names it.
+type source string
+
+const (
+	commandLine   source = "on the command line"
+	standardInput source = "on standard input"
+)
+
+// ReadSettings reads the settings document passed on a command line, --settings <json>.
+// It refuses a secret, a setting the schema marks writeOnly, before anything else,
+// because a command line is visible to the machine's other processes; then a document
+// the schema refuses. An error identifies a setting and what is wrong with it, never a
+// value.
 func ReadSettings(arg string) (Settings, error) {
+	return readSettings([]byte(arg), commandLine)
+}
+
+// ReadSettingsInput reads the settings document on standard input, --settings -, the
+// one place the settings may contain a secret. It reads r to its end before anything
+// else, so a caller has read the settings before it acts, and refuses more than 64 KiB,
+// input with no document, and anything after the first document but white space; then
+// a secret <name> together with <name>_file, before the schema does, and a document the
+// schema refuses. An error identifies a setting and what is wrong with it, never a value
+// or any other part of the input.
+func ReadSettingsInput(r io.Reader) (Settings, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxSettingsInput+1))
+	if err != nil {
+		return Settings{}, fmt.Errorf("reading the settings %s: %w", standardInput, err)
+	}
+	if len(b) > maxSettingsInput {
+		return Settings{}, fmt.Errorf("the settings %s are larger than 64 KiB, %d bytes", standardInput, maxSettingsInput)
+	}
+	return readSettings(b, standardInput)
+}
+
+// readSettings reads one settings document from where. It is what reading the settings
+// on the command line and on standard input share; the command line alone refuses a
+// secret.
+func readSettings(b []byte, where source) (Settings, error) {
 	schema, err := settingsSchema()
 	if err != nil {
 		return Settings{}, err
 	}
-	doc, err := jsonschema.UnmarshalJSON(strings.NewReader(arg))
+	raw, err := one(b)
 	if err != nil {
-		return Settings{}, fmt.Errorf("the settings are not one JSON document: %w", err)
+		return Settings{}, fmt.Errorf("the settings %s %w", where, err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	if err != nil {
+		return Settings{}, fmt.Errorf("the settings %s are not one JSON document", where)
 	}
 	if m, ok := doc.(map[string]any); ok {
 		for _, name := range secrets(schema) {
-			if _, ok := m[name]; ok {
+			_, secret := m[name]
+			if secret && where == commandLine {
 				return Settings{}, fmt.Errorf("the settings on the command line contain %s, a secret, which the machine's other processes see; set %s_file to a file that contains it instead", name, name)
+			}
+			if _, file := m[name+"_file"]; secret && file {
+				return Settings{}, fmt.Errorf("the settings %s contain both %s and %s_file; a secret has one source, so set one of them", where, name, name)
 			}
 		}
 	}
@@ -120,7 +169,7 @@ func ReadSettings(arg string) (Settings, error) {
 		PrivateKeyFile string            `json:"private_key_file"`
 		PrivateKey     string            `json:"private_key"`
 	}
-	if err := json.Unmarshal([]byte(arg), &wire); err != nil {
+	if err := json.Unmarshal(raw, &wire); err != nil {
 		return Settings{}, fmt.Errorf("the settings: %w", err)
 	}
 	s := Settings{InstallationID: wire.InstallationID, Permissions: wire.Permissions, APIURL: wire.APIURL, PrivateKeyFile: wire.PrivateKeyFile, PrivateKey: wire.PrivateKey}
@@ -133,6 +182,30 @@ func ReadSettings(arg string) (Settings, error) {
 		}
 	}
 	return s, nil
+}
+
+// one is the JSON document b contains, which nothing but JSON's white space may
+// follow. Its error completes "the settings ... " and says where in b the document
+// breaks, never what b contains there.
+func one(b []byte) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	var raw json.RawMessage
+	err := dec.Decode(&raw)
+	var syntax *json.SyntaxError
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil, errors.New("are empty")
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return nil, errors.New("are not one JSON document: it ends before the document does")
+	case errors.As(err, &syntax):
+		return nil, fmt.Errorf("are not one JSON document: it breaks at byte %d", syntax.Offset)
+	case err != nil:
+		return nil, errors.New("are not one JSON document")
+	}
+	if strings.Trim(string(b[dec.InputOffset():]), " \t\r\n") != "" {
+		return nil, errors.New("are not one JSON document: something other than white space follows it")
+	}
+	return raw, nil
 }
 
 // secrets are the settings the schema marks writeOnly.

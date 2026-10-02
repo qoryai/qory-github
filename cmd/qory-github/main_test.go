@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,7 +35,14 @@ const token = "ghs_faketokenthatmustnotleak"
 // fakeAPI is GitHub's API as the command uses it, answering the mint with status.
 func fakeAPI(t *testing.T, status int) string {
 	t.Helper()
+	return fakeAPIChecking(t, status, func() {})
+}
+
+// fakeAPIChecking is fakeAPI that runs check on every request, before it answers.
+func fakeAPIChecking(t *testing.T, status int, check func()) string {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		check()
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/installation"):
 			io.WriteString(w, `{"id":42}`)
@@ -82,7 +90,7 @@ func settings(t *testing.T, fields map[string]any) string {
 func TestCredentialPrintsOneDocumentAndNothingElse(t *testing.T) {
 	file, _ := keyFile(t)
 	var out, errs bytes.Buffer
-	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 201)}), "--", "acme/shop"}, &out, &errs)
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 201)}), "--", "acme/shop"}, nil, &out, &errs)
 	if code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
 	}
@@ -98,26 +106,91 @@ func TestCredentialPrintsOneDocumentAndNothingElse(t *testing.T) {
 	}
 }
 
-func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
+// TestCredentialReadsTheSettingsOnStandardInput hands the settings in on standard input,
+// the key itself or its file, and checks that standard input is read to its end before
+// GitHub's API is called.
+func TestCredentialReadsTheSettingsOnStandardInput(t *testing.T) {
 	file, pemBytes := keyFile(t)
 	for _, tc := range []struct {
-		name string
-		args []string
-		want string
+		name   string
+		fields map[string]any
+		after  string
 	}{
-		{"github refuses", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 403)}), "acme/shop"}, "403: Resource not accessible by integration"},
-		{"two owners", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "acme/shop,other/lib"}, "share an owner"},
-		{"no settings", []string{"credential", "acme/shop"}, "--settings is required"},
-		{"no key", []string{"credential", "--settings", settings(t, nil), "acme/shop"}, "missing property 'private_key_file'"},
-		{"the key on the command line", []string{"credential", "--settings", settings(t, map[string]any{"private_key": string(pemBytes)}), "acme/shop"}, "contain private_key, a secret"},
-		{"admin", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"contents": "admin"}}), "acme/shop"}, "/permissions/contents: value must be one of 'read', 'write'"},
-		{"administration", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"administration": "read"}}), "acme/shop"}, "/permissions: invalid propertyName 'administration'"},
-		{"an argument like a flag", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "--", "-acme/shop"}, `"-acme/shop" is not owner/name`},
-		{"a flag of old", []string{"credential", "--app-id", "123456", "--private-key-file", file, "acme/shop"}, "flag provided but not defined"},
+		{"the key", map[string]any{"private_key": string(pemBytes)}, ""},
+		{"the key, white space after", map[string]any{"private_key": string(pemBytes)}, "\n \t\r\n"},
+		{"the key file", map[string]any{"private_key_file": file}, "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := &eofReader{}
+			api := fakeAPIChecking(t, 201, func() {
+				if !in.eof.Load() {
+					t.Error("GitHub's API is called before standard input is read to its end")
+				}
+			})
+			tc.fields["api_url"] = api
+			in.r = strings.NewReader(settings(t, tc.fields) + tc.after)
+			var out, errs bytes.Buffer
+			code := run(context.Background(), []string{"credential", "--settings", "-", "--", "acme/shop"}, in, &out, &errs)
+			if code != 0 || errs.Len() != 0 {
+				t.Fatalf("exit %d: %s", code, errs.String())
+			}
+			if err := conformance.Credential(out.Bytes()); err != nil {
+				t.Error(err)
+			}
+			if !strings.Contains(out.String(), token) {
+				t.Errorf("stdout %s", out.String())
+			}
+		})
+	}
+}
+
+// eofReader is standard input that records when it has been read to its end.
+type eofReader struct {
+	r   io.Reader
+	eof atomic.Bool
+}
+
+func (e *eofReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		e.eof.Store(true)
+	}
+	return n, err
+}
+
+func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
+	file, pemBytes := keyFile(t)
+	// noAPI is an API that a failure on standard input never reaches.
+	noAPI := fakeAPIChecking(t, 201, func() { t.Error("GitHub's API is called for settings that are refused") })
+	key := settings(t, map[string]any{"private_key": string(pemBytes), "api_url": noAPI})
+	stdin := []string{"credential", "--settings", "-", "--", "acme/shop"}
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		stdin string
+		want  string
+	}{
+		{"github refuses", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 403)}), "acme/shop"}, "", "403: Resource not accessible by integration"},
+		{"two owners", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "acme/shop,other/lib"}, "", "share an owner"},
+		{"no settings", []string{"credential", "acme/shop"}, "", "--settings is required"},
+		{"no key", []string{"credential", "--settings", settings(t, nil), "acme/shop"}, "", "missing property 'private_key_file'"},
+		{"the key on the command line", []string{"credential", "--settings", settings(t, map[string]any{"private_key": string(pemBytes)}), "acme/shop"}, "", "contain private_key, a secret"},
+		{"admin", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"contents": "admin"}}), "acme/shop"}, "", "/permissions/contents: value must be one of 'read', 'write'"},
+		{"administration", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"administration": "read"}}), "acme/shop"}, "", "/permissions: invalid propertyName 'administration'"},
+		{"an argument like a flag", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "--", "-acme/shop"}, "", `"-acme/shop" is not owner/name`},
+		{"a flag of old", []string{"credential", "--app-id", "123456", "--private-key-file", file, "acme/shop"}, "", "flag provided but not defined"},
+		{"the key and its file on the command line", []string{"credential", "--settings", settings(t, map[string]any{"private_key": string(pemBytes), "private_key_file": file}), "acme/shop"}, "", "contain private_key, a secret"},
+		{"the key and its file on standard input", stdin, settings(t, map[string]any{"private_key": string(pemBytes), "private_key_file": file, "api_url": noAPI}), "contain both private_key and private_key_file; a secret has one source"},
+		{"empty standard input", stdin, "", "the settings on standard input are empty"},
+		{"white space on standard input", stdin, " \n\t\r\n", "the settings on standard input are empty"},
+		{"two documents on standard input", stdin, key + "\n" + key, "something other than white space follows it"},
+		{"more than 64 KiB on standard input", stdin, key + strings.Repeat(" ", 65537-len(key)), "larger than 64 KiB, 65536 bytes"},
+		{"a key not escaped on standard input", stdin, `{"app_id":123456,"private_key":"` + string(pemBytes) + `"}`, "not one JSON document: it breaks at byte"},
+		{"a key that is not one on standard input", stdin, settings(t, map[string]any{"private_key": "secretvalue", "api_url": noAPI}), "the private key is not PEM"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errs bytes.Buffer
-			code := run(context.Background(), tc.args, &out, &errs)
+			code := run(context.Background(), tc.args, strings.NewReader(tc.stdin), &out, &errs)
 			if tc.name == "a flag of old" {
 				if code != 1 && code != 2 || out.Len() != 0 {
 					t.Fatalf("exit %d, stdout %q", code, out.String())
@@ -134,7 +207,7 @@ func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 			if strings.Count(line, "\n") != 1 || !strings.HasPrefix(line, "qory-github credential: ") || !strings.Contains(line, tc.want) {
 				t.Errorf("stderr %q", line)
 			}
-			if strings.Contains(line, token) || strings.Contains(line, "PRIVATE KEY") || bytes.Contains([]byte(line), pemBytes[40:80]) {
+			if strings.Contains(line, token) || strings.Contains(line, "PRIVATE KEY") || bytes.Contains([]byte(line), pemBytes[40:80]) || strings.Contains(line, "secretvalue") {
 				t.Errorf("stderr contains a secret: %q", line)
 			}
 		})
@@ -151,7 +224,7 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	defer func(v string) { version = v }(version)
 	version = "dev"
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+	if code := run(context.Background(), []string{"describe"}, nil, &out, &errs); code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
 	}
 	if err := conformance.Description(out.Bytes()); err != nil {
@@ -166,7 +239,7 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	}
 	out.Reset()
 	errs.Reset()
-	code := run(context.Background(), []string{"describe", "--settings", "{}"}, &out, &errs)
+	code := run(context.Background(), []string{"describe", "--settings", "{}"}, nil, &out, &errs)
 	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
 		t.Errorf("describe with settings: %v", err)
 	}
@@ -348,7 +421,7 @@ func TestSetupCreatesNothingForARefusedPath(t *testing.T) {
 	home := filepath.Join(t.TempDir(), "h\x01me")
 	t.Setenv("HOME", home)
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"setup"}, &out, &errs); code != 1 || !strings.Contains(errs.String(), "control character") || out.Len() != 0 {
+	if code := run(context.Background(), []string{"setup"}, nil, &out, &errs); code != 1 || !strings.Contains(errs.String(), "control character") || out.Len() != 0 {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, out.String(), errs.String())
 	}
 	if _, err := os.Stat(home); !errors.Is(err, fs.ErrNotExist) {
@@ -458,7 +531,7 @@ func quote(s string) string {
 
 func TestNoCommandIsUsage(t *testing.T) {
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "usage:") {
+	if code := run(context.Background(), nil, nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "usage:") {
 		t.Errorf("exit %d: %s", code, errs.String())
 	}
 }

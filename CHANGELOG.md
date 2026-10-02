@@ -9,8 +9,23 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
+- `qory-github credential --settings - -- owner/name[,owner/name...]` reads the settings
+  from standard input, as the
+  [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#settings)
+  defines it: one JSON document and nothing after it but white space, 64 KiB at most,
+  read to its end before the key is read and before any network call. Empty input is
+  refused. It is the one way to hand in `private_key` itself, which the command line
+  still refuses; `--settings <json>` stays as it is. The package reads them with
+  `ReadSettingsInput`.
 - The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
   name a control plane suggests for storing the key.
+
+### Changed
+
+- Settings that contain both `private_key` and `private_key_file` are refused, before
+  the schema is checked, with an error that names the two: a secret has one source.
+- An error about settings that are not one JSON document says at which byte the document
+  breaks, never the character there.
 
 ## [0.1.0] - 2026-09-30
 

@@ -499,3 +499,59 @@ func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T)
 		}
 	}
 }
+
+// TestReadSettingsInputTakesTheKeyItself reads the settings on standard input, the key
+// itself among them, with white space around the document, and up to 64 KiB of input.
+func TestReadSettingsInputTakesTheKeyItself(t *testing.T) {
+	pemBytes := keyPEM(t)
+	doc, err := json.Marshal(map[string]any{"app_id": 123456, "installation_id": 42, "private_key": string(pemBytes)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []string{
+		string(doc),
+		string(doc) + "\n",
+		" \t\r\n" + string(doc) + " \t\r\n",
+		string(doc) + strings.Repeat(" ", maxSettingsInput-len(doc)),
+	} {
+		s, err := ReadSettingsInput(strings.NewReader(in))
+		if err != nil || s.AppID != appID || s.InstallationID != 42 || s.PrivateKey != string(pemBytes) || s.PrivateKeyFile != "" {
+			t.Errorf("%d bytes: settings %+v, %v", len(in), s, err)
+		}
+	}
+	s, err := ReadSettingsInput(strings.NewReader(`{"app_id":"Iv1.abc","private_key_file":"/k.pem"}`))
+	if err != nil || s.AppID != "Iv1.abc" || s.PrivateKeyFile != "/k.pem" || s.PrivateKey != "" {
+		t.Errorf("settings %+v, %v", s, err)
+	}
+}
+
+// TestReadSettingsInputRefusesAndNeverSaysAValue refuses input that is not one settings
+// document of 64 KiB at most, and a secret beside its file, with an error that contains
+// no part of the input.
+func TestReadSettingsInputRefusesAndNeverSaysAValue(t *testing.T) {
+	secret := `"-----BEGIN RSA PRIVATE KEY-----\nsecretvalue\n-----END RSA PRIVATE KEY-----\n"`
+	doc := `{"app_id":123456,"private_key":` + secret + `}`
+	for _, tc := range []struct{ name, in, want string }{
+		{"empty", "", "the settings on standard input are empty"},
+		{"white space", " \t\r\n ", "the settings on standard input are empty"},
+		{"two documents", doc + ` {"app_id":"secretvalue"}`, "something other than white space follows it"},
+		{"something after", doc + "secretvalue", "something other than white space follows it"},
+		{"a white space JSON has not", doc + "\v", "something other than white space follows it"},
+		{"cut short", `{"app_id":123456,"private_key":` + secret, "it ends before the document does"},
+		{"a key not escaped", `{"app_id":123456,"private_key":"-----BEGIN RSA PRIVATE KEY-----` + "\nsecretvalue\n" + `"}`, "it breaks at byte 64"},
+		{"larger than 64 KiB", doc + strings.Repeat(" ", maxSettingsInput+1-len(doc)), "larger than 64 KiB, 65536 bytes"},
+		{"the key and its file", `{"app_id":123456,"private_key_file":"/k.pem","private_key":` + secret + `}`, "contain both private_key and private_key_file; a secret has one source"},
+		{"no key", `{"app_id":123456}`, "missing property 'private_key_file', or missing property 'private_key'"},
+		{"an unknown setting", `{"app_id":123456,"private_key":` + secret + `,"key":"secretvalue"}`, "additional properties 'key' not allowed"},
+		{"not an object", `["secretvalue"]`, "got array, want object"},
+	} {
+		_, err := ReadSettingsInput(strings.NewReader(tc.in))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), "secretvalue") || strings.Contains(err.Error(), "\n") {
+			t.Errorf("%s: the error contains a value: %v", tc.name, err)
+		}
+	}
+}

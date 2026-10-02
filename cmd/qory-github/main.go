@@ -1,13 +1,15 @@
 // Command qory-github is Qory's integration with GitHub, the runner's credential
 // adapter: `qory-github credential --settings <json> -- owner/name` mints a
 // GitHub App installation token for the repositories listed and prints the runner's
-// credential document. `qory-github describe` prints the integration's description,
+// credential document, and `--settings -` reads the settings from standard input
+// instead. `qory-github describe` prints the integration's description,
 // contracts/integration/v1, and `qory-github setup` creates the App.
 package main
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -31,7 +33,7 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
@@ -129,21 +131,25 @@ It takes no settings and reaches no network.`,
 
 var credentialHelp = help{
 	short: "Mint an access token for a run's repositories",
-	use:   "qory-github credential --settings JSON [--] owner/name[,owner/name...]",
+	use:   "qory-github credential --settings JSON|- [--] owner/name[,owner/name...]",
 	long: `Mint a GitHub App access token for the repositories listed, and print the runner's
 credential document: the access token, its expiry, and where it goes.
 
 The runner runs credential outside the container, as a credential's adapter. qory
 writes that adapter from the integrations: section of runner.yaml.
 
-The settings are one JSON document; qory-github describe lists what it contains. The
-settings go on a command line, so a secret is refused there: set private_key_file, never
-private_key.
+The settings are one JSON document; qory-github describe lists what it contains. On a
+command line, --settings JSON, a secret is refused, since the machine's other processes
+see it: set private_key_file there, never private_key. --settings - reads the settings
+from standard input instead, to its end and before any network call: one JSON document,
+nothing after it but white space, 64 KiB at most. It is the one way to hand in
+private_key itself. private_key and private_key_file together are refused.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,
 	example: `  qory-github credential --settings "$settings" -- acme/shop            # one repository
-  qory-github credential --settings "$settings" -- acme/shop,acme/lib   # two of one owner's`,
+  qory-github credential --settings "$settings" -- acme/shop,acme/lib   # two of one owner's
+  qory-github credential --settings - -- acme/shop < settings.json      # the settings on standard input`,
 	section: "credential",
 }
 
@@ -171,7 +177,7 @@ policy that selects it.`,
 
 // run is the command, with its streams, so a test runs it whole. It returns the exit
 // status; an error is one line on stderr describing what failed, never a secret.
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -179,7 +185,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch args[0] {
 	case "credential":
-		err = credential(ctx, args[1:], stdout, stderr)
+		err = credential(ctx, args[1:], stdin, stdout, stderr)
 	case "setup":
 		err = setup(ctx, args[1:], stdout, stderr)
 	case "describe":
@@ -217,29 +223,36 @@ func describe(args []string, stdout, stderr io.Writer) error {
 
 // credential mints a token and prints the runner's credential document, nothing else
 // on standard output. The settings are one document, the only input besides the
-// argument, so a machine and a control plane hand them in the same way; `--` ends the
-// flags, so the argument is never read as one.
-func credential(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+// argument, so a machine and a control plane hand them in the same way: on the command
+// line, or on standard input with --settings -, which it reads whole before anything
+// else. `--` ends the flags, so the argument is never read as one.
+func credential(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("credential", flag.ContinueOnError)
-	doc := fs.String("settings", "", "the settings, one JSON document (required)")
+	doc := fs.String("settings", "", "the settings, one JSON document, or - to read it from standard input (required)")
 	if err := credentialHelp.parse(fs, args, stderr); err != nil {
+		return err
+	}
+	if *doc == "" {
+		return errors.New("--settings is required")
+	}
+	var s github.Settings
+	var err error
+	if *doc == "-" {
+		s, err = github.ReadSettingsInput(stdin)
+	} else {
+		s, err = github.ReadSettings(*doc)
+	}
+	if err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return errors.New("want one argument, owner/name[,owner/name...]")
 	}
-	if *doc == "" {
-		return errors.New("--settings is required")
-	}
-	s, err := github.ReadSettings(*doc)
-	if err != nil {
-		return err
-	}
 	repos, err := github.ParseRepositories(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	key, err := github.ReadKeyFile(s.PrivateKeyFile)
+	key, err := readKey(s)
 	if err != nil {
 		return err
 	}
@@ -253,6 +266,15 @@ func credential(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	_, err = fmt.Fprintf(stdout, "%s\n", b)
 	return err
+}
+
+// readKey is the App's private key the settings hand in: the key itself, which only the
+// settings on standard input contain, or else the file that contains it.
+func readKey(s github.Settings) (*rsa.PrivateKey, error) {
+	if s.PrivateKey != "" {
+		return github.ParseKey([]byte(s.PrivateKey))
+	}
+	return github.ReadKeyFile(s.PrivateKeyFile)
 }
 
 // setup creates the App with a person's approval in the browser, writes its key and
