@@ -14,8 +14,7 @@
 // [Describe] is the integration's description, the integration contract
 // (https://github.com/qoryai/integrations/tree/main/contracts/integration/v1): its name,
 // the settings it takes as a JSON Schema, and the roles it plays. [ReadSettings] reads
-// a settings document against that schema from a command line, and [ReadSettingsInput]
-// from standard input.
+// a settings document against that schema, as the program reads it on standard input.
 //
 // The package keeps nothing. The settings, the App's private key among them, are handed
 // to it on every call, by whoever has them, and nothing it is handed is written

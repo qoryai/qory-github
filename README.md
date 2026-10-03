@@ -89,22 +89,21 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 ### credential
 
 ```sh
-qory-github credential --settings JSON -- owner/name[,owner/name...]
-qory-github credential --settings - -- owner/name[,owner/name...]   # settings on standard input
+qory-github credential -- owner/name[,owner/name...] < settings.json
 ```
 
-The runner calls this for each run; you normally don't. It mints a token for the listed
-repositories, all of one owner, and prints the runner's credential document: the token,
-`expires_at`, the hosts and paths it applies to, and the placeholders `GH_TOKEN` and
-`GITHUB_TOKEN`. Each call mints a new token; nothing is kept.
+The runner calls this for each run; you normally don't. It reads the settings on
+standard input, mints a token for the listed repositories, all of one owner, and prints
+the runner's credential document: the token, `expires_at`, the hosts and paths it
+applies to, and the placeholders `GH_TOKEN` and `GITHUB_TOKEN`. Each call mints a new
+token; nothing is kept.
 
-With `--settings -`, the settings come on standard input:
-
-- One JSON document, nothing after it but white space, 64 KiB (65536 bytes) at most.
-  Empty input is refused.
-- Standard input is read to its end, or until it has more than 64 KiB, before the key is
-  read and before any network call.
-- It is the only way to pass `private_key` itself; the command line refuses it.
+- The settings are one JSON document on standard input, nothing after it but white
+  space, 64 KiB (65536 bytes) at most. Empty input is refused; `{}` is a document.
+- Standard input is read to its end, or until it has more than 64 KiB, before the
+  argument is checked, before the key is read and before any network call.
+- One argument follows `--`. An empty one is refused as not `owner/name`.
+- `credential` takes no flags. A flag is refused in one line, like any other failure.
 
 ### describe
 
@@ -118,28 +117,27 @@ role. `qory` calls it to check a declaration. No settings, no network.
 ### Exit status
 
 - `0`: success. `describe` and `credential` print one JSON document on standard output.
-- `1`: failure. One line on standard error that says what failed, never the token or the
-  key.
-- `2`: no command, an unknown one, `-h`, or a refused flag. Usage or help on standard
-  error.
+- `1`: failure, a flag `credential` refuses among them. One line on standard error that
+  says what failed, never the token or the key.
+- `2`: no command, an unknown one, `-h`, or a flag `setup` refuses. Usage or help on
+  standard error.
 
 ## Settings
 
-Passed as one JSON document in `--settings`, on standard input with `--settings -`, or
-under `settings:` in `runner.yaml`.
+One JSON document, on the standard input of `credential`; in `runner.yaml`, under
+`settings:`.
 
 | Setting | Required | Meaning |
 |---|---|---|
 | `app_id` | yes | The App's numeric id, or its client id as a string |
-| `private_key_file` | this or `private_key` | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
-| `private_key` | this or `private_key_file` | The App's private key itself, the PEM. Secret: on standard input only. |
+| `private_key_file` | this or `private_key` | Path to the App's private key, the key kept on disk. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
+| `private_key` | this or `private_key_file` | The App's private key itself, the PEM. A secret. |
 | `installation_id` | no | The App's installation on the repositories' owner. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
 | `api_url` | no | GitHub's API, for tests. Default `https://api.github.com`. Plain `http` is accepted only for loopback. |
 
-The private key itself (`private_key`) is refused on the command line; there, use
-`private_key_file`. Settings that contain both `private_key` and `private_key_file` are
-refused: a secret has one source. No setting is read from the environment.
+Settings that contain both `private_key` and `private_key_file` are refused: a secret
+has one source. No setting is read from the environment or the command line.
 
 ## Permissions
 

@@ -86,76 +86,49 @@ type Settings struct {
 	Permissions map[string]string
 	// APIURL is GitHub's API; empty is [APIURL].
 	APIURL string
-	// PrivateKeyFile is a file that contains the App's private key.
+	// PrivateKeyFile is a file that contains the App's private key, the key kept on
+	// disk.
 	PrivateKeyFile string
-	// PrivateKey is the App's private key itself, the secret, which only the settings on
-	// standard input contain.
+	// PrivateKey is the App's private key itself, the secret.
 	PrivateKey string
 }
 
-// maxSettingsInput is the most the settings on standard input may be, 64 KiB, as the
-// integration contract defines it.
-const maxSettingsInput = 64 << 10
+// maxSettings is the most the settings may be, 64 KiB, as the integration contract
+// defines it.
+const maxSettings = 64 << 10
 
-// source is where a settings document comes from, as an error names it.
-type source string
-
-const (
-	commandLine   source = "on the command line"
-	standardInput source = "on standard input"
-)
-
-// ReadSettings reads the settings document passed on a command line, --settings <json>.
-// It refuses a secret, a setting the schema marks writeOnly, before anything else,
-// because a command line is visible to the machine's other processes; then a document
-// the schema refuses. An error identifies a setting and what is wrong with it, never a
-// value.
-func ReadSettings(arg string) (Settings, error) {
-	return readSettings([]byte(arg), commandLine)
-}
-
-// ReadSettingsInput reads the settings document on standard input, --settings -, the
-// one place the settings may contain a secret. It reads r to its end, or until it has
-// more than 64 KiB, before anything else, so a caller has read the settings before it
-// acts. It refuses more than 64 KiB, input with no document, and anything after the
-// first document but white space; then a secret <name> together with <name>_file,
-// before the schema does, and a document the schema refuses. An error identifies a
-// setting and what is wrong with it, never a value or any other part of the input.
-func ReadSettingsInput(r io.Reader) (Settings, error) {
-	b, err := io.ReadAll(io.LimitReader(r, maxSettingsInput+1))
+// ReadSettings reads the settings document the program reads on standard input, the
+// one place its settings come from. It reads r to its end, or until it has more than
+// 64 KiB, before anything else, so a caller has read the settings before it acts. It
+// refuses more than 64 KiB, input with no document, and anything after the first
+// document but white space; then a secret <name> together with <name>_file, before the
+// schema does, and a document the schema refuses. An error identifies a setting and
+// what is wrong with it, never a value or any other part of the input.
+func ReadSettings(r io.Reader) (Settings, error) {
+	b, err := io.ReadAll(io.LimitReader(r, maxSettings+1))
 	if err != nil {
-		return Settings{}, fmt.Errorf("reading the settings %s: %w", standardInput, err)
+		return Settings{}, fmt.Errorf("reading the settings on standard input: %w", err)
 	}
-	if len(b) > maxSettingsInput {
-		return Settings{}, fmt.Errorf("the settings %s are larger than 64 KiB, %d bytes", standardInput, maxSettingsInput)
+	if len(b) > maxSettings {
+		return Settings{}, fmt.Errorf("the settings on standard input are larger than 64 KiB, %d bytes", maxSettings)
 	}
-	return readSettings(b, standardInput)
-}
-
-// readSettings reads one settings document from where. It is what reading the settings
-// on the command line and on standard input share; the command line alone refuses a
-// secret.
-func readSettings(b []byte, where source) (Settings, error) {
 	schema, err := settingsSchema()
 	if err != nil {
 		return Settings{}, err
 	}
 	raw, err := one(b)
 	if err != nil {
-		return Settings{}, fmt.Errorf("the settings %s %w", where, err)
+		return Settings{}, fmt.Errorf("the settings on standard input %w", err)
 	}
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
 	if err != nil {
-		return Settings{}, fmt.Errorf("the settings %s are not one JSON document", where)
+		return Settings{}, errors.New("the settings on standard input are not one JSON document")
 	}
 	if m, ok := doc.(map[string]any); ok {
 		for _, name := range secrets(schema) {
 			_, secret := m[name]
-			if secret && where == commandLine {
-				return Settings{}, fmt.Errorf("the settings on the command line contain %s, a secret, which the machine's other processes see; set %s_file to a file that contains it instead", name, name)
-			}
 			if _, file := m[name+"_file"]; secret && file {
-				return Settings{}, fmt.Errorf("the settings %s contain both %s and %s_file; a secret has one source, so set one of them", where, name, name)
+				return Settings{}, fmt.Errorf("the settings contain both %s and %s_file; a secret has one source, so set one of them", name, name)
 			}
 		}
 	}

@@ -44,7 +44,7 @@
       },
       "private_key_file": {
         "title": "Private key file",
-        "description": "A file that contains the App's private key and that only its owner reads: the one way to hand the key in on a command line.",
+        "description": "A file that contains the App's private key and that only its owner reads: the key kept on disk.",
         "type": "string",
         "minLength": 1
       },

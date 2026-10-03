@@ -9,25 +9,31 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github credential --settings - -- owner/name[,owner/name...]` reads the settings
-  from standard input, as the
+- `qory-github credential -- owner/name[,owner/name...]` reads its settings on standard
+  input, as the
   [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#settings)
-  defines it: one JSON document and nothing after it but white space, 64 KiB at most,
-  read to its end, or until it has more than 64 KiB, before the key is read and before
-  any network call. Empty input is refused. It is the one way to hand in `private_key`
-  itself, which the command line still refuses; `--settings <json>` stays as it is. The
-  package reads them with `ReadSettingsInput`.
+  defines it: one JSON document and nothing after it but white space, 64 KiB at most.
+  It reads standard input to its end, or until it has more than 64 KiB, before it checks
+  the argument, reads the key or calls GitHub's API, and refuses empty input; `{}` is a
+  document. It reads no setting from its environment.
+- The settings may contain the private key itself, `private_key`, in place of
+  `private_key_file`, the key kept on disk.
 - The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
   name a control plane suggests for storing the key.
 
 ### Changed
 
+- `credential` takes no flags, and refuses a flag in one line on standard error with
+  nothing on standard output, like every other failure; before, a refused flag printed
+  the usage too. `-h` still prints the help.
 - Settings that contain both `private_key` and `private_key_file` are refused, before
   the schema is checked, with an error that names the two: a secret has one source.
+- An empty argument, which a connection without one passes, is refused by the rule for
+  repositories, with an error that says it is empty, not as a missing argument.
 - An error about settings that are not one JSON document says at which byte the document
   breaks, never the character there.
-- The description of `private_key_file` says it is the one way to hand the key in on a
-  command line, no longer the way a machine hands it in.
+- The description of `private_key_file` says it is the key kept on disk, no longer the
+  way a machine hands the key in.
 - An error about settings quotes a name the document chose, such as a permission's, where
   it says where the settings are wrong, when the name contains a control character, a
   line or paragraph separator, a quote or a backslash, so the error stays one line.
@@ -35,6 +41,22 @@ change what the program does, and notes it under Upgrading.
   break, which it writes as a space, and the Unicode line and paragraph separators, as Go
   escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
   from GitHub's API among them: before, a line break alone was replaced.
+- `ReadSettings` reads the settings from an `io.Reader`, the program's standard input,
+  and takes `private_key`.
+
+### Removed
+
+- `credential --settings <json>`, the settings on the command line.
+
+### Upgrading
+
+- A runner starts `credential` as `qory-github credential -- <argument>` and writes the
+  settings document to its standard input, `{}` when there are none. `--settings`, in
+  any form, `--settings -` and `--settings=-` among them, is refused as a flag
+  `credential` does not define. The `integrations:` declaration in `runner.yaml` stays
+  as it is.
+- Code that uses the package hands `ReadSettings` a reader of the settings document in
+  place of the document as a string.
 
 ## [0.1.0] - 2026-09-30
 
