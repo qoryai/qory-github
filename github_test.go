@@ -557,6 +557,25 @@ func TestReadSettingsRefusesInputAndNeverSaysAValue(t *testing.T) {
 	}
 }
 
+// TestASettingsErrorLocatesANameAsAJSONPointer pins the location of a refused setting
+// whose name contains ~ or /: escaped as a JSON pointer escapes it, so /permissions/a/b
+// is never what the location reads for the name a/b.
+func TestASettingsErrorLocatesANameAsAJSONPointer(t *testing.T) {
+	for name, want := range map[string]string{
+		`a/b`:   `the settings are invalid: /permissions/a~1b: value must be one of 'read', 'write'`,
+		`a~b`:   `the settings are invalid: /permissions/a~0b: value must be one of 'read', 'write'`,
+		`a~1b`:  `the settings are invalid: /permissions/a~01b: value must be one of 'read', 'write'`,
+		`~/`:    `the settings are invalid: /permissions/~0~1: value must be one of 'read', 'write'`,
+		`a/\nb`: `the settings are invalid: /permissions/"a~1\nb": value must be one of 'read', 'write'`,
+		`a"b`:   `the settings are invalid: /permissions/"a\"b": value must be one of 'read', 'write'`,
+	} {
+		_, err := ReadSettings(strings.NewReader(`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + strings.ReplaceAll(name, `"`, `\"`) + `":"admin"}}`))
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("%s: %v, want it to begin %s", name, err, want)
+		}
+	}
+}
+
 // TestASettingsErrorEscapesTheNamesItReports hands in settings whose names contain a
 // line break, a tab, DEL, C1 or a Unicode line or paragraph separator. A name an error
 // reports is escaped, so the error is one line with none of those characters in it.

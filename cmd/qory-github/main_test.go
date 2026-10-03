@@ -180,11 +180,13 @@ func TestCredentialReadsStandardInputBeforeItChecksTheArgument(t *testing.T) {
 }
 
 // TestCredentialRefusesTheSettingsFlag runs credential with the flag of 0.1.0, --settings,
-// in each of its forms. credential takes no flags, so each is refused before standard
-// input is read, with one line and nothing on standard output; -h still prints the help.
+// in each of its forms, the first as the integration contract's guide runs it.
+// credential takes no flags, so each is refused before standard input is read, with one
+// line and nothing on standard output; -h still prints the help, and reads no input.
 func TestCredentialRefusesTheSettingsFlag(t *testing.T) {
 	file, _ := keyFile(t)
 	for _, args := range [][]string{
+		{"credential", "--settings", "{}", "--", "a/b"},
 		{"credential", "--settings", "{}", "--", "acme/shop"},
 		{"credential", "--settings", "-", "--", "acme/shop"},
 		{"credential", "--settings=-", "--", "acme/shop"},
@@ -204,8 +206,12 @@ func TestCredentialRefusesTheSettingsFlag(t *testing.T) {
 		}
 	}
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"credential", "-h"}, strings.NewReader(""), &out, &errs); code != 2 || out.Len() != 0 || !strings.Contains(errs.String(), "usage:\n  qory-github credential [--] owner/name") {
+	in := &eofReader{r: strings.NewReader(settings(t, map[string]any{"private_key_file": file}))}
+	if code := run(context.Background(), []string{"credential", "-h"}, in, &out, &errs); code != 2 || out.Len() != 0 || !strings.Contains(errs.String(), "usage:\n  qory-github credential [--] owner/name") {
 		t.Errorf("-h: exit %d, stdout %q, stderr %q", code, out.String(), errs.String())
+	}
+	if in.read.Load() {
+		t.Error("-h reads standard input")
 	}
 }
 

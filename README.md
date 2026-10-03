@@ -117,10 +117,10 @@ role. `qory` calls it to check a declaration. No settings, no network.
 ### Exit status
 
 - `0`: success. `describe` and `credential` print one JSON document on standard output.
-- `1`: failure, a flag `credential` refuses among them. One line on standard error that
-  says what failed, never the token or the key.
-- `2`: no command, an unknown one, `-h`, or a flag `setup` refuses. Usage or help on
-  standard error.
+- `1`: failure, a flag a command refuses among them. One line on standard error that
+  says what failed, never the token or the key. `setup` prints its usage before that
+  line when it refuses a flag.
+- `2`: no command, an unknown one, or `-h`. Usage or help on standard error.
 
 ## Settings
 

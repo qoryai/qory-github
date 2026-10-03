@@ -205,14 +205,16 @@ func explain(err error) string {
 }
 
 // location is where in the settings a refusal is, a JSON pointer such as
-// /permissions/contents. A name the document chose is quoted, as Go quotes a string,
-// when it contains what quoting escapes, a control character, a line or paragraph
-// separator, a quote or a backslash among them, so the location stays on one line and
-// reads as it is spelled. The schema's own names never need it.
+// /permissions/contents. A name is escaped as a JSON pointer escapes it, ~ as ~0 and /
+// as ~1, so a / in a name is not read as two. Then a name the document chose is quoted,
+// as Go quotes a string, when it contains what quoting escapes, a control character, a
+// line or paragraph separator, a quote or a backslash among them, so the location stays
+// on one line and reads as it is spelled. The schema's own names need neither.
 func location(names []string) string {
 	var b strings.Builder
 	for _, name := range names {
 		b.WriteString("/")
+		name = strings.ReplaceAll(strings.ReplaceAll(name, "~", "~0"), "/", "~1")
 		if q := strconv.Quote(name); q[1:len(q)-1] != name {
 			name = q
 		}

@@ -34,9 +34,10 @@ change what the program does, and notes it under Upgrading.
   breaks, never the character there.
 - The description of `private_key_file` says it is the key kept on disk, no longer the
   way a machine hands the key in.
-- An error about settings quotes a name the document chose, such as a permission's, where
-  it says where the settings are wrong, when the name contains a control character, a
-  line or paragraph separator, a quote or a backslash, so the error stays one line.
+- An error about settings says where they are wrong as a JSON pointer whose names are
+  escaped as JSON pointers escape them, `~` as `~0` and `/` as `~1`, and quotes a name
+  the document chose when it contains a control character, a line or paragraph
+  separator, a quote or a backslash, so the error stays one line.
 - The line a failure writes on standard error escapes every control character but a line
   break, which it writes as a space, and the Unicode line and paragraph separators, as Go
   escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
@@ -50,11 +51,11 @@ change what the program does, and notes it under Upgrading.
 
 ### Upgrading
 
-- A runner starts `credential` as `qory-github credential -- <argument>` and writes the
-  settings document to its standard input, `{}` when there are none. `--settings`, in
-  any form, `--settings -` and `--settings=-` among them, is refused as a flag
-  `credential` does not define. The `integrations:` declaration in `runner.yaml` stays
-  as it is.
+- This version needs a `qory` and a runner that start `credential` as
+  `qory-github credential -- <argument>` and write the settings document to its standard
+  input, `{}` when there are none. An earlier `qory` starts it with `--settings <json>`,
+  which `credential` refuses, in any form, `--settings -` and `--settings=-` among them,
+  as a flag it does not define: every run that selects the credential then fails.
 - Code that uses the package hands `ReadSettings` a reader of the settings document in
   place of the document as a string.
 
