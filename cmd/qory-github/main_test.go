@@ -350,6 +350,45 @@ func TestCredentialRefusesAnotherOwnersInstallation(t *testing.T) {
 	}
 }
 
+// TestCredentialFollowsNoRedirect has GitHub's API answer the installation's lookup for
+// acme/shop with a 301 to another repository's, as it answers for a repository that was
+// renamed, and checks the one line on standard error, that the redirect's target is
+// never requested and that no token is minted.
+func TestCredentialFollowsNoRedirect(t *testing.T) {
+	file, _ := keyFile(t)
+	var followed, minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/shop/installation":
+			w.Header().Set("Location", "/repos/acme/renamed/installation")
+			w.WriteHeader(http.StatusMovedPermanently)
+			io.WriteString(w, `{"message":"Moved Permanently","url":"/repos/acme/renamed/installation"}`)
+		case "/repos/acme/renamed/installation":
+			followed.Store(true)
+			io.WriteString(w, `{"id":42}`)
+		case "/app/installations/42/access_tokens":
+			minted.Store(true)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"token":"`+token+`","expires_at":"2026-09-25T21:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	in := strings.NewReader(settings(t, map[string]any{"private_key_file": file, "api_url": srv.URL}))
+	code := run(context.Background(), []string{"credential", "--", "acme/shop"}, in, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if followed.Load() || minted.Load() {
+		t.Errorf("the redirect was followed: %v, a token minted: %v", followed.Load(), minted.Load())
+	}
+}
+
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
 // contains control characters and Unicode line separators, and checks that the failure
 // is still one line on standard error, with each of them escaped.

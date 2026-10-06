@@ -115,6 +115,14 @@ change what the program does, and notes it under Upgrading.
   the App, are refused with `installation_id is not the App's installation on the
   repositories' owner; set that owner's installation, or leave installation_id out`.
   Before, a token was minted with whatever installation the settings named.
+- No redirect from GitHub's API is followed, whatever `http.Client` a `Client` is handed,
+  so the App's token, and the code `setup` exchanges, go nowhere but where they were
+  sent. A redirect answering a mint's request, as GitHub answers for a repository that
+  moved or was renamed, fails with `GitHub answered with a redirect; the repository may
+  have moved or been renamed, so name its new owner/name in the connection`, and one
+  answering `setup`'s exchange with `exchanging the code for the App: GitHub answered
+  with a redirect, which setup never follows, so the code is sent nowhere else`. Before,
+  Go's client followed it, and sent the App's token on to a target on the same host.
 
 ### Removed
 

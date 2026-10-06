@@ -219,6 +219,11 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		PEM      string `json:"pem"`
 	}
 	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
+		// GitHub does not redirect the exchange; should it, the code is not sent on.
+		var answered *answerError
+		if errors.As(err, &answered) && answered.redirect() {
+			return nil, errors.New("exchanging the code for the App: GitHub answered with a redirect, which setup never follows, so the code is sent nowhere else")
+		}
 		return nil, err
 	}
 	if got.ID == 0 || got.Slug == "" {

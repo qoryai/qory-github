@@ -327,6 +327,91 @@ func TestARequestsErrorLeavesTheRequestOut(t *testing.T) {
 	}
 }
 
+// redirecting is GitHub's API answering a request for from with a redirect, of status,
+// to the same path under to, on the same server: what it records is whether the
+// redirect was followed to its target, and whether a token was minted.
+type redirecting struct {
+	from, to       string
+	status         int
+	mu             sync.Mutex
+	followed, mint bool
+}
+
+func (rd *redirecting) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
+	switch {
+	case r.URL.Path == rd.from:
+		w.Header().Set("Location", rd.to)
+		w.WriteHeader(rd.status)
+		io.WriteString(w, `{"message":"Moved Permanently","url":"`+rd.to+`"}`)
+		return
+	case strings.HasPrefix(r.URL.Path, "/moved/"):
+		rd.followed = true
+	}
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/repos/acme/shop/installation"):
+		io.WriteString(w, `{"id":42}`)
+	case strings.HasSuffix(r.URL.Path, "/app/installations/42"):
+		io.WriteString(w, `{"id":42,"account":{"login":"acme"}}`)
+	case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+		rd.mint = true
+		w.WriteHeader(201)
+		io.WriteString(w, `{"token":"`+fakeToken+`","expires_at":"2026-09-25T21:00:00Z"}`)
+	case strings.HasSuffix(r.URL.Path, "/conversions"):
+		w.WriteHeader(201)
+		io.WriteString(w, `{"id":123456,"slug":"qory-github-test"}`)
+	default:
+		w.WriteHeader(404)
+	}
+}
+
+// TestNoRedirectIsFollowed has GitHub's API answer each request a mint and setup's
+// exchange make with a redirect, to a target on the same server, which would be handed
+// the App's token or the code, and checks that none is followed, whatever client the
+// request goes through, that no token is minted after one, and the line each fails with.
+func TestNoRedirectIsFollowed(t *testing.T) {
+	const moved = "GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection"
+	for _, tc := range []struct {
+		from           string
+		status         int
+		installationID int64
+		client         *http.Client
+	}{
+		{"/repos/acme/shop/installation", 301, 0, nil},
+		{"/repos/acme/shop/installation", 302, 0, &http.Client{}},
+		{"/repos/acme/shop/installation", 308, 0, nil},
+		{"/app/installations/42", 307, 42, nil},
+		{"/app/installations/42/access_tokens", 307, 42, nil},
+		{"/app/installations/42/access_tokens", 308, 42, &http.Client{}},
+		{"/app/installations/42/access_tokens", 303, 0, nil},
+	} {
+		rd := &redirecting{from: tc.from, to: "/moved" + tc.from, status: tc.status}
+		srv := httptest.NewServer(rd)
+		repos, _ := ParseRepositories("acme/shop")
+		_, err := Client{API: srv.URL, HTTP: tc.client}.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: tc.installationID, Repositories: repos})
+		srv.Close()
+		if err == nil || err.Error() != moved {
+			t.Errorf("%d for %s: err %v, want %s", tc.status, tc.from, err, moved)
+		}
+		if rd.followed || rd.mint {
+			t.Errorf("%d for %s: followed %v, minted %v", tc.status, tc.from, rd.followed, rd.mint)
+		}
+	}
+	for _, status := range []int{301, 307, 308} {
+		rd := &redirecting{from: "/app-manifests/abc/conversions", to: "/moved/app-manifests/abc/conversions", status: status}
+		srv := httptest.NewServer(rd)
+		_, err := Setup{KeyFile: filepath.Join(t.TempDir(), "app.pem"), Client: Client{API: srv.URL}}.exchange(context.Background(), "abc")
+		srv.Close()
+		if want := "exchanging the code for the App: GitHub answered with a redirect, which setup never follows, so the code is sent nowhere else"; err == nil || err.Error() != want {
+			t.Errorf("%d: err %v, want %s", status, err, want)
+		}
+		if rd.followed {
+			t.Errorf("%d: the exchange followed the redirect", status)
+		}
+	}
+}
+
 // TestTheAnswerIsTheRunnersCredentialDocument validates the answer against the runner's
 // published schema, so the adapter and the contract cannot drift apart.
 func TestTheAnswerIsTheRunnersCredentialDocument(t *testing.T) {

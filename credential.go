@@ -130,7 +130,8 @@ func Uses(repos []Repository) []Apply {
 type Client struct {
 	// API is the API's base URL, which [CheckAPIURL] takes; empty is [APIURL].
 	API string
-	// HTTP is the client; nil is one with a thirty-second timeout.
+	// HTTP is the client; nil is one with a thirty-second timeout. Whichever it is, no
+	// redirect is followed.
 	HTTP *http.Client
 	// Now is the clock the App's token is issued by; nil is time.Now.
 	Now func() time.Time
@@ -207,7 +208,7 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 				ID int64 `json:"id"`
 			}
 			if err := c.call(ctx, "finding the App's installation on "+r.String(), http.MethodGet, "/repos/"+r.String()+"/installation", jwt, nil, http.StatusOK, &got); err != nil {
-				return nil, err
+				return nil, moved(err)
 			}
 			if id != 0 && got.ID != id {
 				return nil, errors.New("the repositories are in different installations of the App; a token is one installation's")
@@ -226,7 +227,7 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	body := map[string]any{"repositories": names, "permissions": perms}
 	const minting = "minting the installation token"
 	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
-		return nil, err
+		return nil, moved(err)
 	}
 	if got.Token == "" {
 		return nil, errors.New(minting + ": GitHub answered without a token")
@@ -242,6 +243,20 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 // owner. It says neither the installation's id nor the account GitHub has it on.
 var errNotTheOwners = errors.New("installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out")
 
+// errMoved refuses a redirect GitHub answers a mint's request with, as it answers a
+// request for a repository that moved or was renamed. The redirect is never followed, so
+// the App's token goes nowhere but where the request was sent.
+var errMoved = errors.New("GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection")
+
+// moved is err, or [errMoved] when err is GitHub's redirect.
+func moved(err error) error {
+	var answered *answerError
+	if errors.As(err, &answered) && answered.redirect() {
+		return errMoved
+	}
+	return err
+}
+
 // checkInstallation refuses the installation id unless GitHub says it is the App's
 // installation on the account that owns the repositories, its login compared as GitHub
 // compares logins, in any case. An installation GitHub does not know of the App, a 404,
@@ -252,7 +267,7 @@ func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, rep
 			Login string `json:"login"`
 		} `json:"account"`
 	}
-	err := c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got)
+	err := moved(c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got))
 	var answered *answerError
 	switch {
 	case errors.As(err, &answered) && answered.status == http.StatusNotFound:
@@ -308,9 +323,12 @@ func (c Client) base() string {
 // call makes one request to the API, the one what names, such as "minting the
 // installation token", and decodes the answer. It refuses an API [CheckAPIURL] refuses
 // before anything is sent, so every request, a mint's and setup's, goes to GitHub's API
-// alone. An error begins with what, and says the status and GitHub's message, or why the
-// API could not be reached. It never says what was sent: no URL, no path, which carries
-// the code setup exchanges and an installation's id, no header and no body.
+// alone. It follows no redirect, whatever client it is handed, so neither the App's token
+// nor setup's code goes on to where one points: a redirect is an answer like another,
+// whose status a caller reads. An error begins with what, and says the status and
+// GitHub's message, or why the API could not be reached. It never says what was sent: no
+// URL, no path, which carries the code setup exchanges and an installation's id, no
+// header and no body.
 func (c Client) call(ctx context.Context, what, method, path, jwt string, body any, want int, out any) error {
 	base := c.base()
 	if err := CheckAPIURL(base); err != nil {
@@ -337,10 +355,11 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+	hc := http.Client{Timeout: 30 * time.Second}
+	if c.HTTP != nil {
+		hc = *c.HTTP
 	}
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
@@ -374,6 +393,9 @@ type answerError struct {
 func (e *answerError) Error() string {
 	return fmt.Sprintf("%s: GitHub answered %d: %s", e.what, e.status, e.message)
 }
+
+// redirect is whether the answer is a redirect, a 3xx.
+func (e *answerError) redirect() bool { return e.status >= 300 && e.status < 400 }
 
 // errRequestLeftOut stands for an error that says the request it failed, which a
 // request's error never says.
