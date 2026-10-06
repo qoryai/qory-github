@@ -364,19 +364,26 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 }
 
 // TestProgramVersionFallsBackToTheModuleVersion pins the program's version: the one
-// set with ldflags first, then the module version go install records, a release or a
-// pseudo-version, which the contract's schema accepts, and "dev" for a build whose
-// module version is (devel) or empty, or with no build info.
+// set with ldflags first, as it is given, then the module version go install records,
+// a release or a pseudo-version, without its leading v, as the integration contract
+// reports a release's version, which the contract's schema accepts, and "dev" for a
+// build whose module version is (devel) or empty, or with no build info.
 func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
-	pseudo := "v0.0.0-20260926201317-44236bb3bdba"
+	pseudo := "0.2.1-0.20261006195344-0f167ba9a536"
 	for _, tc := range []struct {
 		ldflags, module string
 		info            bool
 		want            string
 	}{
 		{"1.2.3", "v0.1.0", true, "1.2.3"},
-		{"", "v0.1.0", true, "v0.1.0"},
-		{"", pseudo, true, pseudo},
+		{"v1.2.3", "v0.1.0", true, "v1.2.3"},
+		{"", "v0.1.0", true, "0.1.0"},
+		{"", "v" + pseudo, true, pseudo},
+		{"", "v1", true, "1"},
+		{"", "0.1.0", true, "0.1.0"},
+		{"", "vv0.1.0", true, "vv0.1.0"},
+		{"", "version", true, "version"},
+		{"", "v", true, "v"},
 		{"", "(devel)", true, "dev"},
 		{"", "", true, "dev"},
 		{"", "", false, "dev"},

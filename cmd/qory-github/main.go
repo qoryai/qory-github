@@ -45,18 +45,26 @@ var version string
 
 func init() { version = programVersion(version, debug.ReadBuildInfo) }
 
-// programVersion is the version set with ldflags when there is one, or else the main
-// module's version from the build info, which go records: v0.1.0 for go install
-// ...@v0.1.0, or a pseudo-version for a commit. A build whose module version is
-// (devel) or empty is "dev".
+// programVersion is the version set with ldflags when there is one, as it is given, or
+// else the main module's version from the build info without its leading v, as the
+// integration contract's releases have it, the tag without its v: go records v0.1.0
+// for go install ...@v0.1.0, reported as 0.1.0, or a pseudo-version for a commit,
+// v0.2.1-0.20261006195344-0f167ba9a536 reported as 0.2.1-0.20261006195344-0f167ba9a536.
+// Only a v followed by a digit is dropped; any other version is reported as recorded.
+// A build whose module version is (devel) or empty is "dev".
 func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string {
 	if ldflags != "" {
 		return ldflags
 	}
-	if info, ok := read(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
-		return info.Main.Version
+	info, ok := read()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
 	}
-	return "dev"
+	v := info.Main.Version
+	if len(v) > 1 && v[0] == 'v' && '0' <= v[1] && v[1] <= '9' {
+		return v[1:]
+	}
+	return v
 }
 
 // more is where the program's page is; each command's help links to a section of it.

@@ -74,6 +74,14 @@ change what the program does, and notes it under Upgrading.
   any port: the browser posts the manifest there. Each is refused in one line, naming
   the rule and never the URL, before `setup` creates a directory, listens or opens the
   browser. Every request to the API, a mint's and `setup`'s, is held to the rule.
+- A program built without `-X main.version`, by `go install ...@v0.1.0` among others,
+  reports its module's version without its leading `v` as `program_version`, `0.1.0`
+  in place of `v0.1.0`, and a pseudo-version such as
+  `v0.2.1-0.20261006195344-0f167ba9a536` as `0.2.1-0.20261006195344-0f167ba9a536`: the
+  integration contract's release version is the tag without its `v`, and a reader
+  compares `program_version` with the version it asked for. Only a `v` followed by a
+  digit is dropped. The version set with `-X main.version` is reported as it is given,
+  and a build whose module version is `(devel)` or empty is still `dev`.
 
 ### Removed
 
