@@ -23,13 +23,15 @@
           "string"
         ],
         "minimum": 1,
+        "maximum": 9007199254740991,
         "pattern": "^[A-Za-z0-9.]{1,64}$"
       },
       "installation_id": {
         "title": "Installation id",
         "description": "The App's installation on the account whose repositories runs work on. Absent means it is looked up from the repositories on every call.",
         "type": "integer",
-        "minimum": 1
+        "minimum": 1,
+        "maximum": 9007199254740991
       },
       "permissions": {
         "title": "Permissions",

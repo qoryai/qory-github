@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -117,8 +118,10 @@ const maxSettings = 64 << 10
 // document without a setting the credential role requires, a secret as either, before
 // the schema does; and then a document the schema refuses. api_url, which the role does
 // not list, is taken as well: the runner writes a role only the settings it lists, so a
-// document the runner writes never carries it. An error identifies a setting and what is
-// wrong with it, never a value or any other part of the input.
+// document the runner writes never carries it. An error says where the settings are
+// wrong and what is wrong there, never a value or any other part of the input but a
+// name: the schema's, or one the document chose, escaped, as the location of a
+// refusal or the property refused.
 func ReadSettings(r io.Reader) (Settings, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxSettings+1))
 	if err != nil {
@@ -155,18 +158,30 @@ func ReadSettings(r io.Reader) (Settings, error) {
 	}
 	var wire struct {
 		AppID          json.RawMessage   `json:"app_id"`
-		InstallationID int64             `json:"installation_id"`
+		InstallationID json.Number       `json:"installation_id"`
 		Permissions    map[string]string `json:"permissions"`
 		APIURL         string            `json:"api_url"`
 		PrivateKeyFile string            `json:"private_key_file"`
 		PrivateKey     string            `json:"private_key"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return Settings{}, fmt.Errorf("the settings: %w", err)
+		// Go's error says the value it could not decode, so it is never returned.
+		return Settings{}, errors.New("the settings do not decode as the schema describes them")
 	}
-	s := Settings{InstallationID: wire.InstallationID, Permissions: wire.Permissions, APIURL: wire.APIURL, PrivateKeyFile: wire.PrivateKeyFile, PrivateKey: wire.PrivateKey}
+	s := Settings{Permissions: wire.Permissions, APIURL: wire.APIURL, PrivateKeyFile: wire.PrivateKeyFile, PrivateKey: wire.PrivateKey}
+	if wire.InstallationID != "" {
+		id, ok := integer(wire.InstallationID)
+		if !ok {
+			return Settings{}, errors.New("the settings are invalid: /installation_id: is not a 64-bit integer")
+		}
+		s.InstallationID = id
+	}
 	if err := json.Unmarshal(wire.AppID, &s.AppID); err != nil {
-		s.AppID = string(wire.AppID)
+		id, ok := integer(json.Number(wire.AppID))
+		if !ok {
+			return Settings{}, errors.New("the settings are invalid: /app_id: is not a 64-bit integer")
+		}
+		s.AppID = strconv.FormatInt(id, 10)
 	}
 	if s.APIURL != "" {
 		if err := CheckAPIURL(s.APIURL); err != nil {
@@ -174,6 +189,17 @@ func ReadSettings(r io.Reader) (Settings, error) {
 		}
 	}
 	return s, nil
+}
+
+// integer is the number n as the schema reads it, an integer whatever its notation, 42,
+// 42.0 or 4.2e1 alike, when it is one that an int64 holds. The schema's maximum keeps
+// the settings' ids within that.
+func integer(n json.Number) (int64, bool) {
+	r, ok := new(big.Rat).SetString(string(n))
+	if !ok || !r.IsInt() || !r.Num().IsInt64() {
+		return 0, false
+	}
+	return r.Num().Int64(), true
 }
 
 // required refuses settings m without a setting the credential role requires: the
@@ -232,7 +258,8 @@ func secrets(s *jsonschema.Schema) []string {
 }
 
 // explain is a schema's refusal on one line: where, and what is wrong, never the value
-// that is. An alternative the document matches none of lists what each wanted.
+// that is, nor its length or its number of properties. An alternative the document
+// matches none of lists what each wanted.
 func explain(err error) string {
 	v, ok := err.(*jsonschema.ValidationError)
 	if !ok {
@@ -287,6 +314,10 @@ func reasons(v *jsonschema.ValidationError, p *message.Printer) []string {
 		}
 		return out
 	}
+	// A refusal is said in words that name what the schema wants, never the value: the
+	// validator's own words for a bound, a length or a number of properties say the
+	// value, or its length. Its words are kept for the kinds whose words name only the
+	// schema's wants and the document's names, and any other keyword is named alone.
 	switch k := v.ErrorKind.(type) {
 	case *kind.Pattern:
 		return []string{at + "does not match " + k.Want}
@@ -294,6 +325,27 @@ func reasons(v *jsonschema.ValidationError, p *message.Printer) []string {
 		return []string{at + "is not " + k.Want}
 	case *kind.OneOf:
 		return []string{at + "matches more than one of the alternatives it may match one of"}
+	case *kind.Minimum:
+		return []string{at + "is less than " + k.Want.RatString()}
+	case *kind.Maximum:
+		return []string{at + "is greater than " + k.Want.RatString()}
+	case *kind.MinLength:
+		return []string{at + "is shorter than " + count(k.Want, "character")}
+	case *kind.MinProperties:
+		return []string{at + "has fewer than " + count(k.Want, "property")}
+	case *kind.Type, *kind.Enum, *kind.AdditionalProperties, *kind.Required, *kind.FalseSchema:
+		return []string{at + v.ErrorKind.LocalizedString(p)}
 	}
-	return []string{at + v.ErrorKind.LocalizedString(p)}
+	return []string{at + "is refused by the schema's " + strings.Join(v.ErrorKind.KeywordPath(), "/")}
+}
+
+// count is n of a thing in English words, 1 character or 2 properties.
+func count(n int, thing string) string {
+	switch {
+	case n == 1:
+		return "1 " + thing
+	case strings.HasSuffix(thing, "y"):
+		return strconv.Itoa(n) + " " + strings.TrimSuffix(thing, "y") + "ies"
+	}
+	return strconv.Itoa(n) + " " + thing + "s"
 }

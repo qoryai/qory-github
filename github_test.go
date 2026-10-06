@@ -320,6 +320,20 @@ func TestARunsTokenIsNeverGivenAdminNorMoreThanTheRepositories(t *testing.T) {
 	}
 }
 
+// TestMintRefusesAnAppIdThatIsNotOneAndNeverSaysIt mints with App ids Mint refuses, a
+// library's caller's that the settings' schema has not seen, and checks that the error
+// never says the id, and that nothing is sent.
+func TestMintRefusesAnAppIdThatIsNotOneAndNeverSaysIt(t *testing.T) {
+	repos, _ := ParseRepositories("acme/shop")
+	for _, id := range []string{"", "secretvalue-1", "secretvalue/1", strings.Repeat("secretvalue", 6)} {
+		tr := &sentTransport{}
+		_, err := Client{HTTP: &http.Client{Transport: tr}}.Mint(context.Background(), Request{AppID: id, Key: key(t), InstallationID: 7, Repositories: repos})
+		if err == nil || err.Error() != "the App id is not an id, 1 to 64 letters, digits or dots" || tr.sent {
+			t.Errorf("%q: err %v, sent %v", id, err, tr.sent)
+		}
+	}
+}
+
 // apiURLs are URLs of the API and whether the App's own token may go there: GitHub's
 // API, and for a test a loopback host, and nothing else.
 var apiURLs = map[string]bool{
@@ -591,31 +605,77 @@ func TestReadSettings(t *testing.T) {
 	}
 }
 
+// TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue hands in settings that
+// each keyword of the schema refuses, and checks the error says where and what, and
+// never the value: neither secretvalue, nor a case's own value, a number in any of the
+// ways Go writes it among them, nor the validator's own words for a length.
 func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T) {
-	for _, tc := range []struct{ doc, want string }{
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"contents":"admin"}}`, "/permissions/contents: value must be one of 'read', 'write'"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","key":"secretvalue"}`, "additional properties 'key' not allowed"},
-		{`{"app_id":"not an id secretvalue","private_key_file":"/k.pem"}`, "/app_id: does not match"},
-		{`{"app_id":true,"private_key_file":"/k.pem"}`, "/app_id: got boolean, want integer or string"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"secretvalue"}`, "/api_url: does not match"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"http://api.github.com"}`, "/api_url: does not match"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue@api.github.com"}`, "/api_url: does not match"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue.example/api/v3"}`, "/api_url: does not match"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{}}`, "/permissions: minProperties"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"administration":"read"}}`, "/permissions: invalid propertyName 'administration'"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"organization_administration":"read"}}`, "invalid propertyName 'organization_administration'"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"members":"read"}}`, "invalid propertyName 'members'"},
-		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"secrets":"write"}}`, "invalid propertyName 'secrets'"},
-		{`["app_id"]`, "got array, want object"},
-		{`{"app_id":1} {}`, "not one JSON document"},
+	for _, tc := range []struct {
+		doc, want string
+		value     []string // what the error may not contain besides secretvalue
+	}{
+		{`{"app_id":-778899,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is less than 1", []string{"778899", "778,899", "minimum"}},
+		{`{"app_id":0,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is less than 1", []string{"got"}},
+		{`{"app_id":778899001122334455667788,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is greater than 9007199254740991", []string{"778899", "7.788", "maximum"}},
+		{`{"app_id":` + strings.Repeat("7788990011", 7) + `,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is greater than 9007199254740991", []string{"778899", "7.788"}},
+		{`{"app_id":7.788e99,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is greater than 9007199254740991", []string{"7788", "7.788", "e99", "e+99"}},
+		{`{"app_id":7788.5,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: got number, want integer or string", []string{"7788"}},
+		{`{"app_id":123456,"installation_id":-778899,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: is less than 1", []string{"778899", "778,899"}},
+		{`{"app_id":123456,"installation_id":9007199254740992,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: is greater than 9007199254740991", []string{"9007199254740992", "9.007"}},
+		{`{"app_id":123456,"installation_id":9223372036854775808,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: is greater than 9007199254740991", []string{"9223372036854775808", "9.223"}},
+		{`{"app_id":123456,"installation_id":1e19,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: is greater than 9007199254740991", []string{"1e19", "1e+19", "10000000000000000000"}},
+		{`{"app_id":123456,"installation_id":7788.5,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: got number, want integer", []string{"7788"}},
+		{`{"app_id":123456,"installation_id":"secretvalue","private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: got string, want integer", nil},
+		{`{"app_id":123456,"private_key_file":""}`, "the settings are invalid: /private_key_file: is shorter than 1 character", []string{"got", "minLength"}},
+		{`{"app_id":123456,"private_key":""}`, "the settings are invalid: /private_key: is shorter than 1 character", []string{"got", "minLength"}},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"contents":"secretvalue"}}`, "/permissions/contents: value must be one of 'read', 'write'", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"contents":"admin"}}`, "/permissions/contents: value must be one of 'read', 'write'", []string{"admin"}},
+		{`{"app_id":"123456","private_key_file":"/k.pem","key":"secretvalue"}`, "additional properties 'key' not allowed", nil},
+		{`{"app_id":"not an id secretvalue","private_key_file":"/k.pem"}`, "/app_id: does not match", nil},
+		{`{"app_id":true,"private_key_file":"/k.pem"}`, "/app_id: got boolean, want integer or string", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"secretvalue"}`, "/api_url: does not match", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"http://api.github.com"}`, "/api_url: does not match", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue@api.github.com"}`, "/api_url: does not match", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue.example/api/v3"}`, "/api_url: does not match", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{}}`, "/permissions: has fewer than 1 property", []string{"got", "minProperties"}},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"administration":"read"}}`, "/permissions: invalid propertyName 'administration'", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"organization_administration":"read"}}`, "invalid propertyName 'organization_administration'", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"members":"read"}}`, "invalid propertyName 'members'", nil},
+		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"secrets":"write"}}`, "invalid propertyName 'secrets'", nil},
+		{`["app_id"]`, "got array, want object", nil},
+		{`{"app_id":1} {}`, "not one JSON document", nil},
 	} {
 		_, err := ReadSettings(strings.NewReader(tc.doc))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v", tc.doc, err)
 			continue
 		}
-		if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), "secretvalue") || strings.Contains(err.Error(), "\n") {
-			t.Errorf("%s: the error contains a value: %v", tc.doc, err)
+		for _, v := range append(tc.value, "PRIVATE KEY", "secretvalue", "\n") {
+			if strings.Contains(err.Error(), v) {
+				t.Errorf("%s: the error contains %q: %v", tc.doc, v, err)
+			}
+		}
+	}
+}
+
+// TestReadSettingsTakesAnIntegerAsTheSchemaDoes reads an id written as the schema reads
+// an integer, whatever its notation, up to the schema's maximum, the largest integer
+// every JSON reader holds exactly.
+func TestReadSettingsTakesAnIntegerAsTheSchemaDoes(t *testing.T) {
+	for _, tc := range []struct {
+		doc            string
+		app            string
+		installationID int64
+	}{
+		{`{"app_id":123456,"installation_id":42,"private_key_file":"/k.pem"}`, "123456", 42},
+		{`{"app_id":123456.0,"installation_id":42.0,"private_key_file":"/k.pem"}`, "123456", 42},
+		{`{"app_id":1.23456e5,"installation_id":4.2E1,"private_key_file":"/k.pem"}`, "123456", 42},
+		{`{"app_id":9007199254740991,"installation_id":9007199254740991,"private_key_file":"/k.pem"}`, "9007199254740991", 9007199254740991},
+		{`{"app_id":"1.0","private_key_file":"/k.pem"}`, "1.0", 0},
+	} {
+		s, err := ReadSettings(strings.NewReader(tc.doc))
+		if err != nil || s.AppID != tc.app || s.InstallationID != tc.installationID {
+			t.Errorf("%s: settings %+v, %v", tc.doc, s, err)
 		}
 	}
 }

@@ -151,6 +151,10 @@ Settings without `app_id`, or with neither `private_key` nor `private_key_file`,
 refused, and so are settings that contain both: a secret has one source. No setting is
 read from the environment or the command line.
 
+`app_id` as a number, and `installation_id`, are integers from 1 to 9007199254740991,
+2^53 - 1, the largest integer every JSON reader holds exactly. An integer is read as JSON
+Schema reads it, whatever its notation: `42.0` and `4.2e1` are `42`.
+
 The description's credential role lists the settings the runner writes to the standard
 input of `credential`, as the
 [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#roles)

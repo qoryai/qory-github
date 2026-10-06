@@ -86,6 +86,22 @@ change what the program does, and notes it under Upgrading.
   said it read nothing there: Go's HTTP client takes a proxy from `HTTPS_PROXY` and
   `NO_PROXY`, and on Linux the system's certificates from `SSL_CERT_FILE` and
   `SSL_CERT_DIR`, as before.
+- An error about settings never says a value: a number below or above its bound, a
+  string's length and a number of permissions are no longer in it, where before
+  `/installation_id: minimum: got -42, want 1` said the number. The error says the
+  bound: `/installation_id: is less than 1`,
+  `/private_key_file: is shorter than 1 character`,
+  `/permissions: has fewer than 1 property`. A name the document chose may still appear,
+  escaped, where it is the location or the property refused.
+- `app_id` as a number, and `installation_id`, are at most 9007199254740991, 2^53 - 1,
+  the largest integer every JSON reader holds exactly, so the settings refuse a larger id
+  with `is greater than 9007199254740991`, where before an error from Go, or for `app_id`
+  from `Mint`, said the number. An id written as JSON Schema reads an integer, `42.0` or
+  `4.2e1`, is taken as `42`, as the schema takes it: before, such an `installation_id`
+  was refused with the number in the error, and such an `app_id` went to GitHub as it
+  was written.
+- `Mint` refuses an App id that is not one, and a permission that is neither `read` nor
+  `write`, without saying the id or the level.
 
 ### Removed
 

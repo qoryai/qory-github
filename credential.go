@@ -160,7 +160,7 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	if !appIDShape.MatchString(req.AppID) {
-		return nil, fmt.Errorf("the App id %q is not an id", req.AppID)
+		return nil, errors.New("the App id is not an id, 1 to 64 letters, digits or dots")
 	}
 	if req.Key == nil {
 		return nil, errors.New("no private key")
@@ -180,7 +180,7 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 			return nil, fmt.Errorf("%q is not a permission a run's token may be granted; those are %s", name, strings.Join(RunPermissions, ", "))
 		}
 		if level != "read" && level != "write" {
-			return nil, fmt.Errorf("the permission %s is %q; a run's token reads or writes, never more", name, level)
+			return nil, fmt.Errorf("the permission %s is neither read nor write; a run's token reads or writes, never more", name)
 		}
 	}
 	now := time.Now
