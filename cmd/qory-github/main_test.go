@@ -317,6 +317,39 @@ func TestAFailureToReachGitHubNeverSaysTheRequest(t *testing.T) {
 	}
 }
 
+// TestCredentialRefusesAnotherOwnersInstallation runs credential with an installation
+// GitHub says is another account's, and checks the one line on standard error, which
+// says neither the id nor the login, and that no token is minted.
+func TestCredentialRefusesAnotherOwnersInstallation(t *testing.T) {
+	file, _ := keyFile(t)
+	var minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app/installations/778899":
+			io.WriteString(w, `{"id":778899,"account":{"login":"otherlogin"}}`)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			minted.Store(true)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"token":"`+token+`","expires_at":"2026-09-25T21:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	in := strings.NewReader(settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": srv.URL}))
+	code := run(context.Background(), []string{"credential", "--", "acme/shop"}, in, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if minted.Load() {
+		t.Error("a token was minted with another account's installation")
+	}
+}
+
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
 // contains control characters and Unicode line separators, and checks that the failure
 // is still one line on standard error, with each of them escaped.

@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -64,12 +65,14 @@ func keyPEM(t *testing.T) []byte {
 type fakeGitHub struct {
 	t             *testing.T
 	installations map[string]int64 // owner/name -> installation id
+	accounts      map[int64]string // installation id -> the login of its account
 	status        int              // the mint's status; zero is 201
 	mu            sync.Mutex
 	auth          []string
 	mint          map[string]any
 	mintPath      string
 	lookups       []string
+	checks        []string // the installations' paths read
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +90,16 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"id": id})
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/app/installations/"):
+		f.checks = append(f.checks, r.URL.Path)
+		id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/app/installations/"), 10, 64)
+		login, ok := f.accounts[id]
+		if !ok {
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": id, "account": map[string]any{"login": login, "type": "Organization"}})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app/installations/"):
 		f.mintPath = r.URL.Path
 		json.NewDecoder(r.Body).Decode(&f.mint)
@@ -175,15 +188,68 @@ func TestMintLooksTheInstallationUpAndAsksForTheRepositoriesAlone(t *testing.T) 
 }
 
 func TestMintWithAnInstallationLooksNothingUp(t *testing.T) {
-	f := &fakeGitHub{}
+	f := &fakeGitHub{accounts: map[int64]string{7: "acme"}}
 	c := serve(t, f)
 	repos, _ := ParseRepositories("acme/shop")
 	if _, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := json.Marshal(f.mint)
-	if len(f.lookups) != 0 || f.mintPath != "/app/installations/7/access_tokens" || string(got) != `{"permissions":{"contents":"write","pull_requests":"write"},"repositories":["shop"]}` {
-		t.Errorf("lookups %v, mint %s %s", f.lookups, f.mintPath, got)
+	if len(f.lookups) != 0 || strings.Join(f.checks, " ") != "/app/installations/7" || f.mintPath != "/app/installations/7/access_tokens" || string(got) != `{"permissions":{"contents":"write","pull_requests":"write"},"repositories":["shop"]}` {
+		t.Errorf("lookups %v, checks %v, mint %s %s", f.lookups, f.checks, f.mintPath, got)
+	}
+}
+
+// TestMintChecksTheInstallationIsTheOwners mints with an installation the request names
+// and checks that a token is minted only when GitHub says it is the App's installation
+// on the repositories' owner, the login in any case; an installation of another account,
+// one GitHub does not know of the App and one whose account has no login are refused in
+// one line that says neither id nor login, and nothing reaches the mint.
+func TestMintChecksTheInstallationIsTheOwners(t *testing.T) {
+	const refused = "installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out"
+	for _, tc := range []struct {
+		name     string
+		accounts map[int64]string
+		repos    string
+		ok       bool
+	}{
+		{"the owner's", map[int64]string{778899: "acme"}, "acme/shop", true},
+		{"the owner's, in another case", map[int64]string{778899: "ACME"}, "Acme/shop,acme/lib", true},
+		{"another account's", map[int64]string{778899: "otherlogin"}, "acme/shop", false},
+		{"an account whose login begins the owner's", map[int64]string{778899: "acme-other"}, "acme/shop", false},
+		{"an account with no login", map[int64]string{778899: ""}, "acme/shop", false},
+		{"not the App's, a 404", map[int64]string{}, "acme/shop", false},
+	} {
+		f := &fakeGitHub{accounts: tc.accounts}
+		c := serve(t, f)
+		repos, _ := ParseRepositories(tc.repos)
+		a, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 778899, Repositories: repos})
+		if strings.Join(f.checks, " ") != "/app/installations/778899" || len(f.lookups) != 0 {
+			t.Errorf("%s: checked %v, looked up %v", tc.name, f.checks, f.lookups)
+		}
+		if tc.ok {
+			if err != nil || a.Token != fakeToken || f.mintPath != "/app/installations/778899/access_tokens" {
+				t.Errorf("%s: %v, minted at %q", tc.name, err, f.mintPath)
+			}
+			continue
+		}
+		if err == nil || err.Error() != refused {
+			t.Errorf("%s: err %v, want %s", tc.name, err, refused)
+		}
+		if f.mintPath != "" || f.mint != nil {
+			t.Errorf("%s: a token was minted at %s", tc.name, f.mintPath)
+		}
+	}
+	// Another failure of the check says what failed, and never the id.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"Bad credentials"}`)
+	}))
+	t.Cleanup(srv.Close)
+	repos, _ := ParseRepositories("acme/shop")
+	_, err := Client{API: srv.URL}.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 778899, Repositories: repos})
+	if err == nil || err.Error() != "checking installation_id: GitHub answered 401: Bad credentials" {
+		t.Errorf("err %v", err)
 	}
 }
 
@@ -196,7 +262,7 @@ func TestMintRefusesRepositoriesInTwoInstallations(t *testing.T) {
 }
 
 func TestAMintGitHubRefusesSaysWhyAndCarriesNoSecret(t *testing.T) {
-	f := &fakeGitHub{status: 401}
+	f := &fakeGitHub{accounts: map[int64]string{7: "acme"}, status: 401}
 	c := serve(t, f)
 	repos, _ := ParseRepositories("acme/shop")
 	_, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos})
@@ -353,7 +419,7 @@ func TestTheArgumentPatternIsTheParser(t *testing.T) {
 }
 
 func TestARunsTokenIsNeverGivenAdminNorMoreThanTheRepositories(t *testing.T) {
-	c := serve(t, &fakeGitHub{})
+	c := serve(t, &fakeGitHub{accounts: map[int64]string{7: "acme"}})
 	repos, _ := ParseRepositories("acme/shop")
 	for _, perms := range []map[string]string{
 		{"contents": "admin"}, {"Contents": "read"}, {"administration": "read"}, {"organization_administration": "read"},

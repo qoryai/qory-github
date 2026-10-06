@@ -143,7 +143,7 @@ One JSON document, on the standard input of `credential`; in `runner.yaml`, unde
 | `app_id` | yes | The App's numeric id, or its client id as a string |
 | `private_key_file` | this or `private_key` | Path to the App's private key, the key kept on disk. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
 | `private_key` | this or `private_key_file` | The App's private key itself, the PEM. A secret. |
-| `installation_id` | no | The App's installation on the repositories' owner. Looked up from the repositories when absent. |
+| `installation_id` | no | The App's installation on the repositories' owner. Checked with GitHub before a token is minted: an installation on another account is refused. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
 | `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. Not in the credential role's settings. |
 

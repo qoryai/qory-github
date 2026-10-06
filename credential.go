@@ -142,8 +142,9 @@ type Request struct {
 	AppID string
 	// Key is the App's private key, used to sign and never sent.
 	Key *rsa.PrivateKey
-	// InstallationID is the App's installation on the repositories' owner; zero looks
-	// it up by the repositories, which must all have the same one.
+	// InstallationID is the App's installation on the repositories' owner, which Mint
+	// checks with GitHub before it mints; zero looks it up by the repositories, which
+	// must all have the same one.
 	InstallationID int64
 	// Repositories are what the token covers, one owner's.
 	Repositories []Repository
@@ -154,7 +155,9 @@ type Request struct {
 // Mint requests from GitHub an installation token that covers the request's repositories,
 // with its permissions and no more, and returns the answer the runner reads. It refuses
 // an API [CheckAPIURL] refuses before anything else, so the App's own token goes to
-// GitHub's API alone. It keeps nothing: the runner runs the adapter again before the
+// GitHub's API alone. An installation the request names is minted with only once GitHub
+// says it is the App's installation on the repositories' owner, so a token is never one
+// of another account's. It keeps nothing: the runner runs the adapter again before the
 // token expires.
 func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	if err := CheckAPIURL(c.base()); err != nil {
@@ -193,6 +196,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	id := req.InstallationID
+	if id != 0 {
+		if err := c.checkInstallation(ctx, jwt, id, req.Repositories); err != nil {
+			return nil, err
+		}
+	}
 	if id == 0 {
 		for _, r := range req.Repositories {
 			var got struct {
@@ -228,6 +236,36 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
+}
+
+// errNotTheOwners refuses an installation that is not the App's on the repositories'
+// owner. It says neither the installation's id nor the account GitHub has it on.
+var errNotTheOwners = errors.New("installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out")
+
+// checkInstallation refuses the installation id unless GitHub says it is the App's
+// installation on the account that owns the repositories, its login compared as GitHub
+// compares logins, in any case. An installation GitHub does not know of the App, a 404,
+// is refused the same way.
+func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) error {
+	var got struct {
+		Account struct {
+			Login string `json:"login"`
+		} `json:"account"`
+	}
+	err := c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got)
+	var answered *answerError
+	switch {
+	case errors.As(err, &answered) && answered.status == http.StatusNotFound:
+		return errNotTheOwners
+	case err != nil:
+		return err
+	}
+	for _, r := range repos {
+		if !strings.EqualFold(got.Account.Login, r.Owner) {
+			return errNotTheOwners
+		}
+	}
+	return nil
 }
 
 // apiURLShape is the API a token is minted through: the settings schema's pattern for
@@ -317,12 +355,24 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("%s: GitHub answered %d: %s", what, resp.StatusCode, e.Message)
+		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
 	}
 	return nil
+}
+
+// answerError is GitHub's answer when its status is not the one a request wants: the
+// request it answers, as call names it, the status, and GitHub's message.
+type answerError struct {
+	what    string
+	status  int
+	message string
+}
+
+func (e *answerError) Error() string {
+	return fmt.Sprintf("%s: GitHub answered %d: %s", e.what, e.status, e.message)
 }
 
 // errRequestLeftOut stands for an error that says the request it failed, which a

@@ -109,6 +109,12 @@ change what the program does, and notes it under Upgrading.
   host and port, never the URL nor the path: before, the method, the path and the URL
   were in it, so `setup` wrote the one-time code it exchanges for the App's private key,
   twice, and `credential` the installation's id.
+- An `installation_id` the settings set is checked before a token is minted: GitHub must
+  say it is the App's installation on the account that owns the repositories, its login
+  compared in any case. Another account's installation, and one GitHub does not know of
+  the App, are refused with `installation_id is not the App's installation on the
+  repositories' owner; set that owner's installation, or leave installation_id out`.
+  Before, a token was minted with whatever installation the settings named.
 
 ### Removed
 
