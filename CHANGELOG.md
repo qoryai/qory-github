@@ -102,6 +102,13 @@ change what the program does, and notes it under Upgrading.
   was written.
 - `Mint` refuses an App id that is not one, and a permission that is neither `read` nor
   `write`, without saying the id or the level.
+- An error from a request to GitHub's API names the request, `minting the installation
+  token`, `finding the App's installation on acme/shop` or
+  `exchanging the code for the App`, and never says what was sent. When the API cannot
+  be reached it says `GitHub's API could not be reached` and why, which may name the
+  host and port, never the URL nor the path: before, the method, the path and the URL
+  were in it, so `setup` wrote the one-time code it exchanges for the App's private key,
+  twice, and `credential` the installation's id.
 
 ### Removed
 

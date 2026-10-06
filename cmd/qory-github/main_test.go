@@ -293,6 +293,30 @@ func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 	}
 }
 
+// TestAFailureToReachGitHubNeverSaysTheRequest runs credential with an API nothing
+// listens on and an installation, a setting, and checks that the one line on standard
+// error says what failed, and never the installation's id, the path nor the URL.
+func TestAFailureToReachGitHubNeverSaysTheRequest(t *testing.T) {
+	file, _ := keyFile(t)
+	srv := httptest.NewServer(http.NotFoundHandler())
+	api := srv.URL
+	srv.Close()
+	var out, errs bytes.Buffer
+	in := strings.NewReader(settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": api}))
+	code := run(context.Background(), []string{"credential", "--", "acme/shop"}, in, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if !strings.HasPrefix(errs.String(), "qory-github credential: ") || !strings.Contains(errs.String(), ": GitHub's API could not be reached: ") {
+		t.Errorf("stderr %q", errs.String())
+	}
+	for _, v := range []string{"778899", "/app/", "installations/", "access_tokens", api} {
+		if strings.Contains(errs.String(), v) {
+			t.Errorf("stderr contains %q: %q", v, errs.String())
+		}
+	}
+}
+
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
 // contains control characters and Unicode line separators, and checks that the failure
 // is still one line on standard error, with each of them escaped.

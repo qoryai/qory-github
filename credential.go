@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -197,11 +198,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 			var got struct {
 				ID int64 `json:"id"`
 			}
-			if err := c.call(ctx, http.MethodGet, "/repos/"+r.String()+"/installation", jwt, nil, http.StatusOK, &got); err != nil {
-				return nil, fmt.Errorf("the App's installation on %s: %w", r, err)
+			if err := c.call(ctx, "finding the App's installation on "+r.String(), http.MethodGet, "/repos/"+r.String()+"/installation", jwt, nil, http.StatusOK, &got); err != nil {
+				return nil, err
 			}
 			if id != 0 && got.ID != id {
-				return nil, fmt.Errorf("the repositories are in different installations of the App, %d and %d", id, got.ID)
+				return nil, errors.New("the repositories are in different installations of the App; a token is one installation's")
 			}
 			id = got.ID
 		}
@@ -215,15 +216,16 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		ExpiresAt string `json:"expires_at"`
 	}
 	body := map[string]any{"repositories": names, "permissions": perms}
-	if err := c.call(ctx, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
-		return nil, fmt.Errorf("the installation token: %w", err)
+	const minting = "minting the installation token"
+	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
+		return nil, err
 	}
 	if got.Token == "" {
-		return nil, errors.New("the installation token: GitHub answered without a token")
+		return nil, errors.New(minting + ": GitHub answered without a token")
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, fmt.Errorf("the installation token: the expiry %q is not a time", got.ExpiresAt)
+		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
@@ -265,11 +267,13 @@ func (c Client) base() string {
 	return c.API
 }
 
-// call makes one request to the API and decodes the answer. It refuses an API
-// [CheckAPIURL] refuses before anything is sent, so every request, a mint's and setup's,
-// goes to GitHub's API alone. An error contains the status and GitHub's message, never
-// what was sent.
-func (c Client) call(ctx context.Context, method, path, jwt string, body any, want int, out any) error {
+// call makes one request to the API, the one what names, such as "minting the
+// installation token", and decodes the answer. It refuses an API [CheckAPIURL] refuses
+// before anything is sent, so every request, a mint's and setup's, goes to GitHub's API
+// alone. An error begins with what, and says the status and GitHub's message, or why the
+// API could not be reached. It never says what was sent: no URL, no path, which carries
+// the code setup exchanges and an installation's id, no header and no body.
+func (c Client) call(ctx context.Context, what, method, path, jwt string, body any, want int, out any) error {
 	base := c.base()
 	if err := CheckAPIURL(base); err != nil {
 		return err
@@ -284,7 +288,7 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+path, r)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: the request could not be made: %w", what, unsent(err, path))
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -301,7 +305,7 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -313,10 +317,29 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("GitHub answered %d: %s", resp.StatusCode, e.Message)
+		return fmt.Errorf("%s: GitHub answered %d: %s", what, resp.StatusCode, e.Message)
 	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("GitHub's answer: %w", err)
+		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
 	}
 	return nil
+}
+
+// errRequestLeftOut stands for an error that says the request it failed, which a
+// request's error never says.
+var errRequestLeftOut = errors.New("its error is left out, since it says the request")
+
+// unsent is the error a request failed with, without the request. A *url.Error says the
+// URL, and with it the path, so what it wraps is kept alone: why the API could not be
+// reached, which may name its host and port, never a path. Should that say the path all
+// the same, it is left out.
+func unsent(err error, path string) error {
+	var u *url.Error
+	if errors.As(err, &u) {
+		err = u.Err
+	}
+	if err == nil || strings.Contains(err.Error(), path) {
+		return errRequestLeftOut
+	}
+	return err
 }

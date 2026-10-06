@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -241,6 +242,46 @@ func TestSetupRefusesAnotherWebsiteOrAPIBeforeAnything(t *testing.T) {
 		s := Setup{KeyFile: filepath.Join(t.TempDir(), "app.pem"), Client: Client{API: api, HTTP: &http.Client{Transport: tr}}}
 		if _, err := s.exchange(context.Background(), "abc"); err == nil || !strings.Contains(err.Error(), "the API is neither https://api.github.com") || tr.sent {
 			t.Errorf("exchange through %q: %v, sent %v", api, err, tr.sent)
+		}
+	}
+}
+
+// unreachable is a loopback API nothing listens on: a request to it is refused.
+func unreachable(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := "http://" + ln.Addr().String()
+	ln.Close()
+	return api
+}
+
+// TestSetupNeverSaysTheCodeItExchanges follows GitHub's redirect with a code, which an
+// unused code stays good for and which GitHub exchanges for the App's private key, to a
+// setup whose API cannot be reached, and checks that the error says what failed and
+// never the code, nor the path it is sent in.
+func TestSetupNeverSaysTheCodeItExchanges(t *testing.T) {
+	const code = "secretcode7788990011"
+	s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: Client{API: unreachable(t)}, Wait: time.Minute}
+	local, wait, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, _ := readPage(t, local)
+	u, _ := url.Parse(action)
+	resp, err := http.Get(strings.TrimSuffix(local, "/") + "/callback?state=" + u.Query().Get("state") + "&code=" + code)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("the redirect answered %v %v", resp.StatusCode, err)
+	}
+	_, err = wait()
+	if err == nil || !strings.HasPrefix(err.Error(), "exchanging the code for the App: GitHub's API could not be reached: ") {
+		t.Fatalf("err %v", err)
+	}
+	for _, v := range []string{code, "secretcode", "/app-manifests", "conversions"} {
+		if strings.Contains(err.Error(), v) {
+			t.Errorf("the error contains %q: %v", v, err)
 		}
 	}
 }

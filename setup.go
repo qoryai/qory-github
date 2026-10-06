@@ -218,8 +218,8 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		HTMLURL  string `json:"html_url"`
 		PEM      string `json:"pem"`
 	}
-	if err := s.Client.call(ctx, http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
-		return nil, fmt.Errorf("exchanging the code for the App: %w", err)
+	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
+		return nil, err
 	}
 	if got.ID == 0 || got.Slug == "" {
 		return nil, errors.New("exchanging the code for the App: GitHub answered without the App")

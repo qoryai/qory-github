@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -208,6 +209,55 @@ func TestAMintGitHubRefusesSaysWhyAndCarriesNoSecret(t *testing.T) {
 		if len(secret) < 6 || strings.Contains(err.Error(), secret) {
 			t.Errorf("the error contains %.12q: %v", secret, err)
 		}
+	}
+}
+
+// TestAMintGitHubCannotBeReachedSaysWhatFailedAndNeverTheRequest mints through an API
+// that cannot be reached, with an installation and without, and checks that the error
+// names the request and says why, and never says the path, the installation's id among
+// it, nor the URL.
+func TestAMintGitHubCannotBeReachedSaysWhatFailedAndNeverTheRequest(t *testing.T) {
+	api := unreachable(t)
+	repos, _ := ParseRepositories("acme/shop")
+	for _, tc := range []struct {
+		id   int64
+		want string
+	}{
+		{0, "finding the App's installation on acme/shop: GitHub's API could not be reached: "},
+		{778899, "GitHub's API could not be reached: "},
+	} {
+		_, err := Client{API: api}.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: tc.id, Repositories: repos})
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("installation %d: err %v", tc.id, err)
+		}
+		for _, v := range []string{"778899", "/app/", "/repos/", "access_tokens", "installations/", api, "http://"} {
+			if strings.Contains(err.Error(), v) {
+				t.Errorf("installation %d: the error contains %q: %v", tc.id, v, err)
+			}
+		}
+	}
+}
+
+// TestARequestsErrorLeavesTheRequestOut pins unsent: a *url.Error is kept without its
+// URL, and an error that says the path all the same is left out whole.
+func TestARequestsErrorLeavesTheRequestOut(t *testing.T) {
+	path := "/app-manifests/secretcode7788990011/conversions"
+	refused := errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&url.Error{Op: "Post", URL: "http://127.0.0.1:1" + path, Err: refused}, refused.Error()},
+		{&url.Error{Op: "Post", URL: "http://127.0.0.1:1" + path, Err: errors.New("no route to " + path)}, errRequestLeftOut.Error()},
+		{errors.New("Post " + path), errRequestLeftOut.Error()},
+		{refused, refused.Error()},
+	} {
+		if got := unsent(tc.err, path); got.Error() != tc.want {
+			t.Errorf("unsent(%v) = %v, want %s", tc.err, got, tc.want)
+		}
+	}
+	if err := unsent(&url.Error{Op: "Get", URL: "http://127.0.0.1:1/", Err: context.DeadlineExceeded}, "/"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("unsent drops what the error wraps: %v", err)
 	}
 }
 
