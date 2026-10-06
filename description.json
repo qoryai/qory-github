@@ -2,16 +2,12 @@
   "version": 1,
   "name": "github",
   "title": "GitHub",
+  "publisher": {"name": "Qory", "url": "https://qory.dev"},
   "description": "Mints a GitHub App installation token for the repositories a run works on, with the permissions the machine allows and no more.",
   "domains": ["software"],
   "settings": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["app_id"],
-    "oneOf": [
-      {"required": ["private_key_file"]},
-      {"required": ["private_key"]}
-    ],
     "properties": {
       "app_id": {
         "title": "App id",
@@ -61,7 +57,9 @@
   "roles": {
     "credential": {
       "argument": "[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}(,[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100})*",
-      "hosts": ["github.com", "api.github.com"]
+      "hosts": ["github.com", "api.github.com"],
+      "settings": ["app_id", "installation_id", "permissions", "private_key"],
+      "required": ["app_id", "private_key"]
     }
   }
 }

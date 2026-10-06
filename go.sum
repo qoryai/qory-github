@@ -1,7 +1,7 @@
 github.com/dlclark/regexp2 v1.11.0 h1:G/nrcoOa7ZXlpoa/91N3X7mM3r8eIlMBBJZvsz/mxKI=
 github.com/dlclark/regexp2 v1.11.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
-github.com/qoryai/integrations v0.2.1-0.20261003184833-0970afb56b2a h1:3EG5UOUYybWhqi0SWV6gdgha2owgzY2qoQCDwrn0VQA=
-github.com/qoryai/integrations v0.2.1-0.20261003184833-0970afb56b2a/go.mod h1:qJo3+7VDVx6nb/AVFFBWS0mWDJKDYsijWKiNcb6xF4c=
+github.com/qoryai/integrations v0.2.1-0.20261006195344-0f167ba9a536 h1:ke2UVDV/f8pAEwGYzCV9hAP18XHTWsJ2m6HmZkOG4eE=
+github.com/qoryai/integrations v0.2.1-0.20261006195344-0f167ba9a536/go.mod h1:qJo3+7VDVx6nb/AVFFBWS0mWDJKDYsijWKiNcb6xF4c=
 github.com/qoryai/runner v0.6.0 h1:sRvlOQa/BGxtIWmPiktZIDG1zKN7g47YGJfBXSGe7dI=
 github.com/qoryai/runner v0.6.0/go.mod h1:R7Uzoy04Z1mNNQKeNL2dQ5QbZ1ADNH7VAvvnCUG4RKU=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=

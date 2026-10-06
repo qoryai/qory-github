@@ -20,6 +20,15 @@ change what the program does, and notes it under Upgrading.
   `private_key_file`, the key kept on disk.
 - The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
   name a control plane suggests for storing the key.
+- The description names its `publisher`, `{"name": "Qory", "url": "https://qory.dev"}`,
+  which the integration contract requires, and `Description` has it as `Publisher`.
+- The description's credential role lists the settings the runner writes to its standard
+  input, `"settings": ["app_id", "installation_id", "permissions", "private_key"]`, and
+  those it needs, `"required": ["app_id", "private_key"]`, as the integration contract's
+  ways define a role; `CredentialRole` has them as `Settings` and `Required`. The private
+  key is listed as `private_key`, which the runner writes as `private_key` or
+  `private_key_file`. `api_url` is not listed, so a document the runner writes never
+  carries it; `credential` still takes it when its standard input does.
 
 ### Changed
 
@@ -28,6 +37,14 @@ change what the program does, and notes it under Upgrading.
   the usage too. `-h` still prints the help.
 - Settings that contain both `private_key` and `private_key_file` are refused, before
   the schema is checked, with an error that names the two: a secret has one source.
+- The settings schema has no top-level `required` and no `oneOf` over `private_key` and
+  `private_key_file`, which the integration contract no longer allows at the top level.
+  `ReadSettings` reads the credential role's `required` instead: settings without
+  `app_id`, or with neither `private_key` nor `private_key_file`, are refused before the
+  schema is checked, the key read or GitHub's API called, with an error that names what
+  is missing and the role that requires it, in place of the schema's `missing property`.
+- The integration contract is pinned at `github.com/qoryai/integrations`
+  `0f167ba9a536`, the commit that defines ways and sources on any forge.
 - An empty argument, which a connection without one passes, is refused by the rule for
   repositories, with an error that says it is empty, not as a missing argument.
 - An error about settings that are not one JSON document says at which byte the document
@@ -77,6 +94,13 @@ change what the program does, and notes it under Upgrading.
 - `setup --api-url` and `--web-url` with another host, such as one of GitHub Enterprise
   Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
   Leave them out for GitHub's own.
+- The description follows the integration contract's ways: it has `publisher`, and its
+  credential role has `settings` and `required`. A `qory` or another reader of an earlier
+  contract refuses both, so this version needs a reader of the contract at
+  `github.com/qoryai/integrations` `0f167ba9a536` or later.
+- A runner of that contract writes `credential` only the settings its role lists, and
+  refuses a connection that carries another, so settings with `api_url` no longer reach
+  `credential` through the runner. Leave `api_url` out for GitHub's own.
 
 ## [0.1.0] - 2026-09-30
 

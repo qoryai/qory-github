@@ -125,10 +125,11 @@ var describeHelp = help{
 	long: `Print the integration's description: one JSON document, as the integration contract
 defines it.
 
-It contains the settings qory-github takes, as a JSON Schema, with the private key
-marked writeOnly, a secret. It contains the credential role: the repositories an
-argument may list, and the hosts the access token is for. qory runs describe, and checks
-the declaration's settings against it.
+It contains who publishes qory-github, and the settings it takes, as a JSON Schema, with
+the private key marked writeOnly, a secret. It contains the credential role: the
+repositories an argument may list, the hosts the access token is for, and the settings
+the runner hands credential and those it requires. qory runs describe, and checks the
+declaration's settings against it.
 
 It takes no settings and reaches no network.`,
 	example: `  qory-github describe                  # the whole description
@@ -148,9 +149,10 @@ writes that adapter from the integrations: section of runner.yaml.
 The settings come on standard input, one JSON document; qory-github describe lists what
 it contains. credential reads standard input to its end, or until it has more than
 64 KiB, before it checks the argument and before any network call. It refuses empty
-input, anything after the document but white space, and more than 64 KiB. The private
-key comes as private_key itself or as private_key_file, a file only its owner reads,
-never both. credential takes no flags and reads nothing from its environment.
+input, anything after the document but white space, and more than 64 KiB. It requires
+app_id and the private key, which comes as private_key itself or as private_key_file, a
+file only its owner reads, one of them and never both. credential takes no flags and
+reads nothing from its environment.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,

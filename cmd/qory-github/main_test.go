@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -244,8 +245,9 @@ func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 	}{
 		{"github refuses", cred, settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 403)}), "403: Resource not accessible by integration"},
 		{"two owners", []string{"credential", "--", "acme/shop,other/lib"}, settings(t, map[string]any{"private_key_file": file, "api_url": noAPI}), "share an owner"},
-		{"no settings", cred, "{}", "missing property 'app_id'"},
-		{"no key", cred, settings(t, nil), "missing property 'private_key_file'"},
+		{"no settings", cred, "{}", "the settings do not contain app_id, which the credential role requires"},
+		{"no App id", cred, `{"private_key_file":"/nonexistent/app.pem","api_url":"` + noAPI + `"}`, "the settings do not contain app_id, which the credential role requires"},
+		{"no key", cred, settings(t, map[string]any{"api_url": noAPI}), "the settings contain neither private_key nor private_key_file; the credential role requires the secret, so set one of them"},
 		{"admin", cred, settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"contents": "admin"}}), "/permissions/contents: value must be one of 'read', 'write'"},
 		{"administration", cred, settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"administration": "read"}}), "/permissions: invalid propertyName 'administration'"},
 		{"an argument like a flag", []string{"credential", "--", "-acme/shop"}, settings(t, map[string]any{"private_key_file": file, "api_url": noAPI}), `"-acme/shop" is not owner/name`},
@@ -631,8 +633,10 @@ func TestTheReadmesShowWhatSetupPrints(t *testing.T) {
 // qory-<key> when none is declared, and the argument and the hosts of qory-github's
 // description; and, by key, the settings document written to the program's standard
 // input, the declaration's settings as compact JSON, {} when none are declared, with
-// nothing in it replaced or escaped. How a definition gives the runner that document is
-// the runner's contract, which this leaves out.
+// nothing in it replaced or escaped. A declared setting the credential role does not
+// list, a secret as <name> or <name>_file, fails the test, as the runner refuses it. How
+// a definition gives the runner that document is the runner's contract, which this
+// leaves out.
 func expand(t *testing.T, integrations string) (string, map[string]string) {
 	t.Helper()
 	var doc struct {
@@ -669,8 +673,13 @@ func expand(t *testing.T, integrations string) (string, map[string]string) {
 		if decl.Program != "qory-github" {
 			t.Fatalf("%s: the program %s is not qory-github", key, decl.Program)
 		}
-		stdin[key] = settings.String()
 		d := github.Describe(version)
+		for name := range decl.Settings {
+			if !slices.Contains(d.Roles.Credential.Settings, strings.TrimSuffix(name, "_file")) {
+				t.Fatalf("%s: the credential role does not list the setting %s", key, name)
+			}
+		}
+		stdin[key] = settings.String()
 		fmt.Fprintf(&b, `  %s:
     adapter: [%s, credential, --, "${argument}"]
     argument: %s

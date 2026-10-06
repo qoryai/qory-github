@@ -25,12 +25,15 @@ import (
 var description []byte
 
 // Description is the integration's description, contracts/integration/v1: its name,
-// the domains it serves, the settings it takes as a JSON Schema, and the roles it plays.
+// who publishes it, the domains it serves, the settings it takes as a JSON Schema, and
+// the roles it plays.
 type Description struct {
-	Version     int    `json:"version"`
-	Name        string `json:"name"`
-	Title       string `json:"title"`
-	Description string `json:"description,omitempty"`
+	Version int    `json:"version"`
+	Name    string `json:"name"`
+	Title   string `json:"title"`
+	// Publisher is who publishes the program, as it names them: Qory.
+	Publisher   Publisher `json:"publisher"`
+	Description string    `json:"description,omitempty"`
 	// Domains are the domains the integration serves, software for GitHub.
 	Domains        []string `json:"domains,omitempty"`
 	ProgramVersion string   `json:"program_version"`
@@ -39,16 +42,25 @@ type Description struct {
 	Roles    Roles           `json:"roles"`
 }
 
+// Publisher is who publishes the program, as the program names them, and where.
+type Publisher struct {
+	Name string `json:"name"`
+	URL  string `json:"url,omitempty"`
+}
+
 // Roles are the roles the program plays.
 type Roles struct {
 	Credential *CredentialRole `json:"credential,omitempty"`
 }
 
-// CredentialRole is the runner's credential adapter: the argument a policy defines, and
-// the hosts an answer is for.
+// CredentialRole is the runner's credential adapter: the argument a policy defines, the
+// hosts an answer is for, the settings the runner hands it on standard input, a secret
+// as <name> or <name>_file, and those of them it needs.
 type CredentialRole struct {
 	Argument string   `json:"argument"`
 	Hosts    []string `json:"hosts"`
+	Settings []string `json:"settings"`
+	Required []string `json:"required,omitempty"`
 }
 
 // Describe is the description, with the program's version.
@@ -101,9 +113,12 @@ const maxSettings = 64 << 10
 // one place its settings come from. It reads r to its end, or until it has more than
 // 64 KiB, before anything else, so a caller has read the settings before it acts. It
 // refuses more than 64 KiB, input with no document, and anything after the first
-// document but white space; then a secret <name> together with <name>_file, before the
-// schema does, and a document the schema refuses. An error identifies a setting and
-// what is wrong with it, never a value or any other part of the input.
+// document but white space; then a secret <name> together with <name>_file, and a
+// document without a setting the credential role requires, a secret as either, before
+// the schema does; and then a document the schema refuses. api_url, which the role does
+// not list, is taken as well: the runner writes a role only the settings it lists, so a
+// document the runner writes never carries it. An error identifies a setting and what is
+// wrong with it, never a value or any other part of the input.
 func ReadSettings(r io.Reader) (Settings, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxSettings+1))
 	if err != nil {
@@ -131,6 +146,9 @@ func ReadSettings(r io.Reader) (Settings, error) {
 				return Settings{}, fmt.Errorf("the settings contain both %s and %s_file; a secret has one source, so set one of them", name, name)
 			}
 		}
+		if err := required(m, secrets(schema)); err != nil {
+			return Settings{}, err
+		}
 	}
 	if err := schema.Validate(doc); err != nil {
 		return Settings{}, fmt.Errorf("the settings are invalid: %s", explain(err))
@@ -156,6 +174,25 @@ func ReadSettings(r io.Reader) (Settings, error) {
 		}
 	}
 	return s, nil
+}
+
+// required refuses settings m without a setting the credential role requires: the
+// setting itself, or for a secret <name> either <name> or <name>_file, as the
+// integration contract reads a role's required. The schema's top level requires none,
+// since each role's document holds a subset of the settings.
+func required(m map[string]any, secrets []string) error {
+	for _, name := range Describe("").Roles.Credential.Required {
+		if _, ok := m[name]; ok {
+			continue
+		}
+		if !slices.Contains(secrets, name) {
+			return fmt.Errorf("the settings do not contain %s, which the credential role requires", name)
+		}
+		if _, ok := m[name+"_file"]; !ok {
+			return fmt.Errorf("the settings contain neither %s nor %s_file; the credential role requires the secret, so set one of them", name, name)
+		}
+	}
+	return nil
 }
 
 // one is the JSON document b contains, which nothing but JSON's white space may

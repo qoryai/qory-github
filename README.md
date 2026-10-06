@@ -109,6 +109,9 @@ token; nothing is kept.
   space, 64 KiB (65536 bytes) at most. Empty input is refused; `{}` is a document.
 - Standard input is read to its end, or until it has more than 64 KiB, before the
   argument is checked, before the key is read and before any network call.
+- The settings must contain `app_id` and the private key, as `private_key` or as
+  `private_key_file`, one of them: settings with neither of them, or with both, are
+  refused before the key is read and before any network call.
 - One argument follows `--`. An empty one is refused as not `owner/name`.
 - `credential` takes no flags. A flag is refused in one line, like any other failure.
 
@@ -118,8 +121,9 @@ token; nothing is kept.
 qory-github describe
 ```
 
-Prints the integration's description: the settings as a JSON Schema and the credential
-role. `qory` calls it to check a declaration. No settings, no network.
+Prints the integration's description: its publisher, Qory, the settings as a JSON Schema,
+and the credential role, with the settings the runner hands it and those it requires
+([Settings](#settings)). `qory` calls it to check a declaration. No settings, no network.
 
 ### Exit status
 
@@ -141,10 +145,26 @@ One JSON document, on the standard input of `credential`; in `runner.yaml`, unde
 | `private_key` | this or `private_key_file` | The App's private key itself, the PEM. A secret. |
 | `installation_id` | no | The App's installation on the repositories' owner. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
-| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |
+| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. Not in the credential role's settings. |
 
-Settings that contain both `private_key` and `private_key_file` are refused: a secret
-has one source. No setting is read from the environment or the command line.
+Settings without `app_id`, or with neither `private_key` nor `private_key_file`, are
+refused, and so are settings that contain both: a secret has one source. No setting is
+read from the environment or the command line.
+
+The description's credential role lists the settings the runner writes to the standard
+input of `credential`, as the
+[integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#roles)
+defines a role's `settings` and `required`:
+
+```json
+"settings": ["app_id", "installation_id", "permissions", "private_key"],
+"required": ["app_id", "private_key"]
+```
+
+The private key is listed as `private_key`, and the runner writes it as `private_key` or
+as `private_key_file`; either satisfies `required`. `api_url` is not listed, so a
+document the runner writes never carries it; `credential` takes it when the document on
+its standard input does.
 
 ## Permissions
 
