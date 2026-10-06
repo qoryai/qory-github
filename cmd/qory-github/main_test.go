@@ -216,6 +216,19 @@ func TestCredentialRefusesTheSettingsFlag(t *testing.T) {
 	}
 }
 
+// TestCredentialsHelpSaysWhatItReadsFromItsEnvironment pins what the help says of the
+// environment: no setting and no secret come from it. Go's HTTP client still reads the
+// proxy variables, HTTPS_PROXY and NO_PROXY, and on Linux crypto/x509 reads SSL_CERT_FILE
+// and SSL_CERT_DIR, so the help claims no more than that.
+func TestCredentialsHelpSaysWhatItReadsFromItsEnvironment(t *testing.T) {
+	var out, errs bytes.Buffer
+	run(context.Background(), []string{"credential", "-h"}, strings.NewReader(""), &out, &errs)
+	help := strings.Join(strings.Fields(errs.String()), " ")
+	if !strings.Contains(help, "credential takes no flags, and reads no setting and no secret from its environment.") || strings.Contains(help, "reads nothing from its environment") {
+		t.Errorf("the help says\n%s", errs.String())
+	}
+}
+
 // eofReader is standard input that records when it has been read, and when to its end.
 type eofReader struct {
 	r         io.Reader

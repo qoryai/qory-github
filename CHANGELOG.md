@@ -82,6 +82,10 @@ change what the program does, and notes it under Upgrading.
   compares `program_version` with the version it asked for. Only a `v` followed by a
   digit is dropped. The version set with `-X main.version` is reported as it is given,
   and a build whose module version is `(devel)` or empty is still `dev`.
+- `credential -h` says it reads no setting and no secret from its environment, where it
+  said it read nothing there: Go's HTTP client takes a proxy from `HTTPS_PROXY` and
+  `NO_PROXY`, and on Linux the system's certificates from `SSL_CERT_FILE` and
+  `SSL_CERT_DIR`, as before.
 
 ### Removed
 

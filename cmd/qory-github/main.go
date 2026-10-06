@@ -159,8 +159,8 @@ it contains. credential reads standard input to its end, or until it has more th
 64 KiB, before it checks the argument and before any network call. It refuses empty
 input, anything after the document but white space, and more than 64 KiB. It requires
 app_id and the private key, which comes as private_key itself or as private_key_file, a
-file only its owner reads, one of them and never both. credential takes no flags and
-reads nothing from its environment.
+file only its owner reads, one of them and never both. credential takes no flags, and
+reads no setting and no secret from its environment.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,
