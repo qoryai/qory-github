@@ -416,7 +416,7 @@ func fakeGitHub(t *testing.T) string {
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.invalid/apps/qory-github-test", "pem": string(pemBytes)})
+		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)})
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
@@ -448,7 +448,7 @@ func approve(local string) error {
 // policy that allows GitHub's hosts and selects the credential qory expands it into.
 func TestSetupPrintsTheDeclarationAndThePolicy(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "github-app.pem")
-	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.invalid", Client: github.Client{API: fakeGitHub(t)}, Open: approve, Wait: time.Minute}
+	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.com", Client: github.Client{API: fakeGitHub(t)}, Open: approve, Wait: time.Minute}
 	var out bytes.Buffer
 	if err := runSetup(context.Background(), s, &out); err != nil {
 		t.Fatal(err)
@@ -461,7 +461,7 @@ func TestSetupPrintsTheDeclarationAndThePolicy(t *testing.T) {
 	want := `The App 123456 (qory-github-test) is created, and its private key is in ` + file + `.
 
 Install it on the repositories your agents work on:
-  https://github.invalid/apps/qory-github-test/installations/new
+  https://github.com/apps/qory-github-test/installations/new
 
 Then declare the integration in the machine's configuration, ~/.config/qory/runner.yaml:
 
@@ -546,6 +546,44 @@ func TestSetupCreatesNothingForARefusedPath(t *testing.T) {
 	}
 }
 
+// TestSetupRefusesAnotherURLBeforeAnything runs setup with an API or a website it
+// refuses and checks that it fails in one line, before it creates the key's directory,
+// listens, opens the browser or sends a request, and never says the URL.
+func TestSetupRefusesAnotherURLBeforeAnything(t *testing.T) {
+	// Should a URL get past the checks, setup opens no browser and waits no longer than
+	// the test's context.
+	defer func(o func(string) error) { opener = o }(opener)
+	opener = func(string) error {
+		t.Error("setup opens the browser")
+		return nil
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"setup", "--api-url", "https://ghe.acme.example/api/v3"}, "qory-github setup: the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--api-url", "http://api.github.com"}, "qory-github setup: the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--web-url", "https://ghe.acme.example"}, "qory-github setup: the web URL is neither https://github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--web-url", "https://github.com:443"}, "qory-github setup: the web URL is neither https://github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		var out, errs bytes.Buffer
+		code := run(ctx, tc.args, nil, &out, &errs)
+		cancel()
+		if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+			t.Errorf("%q: %v", tc.args, err)
+		}
+		if errs.String() != tc.want {
+			t.Errorf("%q: stderr %q, want %q", tc.args, errs.String(), tc.want)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%q: setup created %s: %v", tc.args, filepath.Join(home, ".config"), err)
+		}
+	}
+}
+
 // TestSetupPrintsWhereAMovedKeyIs creates the key file while the person approves, so the
 // key goes beside it, and pins the line setup prints: where the key is, the file that
 // could not be written once, and why.
@@ -557,7 +595,7 @@ func TestSetupPrintsWhereAMovedKeyIs(t *testing.T) {
 		}
 		return approve(local)
 	}
-	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.invalid", Client: github.Client{API: fakeGitHub(t)}, Open: open, Wait: time.Minute}
+	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.com", Client: github.Client{API: fakeGitHub(t)}, Open: open, Wait: time.Minute}
 	var out bytes.Buffer
 	if err := runSetup(context.Background(), s, &out); err != nil {
 		t.Fatal(err)

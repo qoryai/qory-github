@@ -40,7 +40,7 @@ func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 	c := serve(t, &fakeGitHub{})
 	file := filepath.Join(t.TempDir(), "app.pem")
 	var opened string
-	s := Setup{Org: "acme", Name: "qory-github-test", KeyFile: file, Web: "https://github.invalid", Client: c, Open: func(u string) error { opened = u; return nil }, Wait: time.Minute}
+	s := Setup{Org: "acme", Name: "qory-github-test", KeyFile: file, Web: "https://github.com", Client: c, Open: func(u string) error { opened = u; return nil }, Wait: time.Minute}
 	local, wait, err := s.Start(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 	}
 	action, manifest := readPage(t, local)
 	u, _ := url.Parse(action)
-	if u.Host != "github.invalid" || u.Path != "/organizations/acme/settings/apps/new" || u.Query().Get("state") == "" {
+	if u.Host != "github.com" || u.Path != "/organizations/acme/settings/apps/new" || u.Query().Get("state") == "" {
 		t.Errorf("the form posts to %s", action)
 	}
 	perms, _ := json.Marshal(manifest["default_permissions"])
@@ -90,7 +90,7 @@ func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if app.ID != 123456 || app.Slug != "qory-github-test" || app.KeyFile != file || app.Moved != nil || app.InstallURL("https://github.invalid") != "https://github.invalid/apps/qory-github-test/installations/new" {
+	if app.ID != 123456 || app.Slug != "qory-github-test" || app.KeyFile != file || app.Moved != nil || app.InstallURL("https://github.com") != "https://github.com/apps/qory-github-test/installations/new" {
 		t.Errorf("app %+v", app)
 	}
 	// Once the wait returned, nothing listens.
@@ -137,8 +137,8 @@ func TestSetupNeverLosesTheKey(t *testing.T) {
 	}
 	body := strings.Split(string(keyPEM(t)), "\n")[1]
 	for _, file := range blocked {
-		_, err = Setup{Org: "acme", KeyFile: file, Web: "https://github.invalid", Client: c}.exchange(context.Background(), "abc")
-		if err == nil || !strings.Contains(err.Error(), "the App 123456 (qory-github-test, https://github.invalid/apps/qory-github-test) is created") || !strings.HasSuffix(err.Error(), "generate a private key at https://github.invalid/organizations/acme/settings/apps/qory-github-test") {
+		_, err = Setup{Org: "acme", KeyFile: file, Web: "https://github.com", Client: c}.exchange(context.Background(), "abc")
+		if err == nil || !strings.Contains(err.Error(), "the App 123456 (qory-github-test, https://github.com/apps/qory-github-test) is created") || !strings.HasSuffix(err.Error(), "generate a private key at https://github.com/organizations/acme/settings/apps/qory-github-test") {
 			t.Fatalf("err %v", err)
 		}
 		if strings.Contains(err.Error(), body) || strings.Contains(err.Error(), "PRIVATE KEY") {
@@ -159,5 +159,88 @@ func TestSetupNeverWritesOverAKeyFile(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(file); string(b) != "someone's" {
 		t.Errorf("the file contains %q", b)
+	}
+}
+
+// webURLs are URLs of GitHub's website and whether setup takes them: GitHub's, and for a
+// test a loopback host, and nothing else.
+var webURLs = map[string]bool{
+	"https://github.com":              true,
+	"https://github.com/":             true,
+	"http://127.0.0.1":                true,
+	"http://127.0.0.1:8080/":          true,
+	"https://127.1.2.3:8443":          true,
+	"http://[::1]:9000":               true,
+	"http://localhost:3000":           true,
+	"https://localhost/":              true,
+	"":                                false,
+	"github.com":                      false,
+	"https://github.acme.example":     false,
+	"https://ghe.acme.example/":       false,
+	"https://example.com":             false,
+	"https://api.github.com":          false,
+	"http://github.com":               false,
+	"https://github.com:443":          false,
+	"https://github.com:8443":         false,
+	"https://github.com/login":        false,
+	"https://github.com//":            false,
+	"https://secretvalue@github.com":  false,
+	"https://github.com?secretvalue":  false,
+	"https://github.com#secretvalue":  false,
+	"HTTPS://github.com":              false,
+	"https://GitHub.com":              false,
+	"https://github.com.":             false,
+	"https://github.com.acme.example": false,
+	"http://10.0.0.1":                 false,
+	"http://127.0.0.256":              false,
+	"http://127.0.0.1:65536":          false,
+	"http://127.0.0.1/x":              false,
+	"http://localhost.acme.example":   false,
+}
+
+// TestSetupTakesGitHubsWebsiteAlone runs each URL of webURLs through CheckWebURL and
+// checks an error never contains the URL.
+func TestSetupTakesGitHubsWebsiteAlone(t *testing.T) {
+	for web, ok := range webURLs {
+		err := CheckWebURL(web)
+		if (err == nil) != ok {
+			t.Errorf("CheckWebURL(%q): %v", web, err)
+		}
+		if err != nil && (web != "" && strings.Contains(strings.ReplaceAll(err.Error(), WebURL, ""), web) || strings.Contains(err.Error(), "secretvalue")) {
+			t.Errorf("%q: the error contains the URL: %v", web, err)
+		}
+	}
+	if got := (App{Slug: "qory-github-test"}).InstallURL("https://github.com/"); got != "https://github.com/apps/qory-github-test/installations/new" {
+		t.Errorf("the install URL is %s", got)
+	}
+}
+
+// TestSetupRefusesAnotherWebsiteOrAPIBeforeAnything starts setup with a website or an
+// API it refuses and checks that it fails before it listens, opens a page or sends a
+// request; and that the exchange of a code refuses such an API before it sends it.
+func TestSetupRefusesAnotherWebsiteOrAPIBeforeAnything(t *testing.T) {
+	for _, tc := range []struct{ web, api, want string }{
+		{"https://ghe.acme.example", "", "the web URL is neither https://github.com"},
+		{"https://github.com//", "", "the web URL is neither https://github.com"},
+		{"https://github.com/", "https://ghe.acme.example/api/v3", "the API is neither https://api.github.com"},
+		{"", "https://api.github.com:8443", "the API is neither https://api.github.com"},
+	} {
+		tr := &sentTransport{}
+		opened := false
+		s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: tc.web, Client: Client{API: tc.api, HTTP: &http.Client{Transport: tr}}, Open: func(string) error { opened = true; return nil }, Wait: time.Second}
+		local, wait, err := s.Start(context.Background())
+		if err == nil || !strings.Contains(err.Error(), tc.want) || local != "" || wait != nil || opened || tr.sent {
+			t.Errorf("web %q, API %q: %v, page %q, opened %v, sent %v", tc.web, tc.api, err, local, opened, tr.sent)
+		}
+	}
+	for api, ok := range apiURLs {
+		if ok || api == "" {
+			continue
+		}
+		tr := &sentTransport{}
+		s := Setup{KeyFile: filepath.Join(t.TempDir(), "app.pem"), Client: Client{API: api, HTTP: &http.Client{Transport: tr}}}
+		if _, err := s.exchange(context.Background(), "abc"); err == nil || !strings.Contains(err.Error(), "the API is neither https://api.github.com") || tr.sent {
+			t.Errorf("exchange through %q: %v, sent %v", api, err, tr.sent)
+		}
 	}
 }

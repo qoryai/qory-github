@@ -79,12 +79,19 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 | `--org` | your account |
 | `--name` | `qory-github-` and six random hex digits; must be unique on GitHub |
 | `--key-file` | `~/.config/qory/github-app.pem` |
+| `--api-url` | `https://api.github.com`; otherwise only a loopback host, for tests |
+| `--web-url` | `https://github.com`; otherwise only a loopback host, for tests |
 
 - The key file is written with mode 0600. An existing file is never overwritten.
 - GitHub hands out the key once. If the file cannot be written, the key goes to
   `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
   App and the page where you generate a new key.
 - The key is never printed.
+- `--api-url` takes `https://api.github.com` alone, with or without a trailing `/` or
+  `:443`, and `--web-url` takes `https://github.com` alone, with or without a trailing
+  `/`. For tests, each also takes `http` or `https` on a loopback host (`127.0.0.0/8`,
+  `[::1]`, `localhost`) with any port. Anything else is refused before `setup` creates,
+  listens on or opens anything. GitHub Enterprise Server is not supported.
 
 ### credential
 

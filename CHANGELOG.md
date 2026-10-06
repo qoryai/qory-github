@@ -51,6 +51,12 @@ change what the program does, and notes it under Upgrading.
   Another `https` host, GitHub Enterprise Server among them, a path, a user, a query and
   a fragment are refused, by the settings' schema and again by `Mint` before anything is
   sent, with an error that names the rule and never the URL.
+- `setup` holds `--api-url` to the same rule, since the code it exchanges there for the
+  App yields the App's private key, and `--web-url` to `https://github.com` alone, with
+  or without a trailing `/`, and for a test `http` or `https` on a loopback host, with
+  any port: the browser posts the manifest there. Each is refused in one line, naming
+  the rule and never the URL, before `setup` creates a directory, listens or opens the
+  browser. Every request to the API, a mint's and `setup`'s, is held to the rule.
 
 ### Removed
 
@@ -68,6 +74,9 @@ change what the program does, and notes it under Upgrading.
 - Settings whose `api_url` is another `https` API, such as one of GitHub Enterprise
   Server, are now refused, and so is `Client.Mint` with such an `API`. Leave `api_url`
   out for GitHub's own.
+- `setup --api-url` and `--web-url` with another host, such as one of GitHub Enterprise
+  Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
+  Leave them out for GitHub's own.
 
 ## [0.1.0] - 2026-09-30
 

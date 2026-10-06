@@ -97,7 +97,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"token": fakeToken, "expires_at": "2026-09-25T21:00:00Z"})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app-manifests/"):
 		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.invalid/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": nil})
+		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": nil})
 	default:
 		w.WriteHeader(404)
 	}

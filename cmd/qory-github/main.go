@@ -308,9 +308,16 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	org := fs.String("org", "", "create the App under this organisation")
 	name := fs.String("name", "", "the App's name (default qory-github- and six random hex digits)")
 	keyFile := fs.String("key-file", "", "where the private key is written (default ~/.config/qory/github-app.pem)")
-	api := fs.String("api-url", github.APIURL, "GitHub's API")
-	web := fs.String("web-url", github.WebURL, "GitHub's website")
+	api := fs.String("api-url", github.APIURL, "GitHub's API: https://api.github.com, or for a test http or https on a loopback host")
+	web := fs.String("web-url", github.WebURL, "GitHub's website: https://github.com, or for a test http or https on a loopback host")
 	if err := setupHelp.parse(fs, args, stderr); err != nil {
+		return err
+	}
+	// The URLs are checked before anything is created, listened on or opened.
+	if err := github.CheckAPIURL(*api); err != nil {
+		return err
+	}
+	if err := github.CheckWebURL(*web); err != nil {
 		return err
 	}
 	if *keyFile == "" {
@@ -330,7 +337,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *name == "" {
 		*name = "qory-github-" + randomSuffix()
 	}
-	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: browse}
+	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
 	return runSetup(ctx, s, stdout)
 }
 
@@ -426,6 +433,10 @@ func checkKeyFile(p string) error {
 
 // browse opens a URL in the machine's browser. It never fails the setup: the URL is
 // printed as well.
+// opener opens setup's page in the machine's browser; a test replaces it, so it never
+// opens one.
+var opener = browse
+
 func browse(u string) error {
 	name := "xdg-open"
 	if runtime.GOOS == "darwin" {

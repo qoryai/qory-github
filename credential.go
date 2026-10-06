@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"slices"
 	"strconv"
@@ -128,7 +127,7 @@ func Uses(repos []Repository) []Apply {
 
 // Client is how the package reaches GitHub's API.
 type Client struct {
-	// API is the API's base URL; empty is [APIURL].
+	// API is the API's base URL, which [CheckAPIURL] takes; empty is [APIURL].
 	API string
 	// HTTP is the client; nil is one with a thirty-second timeout.
 	HTTP *http.Client
@@ -258,24 +257,6 @@ func CheckAPIURL(api string) error {
 	return nil
 }
 
-// checkTransport takes an API that a request reaches over https, or over http on
-// loopback alone, since over http what is sent crosses the network in the clear. A URL
-// with a user in it is refused. It is the rule of every request; [Client.Mint] holds the
-// API to [CheckAPIURL] as well.
-func checkTransport(api string) error {
-	u, err := url.Parse(api)
-	if err != nil || u.Host == "" || u.User != nil {
-		return fmt.Errorf("the API %q is not a URL of a host", api)
-	}
-	switch h := u.Hostname(); {
-	case u.Scheme == "https":
-		return nil
-	case u.Scheme == "http" && (h == "127.0.0.1" || h == "::1" || h == "localhost"):
-		return nil
-	}
-	return fmt.Errorf("the API %s is not https; http is for loopback alone, since over http the token crosses the network in the clear", api)
-}
-
 // base is the API's base URL, [APIURL] when none is set.
 func (c Client) base() string {
 	if c.API == "" {
@@ -284,12 +265,13 @@ func (c Client) base() string {
 	return c.API
 }
 
-// call makes one request to the API as the App and decodes the answer. It refuses an
-// API checkTransport refuses before anything is sent. An error contains the status and
-// GitHub's message, never what was sent.
+// call makes one request to the API and decodes the answer. It refuses an API
+// [CheckAPIURL] refuses before anything is sent, so every request, a mint's and setup's,
+// goes to GitHub's API alone. An error contains the status and GitHub's message, never
+// what was sent.
 func (c Client) call(ctx context.Context, method, path, jwt string, body any, want int, out any) error {
 	base := c.base()
-	if err := checkTransport(base); err != nil {
+	if err := CheckAPIURL(base); err != nil {
 		return err
 	}
 	var r io.Reader
