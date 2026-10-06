@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -151,9 +152,14 @@ type Request struct {
 }
 
 // Mint requests from GitHub an installation token that covers the request's repositories,
-// with its permissions and no more, and returns the answer the runner reads. It keeps
-// nothing: the runner runs the adapter again before the token expires.
+// with its permissions and no more, and returns the answer the runner reads. It refuses
+// an API [CheckAPIURL] refuses before anything else, so the App's own token goes to
+// GitHub's API alone. It keeps nothing: the runner runs the adapter again before the
+// token expires.
 func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
+	if err := CheckAPIURL(c.base()); err != nil {
+		return nil, err
+	}
 	if !appIDShape.MatchString(req.AppID) {
 		return nil, fmt.Errorf("the App id %q is not an id", req.AppID)
 	}
@@ -223,10 +229,40 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
 
-// CheckAPIURL takes the API the App's token goes to when it is https, and when it is
-// http to loopback alone, 127.0.0.1, ::1 or localhost, for a test, since over http the
-// token crosses the network in the clear. A URL with a user in it is refused.
+// apiURLShape is the API a token is minted through: the settings schema's pattern for
+// api_url itself, so the schema and [CheckAPIURL] take the same URLs.
+var apiURLShape = sync.OnceValue(func() *regexp.Regexp {
+	var s struct {
+		Properties struct {
+			APIURL struct {
+				Pattern string `json:"pattern"`
+			} `json:"api_url"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(Describe("").Settings, &s); err != nil {
+		panic(err)
+	}
+	return regexp.MustCompile(s.Properties.APIURL.Pattern)
+})
+
+// CheckAPIURL takes the API the App's own token goes to, which can mint a token for
+// every installation of the App: GitHub's, https://api.github.com, with or without a
+// trailing slash or the port 443, and for a test http or https on a loopback host,
+// 127.0.0.0/8, [::1] or localhost, with any port. Nothing else is taken: no other host,
+// GitHub Enterprise Server among them, no path, user, query or fragment, and only in
+// lower case. The error names the rule, never the URL.
 func CheckAPIURL(api string) error {
+	if !apiURLShape().MatchString(api) {
+		return errors.New("the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported")
+	}
+	return nil
+}
+
+// checkTransport takes an API that a request reaches over https, or over http on
+// loopback alone, since over http what is sent crosses the network in the clear. A URL
+// with a user in it is refused. It is the rule of every request; [Client.Mint] holds the
+// API to [CheckAPIURL] as well.
+func checkTransport(api string) error {
 	u, err := url.Parse(api)
 	if err != nil || u.Host == "" || u.User != nil {
 		return fmt.Errorf("the API %q is not a URL of a host", api)
@@ -240,15 +276,20 @@ func CheckAPIURL(api string) error {
 	return fmt.Errorf("the API %s is not https; http is for loopback alone, since over http the token crosses the network in the clear", api)
 }
 
+// base is the API's base URL, [APIURL] when none is set.
+func (c Client) base() string {
+	if c.API == "" {
+		return APIURL
+	}
+	return c.API
+}
+
 // call makes one request to the API as the App and decodes the answer. It refuses an
-// API [CheckAPIURL] refuses before anything is sent. An error contains the status and
+// API checkTransport refuses before anything is sent. An error contains the status and
 // GitHub's message, never what was sent.
 func (c Client) call(ctx context.Context, method, path, jwt string, body any, want int, out any) error {
-	base := c.API
-	if base == "" {
-		base = APIURL
-	}
-	if err := CheckAPIURL(base); err != nil {
+	base := c.base()
+	if err := checkTransport(base); err != nil {
 		return err
 	}
 	var r io.Reader

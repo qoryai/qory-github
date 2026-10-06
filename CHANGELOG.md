@@ -44,6 +44,13 @@ change what the program does, and notes it under Upgrading.
   from GitHub's API among them: before, a line break alone was replaced.
 - `ReadSettings` reads the settings from an `io.Reader`, the program's standard input,
   and takes `private_key`.
+- `api_url` takes `https://api.github.com` alone, with or without a trailing `/` or the
+  port 443, and for a test `http` or `https` on a loopback host, `127.0.0.0/8`, `[::1]`
+  or `localhost`, with any port: the App's own token goes there, and it can mint a token
+  for every installation of the App, so it never goes to a host the settings choose.
+  Another `https` host, GitHub Enterprise Server among them, a path, a user, a query and
+  a fragment are refused, by the settings' schema and again by `Mint` before anything is
+  sent, with an error that names the rule and never the URL.
 
 ### Removed
 
@@ -58,6 +65,9 @@ change what the program does, and notes it under Upgrading.
   as a flag it does not define: every run that selects the credential then fails.
 - Code that uses the package hands `ReadSettings` a reader of the settings document in
   place of the document as a string.
+- Settings whose `api_url` is another `https` API, such as one of GitHub Enterprise
+  Server, are now refused, and so is `Client.Mint` with such an `API`. Leave `api_url`
+  out for GitHub's own.
 
 ## [0.1.0] - 2026-09-30
 

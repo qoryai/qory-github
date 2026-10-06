@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -318,23 +319,132 @@ func TestARunsTokenIsNeverGivenAdminNorMoreThanTheRepositories(t *testing.T) {
 	}
 }
 
-func TestTheAppsTokenNeverCrossesTheNetworkInTheClear(t *testing.T) {
-	for api, ok := range map[string]bool{
-		"https://api.github.com": true, "https://github.test/api/v3": true, "http://127.0.0.1:8080": true,
-		"http://[::1]:1/": true, "http://localhost": true, "http://api.github.com": false, "http://10.0.0.1": false,
-		"http://localhost@api.github.test": false, "http://localhost.api.github.test": false, "ftp://127.0.0.1": false, "api.github.com": false,
-	} {
-		if err := CheckAPIURL(api); (err == nil) != ok {
-			t.Errorf("%s: %v", api, err)
+// apiURLs are URLs of the API and whether the App's own token may go there: GitHub's
+// API, and for a test a loopback host, and nothing else.
+var apiURLs = map[string]bool{
+	"https://api.github.com":                  true,
+	"https://api.github.com/":                 true,
+	"https://api.github.com:443":              true,
+	"https://api.github.com:443/":             true,
+	"http://127.0.0.1":                        true,
+	"http://127.0.0.1:8080":                   true,
+	"http://127.0.0.1:65535/":                 true,
+	"http://127.255.255.254:1":                true,
+	"https://127.0.0.1:8443":                  true,
+	"http://[::1]:9000":                       true,
+	"https://[::1]/":                          true,
+	"http://localhost":                        true,
+	"http://localhost:3000/":                  true,
+	"https://localhost:8443":                  true,
+	"":                                        false,
+	"api.github.com":                          false,
+	"https://example.com":                     false,
+	"https://github.com":                      false,
+	"https://github.acme.example":             false,
+	"https://github.acme.example/api/v3":      false,
+	"https://ghe.acme.example/api/v3/":        false,
+	"http://api.github.com":                   false,
+	"https://api.github.com/api/v3":           false,
+	"https://api.github.com/x":                false,
+	"https://api.github.com//":                false,
+	"https://api.github.com:8443":             false,
+	"https://api.github.com:0443":             false,
+	"https://secretvalue@api.github.com":      false,
+	"https://user:secretvalue@api.github.com": false,
+	"https://api.github.com?secretvalue":      false,
+	"https://api.github.com/?":                false,
+	"https://api.github.com#secretvalue":      false,
+	"HTTPS://api.github.com":                  false,
+	"https://API.GITHUB.COM":                  false,
+	"https://api.github.com.":                 false,
+	"https://api.github.com.acme.example":     false,
+	" https://api.github.com":                 false,
+	"https://api.github.com\n":                false,
+	"http://10.0.0.1:8080":                    false,
+	"http://192.168.1.10":                     false,
+	"http://128.0.0.1":                        false,
+	"http://127.0.0.256":                      false,
+	"http://127.0.0":                          false,
+	"http://127.0.0.01":                       false,
+	"http://127.0.0.1:0":                      false,
+	"http://127.0.0.1:65536":                  false,
+	"http://127.0.0.1/api":                    false,
+	"http://localhost.acme.example":           false,
+	"http://127.0.0.1.acme.example":           false,
+	"http://localhost@acme.example":           false,
+	"http://LOCALHOST":                        false,
+	"http://[::2]":                            false,
+	"http://[::ffff:127.0.0.1]":               false,
+	"http://::1":                              false,
+	"ftp://127.0.0.1":                         false,
+}
+
+// TestTheAppsTokenGoesToGitHubsAPIAlone runs each URL of apiURLs through the settings,
+// whose schema refuses it, and through CheckAPIURL, which the settings and Mint call,
+// and checks that they agree and that an error never contains the URL.
+func TestTheAppsTokenGoesToGitHubsAPIAlone(t *testing.T) {
+	for api, ok := range apiURLs {
+		err := CheckAPIURL(api)
+		if (err == nil) != ok {
+			t.Errorf("CheckAPIURL(%q): %v", api, err)
+		}
+		doc, _ := json.Marshal(map[string]any{"app_id": 123456, "private_key_file": "/k.pem", "api_url": api})
+		s, serr := ReadSettings(strings.NewReader(string(doc)))
+		switch {
+		case ok && (serr != nil || s.APIURL != api):
+			t.Errorf("the settings refuse %q: %v", api, serr)
+		case !ok && (serr == nil || !strings.Contains(serr.Error(), "/api_url: does not match")):
+			t.Errorf("the settings' schema takes %q: %v", api, serr)
+		}
+		for _, e := range []error{err, serr} {
+			if leaks(e, api) {
+				t.Errorf("%q: the error contains the URL: %v", api, e)
+			}
 		}
 	}
-	sent := false
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { sent = true }))
-	t.Cleanup(srv.Close)
+}
+
+// leaks is whether err contains the URL api, or a secret in it, besides the URL the rule
+// itself names.
+func leaks(err error, api string) bool {
+	if err == nil {
+		return false
+	}
+	e := strings.ReplaceAll(err.Error(), APIURL, "")
+	api = strings.TrimSpace(api)
+	return api != "" && strings.Contains(e, api) || strings.Contains(e, "secretvalue")
+}
+
+// sentTransport is a client's transport that records a request and sends nothing.
+type sentTransport struct{ sent bool }
+
+func (s *sentTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	s.sent = true
+	return nil, errors.New("not sent")
+}
+
+// TestMintRefusesAnotherAPIBeforeAnythingIsSent mints through every API apiURLs refuses
+// that a request could reach and checks that Mint refuses it, names the rule, and sends
+// nothing, whatever the settings let through.
+func TestMintRefusesAnotherAPIBeforeAnythingIsSent(t *testing.T) {
 	repos, _ := ParseRepositories("acme/shop")
-	c := Client{API: strings.Replace(srv.URL, "127.0.0.1", "localhost.localdomain", 1)}
-	if _, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos}); err == nil || !strings.Contains(err.Error(), "not https") || sent {
-		t.Errorf("err %v, sent %v", err, sent)
+	for api, ok := range apiURLs {
+		if ok || api == "" {
+			continue
+		}
+		tr := &sentTransport{}
+		c := Client{API: api, HTTP: &http.Client{Transport: tr}}
+		_, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos})
+		if err == nil || !strings.Contains(err.Error(), "neither https://api.github.com nor, for a test, http or https on a loopback host") || tr.sent {
+			t.Errorf("%q: err %v, sent %v", api, err, tr.sent)
+		}
+		if leaks(err, api) {
+			t.Errorf("%q: the error contains the URL: %v", api, err)
+		}
+	}
+	tr := &sentTransport{}
+	if _, err := (Client{HTTP: &http.Client{Transport: tr}}).Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos}); err == nil || !tr.sent {
+		t.Errorf("the default API: err %v, sent %v", err, tr.sent)
 	}
 }
 
@@ -482,6 +592,7 @@ func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T)
 		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"secretvalue"}`, "/api_url: does not match"},
 		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"http://api.github.com"}`, "/api_url: does not match"},
 		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue@api.github.com"}`, "/api_url: does not match"},
+		{`{"app_id":"123456","private_key_file":"/k.pem","api_url":"https://secretvalue.example/api/v3"}`, "/api_url: does not match"},
 		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{}}`, "/permissions: minProperties"},
 		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"administration":"read"}}`, "/permissions: invalid propertyName 'administration'"},
 		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"organization_administration":"read"}}`, "invalid propertyName 'organization_administration'"},
