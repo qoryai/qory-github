@@ -1,6 +1,7 @@
 package github
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -16,11 +17,39 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // WebURL is where an App is created.
 const WebURL = "https://github.com"
+
+// webURLShape is GitHub's website as [CheckWebURL] takes it: https://github.com, with
+// or without a trailing slash, and for a test http or https on a loopback host, with
+// any port; the loopback hosts are those [CheckAPIURL] takes.
+var webURLShape = regexp.MustCompile(`^(https://github\.com|https?://(localhost|\[::1\]|127(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?)/?$`)
+
+// CheckWebURL takes GitHub's website, where setup sends a person to approve the App
+// and the manifest goes: https://github.com, with or without a trailing slash, and for a
+// test http or https on a loopback host, 127.0.0.0/8, [::1] or localhost, with any
+// port. Nothing else is taken: no other host, GitHub Enterprise Server among them, no
+// port on github.com, no path, user, query or fragment, and only in lower case. The
+// error names the rule, never the URL.
+func CheckWebURL(web string) error {
+	if !webURLShape.MatchString(web) {
+		return errors.New("the web URL is neither https://github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported")
+	}
+	return nil
+}
+
+// webBase is GitHub's website as the URLs setup builds start, [WebURL] when none is
+// set, without a trailing slash.
+func webBase(web string) string {
+	if web == "" {
+		return WebURL
+	}
+	return strings.TrimSuffix(web, "/")
+}
 
 // Setup creates a GitHub App for Qory with GitHub's manifest flow and writes its private
 // key to a file. It listens on loopback for GitHub's redirect, and a person approves the
@@ -35,7 +64,7 @@ type Setup struct {
 	// KeyFile is where the private key is written, 0600. A file that exists is never
 	// written over.
 	KeyFile string
-	// Web is GitHub's web URL; empty is [WebURL].
+	// Web is GitHub's web URL, which [CheckWebURL] takes; empty is [WebURL].
 	Web string
 	// Client reaches the API to exchange the redirect's code for the App.
 	Client Client
@@ -60,10 +89,7 @@ type App struct {
 
 // InstallURL is where a person installs the App on the repositories runs work on.
 func (a App) InstallURL(web string) string {
-	if web == "" {
-		web = WebURL
-	}
-	return web + "/apps/" + url.PathEscape(a.Slug) + "/installations/new"
+	return webBase(web) + "/apps/" + url.PathEscape(a.Slug) + "/installations/new"
 }
 
 // Manifest is the App Setup requests from GitHub: private, with no webhook, allowed to
@@ -95,8 +121,15 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 
 // Start listens on loopback and returns the local page's URL and a function that waits
 // for GitHub's redirect, exchanges its code for the App and writes the key. The
-// listener is closed when the wait returns.
+// listener is closed when the wait returns. Before anything else it refuses a web URL
+// [CheckWebURL] refuses and an API [CheckAPIURL] refuses.
 func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) {
+	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
+		return "", nil, err
+	}
+	if err := CheckAPIURL(s.Client.base()); err != nil {
+		return "", nil, err
+	}
 	if s.KeyFile == "" {
 		return "", nil, errors.New("no key file")
 	}
@@ -105,10 +138,7 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", nil, fmt.Errorf("the key file: %w", err)
 	}
-	web := s.Web
-	if web == "" {
-		web = WebURL
-	}
+	web := webBase(s.Web)
 	b := make([]byte, 16)
 	rand.Read(b)
 	state := hex.EncodeToString(b)
@@ -188,8 +218,13 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		HTMLURL  string `json:"html_url"`
 		PEM      string `json:"pem"`
 	}
-	if err := s.Client.call(ctx, http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
-		return nil, fmt.Errorf("exchanging the code for the App: %w", err)
+	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
+		// GitHub does not redirect the exchange; should it, the code is not sent on.
+		var answered *answerError
+		if errors.As(err, &answered) && answered.redirect() {
+			return nil, errors.New("exchanging the code for the App: GitHub answered with a redirect, which setup never follows, so the code is sent nowhere else")
+		}
+		return nil, err
 	}
 	if got.ID == 0 || got.Slug == "" {
 		return nil, errors.New("exchanging the code for the App: GitHub answered without the App")
@@ -214,10 +249,7 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 
 // keysURL is the App's settings page on GitHub, where a private key is generated.
 func (s Setup) keysURL(slug string) string {
-	web := s.Web
-	if web == "" {
-		web = WebURL
-	}
+	web := webBase(s.Web)
 	if s.Org != "" {
 		return web + "/organizations/" + url.PathEscape(s.Org) + "/settings/apps/" + url.PathEscape(slug)
 	}

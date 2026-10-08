@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -124,9 +125,10 @@ func Uses(repos []Repository) []Apply {
 
 // Client is how the package reaches GitHub's API.
 type Client struct {
-	// API is the API's base URL; empty is [APIURL].
+	// API is the API's base URL, which [CheckAPIURL] takes; empty is [APIURL].
 	API string
-	// HTTP is the client; nil is one with a thirty-second timeout.
+	// HTTP is the client; nil is one with a thirty-second timeout. Whichever it is, no
+	// redirect is followed.
 	HTTP *http.Client
 	// Now is the clock the App's token is issued by; nil is time.Now.
 	Now func() time.Time
@@ -138,8 +140,9 @@ type Request struct {
 	AppID string
 	// Key is the App's private key, used to sign and never sent.
 	Key *rsa.PrivateKey
-	// InstallationID is the App's installation on the repositories' owner; zero looks
-	// it up by the repositories, which must all have the same one.
+	// InstallationID is the App's installation on the repositories' owner, which Mint
+	// checks with GitHub before it mints; zero looks it up by the repositories, which
+	// must all have the same one.
 	InstallationID int64
 	// Repositories are what the token covers, one owner's.
 	Repositories []Repository
@@ -148,11 +151,18 @@ type Request struct {
 }
 
 // Mint requests from GitHub an installation token that covers the request's repositories,
-// with its permissions and no more, and returns the answer the runner reads. It keeps
-// nothing: the runner runs the adapter again before the token expires.
+// with its permissions and no more, and returns the answer the runner reads. It refuses
+// an API [CheckAPIURL] refuses before anything else, so the App's own token goes to
+// GitHub's API alone. An installation the request names is minted with only once GitHub
+// says it is the App's installation on the repositories' owner, so a token is never one
+// of another account's. It keeps nothing: the runner runs the adapter again before the
+// token expires.
 func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
+	if err := CheckAPIURL(c.base()); err != nil {
+		return nil, err
+	}
 	if !appIDShape.MatchString(req.AppID) {
-		return nil, fmt.Errorf("the App id %q is not an id", req.AppID)
+		return nil, errors.New("the App id is not an id, 1 to 64 letters, digits or dots")
 	}
 	if req.Key == nil {
 		return nil, errors.New("no private key")
@@ -172,7 +182,7 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 			return nil, fmt.Errorf("%q is not a permission a run's token may be granted; those are %s", name, strings.Join(RunPermissions, ", "))
 		}
 		if level != "read" && level != "write" {
-			return nil, fmt.Errorf("the permission %s is %q; a run's token reads or writes, never more", name, level)
+			return nil, fmt.Errorf("the permission %s is neither read nor write; a run's token reads or writes, never more", name)
 		}
 	}
 	now := time.Now
@@ -184,16 +194,21 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	id := req.InstallationID
+	if id != 0 {
+		if err := c.checkInstallation(ctx, jwt, id, req.Repositories); err != nil {
+			return nil, err
+		}
+	}
 	if id == 0 {
 		for _, r := range req.Repositories {
 			var got struct {
 				ID int64 `json:"id"`
 			}
-			if err := c.call(ctx, http.MethodGet, "/repos/"+r.String()+"/installation", jwt, nil, http.StatusOK, &got); err != nil {
-				return nil, fmt.Errorf("the App's installation on %s: %w", r, err)
+			if err := c.call(ctx, "finding the App's installation on "+r.String(), http.MethodGet, "/repos/"+r.String()+"/installation", jwt, nil, http.StatusOK, &got); err != nil {
+				return nil, moved(err)
 			}
 			if id != 0 && got.ID != id {
-				return nil, fmt.Errorf("the repositories are in different installations of the App, %d and %d", id, got.ID)
+				return nil, errors.New("the repositories are in different installations of the App; a token is one installation's")
 			}
 			id = got.ID
 		}
@@ -207,44 +222,112 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		ExpiresAt string `json:"expires_at"`
 	}
 	body := map[string]any{"repositories": names, "permissions": perms}
-	if err := c.call(ctx, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
-		return nil, fmt.Errorf("the installation token: %w", err)
+	const minting = "minting the installation token"
+	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
+		return nil, moved(err)
 	}
 	if got.Token == "" {
-		return nil, errors.New("the installation token: GitHub answered without a token")
+		return nil, errors.New(minting + ": GitHub answered without a token")
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, fmt.Errorf("the installation token: the expiry %q is not a time", got.ExpiresAt)
+		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
 
-// CheckAPIURL takes the API the App's token goes to when it is https, and when it is
-// http to loopback alone, 127.0.0.1, ::1 or localhost, for a test, since over http the
-// token crosses the network in the clear. A URL with a user in it is refused.
-func CheckAPIURL(api string) error {
-	u, err := url.Parse(api)
-	if err != nil || u.Host == "" || u.User != nil {
-		return fmt.Errorf("the API %q is not a URL of a host", api)
+// errNotTheOwners refuses an installation that is not the App's on the repositories'
+// owner. It says neither the installation's id nor the account GitHub has it on.
+var errNotTheOwners = errors.New("installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out")
+
+// errMoved refuses a redirect GitHub answers a mint's request with, as it answers a
+// request for a repository that moved or was renamed. The redirect is never followed, so
+// the App's token goes nowhere but where the request was sent.
+var errMoved = errors.New("GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument")
+
+// moved is err, or [errMoved] when err is GitHub's redirect.
+func moved(err error) error {
+	var answered *answerError
+	if errors.As(err, &answered) && answered.redirect() {
+		return errMoved
 	}
-	switch h := u.Hostname(); {
-	case u.Scheme == "https":
-		return nil
-	case u.Scheme == "http" && (h == "127.0.0.1" || h == "::1" || h == "localhost"):
-		return nil
-	}
-	return fmt.Errorf("the API %s is not https; http is for loopback alone, since over http the token crosses the network in the clear", api)
+	return err
 }
 
-// call makes one request to the API as the App and decodes the answer. It refuses an
-// API [CheckAPIURL] refuses before anything is sent. An error contains the status and
-// GitHub's message, never what was sent.
-func (c Client) call(ctx context.Context, method, path, jwt string, body any, want int, out any) error {
-	base := c.API
-	if base == "" {
-		base = APIURL
+// checkInstallation refuses the installation id unless GitHub says it is the App's
+// installation on the account that owns the repositories, its login compared as GitHub
+// compares logins, in any case. An installation GitHub does not know of the App, a 404,
+// is refused the same way.
+func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) error {
+	var got struct {
+		Account struct {
+			Login string `json:"login"`
+		} `json:"account"`
 	}
+	err := moved(c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got))
+	var answered *answerError
+	switch {
+	case errors.As(err, &answered) && answered.status == http.StatusNotFound:
+		return errNotTheOwners
+	case err != nil:
+		return err
+	}
+	for _, r := range repos {
+		if !strings.EqualFold(got.Account.Login, r.Owner) {
+			return errNotTheOwners
+		}
+	}
+	return nil
+}
+
+// apiURLShape is the API a token is minted through: the settings schema's pattern for
+// api_url itself, so the schema and [CheckAPIURL] take the same URLs.
+var apiURLShape = sync.OnceValue(func() *regexp.Regexp {
+	var s struct {
+		Properties struct {
+			APIURL struct {
+				Pattern string `json:"pattern"`
+			} `json:"api_url"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(Describe("").Settings, &s); err != nil {
+		panic(err)
+	}
+	return regexp.MustCompile(s.Properties.APIURL.Pattern)
+})
+
+// CheckAPIURL takes the API the App's own token goes to, which can mint a token for
+// every installation of the App: GitHub's, https://api.github.com, with or without a
+// trailing slash or the port 443, and for a test http or https on a loopback host,
+// 127.0.0.0/8, [::1] or localhost, with any port. Nothing else is taken: no other host,
+// GitHub Enterprise Server among them, no path, user, query or fragment, and only in
+// lower case. The error names the rule, never the URL.
+func CheckAPIURL(api string) error {
+	if !apiURLShape().MatchString(api) {
+		return errors.New("the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported")
+	}
+	return nil
+}
+
+// base is the API's base URL, [APIURL] when none is set.
+func (c Client) base() string {
+	if c.API == "" {
+		return APIURL
+	}
+	return c.API
+}
+
+// call makes one request to the API, the one what names, such as "minting the
+// installation token", and decodes the answer. It refuses an API [CheckAPIURL] refuses
+// before anything is sent, so every request, a mint's and setup's, goes to GitHub's API
+// alone. It follows no redirect, whatever client it is handed, so neither the App's token
+// nor setup's code goes on to where one points: a redirect is an answer like another,
+// whose status a caller reads. An error begins with what, and says the status and
+// GitHub's message, or why the API could not be reached. It never says what was sent: no
+// URL, no path, which carries the code setup exchanges and an installation's id, no
+// header and no body.
+func (c Client) call(ctx context.Context, what, method, path, jwt string, body any, want int, out any) error {
+	base := c.base()
 	if err := CheckAPIURL(base); err != nil {
 		return err
 	}
@@ -258,7 +341,7 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+path, r)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: the request could not be made: %w", what, unsent(err, path))
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -269,13 +352,14 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+	hc := http.Client{Timeout: 30 * time.Second}
+	if c.HTTP != nil {
+		hc = *c.HTTP
 	}
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -287,10 +371,44 @@ func (c Client) call(ctx context.Context, method, path, jwt string, body any, wa
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return fmt.Errorf("GitHub answered %d: %s", resp.StatusCode, e.Message)
+		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
 	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("GitHub's answer: %w", err)
+		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
 	}
 	return nil
+}
+
+// answerError is GitHub's answer when its status is not the one a request wants: the
+// request it answers, as call names it, the status, and GitHub's message.
+type answerError struct {
+	what    string
+	status  int
+	message string
+}
+
+func (e *answerError) Error() string {
+	return fmt.Sprintf("%s: GitHub answered %d: %s", e.what, e.status, e.message)
+}
+
+// redirect is whether the answer is a redirect, a 3xx.
+func (e *answerError) redirect() bool { return e.status >= 300 && e.status < 400 }
+
+// errRequestLeftOut stands for an error that says the request it failed, which a
+// request's error never says.
+var errRequestLeftOut = errors.New("its error is left out, since it says the request")
+
+// unsent is the error a request failed with, without the request. A *url.Error says the
+// URL, and with it the path, so what it wraps is kept alone: why the API could not be
+// reached, which may name its host and port, never a path. Should that say the path all
+// the same, it is left out.
+func unsent(err error, path string) error {
+	var u *url.Error
+	if errors.As(err, &u) {
+		err = u.Err
+	}
+	if err == nil || strings.Contains(err.Error(), path) {
+		return errRequestLeftOut
+	}
+	return err
 }

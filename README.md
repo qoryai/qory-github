@@ -79,12 +79,19 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 | `--org` | your account |
 | `--name` | `qory-github-` and six random hex digits; must be unique on GitHub |
 | `--key-file` | `~/.config/qory/github-app.pem` |
+| `--api-url` | `https://api.github.com`; otherwise only a loopback host, for tests |
+| `--web-url` | `https://github.com`; otherwise only a loopback host, for tests |
 
 - The key file is written with mode 0600. An existing file is never overwritten.
 - GitHub hands out the key once. If the file cannot be written, the key goes to
   `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
   App and the page where you generate a new key.
 - The key is never printed.
+- `--api-url` takes `https://api.github.com` alone, with or without a trailing `/` or
+  `:443`, and `--web-url` takes `https://github.com` alone, with or without a trailing
+  `/`. For tests, each also takes `http` or `https` on a loopback host (`127.0.0.0/8`,
+  `[::1]`, `localhost`) with any port. Anything else is refused before `setup` creates,
+  listens on or opens anything. GitHub Enterprise Server is not supported.
 
 ### credential
 
@@ -109,10 +116,10 @@ role. `qory` calls it to check a declaration. No settings, no network.
 ### Exit status
 
 - `0`: success. `describe` and `credential` print one JSON document on standard output.
-- `1`: failure. One line on standard error that says what failed, never the token or the
-  key.
-- `2`: no command, an unknown one, `-h`, or a refused flag. Usage or help on standard
-  error.
+- `1`: failure, a flag a command refuses among them. One line on standard error says
+  what failed, never the token or the key. `credential` and `setup` print the flag
+  package's own line and their usage before that line when they refuse a flag.
+- `2`: no command, an unknown one, or `-h`. Usage or help on standard error.
 
 ## Settings
 
@@ -122,12 +129,16 @@ Passed as one JSON document in `--settings`, or under `settings:` in `runner.yam
 |---|---|---|
 | `app_id` | yes | The App's numeric id, or its client id as a string |
 | `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
-| `installation_id` | no | The App's installation on the repositories' owner. Looked up from the repositories when absent. |
+| `installation_id` | no | The App's installation on the repositories' owner. Checked with GitHub before a token is minted: an installation on another account is refused. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
-| `api_url` | no | GitHub's API, for tests. Default `https://api.github.com`. Plain `http` is accepted only for loopback. |
+| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |
 
 The private key itself (`private_key`) is refused on the command line; use
-`private_key_file`.
+`private_key_file`. No setting is read from the environment.
+
+`app_id` as a number, and `installation_id`, are integers from 1 to 9007199254740991,
+2^53 - 1, the largest integer every JSON reader holds exactly. An integer is read as JSON
+Schema reads it, whatever its notation: `42.0` and `4.2e1` are `42`.
 
 ## Permissions
 
@@ -202,6 +213,9 @@ hosts and paths stay the same; only the token changes.
   owners, or when it lists a repository twice.
 - Git LFS objects are served from other hosts through signed URLs; allow those hosts in
   the policy.
+- No redirect from GitHub's API is followed, so the App's own token goes nowhere else. A
+  repository that moved or was renamed is refused; name its new owner/name in the
+  policy's credential argument.
 - Errors are one line on standard error and never contain the token or the key.
 
 ## Development

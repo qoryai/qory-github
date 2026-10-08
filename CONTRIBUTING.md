@@ -5,8 +5,8 @@ Thank you for considering a contribution.
 ## Where contributions go
 
 - **A fix**, with the test that shows it.
-- **What the integration does for a run**: a permission, a host GitHub serves a run from,
-  or a role once its contract is written. The integration speaks the
+- **What the integration does for a run**: a permission, or a host GitHub serves a run
+  from. The integration speaks the
   [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1)
   and, for the credential role, the runner's
   [§Credentials](https://github.com/qoryai/runner/tree/main/contracts/runner/v1#credentials);
@@ -26,8 +26,7 @@ the Apache License, Version 2.0. You keep your copyright.
 
 Opening a pull request against this repository is your acceptance of the agreement, for that
 contribution and every later one. The pull request is the record of your acceptance. Read
-[CLA.md](CLA.md) before your first pull request. A signing step on the pull request may be
-added later; it will not change the terms.
+[CLA.md](CLA.md) before your first pull request.
 
 The agreement names the owner with successors-and-assigns wording, so that if the
 project moves into a dedicated entity, existing grants travel with it and nobody signs again.

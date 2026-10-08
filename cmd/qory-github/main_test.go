@@ -19,8 +19,10 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/qoryai/integrations/conformance"
 	"github.com/qoryai/integrations/contracts"
@@ -98,22 +100,88 @@ func TestCredentialPrintsOneDocumentAndNothingElse(t *testing.T) {
 	}
 }
 
+// TestCredentialNeverReadsStandardInput runs credential with its settings on the
+// command line and standard input open, with something written to it, and checks that
+// it mints and leaves standard input as it found it: the settings come from --settings
+// alone, and credential never waits for standard input.
+func TestCredentialNeverReadsStandardInput(t *testing.T) {
+	file, _ := keyFile(t)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	unread := settings(t, map[string]any{"private_key_file": "/nonexistent/app.pem"})
+	if _, err := io.WriteString(w, unread); err != nil {
+		t.Fatal(err)
+	}
+	defer func(f *os.File) { os.Stdin = f }(os.Stdin)
+	os.Stdin = r
+	var out, errs bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 201)}), "--", "acme/shop"}, &out, &errs)
+	}()
+	select {
+	case code := <-done:
+		if code != 0 || errs.Len() != 0 {
+			t.Fatalf("exit %d: %s", code, errs.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("credential waits on standard input")
+	}
+	if err := conformance.Credential(out.Bytes()); err != nil {
+		t.Error(err)
+	}
+	w.Close()
+	left, err := io.ReadAll(r)
+	if err != nil || string(left) != unread {
+		t.Errorf("standard input was read: %q left of %q, %v", left, unread, err)
+	}
+}
+
+// TestCredentialsHelpSaysWhatItReadsFromItsEnvironment pins what the help says of the
+// environment: no setting and no secret come from it. Go's HTTP client still reads the
+// proxy variables, HTTPS_PROXY and NO_PROXY, and on Linux crypto/x509 reads SSL_CERT_FILE
+// and SSL_CERT_DIR, so the help claims no more than that.
+func TestCredentialsHelpSaysWhatItReadsFromItsEnvironment(t *testing.T) {
+	var out, errs bytes.Buffer
+	run(context.Background(), []string{"credential", "-h"}, &out, &errs)
+	help := strings.Join(strings.Fields(errs.String()), " ")
+	if !strings.Contains(help, "credential reads no setting and no secret from its environment.") || strings.Contains(help, "reads nothing from its environment") {
+		t.Errorf("the help says\n%s", errs.String())
+	}
+}
+
 func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 	file, pemBytes := keyFile(t)
+	// noAPI is an API on loopback that settings the command refuses never reach: a
+	// request to it fails the test, and no row falls back to GitHub's own API.
+	noSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("GitHub's API is called for settings that are refused: %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(noSrv.Close)
+	noAPI := noSrv.URL
 	for _, tc := range []struct {
 		name string
 		args []string
 		want string
 	}{
 		{"github refuses", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": fakeAPI(t, 403)}), "acme/shop"}, "403: Resource not accessible by integration"},
-		{"two owners", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "acme/shop,other/lib"}, "share an owner"},
+		{"two owners", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": noAPI}), "acme/shop,other/lib"}, "share an owner"},
 		{"no settings", []string{"credential", "acme/shop"}, "--settings is required"},
-		{"no key", []string{"credential", "--settings", settings(t, nil), "acme/shop"}, "missing property 'private_key_file'"},
-		{"the key on the command line", []string{"credential", "--settings", settings(t, map[string]any{"private_key": string(pemBytes)}), "acme/shop"}, "contain private_key, a secret"},
-		{"admin", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"contents": "admin"}}), "acme/shop"}, "/permissions/contents: value must be one of 'read', 'write'"},
-		{"administration", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "permissions": map[string]string{"administration": "read"}}), "acme/shop"}, "/permissions: invalid propertyName 'administration'"},
-		{"an argument like a flag", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file}), "--", "-acme/shop"}, `"-acme/shop" is not owner/name`},
+		{"no key", []string{"credential", "--settings", settings(t, map[string]any{"api_url": noAPI}), "acme/shop"}, "missing property 'private_key_file'"},
+		{"the key on the command line", []string{"credential", "--settings", settings(t, map[string]any{"private_key": string(pemBytes), "api_url": noAPI}), "acme/shop"}, "contain private_key, a secret"},
+		{"admin", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": noAPI, "permissions": map[string]string{"contents": "admin"}}), "acme/shop"}, "/permissions/contents: value must be one of 'read', 'write'"},
+		{"administration", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": noAPI, "permissions": map[string]string{"administration": "read"}}), "acme/shop"}, "/permissions: invalid propertyName 'administration'"},
+		{"an argument like a flag", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": noAPI}), "--", "-acme/shop"}, `"-acme/shop" is not owner/name`},
 		{"a flag of old", []string{"credential", "--app-id", "123456", "--private-key-file", file, "acme/shop"}, "flag provided but not defined"},
+		{"no App id", []string{"credential", "--settings", `{"private_key_file":"/nonexistent/app.pem","api_url":"` + noAPI + `"}`, "--", "acme/shop"}, "missing property 'app_id'"},
+		{"empty settings", []string{"credential", "--settings", "", "--", "acme/shop"}, "--settings is required"},
+		{"settings of -", []string{"credential", "--settings", "-", "--", "acme/shop"}, "the settings are not one JSON document"},
+		{"two documents", []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": noAPI}) + "\n{}", "--", "acme/shop"}, "something other than white space follows it"},
+		{"a key not escaped", []string{"credential", "--settings", `{"app_id":123456,"api_url":"` + noAPI + `","private_key":"` + string(pemBytes) + `"}`, "--", "acme/shop"}, "not one JSON document: it breaks at byte"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errs bytes.Buffer
@@ -134,10 +202,150 @@ func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 			if strings.Count(line, "\n") != 1 || !strings.HasPrefix(line, "qory-github credential: ") || !strings.Contains(line, tc.want) {
 				t.Errorf("stderr %q", line)
 			}
-			if strings.Contains(line, token) || strings.Contains(line, "PRIVATE KEY") || bytes.Contains([]byte(line), pemBytes[40:80]) {
+			if strings.Contains(line, token) || strings.Contains(line, "PRIVATE KEY") || bytes.Contains([]byte(line), pemBytes[40:80]) || strings.Contains(line, "secretvalue") {
 				t.Errorf("stderr contains a secret: %q", line)
 			}
 		})
+	}
+}
+
+// TestAFailureToReachGitHubNeverSaysTheRequest runs credential with an API nothing
+// listens on and an installation, a setting, and checks that the one line on standard
+// error says what failed, and never the installation's id, the path nor the URL.
+func TestAFailureToReachGitHubNeverSaysTheRequest(t *testing.T) {
+	file, _ := keyFile(t)
+	srv := httptest.NewServer(http.NotFoundHandler())
+	api := srv.URL
+	srv.Close()
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": api}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if !strings.HasPrefix(errs.String(), "qory-github credential: ") || !strings.Contains(errs.String(), ": GitHub's API could not be reached: ") {
+		t.Errorf("stderr %q", errs.String())
+	}
+	for _, v := range []string{"778899", "/app/", "installations/", "access_tokens", api} {
+		if strings.Contains(errs.String(), v) {
+			t.Errorf("stderr contains %q: %q", v, errs.String())
+		}
+	}
+}
+
+// TestCredentialRefusesAnotherOwnersInstallation runs credential with an installation
+// GitHub says is another account's, and checks the one line on standard error, which
+// says neither the id nor the login, and that no token is minted.
+func TestCredentialRefusesAnotherOwnersInstallation(t *testing.T) {
+	file, _ := keyFile(t)
+	var minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/app/installations/778899":
+			io.WriteString(w, `{"id":778899,"account":{"login":"otherlogin"}}`)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			minted.Store(true)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"token":"`+token+`","expires_at":"2026-09-25T21:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": srv.URL}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if minted.Load() {
+		t.Error("a token was minted with another account's installation")
+	}
+}
+
+// TestCredentialFollowsNoRedirect has GitHub's API answer the installation's lookup for
+// acme/shop with a 301 to another repository's, as it answers for a repository that was
+// renamed, and checks the one line on standard error, that the redirect's target is
+// never requested and that no token is minted.
+func TestCredentialFollowsNoRedirect(t *testing.T) {
+	file, _ := keyFile(t)
+	var followed, minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/shop/installation":
+			w.Header().Set("Location", "/repos/acme/renamed/installation")
+			w.WriteHeader(http.StatusMovedPermanently)
+			io.WriteString(w, `{"message":"Moved Permanently","url":"/repos/acme/renamed/installation"}`)
+		case "/repos/acme/renamed/installation":
+			followed.Store(true)
+			io.WriteString(w, `{"id":42}`)
+		case "/app/installations/42/access_tokens":
+			minted.Store(true)
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"token":"`+token+`","expires_at":"2026-09-25T21:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": srv.URL}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if followed.Load() || minted.Load() {
+		t.Errorf("the redirect was followed: %v, a token minted: %v", followed.Load(), minted.Load())
+	}
+}
+
+// TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
+// contains control characters and Unicode line separators, and checks that the failure
+// is still one line on standard error, with each of them escaped.
+func TestAFailureFromGitHubIsOneLine(t *testing.T) {
+	file, _ := keyFile(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/installation") {
+			io.WriteString(w, `{"id":42}`)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni"}`)
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "api_url": srv.URL}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	line := strings.TrimSuffix(errs.String(), "\n")
+	if i := strings.IndexFunc(line, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' }); i >= 0 {
+		t.Errorf("stderr contains %q: %q", []rune(line[i:])[0], errs.String())
+	}
+	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i` + "\n"; !strings.HasSuffix(errs.String(), want) {
+		t.Errorf("stderr %q, want it to end in %q", errs.String(), want)
+	}
+}
+
+// TestOneLine pins how an error's text is written on its line: a line break as a space,
+// every other control character, a line or paragraph separator and a byte that is not
+// UTF-8 escaped, and the rest as it is.
+func TestOneLine(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
+		{`/permissions/"a\u2028b": a quote " and a backslash \ stay`, `/permissions/"a\u2028b": a quote " and a backslash \ stay`},
+		{"one\ntwo\r\nthree", "one two three"},
+		{"a\rb\tc\x00d\x1be\x7ff", `a\rb\tc\x00d\x1be\x7ff`},
+		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
+		{"a\x85b\xffc", `a\x85b\xffc`},
+		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
+	} {
+		if got := oneLine(tc.in); got != tc.want {
+			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
@@ -173,19 +381,26 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 }
 
 // TestProgramVersionFallsBackToTheModuleVersion pins the program's version: the one
-// set with ldflags first, then the module version go install records, a release or a
-// pseudo-version, which the contract's schema accepts, and "dev" for a build whose
-// module version is (devel) or empty, or with no build info.
+// set with ldflags first, as it is given, then the module version go install records,
+// a release or a pseudo-version, without its leading v, as the integration contract
+// reports a release's version, which the contract's schema accepts, and "dev" for a
+// build whose module version is (devel) or empty, or with no build info.
 func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
-	pseudo := "v0.0.0-20260926201317-44236bb3bdba"
+	pseudo := "0.2.1-0.20261006195344-0f167ba9a536"
 	for _, tc := range []struct {
 		ldflags, module string
 		info            bool
 		want            string
 	}{
 		{"1.2.3", "v0.1.0", true, "1.2.3"},
-		{"", "v0.1.0", true, "v0.1.0"},
-		{"", pseudo, true, pseudo},
+		{"v1.2.3", "v0.1.0", true, "v1.2.3"},
+		{"", "v0.1.0", true, "0.1.0"},
+		{"", "v" + pseudo, true, pseudo},
+		{"", "v1", true, "1"},
+		{"", "0.1.0", true, "0.1.0"},
+		{"", "vv0.1.0", true, "vv0.1.0"},
+		{"", "version", true, "version"},
+		{"", "v", true, "v"},
 		{"", "(devel)", true, "dev"},
 		{"", "", true, "dev"},
 		{"", "", false, "dev"},
@@ -227,7 +442,7 @@ func fakeGitHub(t *testing.T) string {
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.invalid/apps/qory-github-test", "pem": string(pemBytes)})
+		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)})
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
@@ -259,7 +474,7 @@ func approve(local string) error {
 // policy that allows GitHub's hosts and selects the credential qory expands it into.
 func TestSetupPrintsTheDeclarationAndThePolicy(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "github-app.pem")
-	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.invalid", Client: github.Client{API: fakeGitHub(t)}, Open: approve, Wait: time.Minute}
+	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.com", Client: github.Client{API: fakeGitHub(t)}, Open: approve, Wait: time.Minute}
 	var out bytes.Buffer
 	if err := runSetup(context.Background(), s, &out); err != nil {
 		t.Fatal(err)
@@ -272,7 +487,7 @@ func TestSetupPrintsTheDeclarationAndThePolicy(t *testing.T) {
 	want := `The App 123456 (qory-github-test) is created, and its private key is in ` + file + `.
 
 Install it on the repositories your agents work on:
-  https://github.invalid/apps/qory-github-test/installations/new
+  https://github.com/apps/qory-github-test/installations/new
 
 Then declare the integration in the machine's configuration, ~/.config/qory/runner.yaml:
 
@@ -356,6 +571,44 @@ func TestSetupCreatesNothingForARefusedPath(t *testing.T) {
 	}
 }
 
+// TestSetupRefusesAnotherURLBeforeAnything runs setup with an API or a website it
+// refuses and checks that it fails in one line, before it creates the key's directory,
+// listens, opens the browser or sends a request, and never says the URL.
+func TestSetupRefusesAnotherURLBeforeAnything(t *testing.T) {
+	// Should a URL get past the checks, setup opens no browser and waits no longer than
+	// the test's context.
+	defer func(o func(string) error) { opener = o }(opener)
+	opener = func(string) error {
+		t.Error("setup opens the browser")
+		return nil
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"setup", "--api-url", "https://ghe.acme.example/api/v3"}, "qory-github setup: the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--api-url", "http://api.github.com"}, "qory-github setup: the API is neither https://api.github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--web-url", "https://ghe.acme.example"}, "qory-github setup: the web URL is neither https://github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+		{[]string{"setup", "--web-url", "https://github.com:443"}, "qory-github setup: the web URL is neither https://github.com nor, for a test, http or https on a loopback host; GitHub Enterprise Server is not supported\n"},
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		var out, errs bytes.Buffer
+		code := run(ctx, tc.args, &out, &errs)
+		cancel()
+		if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+			t.Errorf("%q: %v", tc.args, err)
+		}
+		if errs.String() != tc.want {
+			t.Errorf("%q: stderr %q, want %q", tc.args, errs.String(), tc.want)
+		}
+		if _, err := os.Stat(filepath.Join(home, ".config")); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%q: setup created %s: %v", tc.args, filepath.Join(home, ".config"), err)
+		}
+	}
+}
+
 // TestSetupPrintsWhereAMovedKeyIs creates the key file while the person approves, so the
 // key goes beside it, and pins the line setup prints: where the key is, the file that
 // could not be written once, and why.
@@ -367,7 +620,7 @@ func TestSetupPrintsWhereAMovedKeyIs(t *testing.T) {
 		}
 		return approve(local)
 	}
-	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.invalid", Client: github.Client{API: fakeGitHub(t)}, Open: open, Wait: time.Minute}
+	s := github.Setup{Name: "qory-github-test", KeyFile: file, Web: "https://github.com", Client: github.Client{API: fakeGitHub(t)}, Open: open, Wait: time.Minute}
 	var out bytes.Buffer
 	if err := runSetup(context.Background(), s, &out); err != nil {
 		t.Fatal(err)

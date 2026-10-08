@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode"
@@ -43,18 +44,26 @@ var version string
 
 func init() { version = programVersion(version, debug.ReadBuildInfo) }
 
-// programVersion is the version set with ldflags when there is one, or else the main
-// module's version from the build info, which go records: v0.1.0 for go install
-// ...@v0.1.0, or a pseudo-version for a commit. A build whose module version is
-// (devel) or empty is "dev".
+// programVersion is the version set with ldflags when there is one, as it is given, or
+// else the main module's version from the build info without its leading v, as the
+// integration contract's releases have it, the tag without its v: go records v0.1.0
+// for go install ...@v0.1.0, reported as 0.1.0, or a pseudo-version for a commit,
+// v0.2.1-0.20261006195344-0f167ba9a536 reported as 0.2.1-0.20261006195344-0f167ba9a536.
+// Only a v followed by a digit is dropped; any other version is reported as recorded.
+// A build whose module version is (devel) or empty is "dev".
 func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string {
 	if ldflags != "" {
 		return ldflags
 	}
-	if info, ok := read(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
-		return info.Main.Version
+	info, ok := read()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return "dev"
 	}
-	return "dev"
+	v := info.Main.Version
+	if len(v) > 1 && v[0] == 'v' && '0' <= v[1] && v[1] <= '9' {
+		return v[1:]
+	}
+	return v
 }
 
 // more is where the program's page is; each command's help links to a section of it.
@@ -136,9 +145,10 @@ credential document: the access token, its expiry, and where it goes.
 The runner runs credential outside the container, as a credential's adapter. qory
 writes that adapter from the integrations: section of runner.yaml.
 
-The settings are one JSON document; qory-github describe lists what it contains. The
-settings go on a command line, so a secret is refused there: set private_key_file, never
-private_key.
+The settings are one JSON document, given with --settings; qory-github describe lists
+what it contains. The settings go on a command line, so a secret is refused there: set
+private_key_file, a file only its owner reads, never private_key. credential reads no
+setting and no secret from its environment.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,
@@ -192,10 +202,36 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], strings.ReplaceAll(err.Error(), "\n", " "))
+		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], oneLine(err.Error()))
 		return 1
 	}
 	return 0
+}
+
+// oneLine is an error's text as the one line it is written on: a line break, \n or
+// \r\n, is a space, and every other control character, C0, DEL or C1, and the Unicode
+// line and paragraph separators are escaped as Go escapes them in a string, \r, \x7f,
+// \u2028, and so is a byte that is not UTF-8, wherever the text comes from, GitHub's
+// answer among them. The rest is left as it is, a quote or a backslash too, so a name
+// the settings' error already quoted reads the same.
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	var b strings.Builder
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		switch {
+		case r == utf8.RuneError && size == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[0])
+		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029':
+			q := strconv.QuoteRune(r)
+			b.WriteString(q[1 : len(q)-1])
+		default:
+			b.WriteString(s[:size])
+		}
+		s = s[size:]
+	}
+	return b.String()
 }
 
 // describe prints the integration's description, one JSON document. It takes no
@@ -216,9 +252,8 @@ func describe(args []string, stdout, stderr io.Writer) error {
 }
 
 // credential mints a token and prints the runner's credential document, nothing else
-// on standard output. The settings are one document, the only input besides the
-// argument, so a machine and a control plane hand them in the same way; `--` ends the
-// flags, so the argument is never read as one.
+// on standard output. The settings are one document, --settings, the only input besides
+// the argument; `--` ends the flags, so the argument is never read as one.
 func credential(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("credential", flag.ContinueOnError)
 	doc := fs.String("settings", "", "the settings, one JSON document (required)")
@@ -262,9 +297,16 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	org := fs.String("org", "", "create the App under this organisation")
 	name := fs.String("name", "", "the App's name (default qory-github- and six random hex digits)")
 	keyFile := fs.String("key-file", "", "where the private key is written (default ~/.config/qory/github-app.pem)")
-	api := fs.String("api-url", github.APIURL, "GitHub's API")
-	web := fs.String("web-url", github.WebURL, "GitHub's website")
+	api := fs.String("api-url", github.APIURL, "GitHub's API: https://api.github.com, or for a test http or https on a loopback host")
+	web := fs.String("web-url", github.WebURL, "GitHub's website: https://github.com, or for a test http or https on a loopback host")
 	if err := setupHelp.parse(fs, args, stderr); err != nil {
+		return err
+	}
+	// The URLs are checked before anything is created, listened on or opened.
+	if err := github.CheckAPIURL(*api); err != nil {
+		return err
+	}
+	if err := github.CheckWebURL(*web); err != nil {
 		return err
 	}
 	if *keyFile == "" {
@@ -284,7 +326,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *name == "" {
 		*name = "qory-github-" + randomSuffix()
 	}
-	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: browse}
+	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
 	return runSetup(ctx, s, stdout)
 }
 
@@ -380,6 +422,10 @@ func checkKeyFile(p string) error {
 
 // browse opens a URL in the machine's browser. It never fails the setup: the URL is
 // printed as well.
+// opener opens setup's page in the machine's browser; a test replaces it, so it never
+// opens one.
+var opener = browse
+
 func browse(u string) error {
 	name := "xdg-open"
 	if runtime.GOOS == "darwin" {
