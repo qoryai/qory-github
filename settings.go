@@ -217,7 +217,7 @@ func explain(err error) string {
 	return strings.Join(reasons(v, message.NewPrinter(language.English)), "; ")
 }
 
-// location is where in the settings a refusal is, a JSON pointer such as
+// location is where in the settings a refusal is, a path of names such as
 // /permissions/contents. A name the document chose is quoted, as Go quotes a string,
 // when it contains what quoting escapes, a control character, a line or paragraph
 // separator, a quote or a backslash among them, so the location stays on one line and
