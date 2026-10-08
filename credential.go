@@ -60,12 +60,9 @@ var (
 
 // ParseRepositories reads the argument the runner passes, owner/name[,owner/name...].
 // Every repository has the same owner, because an installation token is one account's;
-// an empty argument, a repository listed twice, a name GitHub refuses, and a name that
-// is a dot segment are refused.
+// a repository listed twice, a name GitHub refuses, and a name that is a dot
+// segment are refused.
 func ParseRepositories(arg string) ([]Repository, error) {
-	if arg == "" {
-		return nil, errors.New("the argument is empty; want owner/name[,owner/name...]")
-	}
 	var out []Repository
 	for _, part := range strings.Split(arg, ",") {
 		owner, name, ok := strings.Cut(part, "/")

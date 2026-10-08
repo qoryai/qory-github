@@ -7,60 +7,20 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
-### Added
-
-- `qory-github credential -- owner/name[,owner/name...]` reads its settings on standard
-  input, as the
-  [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#settings)
-  defines it: one JSON document and nothing after it but white space, 64 KiB at most.
-  It reads standard input to its end, or until it has more than 64 KiB, before it checks
-  the argument, reads the key or calls GitHub's API, and refuses empty input; `{}` is a
-  document. It reads no setting from its environment.
-- The settings may contain the private key itself, `private_key`, in place of
-  `private_key_file`, the key kept on disk.
-- The description's `private_key` carries `x-secret-name`, `GITHUB_APP_PRIVATE_KEY`: the
-  name a control plane suggests for storing the key.
-- The description names its `publisher`, `{"name": "Qory", "url": "https://qory.dev"}`,
-  which the integration contract requires, and `Description` has it as `Publisher`.
-- The description's credential role lists the settings the runner writes to its standard
-  input, `"settings": ["app_id", "installation_id", "permissions", "private_key"]`, and
-  those it needs, `"required": ["app_id", "private_key"]`, as the integration contract's
-  ways define a role; `CredentialRole` has them as `Settings` and `Required`. The private
-  key is listed as `private_key`, which the runner writes as `private_key` or
-  `private_key_file`. `api_url` is not listed, so a document the runner writes never
-  carries it; `credential` still takes it when its standard input does.
-
 ### Changed
 
-- `credential` takes no flags, and refuses a flag in one line on standard error with
-  nothing on standard output, like every other failure; before, a refused flag printed
-  the usage too. `-h` still prints the help.
-- Settings that contain both `private_key` and `private_key_file` are refused, before
-  the schema is checked, with an error that names the two: a secret has one source.
-- The settings schema has no top-level `required` and no `oneOf` over `private_key` and
-  `private_key_file`, which the integration contract no longer allows at the top level.
-  `ReadSettings` reads the credential role's `required` instead: settings without
-  `app_id`, or with neither `private_key` nor `private_key_file`, are refused before the
-  schema is checked, the key read or GitHub's API called, with an error that names what
-  is missing and the role that requires it, in place of the schema's `missing property`.
-- The integration contract is pinned at `github.com/qoryai/integrations`
-  `0f167ba9a536`, the commit that defines ways and sources on any forge.
-- An empty argument, which a connection without one passes, is refused by the rule for
-  repositories, with an error that says it is empty, not as a missing argument.
 - An error about settings that are not one JSON document says at which byte the document
-  breaks, never the character there.
-- The description of `private_key_file` says it is the key kept on disk, no longer the
-  way a machine hands the key in.
-- An error about settings says where they are wrong as a JSON pointer whose names are
-  escaped as JSON pointers escape them, `~` as `~0` and `/` as `~1`, and quotes a name
-  the document chose when it contains a control character, a line or paragraph
-  separator, a quote or a backslash, so the error stays one line.
+  breaks, or that it is empty, ends too soon or has something other than white space
+  after it, and never the character there.
+- The description of `private_key_file` says it is the one way to hand the key in on a
+  command line, no longer the way a machine hands it in.
+- An error about settings quotes a name the document chose, such as a permission's, where
+  it says where the settings are wrong, when the name contains a control character, a
+  line or paragraph separator, a quote or a backslash, so the error stays one line.
 - The line a failure writes on standard error escapes every control character but a line
   break, which it writes as a space, and the Unicode line and paragraph separators, as Go
   escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
   from GitHub's API among them: before, a line break alone was replaced.
-- `ReadSettings` reads the settings from an `io.Reader`, the program's standard input,
-  and takes `private_key`.
 - `api_url` takes `https://api.github.com` alone, with or without a trailing `/` or the
   port 443, and for a test `http` or `https` on a loopback host, `127.0.0.0/8`, `[::1]`
   or `localhost`, with any port: the App's own token goes there, and it can mint a token
@@ -82,10 +42,9 @@ change what the program does, and notes it under Upgrading.
   compares `program_version` with the version it asked for. Only a `v` followed by a
   digit is dropped. The version set with `-X main.version` is reported as it is given,
   and a build whose module version is `(devel)` or empty is still `dev`.
-- `credential -h` says it reads no setting and no secret from its environment, where it
-  said it read nothing there: Go's HTTP client takes a proxy from `HTTPS_PROXY` and
-  `NO_PROXY`, and on Linux the system's certificates from `SSL_CERT_FILE` and
-  `SSL_CERT_DIR`, as before.
+- `credential -h` says it reads no setting and no secret from its environment. Go's
+  HTTP client takes a proxy from `HTTPS_PROXY` and `NO_PROXY`, and on Linux the
+  system's certificates from `SSL_CERT_FILE` and `SSL_CERT_DIR`, as before.
 - An error about settings never says a value: a number below or above its bound, a
   string's length and a number of permissions are no longer in it, where before
   `/installation_id: minimum: got -42, want 1` said the number. The error says the
@@ -124,32 +83,14 @@ change what the program does, and notes it under Upgrading.
   with a redirect, which setup never follows, so the code is sent nowhere else`. Before,
   Go's client followed it, and sent the App's token on to a target on the same host.
 
-### Removed
-
-- `credential --settings <json>`, the settings on the command line.
-
 ### Upgrading
 
-- This version needs a `qory` and a runner that start `credential` as
-  `qory-github credential -- <argument>` and write the settings document to its standard
-  input, `{}` when there are none. An earlier `qory` starts it with `--settings <json>`,
-  which `credential` refuses, in any form, `--settings -` and `--settings=-` among them,
-  as a flag it does not define: every run that selects the credential then fails.
-- Code that uses the package hands `ReadSettings` a reader of the settings document in
-  place of the document as a string.
 - Settings whose `api_url` is another `https` API, such as one of GitHub Enterprise
   Server, are now refused, and so is `Client.Mint` with such an `API`. Leave `api_url`
   out for GitHub's own.
 - `setup --api-url` and `--web-url` with another host, such as one of GitHub Enterprise
   Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
   Leave them out for GitHub's own.
-- The description follows the integration contract's ways: it has `publisher`, and its
-  credential role has `settings` and `required`. A `qory` or another reader of an earlier
-  contract refuses both, so this version needs a reader of the contract at
-  `github.com/qoryai/integrations` `0f167ba9a536` or later.
-- A runner of that contract writes `credential` only the settings its role lists, and
-  refuses a connection that carries another, so settings with `api_url` no longer reach
-  `credential` through the runner. Leave `api_url` out for GitHub's own.
 
 ## [0.1.0] - 2026-09-30
 

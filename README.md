@@ -96,24 +96,13 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 ### credential
 
 ```sh
-qory-github credential -- owner/name[,owner/name...] < settings.json
+qory-github credential --settings JSON -- owner/name[,owner/name...]
 ```
 
-The runner calls this for each run; you normally don't. It reads the settings on
-standard input, mints a token for the listed repositories, all of one owner, and prints
-the runner's credential document: the token, `expires_at`, the hosts and paths it
-applies to, and the placeholders `GH_TOKEN` and `GITHUB_TOKEN`. Each call mints a new
-token; nothing is kept.
-
-- The settings are one JSON document on standard input, nothing after it but white
-  space, 64 KiB (65536 bytes) at most. Empty input is refused; `{}` is a document.
-- Standard input is read to its end, or until it has more than 64 KiB, before the
-  argument is checked, before the key is read and before any network call.
-- The settings must contain `app_id` and the private key, as `private_key` or as
-  `private_key_file`, one of them: settings with neither of them, or with both, are
-  refused before the key is read and before any network call.
-- One argument follows `--`. An empty one is refused as not `owner/name`.
-- `credential` takes no flags. A flag is refused in one line, like any other failure.
+The runner calls this for each run; you normally don't. It mints a token for the listed
+repositories, all of one owner, and prints the runner's credential document: the token,
+`expires_at`, the hosts and paths it applies to, and the placeholders `GH_TOKEN` and
+`GITHUB_TOKEN`. Each call mints a new token; nothing is kept.
 
 ### describe
 
@@ -121,54 +110,35 @@ token; nothing is kept.
 qory-github describe
 ```
 
-Prints the integration's description: its publisher, Qory, the settings as a JSON Schema,
-and the credential role, with the settings the runner hands it and those it requires
-([Settings](#settings)). `qory` calls it to check a declaration. No settings, no network.
+Prints the integration's description: the settings as a JSON Schema and the credential
+role. `qory` calls it to check a declaration. No settings, no network.
 
 ### Exit status
 
 - `0`: success. `describe` and `credential` print one JSON document on standard output.
-- `1`: failure, a flag a command refuses among them. One line on standard error that
-  says what failed, never the token or the key. `setup` prints its usage before that
-  line when it refuses a flag.
+- `1`: failure, a flag a command refuses among them. One line on standard error says
+  what failed, never the token or the key. `credential` and `setup` print the flag
+  package's own line and their usage before that line when they refuse a flag.
 - `2`: no command, an unknown one, or `-h`. Usage or help on standard error.
 
 ## Settings
 
-One JSON document, on the standard input of `credential`; in `runner.yaml`, under
-`settings:`.
+Passed as one JSON document in `--settings`, or under `settings:` in `runner.yaml`.
 
 | Setting | Required | Meaning |
 |---|---|---|
 | `app_id` | yes | The App's numeric id, or its client id as a string |
-| `private_key_file` | this or `private_key` | Path to the App's private key, the key kept on disk. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
-| `private_key` | this or `private_key_file` | The App's private key itself, the PEM. A secret. |
+| `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
 | `installation_id` | no | The App's installation on the repositories' owner. Checked with GitHub before a token is minted: an installation on another account is refused. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
-| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. Not in the credential role's settings. |
+| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |
 
-Settings without `app_id`, or with neither `private_key` nor `private_key_file`, are
-refused, and so are settings that contain both: a secret has one source. No setting is
-read from the environment or the command line.
+The private key itself (`private_key`) is refused on the command line; use
+`private_key_file`. No setting is read from the environment.
 
 `app_id` as a number, and `installation_id`, are integers from 1 to 9007199254740991,
 2^53 - 1, the largest integer every JSON reader holds exactly. An integer is read as JSON
 Schema reads it, whatever its notation: `42.0` and `4.2e1` are `42`.
-
-The description's credential role lists the settings the runner writes to the standard
-input of `credential`, as the
-[integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1#roles)
-defines a role's `settings` and `required`:
-
-```json
-"settings": ["app_id", "installation_id", "permissions", "private_key"],
-"required": ["app_id", "private_key"]
-```
-
-The private key is listed as `private_key`, and the runner writes it as `private_key` or
-as `private_key_file`; either satisfies `required`. `api_url` is not listed, so a
-document the runner writes never carries it; `credential` takes it when the document on
-its standard input does.
 
 ## Permissions
 

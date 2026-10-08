@@ -12,7 +12,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
-	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -605,7 +604,7 @@ func TestTheAppsTokenGoesToGitHubsAPIAlone(t *testing.T) {
 			t.Errorf("CheckAPIURL(%q): %v", api, err)
 		}
 		doc, _ := json.Marshal(map[string]any{"app_id": 123456, "private_key_file": "/k.pem", "api_url": api})
-		s, serr := ReadSettings(strings.NewReader(string(doc)))
+		s, serr := ReadSettings(string(doc))
 		switch {
 		case ok && (serr != nil || s.APIURL != api):
 			t.Errorf("the settings refuse %q: %v", api, serr)
@@ -754,17 +753,6 @@ func TestTheDescriptionSaysWhatThePackageDoes(t *testing.T) {
 	if strings.Join(d.Domains, " ") != "software" {
 		t.Errorf("domains %v", d.Domains)
 	}
-	if d.Publisher != (Publisher{Name: "Qory", URL: "https://qory.dev"}) {
-		t.Errorf("publisher %+v", d.Publisher)
-	}
-	// The credential role lists what the runner hands it, the key as private_key or
-	// private_key_file, and never api_url, which no document the runner writes carries.
-	if got := d.Roles.Credential.Settings; !slices.Equal(got, []string{"app_id", "installation_id", "permissions", "private_key"}) {
-		t.Errorf("the credential role's settings are %v", got)
-	}
-	if got := d.Roles.Credential.Required; !slices.Equal(got, []string{"app_id", "private_key"}) {
-		t.Errorf("the credential role requires %v", got)
-	}
 	var s struct {
 		Properties map[string]struct {
 			WriteOnly     bool `json:"writeOnly"`
@@ -794,14 +782,14 @@ func TestTheDescriptionSaysWhatThePackageDoes(t *testing.T) {
 }
 
 func TestReadSettings(t *testing.T) {
-	s, err := ReadSettings(strings.NewReader(`{"app_id":123456,"installation_id":42,"permissions":{"contents":"read"},"api_url":"http://127.0.0.1:1","private_key_file":"/k.pem"}`))
+	s, err := ReadSettings(`{"app_id":123456,"installation_id":42,"permissions":{"contents":"read"},"api_url":"http://127.0.0.1:1","private_key_file":"/k.pem"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.AppID != "123456" || s.InstallationID != 42 || s.Permissions["contents"] != "read" || s.APIURL != "http://127.0.0.1:1" || s.PrivateKeyFile != "/k.pem" {
 		t.Errorf("settings %+v", s)
 	}
-	if s, err := ReadSettings(strings.NewReader(`{"app_id":"Iv1.abc","private_key_file":"/k.pem"}`)); err != nil || s.AppID != "Iv1.abc" || s.Permissions != nil {
+	if s, err := ReadSettings(`{"app_id":"Iv1.abc","private_key_file":"/k.pem"}`); err != nil || s.AppID != "Iv1.abc" || s.Permissions != nil {
 		t.Errorf("settings %+v, %v", s, err)
 	}
 }
@@ -815,6 +803,11 @@ func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T)
 		doc, want string
 		value     []string // what the error may not contain besides secretvalue
 	}{
+		{`{"app_id":"123456","private_key_file":"/k.pem","private_key":"-----BEGIN RSA PRIVATE KEY-----"}`, "contain private_key, a secret", nil},
+		{`{"private_key":"-----BEGIN RSA PRIVATE KEY-----"}`, "contain private_key", nil},
+		{`{"app_id":"123456"}`, "missing property 'private_key_file', or missing property 'private_key'", nil},
+		{`{"private_key_file":"/k.pem"}`, "missing property 'app_id'", nil},
+		{`{}`, "missing property 'app_id'", nil},
 		{`{"app_id":-778899,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is less than 1", []string{"778899", "778,899", "minimum"}},
 		{`{"app_id":0,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is less than 1", []string{"got"}},
 		{`{"app_id":778899001122334455667788,"private_key_file":"/k.pem"}`, "the settings are invalid: /app_id: is greater than 9007199254740991", []string{"778899", "7.788", "maximum"}},
@@ -828,7 +821,7 @@ func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T)
 		{`{"app_id":123456,"installation_id":7788.5,"private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: got number, want integer", []string{"7788"}},
 		{`{"app_id":123456,"installation_id":"secretvalue","private_key_file":"/k.pem"}`, "the settings are invalid: /installation_id: got string, want integer", nil},
 		{`{"app_id":123456,"private_key_file":""}`, "the settings are invalid: /private_key_file: is shorter than 1 character", []string{"got", "minLength"}},
-		{`{"app_id":123456,"private_key":""}`, "the settings are invalid: /private_key: is shorter than 1 character", []string{"got", "minLength"}},
+		{`{"app_id":123456,"private_key":""}`, "contain private_key, a secret", []string{"got", "minLength"}},
 		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"contents":"secretvalue"}}`, "/permissions/contents: value must be one of 'read', 'write'", nil},
 		{`{"app_id":"123456","private_key_file":"/k.pem","permissions":{"contents":"admin"}}`, "/permissions/contents: value must be one of 'read', 'write'", []string{"admin"}},
 		{`{"app_id":"123456","private_key_file":"/k.pem","key":"secretvalue"}`, "additional properties 'key' not allowed", nil},
@@ -846,7 +839,7 @@ func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T)
 		{`["app_id"]`, "got array, want object", nil},
 		{`{"app_id":1} {}`, "not one JSON document", nil},
 	} {
-		_, err := ReadSettings(strings.NewReader(tc.doc))
+		_, err := ReadSettings(tc.doc)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v", tc.doc, err)
 			continue
@@ -874,60 +867,34 @@ func TestReadSettingsTakesAnIntegerAsTheSchemaDoes(t *testing.T) {
 		{`{"app_id":9007199254740991,"installation_id":9007199254740991,"private_key_file":"/k.pem"}`, "9007199254740991", 9007199254740991},
 		{`{"app_id":"1.0","private_key_file":"/k.pem"}`, "1.0", 0},
 	} {
-		s, err := ReadSettings(strings.NewReader(tc.doc))
+		s, err := ReadSettings(tc.doc)
 		if err != nil || s.AppID != tc.app || s.InstallationID != tc.installationID {
 			t.Errorf("%s: settings %+v, %v", tc.doc, s, err)
 		}
 	}
 }
 
-// TestReadSettingsTakesTheKeyItself reads the settings on standard input, the key itself
-// among them, with white space around the document, and up to 64 KiB of input.
-func TestReadSettingsTakesTheKeyItself(t *testing.T) {
-	pemBytes := keyPEM(t)
-	doc, err := json.Marshal(map[string]any{"app_id": 123456, "installation_id": 42, "private_key": string(pemBytes)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, in := range []string{
-		string(doc),
-		string(doc) + "\n",
-		" \t\r\n" + string(doc) + " \t\r\n",
-		string(doc) + strings.Repeat(" ", maxSettings-len(doc)),
-	} {
-		s, err := ReadSettings(strings.NewReader(in))
-		if err != nil || s.AppID != appID || s.InstallationID != 42 || s.PrivateKey != string(pemBytes) || s.PrivateKeyFile != "" {
-			t.Errorf("%d bytes: settings %+v, %v", len(in), s, err)
-		}
-	}
-	s, err := ReadSettings(strings.NewReader(`{"app_id":"Iv1.abc","private_key_file":"/k.pem"}`))
-	if err != nil || s.AppID != "Iv1.abc" || s.PrivateKeyFile != "/k.pem" || s.PrivateKey != "" {
-		t.Errorf("settings %+v, %v", s, err)
-	}
-}
-
-// TestReadSettingsRefusesInputAndNeverSaysAValue refuses input that is not one settings
-// document of 64 KiB at most, and a secret beside its file, with an error that contains
-// no part of the input.
-func TestReadSettingsRefusesInputAndNeverSaysAValue(t *testing.T) {
+// TestReadSettingsRefusesWhatIsNotOneDocumentAndNeverSaysAValue refuses settings that
+// are not one JSON document, with an error that says where the document breaks and
+// contains no part of it.
+func TestReadSettingsRefusesWhatIsNotOneDocumentAndNeverSaysAValue(t *testing.T) {
 	secret := `"-----BEGIN RSA PRIVATE KEY-----\nsecretvalue\n-----END RSA PRIVATE KEY-----\n"`
-	doc := `{"app_id":123456,"private_key":` + secret + `}`
+	doc := `{"app_id":123456,"private_key_file":"/k.pem"}`
 	for _, tc := range []struct{ name, in, want string }{
-		{"empty", "", "the settings on standard input are empty"},
-		{"white space", " \t\r\n ", "the settings on standard input are empty"},
+		{"empty", "", "the settings are empty"},
+		{"white space", " \t\r\n ", "the settings are empty"},
 		{"two documents", doc + ` {"app_id":"secretvalue"}`, "something other than white space follows it"},
 		{"something after", doc + "secretvalue", "something other than white space follows it"},
 		{"a white space JSON has not", doc + "\v", "something other than white space follows it"},
 		{"cut short", `{"app_id":123456,"private_key":` + secret, "it ends before the document does"},
 		{"a key not escaped", `{"app_id":123456,"private_key":"-----BEGIN RSA PRIVATE KEY-----` + "\nsecretvalue\n" + `"}`, "it breaks at byte 64"},
-		{"larger than 64 KiB", doc + strings.Repeat(" ", maxSettings+1-len(doc)), "larger than 64 KiB, 65536 bytes"},
-		{"the key and its file", `{"app_id":123456,"private_key_file":"/k.pem","private_key":` + secret + `}`, "contain both private_key and private_key_file; a secret has one source"},
-		{"no key", `{"app_id":123456}`, "contain neither private_key nor private_key_file; the credential role requires the secret, so set one of them"},
-		{"no App id", `{"private_key":` + secret + `}`, "do not contain app_id, which the credential role requires"},
-		{"an unknown setting", `{"app_id":123456,"private_key":` + secret + `,"key":"secretvalue"}`, "additional properties 'key' not allowed"},
+		{"not JSON", "secretvalue", "it breaks at byte 1"},
+		{"the key", `{"app_id":123456,"private_key":` + secret + `}`, "contain private_key, a secret"},
+		{"the key and its file", `{"app_id":123456,"private_key_file":"/k.pem","private_key":` + secret + `}`, "contain private_key, a secret"},
+		{"an unknown setting", `{"app_id":123456,"private_key_file":"/k.pem","key":"secretvalue"}`, "additional properties 'key' not allowed"},
 		{"not an object", `["secretvalue"]`, "got array, want object"},
 	} {
-		_, err := ReadSettings(strings.NewReader(tc.in))
+		_, err := ReadSettings(tc.in)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v", tc.name, err)
 			continue
@@ -938,28 +905,10 @@ func TestReadSettingsRefusesInputAndNeverSaysAValue(t *testing.T) {
 	}
 }
 
-// TestASettingsErrorLocatesANameAsAJSONPointer pins the location of a refused setting
-// whose name contains ~ or /: escaped as a JSON pointer escapes it, so /permissions/a/b
-// is never what the location reads for the name a/b.
-func TestASettingsErrorLocatesANameAsAJSONPointer(t *testing.T) {
-	for name, want := range map[string]string{
-		`a/b`:   `the settings are invalid: /permissions/a~1b: value must be one of 'read', 'write'`,
-		`a~b`:   `the settings are invalid: /permissions/a~0b: value must be one of 'read', 'write'`,
-		`a~1b`:  `the settings are invalid: /permissions/a~01b: value must be one of 'read', 'write'`,
-		`~/`:    `the settings are invalid: /permissions/~0~1: value must be one of 'read', 'write'`,
-		`a/\nb`: `the settings are invalid: /permissions/"a~1\nb": value must be one of 'read', 'write'`,
-		`a"b`:   `the settings are invalid: /permissions/"a\"b": value must be one of 'read', 'write'`,
-	} {
-		_, err := ReadSettings(strings.NewReader(`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + strings.ReplaceAll(name, `"`, `\"`) + `":"admin"}}`))
-		if err == nil || !strings.HasPrefix(err.Error(), want) {
-			t.Errorf("%s: %v, want it to begin %s", name, err, want)
-		}
-	}
-}
-
 // TestASettingsErrorEscapesTheNamesItReports hands in settings whose names contain a
-// line break, a tab, DEL, C1 or a Unicode line or paragraph separator. A name an error
-// reports is escaped, so the error is one line with none of those characters in it.
+// line break, a tab, DEL, C1 or a Unicode line or paragraph separator, on the command
+// line. A name an error reports is escaped, so the error is one line with none of those
+// characters in it.
 func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
 	for _, name := range []string{`a\nb`, `a\rb`, `a\tb`, `a\u007fb`, `a\u0085b`, `a\u2028b`, `a\u2029b`} {
 		for doc, want := range map[string]string{
@@ -967,7 +916,7 @@ func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
 			`{"app_id":123456,"private_key_file":"/k.pem","permissions":{"` + name + `":"read"}}`:  `invalid propertyName 'a\`,
 			`{"app_id":123456,"private_key_file":"/k.pem","` + name + `":1}`:                       `additional properties 'a\`,
 		} {
-			_, err := ReadSettings(strings.NewReader(doc))
+			_, err := ReadSettings(doc)
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Errorf("%s: %v", doc, err)
 				continue
@@ -977,60 +926,6 @@ func TestASettingsErrorEscapesTheNamesItReports(t *testing.T) {
 			}); i >= 0 {
 				t.Errorf("%s: the error contains %q: %q", doc, []rune(err.Error()[i:])[0], err)
 			}
-		}
-	}
-}
-
-// TestReadSettingsTakesWhatTheCredentialRoleRequires reads the credential role's
-// required as the integration contract does, the settings' schema requiring nothing at
-// its top level: app_id, and the private key as private_key or as private_key_file,
-// one of them and never both. Each is refused, before the schema and with no value in
-// the error, when it is missing.
-func TestReadSettingsTakesWhatTheCredentialRoleRequires(t *testing.T) {
-	secret := `"-----BEGIN RSA PRIVATE KEY-----\nsecretvalue\n-----END RSA PRIVATE KEY-----\n"`
-	for _, doc := range []string{
-		`{"app_id":123456,"private_key":` + secret + `}`,
-		`{"app_id":"Iv1.abc","private_key_file":"/k.pem"}`,
-		`{"app_id":123456,"private_key":` + secret + `,"installation_id":42,"permissions":{"contents":"read"}}`,
-		// api_url is not the role's: the runner never writes it, and whoever runs the
-		// program itself may.
-		`{"app_id":123456,"private_key_file":"/k.pem","api_url":"http://127.0.0.1:1"}`,
-	} {
-		if _, err := ReadSettings(strings.NewReader(doc)); err != nil {
-			t.Errorf("%s: %v", doc, err)
-		}
-	}
-	for _, tc := range []struct{ doc, want string }{
-		{`{}`, "the settings do not contain app_id, which the credential role requires"},
-		{`{"private_key":` + secret + `}`, "the settings do not contain app_id, which the credential role requires"},
-		{`{"private_key_file":"/k.pem","installation_id":42}`, "the settings do not contain app_id, which the credential role requires"},
-		{`{"app_id":123456}`, "the settings contain neither private_key nor private_key_file; the credential role requires the secret, so set one of them"},
-		{`{"app_id":"123456","installation_id":42,"api_url":"http://127.0.0.1:1"}`, "the settings contain neither private_key nor private_key_file; the credential role requires the secret, so set one of them"},
-		{`{"app_id":123456,"private_key_file":"/k.pem","private_key":` + secret + `}`, "the settings contain both private_key and private_key_file; a secret has one source, so set one of them"},
-		// A missing setting is refused before a value the schema refuses.
-		{`{"app_id":"not an id secretvalue"}`, "the settings contain neither private_key nor private_key_file"},
-	} {
-		_, err := ReadSettings(strings.NewReader(tc.doc))
-		if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
-			t.Errorf("%s: %v, want %s", tc.doc, err, tc.want)
-			continue
-		}
-		if strings.Contains(err.Error(), "PRIVATE KEY") || strings.Contains(err.Error(), "secretvalue") {
-			t.Errorf("%s: the error contains a value: %v", tc.doc, err)
-		}
-	}
-	// Every setting the role requires is refused when it alone is missing, a secret when
-	// neither of its forms is there.
-	full := map[string]any{"app_id": 123456, "private_key": "-----BEGIN RSA PRIVATE KEY-----"}
-	for _, name := range Describe("").Roles.Credential.Required {
-		doc := maps.Clone(full)
-		delete(doc, name)
-		b, err := json.Marshal(doc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := ReadSettings(strings.NewReader(string(b))); err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "the credential role requires") {
-			t.Errorf("without %s: %v", name, err)
 		}
 	}
 }

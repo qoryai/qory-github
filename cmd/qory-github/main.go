@@ -1,14 +1,13 @@
 // Command qory-github is Qory's integration with GitHub, the runner's credential
-// adapter: `qory-github credential -- owner/name` reads its settings on standard input,
-// mints a GitHub App installation token for the repositories listed and prints the
-// runner's credential document. `qory-github describe` prints the integration's
-// description, contracts/integration/v1, and `qory-github setup` creates the App.
+// adapter: `qory-github credential --settings <json> -- owner/name` mints a
+// GitHub App installation token for the repositories listed and prints the runner's
+// credential document. `qory-github describe` prints the integration's description,
+// contracts/integration/v1, and `qory-github setup` creates the App.
 package main
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,7 +32,7 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	stop()
 	os.Exit(code)
 }
@@ -87,30 +86,23 @@ qory-github <command> -h prints a command's help.
 More: ` + more
 
 // help is one command's help. short is its line in usage; -h prints the rest, and the
-// command's flags, on standard error. machine is set for a command a machine runs,
-// whose failure is one line.
+// command's flags, on standard error.
 type help struct {
 	short, use, long, example, section string
-	machine                            bool
 }
 
-// parse parses args into fs. -h prints the whole help. A flag fs refuses prints the
-// command's usage and flags alone, after the flag package's own line, unless the
-// command is a machine's: then the error alone is its failure, the one line run writes.
+// parse parses args into fs. -h prints the whole help; a flag fs refuses prints the
+// command's usage and flags alone, after the flag package's own line.
 func (h help) parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
-	if h.machine {
-		fs.SetOutput(io.Discard)
-	}
 	fs.Usage = func() {}
 	err := fs.Parse(args)
-	fs.SetOutput(stderr)
 	switch {
 	case errors.Is(err, flag.ErrHelp):
 		fmt.Fprintf(stderr, "%s\n\n", h.long)
 		h.usage(stderr, fs)
 		fmt.Fprintf(stderr, "\nexamples:\n%s\n\nMore: %s#%s\n", h.example, more, h.section)
-	case err != nil && !h.machine:
+	case err != nil:
 		h.usage(stderr, fs)
 	}
 	return err
@@ -133,11 +125,10 @@ var describeHelp = help{
 	long: `Print the integration's description: one JSON document, as the integration contract
 defines it.
 
-It contains who publishes qory-github, and the settings it takes, as a JSON Schema, with
-the private key marked writeOnly, a secret. It contains the credential role: the
-repositories an argument may list, the hosts the access token is for, and the settings
-the runner hands credential and those it requires. qory runs describe, and checks the
-declaration's settings against it.
+It contains the settings qory-github takes, as a JSON Schema, with the private key
+marked writeOnly, a secret. It contains the credential role: the repositories an
+argument may list, and the hosts the access token is for. qory runs describe, and checks
+the declaration's settings against it.
 
 It takes no settings and reaches no network.`,
 	example: `  qory-github describe                  # the whole description
@@ -147,27 +138,23 @@ It takes no settings and reaches no network.`,
 
 var credentialHelp = help{
 	short: "Mint an access token for a run's repositories",
-	use:   "qory-github credential [--] owner/name[,owner/name...]",
+	use:   "qory-github credential --settings JSON [--] owner/name[,owner/name...]",
 	long: `Mint a GitHub App access token for the repositories listed, and print the runner's
 credential document: the access token, its expiry, and where it goes.
 
 The runner runs credential outside the container, as a credential's adapter. qory
 writes that adapter from the integrations: section of runner.yaml.
 
-The settings come on standard input, one JSON document; qory-github describe lists what
-it contains. credential reads standard input to its end, or until it has more than
-64 KiB, before it checks the argument and before any network call. It refuses empty
-input, anything after the document but white space, and more than 64 KiB. It requires
-app_id and the private key, which comes as private_key itself or as private_key_file, a
-file only its owner reads, one of them and never both. credential takes no flags, and
-reads no setting and no secret from its environment.
+The settings are one JSON document, given with --settings; qory-github describe lists
+what it contains. The settings go on a command line, so a secret is refused there: set
+private_key_file, a file only its owner reads, never private_key. credential reads no
+setting and no secret from its environment.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,
-	example: `  qory-github credential -- acme/shop < settings.json            # one repository
-  qory-github credential -- acme/shop,acme/lib < settings.json   # two of one owner's`,
+	example: `  qory-github credential --settings "$settings" -- acme/shop            # one repository
+  qory-github credential --settings "$settings" -- acme/shop,acme/lib   # two of one owner's`,
 	section: "credential",
-	machine: true,
 }
 
 var setupHelp = help{
@@ -194,7 +181,7 @@ policy that selects it.`,
 
 // run is the command, with its streams, so a test runs it whole. It returns the exit
 // status; an error is one line on stderr describing what failed, never a secret.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -202,7 +189,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var err error
 	switch args[0] {
 	case "credential":
-		err = credential(ctx, args[1:], stdin, stdout, stderr)
+		err = credential(ctx, args[1:], stdout, stderr)
 	case "setup":
 		err = setup(ctx, args[1:], stdout, stderr)
 	case "describe":
@@ -265,28 +252,29 @@ func describe(args []string, stdout, stderr io.Writer) error {
 }
 
 // credential mints a token and prints the runner's credential document, nothing else
-// on standard output. The settings are one document on standard input, the only input
-// besides the argument, so a machine and a control plane hand them in the same way. It
-// takes no flags, which it parses first, since that needs no input; then it reads
-// standard input whole, before it checks the argument. `--` ends the flags, so the
-// argument is never read as one.
-func credential(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+// on standard output. The settings are one document, --settings, the only input besides
+// the argument; `--` ends the flags, so the argument is never read as one.
+func credential(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("credential", flag.ContinueOnError)
+	doc := fs.String("settings", "", "the settings, one JSON document (required)")
 	if err := credentialHelp.parse(fs, args, stderr); err != nil {
-		return err
-	}
-	s, err := github.ReadSettings(stdin)
-	if err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return errors.New("want one argument, owner/name[,owner/name...]")
 	}
+	if *doc == "" {
+		return errors.New("--settings is required")
+	}
+	s, err := github.ReadSettings(*doc)
+	if err != nil {
+		return err
+	}
 	repos, err := github.ParseRepositories(fs.Arg(0))
 	if err != nil {
 		return err
 	}
-	key, err := readKey(s)
+	key, err := github.ReadKeyFile(s.PrivateKeyFile)
 	if err != nil {
 		return err
 	}
@@ -300,15 +288,6 @@ func credential(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	}
 	_, err = fmt.Fprintf(stdout, "%s\n", b)
 	return err
-}
-
-// readKey is the App's private key the settings hand in: the key itself, or else the
-// file that contains it.
-func readKey(s github.Settings) (*rsa.PrivateKey, error) {
-	if s.PrivateKey != "" {
-		return github.ParseKey([]byte(s.PrivateKey))
-	}
-	return github.ReadKeyFile(s.PrivateKeyFile)
 }
 
 // setup creates the App with a person's approval in the browser, writes its key and

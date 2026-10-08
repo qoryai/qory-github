@@ -13,10 +13,8 @@
 //
 // [Describe] is the integration's description, the integration contract
 // (https://github.com/qoryai/integrations/tree/main/contracts/integration/v1): its name,
-// who publishes it, the settings it takes as a JSON Schema, and the roles it plays, each
-// with the settings it receives and requires. [ReadSettings] reads a settings document
-// against that schema and the credential role's required, as the program reads it on
-// standard input.
+// the settings it takes as a JSON Schema, and the roles it plays. [ReadSettings] reads
+// a settings document against that schema.
 //
 // The package keeps nothing. The settings, the App's private key among them, are handed
 // to it on every call, by whoever has them, and nothing it is handed is written
