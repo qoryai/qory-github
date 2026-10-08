@@ -26,13 +26,14 @@ import (
 var description []byte
 
 // Description is the integration's description, contracts/integration/v1: its name,
-// the domains it serves, the settings it takes as a JSON Schema, and the roles it plays.
+// the domains it works with, the settings it takes as a JSON Schema, and the roles it
+// plays.
 type Description struct {
 	Version     int    `json:"version"`
 	Name        string `json:"name"`
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
-	// Domains are the domains the integration serves, software for GitHub.
+	// Domains are the domains the integration works with, software for GitHub.
 	Domains        []string `json:"domains,omitempty"`
 	ProgramVersion string   `json:"program_version"`
 	// Settings is the settings schema, the private key marked writeOnly, the secret.

@@ -370,7 +370,7 @@ func (rd *redirecting) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // the App's token or the code, and checks that none is followed, whatever client the
 // request goes through, that no token is minted after one, and the line each fails with.
 func TestNoRedirectIsFollowed(t *testing.T) {
-	const moved = "GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection"
+	const moved = "GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument"
 	for _, tc := range []struct {
 		from           string
 		status         int

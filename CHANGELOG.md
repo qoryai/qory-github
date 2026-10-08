@@ -78,10 +78,11 @@ change what the program does, and notes it under Upgrading.
   so the App's token, and the code `setup` exchanges, go nowhere but where they were
   sent. A redirect answering a mint's request, as GitHub answers for a repository that
   moved or was renamed, fails with `GitHub answered with a redirect; the repository may
-  have moved or been renamed, so name its new owner/name in the connection`, and one
-  answering `setup`'s exchange with `exchanging the code for the App: GitHub answered
-  with a redirect, which setup never follows, so the code is sent nowhere else`. Before,
-  Go's client followed it, and sent the App's token on to a target on the same host.
+  have moved or been renamed, so name its new owner/name in the policy's credential
+  argument`, and one answering `setup`'s exchange with `exchanging the code for the App:
+  GitHub answered with a redirect, which setup never follows, so the code is sent
+  nowhere else`. Before, Go's client followed it, and sent the App's token on to a
+  target on the same host.
 
 ### Upgrading
 

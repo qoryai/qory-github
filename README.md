@@ -214,7 +214,8 @@ hosts and paths stay the same; only the token changes.
 - Git LFS objects are served from other hosts through signed URLs; allow those hosts in
   the policy.
 - No redirect from GitHub's API is followed, so the App's own token goes nowhere else. A
-  repository that moved or was renamed is refused; name its new owner/name.
+  repository that moved or was renamed is refused; name its new owner/name in the
+  policy's credential argument.
 - Errors are one line on standard error and never contain the token or the key.
 
 ## Development

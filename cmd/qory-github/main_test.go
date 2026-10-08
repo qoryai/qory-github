@@ -294,7 +294,7 @@ func TestCredentialFollowsNoRedirect(t *testing.T) {
 	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
 		t.Error(err)
 	}
-	if want := "qory-github credential: GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection\n"; errs.String() != want {
+	if want := "qory-github credential: GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument\n"; errs.String() != want {
 		t.Errorf("stderr %q, want %q", errs.String(), want)
 	}
 	if followed.Load() || minted.Load() {

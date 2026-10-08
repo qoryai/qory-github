@@ -243,7 +243,7 @@ var errNotTheOwners = errors.New("installation_id is not the App's installation 
 // errMoved refuses a redirect GitHub answers a mint's request with, as it answers a
 // request for a repository that moved or was renamed. The redirect is never followed, so
 // the App's token goes nowhere but where the request was sent.
-var errMoved = errors.New("GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the connection")
+var errMoved = errors.New("GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument")
 
 // moved is err, or [errMoved] when err is GitHub's redirect.
 func moved(err error) error {
