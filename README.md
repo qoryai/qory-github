@@ -152,6 +152,12 @@ Schema reads it, whatever its notation: `42.0` and `4.2e1` are `42`.
 A token can get these permissions, `read` or `write`: `actions`, `checks`, `contents`,
 `deployments`, `issues`, `metadata`, `pages`, `pull_requests`, `statuses`, `workflows`.
 
+`workflows: write` lets a run change the repositories' workflows, which run with their
+Actions secrets, so grant it only to runs that must edit workflows; GitHub refuses a push
+that touches `.github/workflows/` without it. An App that `qory-github setup` creates is
+granted contents, pull requests and metadata alone, so a token with `workflows: write`
+cannot be minted until the App's owner adds the Workflows permission on GitHub.
+
 Refused: `administration`, `secrets`, `environments`, `repository_hooks`, every
 `organization_*` permission, `members`, the level `admin`, and an empty `permissions`
 (GitHub reads it as "all").

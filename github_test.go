@@ -797,6 +797,41 @@ func TestTheDescriptionSaysWhatThePackageDoes(t *testing.T) {
 	}
 }
 
+// TestWorkflowsWriteComesWithACaution pins that a run's token may be granted workflows,
+// which a run that edits .github/workflows/ needs, and that where the permissions are
+// documented, the description and README.md, say what writing it lets a run do, and
+// that the App setup creates lacks it.
+func TestWorkflowsWriteComesWithACaution(t *testing.T) {
+	if !slices.Contains(RunPermissions, "workflows") {
+		t.Fatal("a run's token may not be granted workflows")
+	}
+	var s struct {
+		Properties struct {
+			Permissions struct {
+				Description string `json:"description"`
+			} `json:"permissions"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(Describe("").Settings, &s); err != nil {
+		t.Fatal(err)
+	}
+	const caution = "lets a run change the repositories' workflows, which run with their Actions secrets, so grant it only to runs that must edit workflows"
+	if d := s.Properties.Permissions.Description; !strings.Contains(d, "workflows write "+caution+".") || !strings.HasSuffix(d, " An App that qory-github setup creates lacks it until its owner adds it on GitHub.") {
+		t.Errorf("the description of permissions says %q", d)
+	}
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(strings.Fields(string(readme)), " ")
+	if !strings.Contains(text, "`workflows: write` "+caution+"; GitHub refuses a push that touches `.github/workflows/` without it.") || !strings.Contains(text, "so a token with `workflows: write` cannot be minted until the App's owner adds the Workflows permission on GitHub.") {
+		t.Error("README.md's permissions say nothing of workflows write")
+	}
+	if Manifest("qory-github-test", "http://127.0.0.1:1/callback")["default_permissions"].(map[string]string)["workflows"] != "" {
+		t.Error("the App setup creates has workflows, which the README says it lacks")
+	}
+}
+
 func TestReadSettings(t *testing.T) {
 	s, err := ReadSettings(`{"app_id":123456,"installation_id":42,"permissions":{"contents":"read"},"api_url":"http://127.0.0.1:1","private_key_file":"/k.pem"}`)
 	if err != nil {

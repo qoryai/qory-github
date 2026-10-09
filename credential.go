@@ -41,7 +41,9 @@ var DefaultPermissions = map[string]string{"contents": "write", "pull_requests":
 // workflows do. Every other is refused, administration, secrets, environments, webhooks
 // and every organisation's and member's permission among them, since each reaches past
 // the repositories' code: their settings, their secrets, the organisation and its
-// people. A permission is read or write, never admin.
+// people. A permission is read or write, never admin. workflows write lets a run change
+// the repositories' workflows, which run with their Actions secrets, so grant it only to
+// runs that must edit workflows.
 var RunPermissions = []string{"actions", "checks", "contents", "deployments", "issues", "metadata", "pages", "pull_requests", "statuses", "workflows"}
 
 // Repository is one repository a run works on.

@@ -106,6 +106,11 @@ change what the program does, and notes it under Upgrading.
   to disk: ...`, is removed, and the key goes beside it, as for a file that cannot be
   written. On a filesystem that cannot sync a file, the file is kept as it is written.
   Before, the file was closed without a sync.
+- The description of `permissions` and the README say that `workflows` `write` lets a
+  run change the repositories' workflows, which run with their Actions secrets, so it is
+  for runs that must edit workflows alone. A run may still be granted it: GitHub refuses
+  a push that touches `.github/workflows/` without it. They also say that an App
+  `setup` creates lacks it until its owner adds it on GitHub.
 
 ### Upgrading
 

@@ -46,7 +46,7 @@
       },
       "permissions": {
         "title": "Permissions",
-        "description": "The most a run's token gets, by GitHub's permission name, of those a run may be granted: read or write, never admin. At least one; absent is the default. Administration, secrets, environments and every organisation's and member's permission are refused.",
+        "description": "The most a run's token gets, by GitHub's permission name, of those a run may be granted: read or write, never admin. At least one; absent is the default. Administration, secrets, environments and every organisation's and member's permission are refused. workflows write lets a run change the repositories' workflows, which run with their Actions secrets, so grant it only to runs that must edit workflows. An App that qory-github setup creates lacks it until its owner adds it on GitHub.",
         "type": "object",
         "minProperties": 1,
         "propertyNames": {
