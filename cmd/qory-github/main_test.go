@@ -489,10 +489,10 @@ func TestSetupPrintsTheDeclarationAndThePolicy(t *testing.T) {
 Install it on the repositories your agents work on:
   https://github.com/apps/qory-github-test/installations/new
 
-Then declare the integration in the machine's configuration, ~/.config/qory/runner.yaml:
+Then declare the integration in the machine's configuration, ~/.config/qory/forager.yaml:
 
 ` + integrations + `
-qory expands the declaration into the runner's credential github. A run's policy selects it
+qory expands the declaration into the gateway's credential github. A run's policy selects it
 with the repositories the run works on, and allows GitHub's hosts beside the others the
 run reaches:
 
@@ -660,14 +660,16 @@ func TestTheReadmesShowWhatSetupPrints(t *testing.T) {
 func expand(t *testing.T, integrations string) string {
 	t.Helper()
 	var doc struct {
-		Integrations yaml.Node `yaml:"integrations"`
+		Gateway struct {
+			Integrations yaml.Node `yaml:"integrations"`
+		} `yaml:"gateway"`
 	}
-	if err := yaml.Unmarshal([]byte(integrations), &doc); err != nil || doc.Integrations.Kind != yaml.MappingNode {
+	if err := yaml.Unmarshal([]byte(integrations), &doc); err != nil || doc.Gateway.Integrations.Kind != yaml.MappingNode {
 		t.Fatalf("%v\n%s", err, integrations)
 	}
 	var b strings.Builder
 	b.WriteString("credentials:\n")
-	nodes := doc.Integrations.Content
+	nodes := doc.Gateway.Integrations.Content
 	for i := 0; i+1 < len(nodes); i += 2 {
 		key := nodes[i].Value
 		var decl struct {

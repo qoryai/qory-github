@@ -83,6 +83,10 @@ change what the program does, and notes it under Upgrading.
   GitHub answered with a redirect, which setup never follows, so the code is sent
   nowhere else`. Before, Go's client followed it, and sent the App's token on to a
   target on the same host.
+- The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
+- The help, `setup`'s printed declaration and the README name the gateway and
+  `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
+  they said the runner and `runner.yaml`.
 
 ### Upgrading
 

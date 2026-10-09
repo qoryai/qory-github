@@ -31,8 +31,8 @@ The README says what `qory-github` promises. For example:
 
 - What a token may do on the paths a run was given is the token's grant: the App's
   permissions and the repositories it is installed on.
-- The runner, and what it does with the answer, are the
-  [runner's](https://github.com/qoryai/runner/blob/main/SECURITY.md).
+- The gateway, and what it does with the answer, are
+  [Forager's](https://github.com/qoryai/forager/blob/main/SECURITY.md).
 - The integration contract and the workflows that build the release are
   [qoryai/integrations'](https://github.com/qoryai/integrations/blob/main/SECURITY.md).
 

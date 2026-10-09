@@ -3,10 +3,10 @@
 Gives a Qory run a GitHub token for the repositories it works on, without the agent ever
 holding the token.
 
-`qory-github` is a credential adapter for the [Qory runner](https://github.com/qoryai/runner).
+`qory-github` is a credential adapter for [Forager](https://github.com/qoryai/forager)'s gateway.
 For each run it mints a
 [GitHub App installation token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
-limited to the run's repositories and to the permissions you allow. The runner keeps the
+limited to the run's repositories and to the permissions you allow. The gateway keeps the
 token outside the agent's container and adds it to the agent's requests to GitHub. Inside
 the container, `GH_TOKEN` and `GITHUB_TOKEN` hold a placeholder, so `git` and `gh` work.
 
@@ -39,13 +39,14 @@ Install it on the repositories your agents work on, at the URL `setup` prints.
 
 ### 4. Declare the integration
 
-In `~/.config/qory/runner.yaml`. `setup` prints this block with your App's id and key
+In `~/.config/qory/forager.yaml`. `setup` prints this block with your App's id and key
 file:
 
 ```yaml
-integrations:
-  github:
-    settings: {"app_id":123456,"private_key_file":"/home/dev/.config/qory/github-app.pem"}
+gateway:
+  integrations:
+    github:
+      settings: {"app_id":123456,"private_key_file":"/home/dev/.config/qory/github-app.pem"}
 ```
 
 ### 5. Select it in a run's policy
@@ -99,8 +100,8 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 qory-github credential --settings JSON -- owner/name[,owner/name...]
 ```
 
-The runner calls this for each run; you normally don't. It mints a token for the listed
-repositories, all of one owner, and prints the runner's credential document: the token,
+The gateway calls this for each run; you normally don't. It mints a token for the listed
+repositories, all of one owner, and prints the gateway's credential document: the token,
 `expires_at`, the hosts and paths it applies to, and the placeholders `GH_TOKEN` and
 `GITHUB_TOKEN`. Each call mints a new token; nothing is kept.
 
@@ -123,7 +124,7 @@ role. `qory` calls it to check a declaration. No settings, no network.
 
 ## Settings
 
-Passed as one JSON document in `--settings`, or under `settings:` in `runner.yaml`.
+Passed as one JSON document in `--settings`, or under `settings:` in `forager.yaml`.
 
 | Setting | Required | Meaning |
 |---|---|---|
@@ -168,13 +169,13 @@ permissions on GitHub and accept the change on the installation.
   the repositories the token covers.
 - To allow fetch but not push, use `"permissions": {"contents": "read"}`, or limit the
   host to the fetch paths in the policy
-  ([runner contract](https://github.com/qoryai/runner/tree/main/contracts/runner/v1#the-policy)).
+  ([Forager contract](https://github.com/qoryai/forager/tree/main/contracts/forager/v1#the-policy)).
 
 ### What the agent sees
 
 - `GH_TOKEN` and `GITHUB_TOKEN` hold `qory-sets-the-credential-outside-the-enclosure`, a
   placeholder so `gh` starts.
-- The runner's proxy terminates TLS for `github.com` and `api.github.com` with a
+- The gateway terminates TLS for `github.com` and `api.github.com` with a
   certificate the container trusts, and sets the token on requests to the paths above.
 - Under `enforce`, a request to another path gets `403` and a line such as:
 
@@ -199,7 +200,7 @@ permissions allow it. Tested with git 2.39 and gh 2.100:
 
 ### Token expiry
 
-GitHub's installation tokens expire after an hour. The runner calls `credential` again
+GitHub's installation tokens expire after an hour. The gateway calls `credential` again
 five minutes before `expires_at`, and after a `401`, at most once every 30 seconds. The
 hosts and paths stay the same; only the token changes.
 

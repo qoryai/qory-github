@@ -1,11 +1,11 @@
 // Package github is Qory's integration with GitHub: what the program qory-github does,
 // as a library.
 //
-// It plays one role, the runner's credential adapter
-// (https://github.com/qoryai/runner/tree/main/contracts/runner/v1#credentials): it mints a
+// It plays one role, the gateway's credential adapter
+// (https://github.com/qoryai/forager/tree/main/contracts/forager/v1#credentials): it mints a
 // GitHub App installation token for the repositories a run works on, and answers with
 // the token, when it expires, and how it is used, the hosts, the schemes and the paths.
-// [Mint] does that; [Answer] is the document the runner reads.
+// [Mint] does that; [Answer] is the document the gateway reads.
 //
 // A token is one account's and covers the repositories listed and no other, with the
 // permissions requested and no more: that scope, not a path rule, is what bounds a
