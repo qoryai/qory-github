@@ -1,6 +1,6 @@
-// Command qory-github is Qory's integration with GitHub, the runner's credential
+// Command qory-github is Qory's integration with GitHub, the gateway's credential
 // adapter: `qory-github credential --settings <json> -- owner/name` mints a
-// GitHub App installation token for the repositories listed and prints the runner's
+// GitHub App installation token for the repositories listed and prints the gateway's
 // credential document. `qory-github describe` prints the integration's description,
 // contracts/integration/v1, and `qory-github setup` creates the App.
 package main
@@ -70,7 +70,7 @@ func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 const more = "https://github.com/qoryai/qory-github/blob/main/README.md"
 
 // usage is what the command prints when it is run without a command it knows.
-var usage = `qory-github mints GitHub App access tokens for Qory's runner. The agent works on
+var usage = `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
 GitHub and never holds the access token.
 
 usage:
@@ -139,11 +139,11 @@ It takes no settings and reaches no network.`,
 var credentialHelp = help{
 	short: "Mint an access token for a run's repositories",
 	use:   "qory-github credential --settings JSON [--] owner/name[,owner/name...]",
-	long: `Mint a GitHub App access token for the repositories listed, and print the runner's
+	long: `Mint a GitHub App access token for the repositories listed, and print the gateway's
 credential document: the access token, its expiry, and where it goes.
 
-The runner runs credential outside the container, as a credential's adapter. qory
-writes that adapter from the integrations: section of runner.yaml.
+The gateway runs credential outside the container, as a credential's adapter. qory
+writes that adapter from the gateway: integrations: section of forager.yaml.
 
 The settings are one JSON document, given with --settings; qory-github describe lists
 what it contains. The settings go on a command line, so a secret is refused there: set
@@ -171,7 +171,7 @@ The private key goes to --key-file, which only you may read. setup never writes 
 file that exists, and never prints the key. GitHub hands the key out once: when the
 file cannot be written, the key goes beside it, and setup prints where.
 
-Then setup prints where to install the App, the declaration for runner.yaml, and a
+Then setup prints where to install the App, the declaration for forager.yaml, and a
 policy that selects it.`,
 	example: `  qory-github setup                                       # under your account
   qory-github setup --org acme                            # under the organisation acme
@@ -251,7 +251,7 @@ func describe(args []string, stdout, stderr io.Writer) error {
 	return err
 }
 
-// credential mints a token and prints the runner's credential document, nothing else
+// credential mints a token and prints the gateway's credential document, nothing else
 // on standard output. The settings are one document, --settings, the only input besides
 // the argument; `--` ends the flags, so the argument is never read as one.
 func credential(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -366,10 +366,10 @@ The App %d (%s) is created, and its private key is in %s.
 Install it on the repositories your agents work on:
   %s
 
-Then declare the integration in the machine's configuration, ~/.config/qory/runner.yaml:
+Then declare the integration in the machine's configuration, ~/.config/qory/forager.yaml:
 
 %s
-qory expands the declaration into the runner's credential %s. A run's policy selects it
+qory expands the declaration into the gateway's credential %s. A run's policy selects it
 with the repositories the run works on, and allows GitHub's hosts beside the others the
 run reaches:
 
@@ -389,9 +389,10 @@ func declaration(appID int64, keyFile string) (integrations, policy string, err 
 		return "", "", err
 	}
 	d := github.Describe(version)
-	integrations = fmt.Sprintf(`integrations:
-  %s:
-    settings: %s
+	integrations = fmt.Sprintf(`gateway:
+  integrations:
+    %s:
+      settings: %s
 `, d.Name, settings)
 	policy = fmt.Sprintf(`egress:
   mode: enforce

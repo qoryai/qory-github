@@ -46,7 +46,7 @@ type Roles struct {
 	Credential *CredentialRole `json:"credential,omitempty"`
 }
 
-// CredentialRole is the runner's credential adapter: the argument a policy defines, and
+// CredentialRole is the gateway's credential adapter: the argument a policy defines, and
 // the hosts an answer is for.
 type CredentialRole struct {
 	Argument string   `json:"argument"`

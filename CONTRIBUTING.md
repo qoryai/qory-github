@@ -8,8 +8,8 @@ Thank you for considering a contribution.
 - **What the integration does for a run**: a permission, or a host GitHub serves a run
   from. The integration speaks the
   [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1)
-  and, for the credential role, the runner's
-  [§Credentials](https://github.com/qoryai/runner/tree/main/contracts/runner/v1#credentials);
+  and, for the credential role, Forager's
+  [§Credentials](https://github.com/qoryai/forager/tree/main/contracts/forager/v1#credentials);
   a change to either contract goes to its own repository first.
 
 The repository holds one integration: its README, its program's command under
@@ -57,7 +57,7 @@ generated in the test. No test reaches the network or reads the machine's config
 and no fixture contains a real secret, a real account or a real repository of anyone's.
 What the program prints is checked with the `conformance` package of
 [qoryai/integrations](https://github.com/qoryai/integrations): the description against the
-integration contract, the credential answer against the runner's schema, and every failure
+integration contract, the credential answer against the gateway's schema, and every failure
 against the exit status the contract's commands share. What `describe` prints is pinned in
 `testdata/describe.json`.
 

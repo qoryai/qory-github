@@ -27,7 +27,7 @@ const (
 	APIURL = "https://api.github.com"
 )
 
-// Placeholders are the variables the runner sets in the enclosure to a value that is
+// Placeholders are the variables Forager sets in the enclosure to a value that is
 // no credential, so the GitHub command and the programs that read them start.
 var Placeholders = []string{"GH_TOKEN", "GITHUB_TOKEN"}
 
@@ -58,7 +58,7 @@ var (
 	appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 )
 
-// ParseRepositories reads the argument the runner passes, owner/name[,owner/name...].
+// ParseRepositories reads the argument the gateway passes, owner/name[,owner/name...].
 // Every repository has the same owner, because an installation token is one account's;
 // a repository listed twice, a name GitHub refuses, and a name that is a dot
 // segment are refused.
@@ -81,7 +81,7 @@ func ParseRepositories(arg string) ([]Repository, error) {
 	return out, nil
 }
 
-// Answer is the credential adapter's answer, the runner's credential.schema.json,
+// Answer is the credential adapter's answer, the gateway's credential.schema.json,
 // version 1: the token, when it expires, and where it goes.
 type Answer struct {
 	Version      int      `json:"version"`
@@ -101,7 +101,7 @@ type Apply struct {
 }
 
 // Uses are where a token for the repositories goes, the same for the same repositories
-// every time, since the runner refuses an answer whose hosts, schemes or paths change
+// every time, since the gateway refuses an answer whose hosts, schemes or paths change
 // under a run:
 //
 //   - github.com, with basic and the username x-access-token: /owner/name.git/* and
@@ -151,11 +151,11 @@ type Request struct {
 }
 
 // Mint requests from GitHub an installation token that covers the request's repositories,
-// with its permissions and no more, and returns the answer the runner reads. It refuses
+// with its permissions and no more, and returns the answer the gateway reads. It refuses
 // an API [CheckAPIURL] refuses before anything else, so the App's own token goes to
 // GitHub's API alone. An installation the request names is minted with only once GitHub
 // says it is the App's installation on the repositories' owner, so a token is never one
-// of another account's. It keeps nothing: the runner runs the adapter again before the
+// of another account's. It keeps nothing: the gateway runs the adapter again before the
 // token expires.
 func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	if err := CheckAPIURL(c.base()); err != nil {

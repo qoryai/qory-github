@@ -27,7 +27,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/qoryai/runner/contracts"
+	"github.com/qoryai/forager/contracts"
 )
 
 // The token and the App the fake GitHub hands out: synthetic, and what no error may
@@ -411,9 +411,9 @@ func TestNoRedirectIsFollowed(t *testing.T) {
 	}
 }
 
-// TestTheAnswerIsTheRunnersCredentialDocument validates the answer against the runner's
+// TestTheAnswerIsTheGatewaysCredentialDocument validates the answer against the gateway's
 // published schema, so the adapter and the contract cannot drift apart.
-func TestTheAnswerIsTheRunnersCredentialDocument(t *testing.T) {
+func TestTheAnswerIsTheGatewaysCredentialDocument(t *testing.T) {
 	c := serve(t, &fakeGitHub{installations: map[string]int64{"acme/shop": 42, "acme/lib": 42}})
 	repos, _ := ParseRepositories("acme/shop,acme/lib")
 	a, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), Repositories: repos})
@@ -430,7 +430,7 @@ func TestTheAnswerIsTheRunnersCredentialDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := schema.Validate(doc); err != nil {
-		t.Fatalf("the runner's schema refuses the answer: %v\n%s", err, b)
+		t.Fatalf("the gateway's schema refuses the answer: %v\n%s", err, b)
 	}
 	want := `{"version":1,"token":"` + fakeToken + `","expires_at":"2026-09-25T21:00:00Z","apply":[` +
 		`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/*","/acme/shop/*","/acme/lib.git/*","/acme/lib/*"]},` +
@@ -454,7 +454,7 @@ func TestOneRunsRepositoriesShareAnOwner(t *testing.T) {
 }
 
 // TestTheArgumentPatternIsTheParser walks arguments through the credential role's
-// pattern, matched whole as the runner matches it, and through ParseRepositories. They
+// pattern, matched whole as the gateway matches it, and through ParseRepositories. They
 // agree but where the README states the program refuses what the pattern lets through: a
 // dot segment, a name ending in .git, two owners and a repository listed twice.
 func TestTheArgumentPatternIsTheParser(t *testing.T) {
