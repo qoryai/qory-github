@@ -341,8 +341,9 @@ func TestCredentialSaysARedirectOnTheCheckIsNoMove(t *testing.T) {
 }
 
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
-// contains control characters and Unicode line separators, and checks that the failure
-// is still one line on standard error, with each of them escaped.
+// contains control characters, Unicode line separators and a bidirectional formatting
+// character, and checks that the failure is still one line on standard error, with each
+// of them escaped.
 func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 	file, _ := keyFile(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -351,7 +352,7 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni"}`)
+		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni\u202ej"}`)
 	}))
 	t.Cleanup(srv.Close)
 	var out, errs bytes.Buffer
@@ -360,17 +361,19 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 		t.Error(err)
 	}
 	line := strings.TrimSuffix(errs.String(), "\n")
-	if i := strings.IndexFunc(line, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' }); i >= 0 {
+	if i := strings.IndexFunc(line, func(r rune) bool {
+		return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Bidi_Control, r)
+	}); i >= 0 {
 		t.Errorf("stderr contains %q: %q", []rune(line[i:])[0], errs.String())
 	}
-	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i` + "\n"; !strings.HasSuffix(errs.String(), want) {
+	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i\u202ej` + "\n"; !strings.HasSuffix(errs.String(), want) {
 		t.Errorf("stderr %q, want it to end in %q", errs.String(), want)
 	}
 }
 
 // TestOneLine pins how an error's text is written on its line: a line break as a space,
-// every other control character, a line or paragraph separator and a byte that is not
-// UTF-8 escaped, and the rest as it is.
+// every other control character, a line or paragraph separator, a bidirectional
+// formatting character and a byte that is not UTF-8 escaped, and the rest as it is.
 func TestOneLine(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
@@ -380,6 +383,13 @@ func TestOneLine(t *testing.T) {
 		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
 		{"a\x85b\xffc", `a\x85b\xffc`},
 		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
+		{"acme\u202epohs", `acme\u202epohs`},
+		{"a\u202ab\u202bc\u202cd\u202de\u202ef", `a\u202ab\u202bc\u202cd\u202de\u202ef`},
+		{"a\u2066b\u2067c\u2068d\u2069e", `a\u2066b\u2067c\u2068d\u2069e`},
+		{"a\u200eb\u200fc\u061cd", `a\u200eb\u200fc\u061cd`},
+		// The characters beside them are left as they are: a zero-width joiner, U+200D, an
+		// Arabic letter, U+0628, a narrow no-break space, U+202F, and U+2065 and U+206A.
+		{"a\u200db\u0628c\u202fd\u2065e\u206af", "a\u200db\u0628c\u202fd\u2065e\u206af"},
 	} {
 		if got := oneLine(tc.in); got != tc.want {
 			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)

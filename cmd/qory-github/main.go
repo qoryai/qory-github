@@ -209,11 +209,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 }
 
 // oneLine is an error's text as the one line it is written on: a line break, \n or
-// \r\n, is a space, and every other control character, C0, DEL or C1, and the Unicode
-// line and paragraph separators are escaped as Go escapes them in a string, \r, \x7f,
-// \u2028, and so is a byte that is not UTF-8, wherever the text comes from, GitHub's
-// answer among them. The rest is left as it is, a quote or a backslash too, so a name
-// the settings' error already quoted reads the same.
+// \r\n, is a space, and every other control character, C0, DEL or C1, the Unicode line
+// and paragraph separators, and the bidirectional formatting characters, Unicode's
+// Bidi_Control, U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F and U+061C, which
+// reorder what a terminal shows, are escaped as Go escapes them in a string, \r, \x7f,
+// \u2028, \u202e, and so is a byte that is not UTF-8, wherever the text comes from,
+// GitHub's answer among them. The rest is left as it is, a quote or a backslash too, so
+// a name the settings' error already quoted reads the same.
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
@@ -223,7 +225,7 @@ func oneLine(s string) string {
 		switch {
 		case r == utf8.RuneError && size == 1:
 			fmt.Fprintf(&b, `\x%02x`, s[0])
-		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029':
+		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Bidi_Control, r):
 			q := strconv.QuoteRune(r)
 			b.WriteString(q[1 : len(q)-1])
 		default:

@@ -18,9 +18,11 @@ change what the program does, and notes it under Upgrading.
   it says where the settings are wrong, when the name contains a control character, a
   line or paragraph separator, a quote or a backslash, so the error stays one line.
 - The line a failure writes on standard error escapes every control character but a line
-  break, which it writes as a space, and the Unicode line and paragraph separators, as Go
-  escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
-  from GitHub's API among them: before, a line break alone was replaced.
+  break, which it writes as a space, the Unicode line and paragraph separators, and the
+  bidirectional formatting characters, U+202A to U+202E, U+2066 to U+2069, U+200E,
+  U+200F and U+061C, which reorder what a terminal shows, as Go escapes them, `\r`,
+  `\x7f`, `\u2028`, `\u202e`, whatever the error contains, an error message from
+  GitHub's API among them: before, a line break alone was replaced.
 - `api_url` takes `https://api.github.com` alone, with or without a trailing `/` or the
   port 443, and for a test `http` or `https` on a loopback host, `127.0.0.0/8`, `[::1]`
   or `localhost`, with any port: the App's own token goes there, and it can mint a token
