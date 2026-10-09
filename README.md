@@ -83,11 +83,17 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 | `--api-url` | `https://api.github.com`; otherwise only a loopback host, for tests |
 | `--web-url` | `https://github.com`; otherwise only a loopback host, for tests |
 
-- The key file is written with mode 0600. An existing file is never overwritten.
-- GitHub hands out the key once. If the file cannot be written, the key goes to
-  `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
-  App and the page where you generate a new key.
+- The key file is written with mode 0600, and synced to disk before `setup` says where
+  it is, on a filesystem that can sync a file. An existing file is never overwritten.
+- GitHub hands out the key once. If the file cannot be written or synced to disk, the key
+  goes to `<file>.<random hex>` and `setup` prints where. If that fails too, the error
+  names the App and the page where you generate a new key.
 - The key is never printed.
+- The page `setup` opens, which posts the App's manifest to GitHub, is served on
+  loopback at a random path, `http://127.0.0.1:<port>/<32 hex digits>`, the URL `setup`
+  prints. A request to that address for any other path but GitHub's redirect back is
+  not found, and one naming another address is refused, so a process on the machine
+  that does not know the URL cannot read the page's state.
 - `--api-url` takes `https://api.github.com` alone, with or without a trailing `/` or
   `:443`, and `--web-url` takes `https://github.com` alone, with or without a trailing
   `/`. For tests, each also takes `http` or `https` on a loopback host (`127.0.0.0/8`,
@@ -145,6 +151,12 @@ Schema reads it, whatever its notation: `42.0` and `4.2e1` are `42`.
 
 A token can get these permissions, `read` or `write`: `actions`, `checks`, `contents`,
 `deployments`, `issues`, `metadata`, `pages`, `pull_requests`, `statuses`, `workflows`.
+
+`workflows: write` lets a run change the repositories' workflows, which run with their
+Actions secrets, so grant it only to runs that must edit workflows; GitHub refuses a push
+that touches `.github/workflows/` without it. An App that `qory-github setup` creates is
+granted contents, pull requests and metadata alone, so a token with `workflows: write`
+cannot be minted until the App's owner adds the Workflows permission on GitHub.
 
 Refused: `administration`, `secrets`, `environments`, `repository_hooks`, every
 `organization_*` permission, `members`, the level `admin`, and an empty `permissions`

@@ -18,9 +18,11 @@ change what the program does, and notes it under Upgrading.
   it says where the settings are wrong, when the name contains a control character, a
   line or paragraph separator, a quote or a backslash, so the error stays one line.
 - The line a failure writes on standard error escapes every control character but a line
-  break, which it writes as a space, and the Unicode line and paragraph separators, as Go
-  escapes them, `\r`, `\x7f`, `\u2028`, whatever the error contains, an error message
-  from GitHub's API among them: before, a line break alone was replaced.
+  break, which it writes as a space, the Unicode line and paragraph separators, and the
+  bidirectional formatting characters, U+202A to U+202E, U+2066 to U+2069, U+200E,
+  U+200F and U+061C, which reorder what a terminal shows, as Go escapes them, `\r`,
+  `\x7f`, `\u2028`, `\u202e`, whatever the error contains, an error message from
+  GitHub's API among them: before, a line break alone was replaced.
 - `api_url` takes `https://api.github.com` alone, with or without a trailing `/` or the
   port 443, and for a test `http` or `https` on a loopback host, `127.0.0.0/8`, `[::1]`
   or `localhost`, with any port: the App's own token goes there, and it can mint a token
@@ -70,23 +72,46 @@ change what the program does, and notes it under Upgrading.
   twice, and `credential` the installation's id.
 - An `installation_id` the settings set is checked before a token is minted: GitHub must
   say it is the App's installation on the account that owns the repositories, its login
-  compared in any case. Another account's installation, and one GitHub does not know of
-  the App, are refused with `installation_id is not the App's installation on the
-  repositories' owner; set that owner's installation, or leave installation_id out`.
-  Before, a token was minted with whatever installation the settings named.
+  compared in ASCII case alone: a login with any other character is refused, so the
+  Kelvin sign, U+212A, is never taken for a k. Another account's
+  installation, and one GitHub does not know of the App, are refused with
+  `installation_id is not the App's installation on the repositories' owner; set that
+  owner's installation, or leave installation_id out`. Before, a token was minted with
+  whatever installation the settings named.
 - No redirect from GitHub's API is followed, whatever `http.Client` a `Client` is handed,
   so the App's token, and the code `setup` exchanges, go nowhere but where they were
-  sent. A redirect answering a mint's request, as GitHub answers for a repository that
-  moved or was renamed, fails with `GitHub answered with a redirect; the repository may
-  have moved or been renamed, so name its new owner/name in the policy's credential
-  argument`, and one answering `setup`'s exchange with `exchanging the code for the App:
-  GitHub answered with a redirect, which setup never follows, so the code is sent
-  nowhere else`. Before, Go's client followed it, and sent the App's token on to a
-  target on the same host.
+  sent. A redirect answering the lookup of a repository's installation, as GitHub
+  answers for a repository that moved or was renamed, fails with `GitHub answered with
+  a redirect; the repository may have moved or been renamed, so name its new owner/name
+  in the policy's credential argument`; one answering the check of `installation_id`
+  with `checking installation_id: GitHub answered with a redirect, which is never
+  followed`; one answering the mint with `minting the installation token: GitHub
+  answered with a redirect, which is never followed`; and one answering `setup`'s
+  exchange with `exchanging the code for the App: GitHub answered with a redirect, which
+  setup never follows, so the code is sent nowhere else`. Before, Go's client followed
+  it, and sent the App's token on to a target on the same host.
 - The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
   they said the runner and `runner.yaml`.
+- `setup`'s local page, which posts the App's manifest to GitHub with the state
+  GitHub's redirect must return, is served at a random path,
+  `http://127.0.0.1:<port>/<32 hex digits>`, the URL `setup` opens and prints. A request
+  to that address for any other path but the redirect's, `/` among them, is not found;
+  one naming another address is refused, as before. Before, the page was at `/`, so any
+  process on the machine could read the state from it.
+- `setup` syncs the private key file to disk before it closes it, and then, where the
+  system can, the directory it is in, so the key GitHub hands out once is on disk when
+  `setup` says where it is. A file whose sync fails, `the key file could not be synced
+  to disk: ...`, is removed, and the key goes beside it, as for a file that cannot be
+  written. `setup` then prints that the file `could not be written or synced`. On a
+  filesystem that cannot sync a file, the file is kept as it is written. Before, the
+  file was closed without a sync.
+- The description of `permissions` and the README say that `workflows` `write` lets a
+  run change the repositories' workflows, which run with their Actions secrets, so it is
+  for runs that must edit workflows alone. A run may still be granted it: GitHub refuses
+  a push that touches `.github/workflows/` without it. They also say that an App
+  `setup` creates lacks it until its owner adds it on GitHub.
 
 ### Upgrading
 

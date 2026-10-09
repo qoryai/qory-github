@@ -41,7 +41,9 @@ var DefaultPermissions = map[string]string{"contents": "write", "pull_requests":
 // workflows do. Every other is refused, administration, secrets, environments, webhooks
 // and every organisation's and member's permission among them, since each reaches past
 // the repositories' code: their settings, their secrets, the organisation and its
-// people. A permission is read or write, never admin.
+// people. A permission is read or write, never admin. workflows write lets a run change
+// the repositories' workflows, which run with their Actions secrets, so grant it only to
+// runs that must edit workflows.
 var RunPermissions = []string{"actions", "checks", "contents", "deployments", "issues", "metadata", "pages", "pull_requests", "statuses", "workflows"}
 
 // Repository is one repository a run works on.
@@ -224,7 +226,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	body := map[string]any{"repositories": names, "permissions": perms}
 	const minting = "minting the installation token"
 	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(id, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
-		return nil, moved(err)
+		var answered *answerError
+		if errors.As(err, &answered) && answered.redirect() {
+			return nil, errMintRedirected
+		}
+		return nil, err
 	}
 	if got.Token == "" {
 		return nil, errors.New(minting + ": GitHub answered without a token")
@@ -240,10 +246,20 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 // owner. It says neither the installation's id nor the account GitHub has it on.
 var errNotTheOwners = errors.New("installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out")
 
-// errMoved refuses a redirect GitHub answers a mint's request with, as it answers a
-// request for a repository that moved or was renamed. The redirect is never followed, so
-// the App's token goes nowhere but where the request was sent.
+// errMoved refuses a redirect GitHub answers the lookup of a repository's installation
+// with, GET /repos/{owner}/{repo}/installation, as it answers a request for a repository
+// that moved or was renamed. The redirect is never followed, so the App's token goes
+// nowhere but where the request was sent.
 var errMoved = errors.New("GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument")
+
+// errCheckRedirected refuses a redirect GitHub answers the installation's check with,
+// which names no repository, so it is not [errMoved]. It is never followed either.
+var errCheckRedirected = errors.New("checking installation_id: GitHub answered with a redirect, which is never followed")
+
+// errMintRedirected refuses a redirect GitHub answers the mint with, which names no
+// repository, so it is not [errMoved]. It is never followed either, so neither the App's
+// token nor the mint's body goes on.
+var errMintRedirected = errors.New("minting the installation token: GitHub answered with a redirect, which is never followed")
 
 // moved is err, or [errMoved] when err is GitHub's redirect.
 func moved(err error) error {
@@ -255,25 +271,33 @@ func moved(err error) error {
 }
 
 // checkInstallation refuses the installation id unless GitHub says it is the App's
-// installation on the account that owns the repositories, its login compared as GitHub
-// compares logins, in any case. An installation GitHub does not know of the App, a 404,
-// is refused the same way.
+// installation on the account that owns the repositories. The account's login must be
+// one GitHub gives, ASCII letters, digits and hyphens, and is compared with the owner's
+// in either case of ASCII alone, as GitHub compares logins: compared as Unicode folds
+// case, the Kelvin sign, U+212A, would be a k. An installation GitHub does not know of
+// the App, a 404, is refused the same way, and a redirect in a line of its own.
 func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) error {
 	var got struct {
 		Account struct {
 			Login string `json:"login"`
 		} `json:"account"`
 	}
-	err := moved(c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got))
+	err := c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got)
 	var answered *answerError
 	switch {
+	case errors.As(err, &answered) && answered.redirect():
+		return errCheckRedirected
 	case errors.As(err, &answered) && answered.status == http.StatusNotFound:
 		return errNotTheOwners
 	case err != nil:
 		return err
 	}
+	if !ownerShape.MatchString(got.Account.Login) {
+		return errNotTheOwners
+	}
 	for _, r := range repos {
-		if !strings.EqualFold(got.Account.Login, r.Owner) {
+		// Both are ASCII, so EqualFold folds ASCII's cases alone.
+		if !ownerShape.MatchString(r.Owner) || !strings.EqualFold(got.Account.Login, r.Owner) {
 			return errNotTheOwners
 		}
 	}

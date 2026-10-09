@@ -120,9 +120,12 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 `))
 
 // Start listens on loopback and returns the local page's URL and a function that waits
-// for GitHub's redirect, exchanges its code for the App and writes the key. The
-// listener is closed when the wait returns. Before anything else it refuses a web URL
-// [CheckWebURL] refuses and an API [CheckAPIURL] refuses.
+// for GitHub's redirect, exchanges its code for the App and writes the key. The page,
+// which carries the state GitHub's redirect must return, is at a random path, so a
+// process on the machine that does not know the URL cannot read it: every other path but
+// the redirect's is not found. The listener is closed when the wait returns. Before
+// anything else it refuses a web URL [CheckWebURL] refuses and an API [CheckAPIURL]
+// refuses.
 func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) {
 	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
 		return "", nil, err
@@ -139,9 +142,8 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 		return "", nil, fmt.Errorf("the key file: %w", err)
 	}
 	web := webBase(s.Web)
-	b := make([]byte, 16)
-	rand.Read(b)
-	state := hex.EncodeToString(b)
+	state := randomHex()
+	pagePath := "/" + randomHex()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, err
@@ -155,7 +157,7 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	codes := make(chan string, 1)
 	host := ln.Addr().String()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET "+pagePath, func(w http.ResponseWriter, _ *http.Request) {
 		page.Execute(w, map[string]string{"Action": action, "Manifest": string(manifest)})
 	})
 	mux.HandleFunc("GET /callback", func(w http.ResponseWriter, r *http.Request) {
@@ -198,12 +200,19 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 		}
 	}
 	if s.Open != nil {
-		if err := s.Open(local + "/"); err != nil {
+		if err := s.Open(local + pagePath); err != nil {
 			srv.Close()
 			return "", nil, fmt.Errorf("opening the browser: %w", err)
 		}
 	}
-	return local + "/", done, nil
+	return local + pagePath, done, nil
+}
+
+// randomHex is 16 random bytes from crypto/rand in hex, 32 digits, which no one guesses.
+func randomHex() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // exchange turns the redirect's code into the App, and writes its key. GitHub hands the

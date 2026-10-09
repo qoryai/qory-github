@@ -201,9 +201,11 @@ func TestMintWithAnInstallationLooksNothingUp(t *testing.T) {
 
 // TestMintChecksTheInstallationIsTheOwners mints with an installation the request names
 // and checks that a token is minted only when GitHub says it is the App's installation
-// on the repositories' owner, the login in any case; an installation of another account,
-// one GitHub does not know of the App and one whose account has no login are refused in
-// one line that says neither id nor login, and nothing reaches the mint.
+// on the repositories' owner, the login in either case of ASCII; an installation of
+// another account, one GitHub does not know of the App, one whose account has no login,
+// and a login or an owner with a letter outside ASCII, which Unicode would fold to the
+// owner's, are refused in one line that says neither id nor login, and nothing reaches
+// the mint.
 func TestMintChecksTheInstallationIsTheOwners(t *testing.T) {
 	const refused = "installation_id is not the App's installation on the repositories' owner; set that owner's installation, or leave installation_id out"
 	for _, tc := range []struct {
@@ -211,17 +213,24 @@ func TestMintChecksTheInstallationIsTheOwners(t *testing.T) {
 		accounts map[int64]string
 		repos    string
 		ok       bool
+		lib      []Repository // set by a library's caller, without ParseRepositories
 	}{
-		{"the owner's", map[int64]string{778899: "acme"}, "acme/shop", true},
-		{"the owner's, in another case", map[int64]string{778899: "ACME"}, "Acme/shop,acme/lib", true},
-		{"another account's", map[int64]string{778899: "otherlogin"}, "acme/shop", false},
-		{"an account whose login begins the owner's", map[int64]string{778899: "acme-other"}, "acme/shop", false},
-		{"an account with no login", map[int64]string{778899: ""}, "acme/shop", false},
-		{"not the App's, a 404", map[int64]string{}, "acme/shop", false},
+		{"the owner's", map[int64]string{778899: "acme"}, "acme/shop", true, nil},
+		{"the owner's, in another case", map[int64]string{778899: "ACME"}, "Acme/shop,acme/lib", true, nil},
+		{"another account's", map[int64]string{778899: "otherlogin"}, "acme/shop", false, nil},
+		{"an account whose login begins the owner's", map[int64]string{778899: "acme-other"}, "acme/shop", false, nil},
+		{"an account with no login", map[int64]string{778899: ""}, "acme/shop", false, nil},
+		{"not the App's, a 404", map[int64]string{}, "acme/shop", false, nil},
+		{"a login with the Kelvin sign", map[int64]string{778899: "\u212aacme"}, "kacme/shop", false, nil},
+		{"a login with a Cyrillic a", map[int64]string{778899: "\u0430cme"}, "acme/shop", false, nil},
+		{"an owner with the Kelvin sign", map[int64]string{778899: "kacme"}, "", false, []Repository{{Owner: "\u212aacme", Name: "shop"}}},
 	} {
 		f := &fakeGitHub{accounts: tc.accounts}
 		c := serve(t, f)
 		repos, _ := ParseRepositories(tc.repos)
+		if tc.lib != nil {
+			repos = tc.lib
+		}
 		a, err := c.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 778899, Repositories: repos})
 		if strings.Join(f.checks, " ") != "/app/installations/778899" || len(f.lookups) != 0 {
 			t.Errorf("%s: checked %v, looked up %v", tc.name, f.checks, f.lookups)
@@ -370,28 +379,35 @@ func (rd *redirecting) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // the App's token or the code, and checks that none is followed, whatever client the
 // request goes through, that no token is minted after one, and the line each fails with.
 func TestNoRedirectIsFollowed(t *testing.T) {
-	const moved = "GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument"
+	const (
+		moved   = "GitHub answered with a redirect; the repository may have moved or been renamed, so name its new owner/name in the policy's credential argument"
+		checked = "checking installation_id: GitHub answered with a redirect, which is never followed"
+		minted  = "minting the installation token: GitHub answered with a redirect, which is never followed"
+	)
 	for _, tc := range []struct {
 		from           string
 		status         int
 		installationID int64
 		client         *http.Client
+		want           string
 	}{
-		{"/repos/acme/shop/installation", 301, 0, nil},
-		{"/repos/acme/shop/installation", 302, 0, &http.Client{}},
-		{"/repos/acme/shop/installation", 308, 0, nil},
-		{"/app/installations/42", 307, 42, nil},
-		{"/app/installations/42/access_tokens", 307, 42, nil},
-		{"/app/installations/42/access_tokens", 308, 42, &http.Client{}},
-		{"/app/installations/42/access_tokens", 303, 0, nil},
+		{"/repos/acme/shop/installation", 301, 0, nil, moved},
+		{"/repos/acme/shop/installation", 302, 0, &http.Client{}, moved},
+		{"/repos/acme/shop/installation", 308, 0, nil, moved},
+		{"/app/installations/42", 301, 42, nil, checked},
+		{"/app/installations/42", 307, 42, nil, checked},
+		{"/app/installations/42", 308, 42, &http.Client{}, checked},
+		{"/app/installations/42/access_tokens", 307, 42, nil, minted},
+		{"/app/installations/42/access_tokens", 308, 42, &http.Client{}, minted},
+		{"/app/installations/42/access_tokens", 303, 0, nil, minted},
 	} {
 		rd := &redirecting{from: tc.from, to: "/moved" + tc.from, status: tc.status}
 		srv := httptest.NewServer(rd)
 		repos, _ := ParseRepositories("acme/shop")
 		_, err := Client{API: srv.URL, HTTP: tc.client}.Mint(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: tc.installationID, Repositories: repos})
 		srv.Close()
-		if err == nil || err.Error() != moved {
-			t.Errorf("%d for %s: err %v, want %s", tc.status, tc.from, err, moved)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%d for %s: err %v, want %s", tc.status, tc.from, err, tc.want)
 		}
 		if rd.followed || rd.mint {
 			t.Errorf("%d for %s: followed %v, minted %v", tc.status, tc.from, rd.followed, rd.mint)
@@ -778,6 +794,41 @@ func TestTheDescriptionSaysWhatThePackageDoes(t *testing.T) {
 	}
 	if s.Properties["api_url"].Default != APIURL {
 		t.Errorf("the schema's default API is %v", s.Properties["api_url"].Default)
+	}
+}
+
+// TestWorkflowsWriteComesWithACaution pins that a run's token may be granted workflows,
+// which a run that edits .github/workflows/ needs, and that where the permissions are
+// documented, the description and README.md, say what writing it lets a run do, and
+// that the App setup creates lacks it.
+func TestWorkflowsWriteComesWithACaution(t *testing.T) {
+	if !slices.Contains(RunPermissions, "workflows") {
+		t.Fatal("a run's token may not be granted workflows")
+	}
+	var s struct {
+		Properties struct {
+			Permissions struct {
+				Description string `json:"description"`
+			} `json:"permissions"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(Describe("").Settings, &s); err != nil {
+		t.Fatal(err)
+	}
+	const caution = "lets a run change the repositories' workflows, which run with their Actions secrets, so grant it only to runs that must edit workflows"
+	if d := s.Properties.Permissions.Description; !strings.Contains(d, "workflows write "+caution+".") || !strings.HasSuffix(d, " An App that qory-github setup creates lacks it until its owner adds it on GitHub.") {
+		t.Errorf("the description of permissions says %q", d)
+	}
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Join(strings.Fields(string(readme)), " ")
+	if !strings.Contains(text, "`workflows: write` "+caution+"; GitHub refuses a push that touches `.github/workflows/` without it.") || !strings.Contains(text, "so a token with `workflows: write` cannot be minted until the App's owner adds the Workflows permission on GitHub.") {
+		t.Error("README.md's permissions say nothing of workflows write")
+	}
+	if Manifest("qory-github-test", "http://127.0.0.1:1/callback")["default_permissions"].(map[string]string)["workflows"] != "" {
+		t.Error("the App setup creates has workflows, which the README says it lacks")
 	}
 }
 

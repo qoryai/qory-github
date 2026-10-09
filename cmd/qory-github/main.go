@@ -209,11 +209,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 }
 
 // oneLine is an error's text as the one line it is written on: a line break, \n or
-// \r\n, is a space, and every other control character, C0, DEL or C1, and the Unicode
-// line and paragraph separators are escaped as Go escapes them in a string, \r, \x7f,
-// \u2028, and so is a byte that is not UTF-8, wherever the text comes from, GitHub's
-// answer among them. The rest is left as it is, a quote or a backslash too, so a name
-// the settings' error already quoted reads the same.
+// \r\n, is a space, and every other control character, C0, DEL or C1, the Unicode line
+// and paragraph separators, and the bidirectional formatting characters, Unicode's
+// Bidi_Control, U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F and U+061C, which
+// reorder what a terminal shows, are escaped as Go escapes them in a string, \r, \x7f,
+// \u2028, \u202e, and so is a byte that is not UTF-8, wherever the text comes from,
+// GitHub's answer among them. The rest is left as it is, a quote or a backslash too, so
+// a name the settings' error already quoted reads the same.
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
@@ -223,7 +225,7 @@ func oneLine(s string) string {
 		switch {
 		case r == utf8.RuneError && size == 1:
 			fmt.Fprintf(&b, `\x%02x`, s[0])
-		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029':
+		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Bidi_Control, r):
 			q := strconv.QuoteRune(r)
 			b.WriteString(q[1 : len(q)-1])
 		default:
@@ -346,15 +348,7 @@ func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
 	}
 	abs, _ := filepath.Abs(app.KeyFile)
 	if app.Moved != nil {
-		why := app.Moved.Error()
-		var pe *fs.PathError
-		switch {
-		case errors.Is(app.Moved, fs.ErrExist):
-			why = "it exists"
-		case errors.As(app.Moved, &pe):
-			why = pe.Err.Error()
-		}
-		fmt.Fprintf(stdout, "\nThe key is in %s, since %s could not be written: %s.\n", abs, s.KeyFile, why)
+		fmt.Fprint(stdout, movedLine(abs, s.KeyFile, app.Moved))
 	}
 	integrations, policy, err := declaration(app.ID, abs)
 	if err != nil {
@@ -375,6 +369,24 @@ run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
 	return nil
+}
+
+// movedLine is the line setup prints when the key is in abs, beside file, since file could
+// not be written, or was written and its sync failed, and why: the error of the
+// [*fs.PathError] that moved wraps, or "it exists".
+func movedLine(abs, file string, moved error) string {
+	what, why := "written", moved.Error()
+	var pe *fs.PathError
+	switch {
+	case errors.Is(moved, fs.ErrExist):
+		why = "it exists"
+	case errors.As(moved, &pe):
+		why = pe.Err.Error()
+		if pe.Op == "sync" {
+			what = "written or synced"
+		}
+	}
+	return fmt.Sprintf("\nThe key is in %s, since %s could not be %s: %s.\n", abs, file, what, why)
 }
 
 // declaration is what setup prints for the App: the integration as the machine's

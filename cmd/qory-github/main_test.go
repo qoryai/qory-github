@@ -14,12 +14,14 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unicode"
@@ -302,9 +304,47 @@ func TestCredentialFollowsNoRedirect(t *testing.T) {
 	}
 }
 
+// TestCredentialSaysARedirectOnTheCheckIsNoMove runs credential with an installation_id
+// that GitHub's API answers the check of with a 301, and checks the one line on standard
+// error says the check was redirected, not that a repository moved, since the check
+// names none, that the redirect's target is never requested and that no token is minted.
+func TestCredentialSaysARedirectOnTheCheckIsNoMove(t *testing.T) {
+	file, _ := keyFile(t)
+	var followed, minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/778899":
+			w.Header().Set("Location", "/app/installations/42")
+			w.WriteHeader(http.StatusMovedPermanently)
+			io.WriteString(w, `{"message":"Moved Permanently","url":"/app/installations/42"}`)
+		case "/app/installations/42":
+			followed.Store(true)
+			io.WriteString(w, `{"id":42,"account":{"login":"acme"}}`)
+		default:
+			if strings.HasSuffix(r.URL.Path, "/access_tokens") {
+				minted.Store(true)
+			}
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": srv.URL}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: checking installation_id: GitHub answered with a redirect, which is never followed\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if followed.Load() || minted.Load() {
+		t.Errorf("the redirect was followed: %v, a token minted: %v", followed.Load(), minted.Load())
+	}
+}
+
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
-// contains control characters and Unicode line separators, and checks that the failure
-// is still one line on standard error, with each of them escaped.
+// contains control characters, Unicode line separators and a bidirectional formatting
+// character, and checks that the failure is still one line on standard error, with each
+// of them escaped.
 func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 	file, _ := keyFile(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -313,7 +353,7 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusForbidden)
-		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni"}`)
+		io.WriteString(w, `{"message":"a\r\nb\rc\td\u007fe\u0085f\u2028g\u2029h\ni\u202ej"}`)
 	}))
 	t.Cleanup(srv.Close)
 	var out, errs bytes.Buffer
@@ -322,17 +362,19 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 		t.Error(err)
 	}
 	line := strings.TrimSuffix(errs.String(), "\n")
-	if i := strings.IndexFunc(line, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' }); i >= 0 {
+	if i := strings.IndexFunc(line, func(r rune) bool {
+		return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Bidi_Control, r)
+	}); i >= 0 {
 		t.Errorf("stderr contains %q: %q", []rune(line[i:])[0], errs.String())
 	}
-	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i` + "\n"; !strings.HasSuffix(errs.String(), want) {
+	if want := `403: a b\rc\td\x7fe\u0085f\u2028g\u2029h i\u202ej` + "\n"; !strings.HasSuffix(errs.String(), want) {
 		t.Errorf("stderr %q, want it to end in %q", errs.String(), want)
 	}
 }
 
 // TestOneLine pins how an error's text is written on its line: a line break as a space,
-// every other control character, a line or paragraph separator and a byte that is not
-// UTF-8 escaped, and the rest as it is.
+// every other control character, a line or paragraph separator, a bidirectional
+// formatting character and a byte that is not UTF-8 escaped, and the rest as it is.
 func TestOneLine(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
@@ -342,6 +384,13 @@ func TestOneLine(t *testing.T) {
 		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
 		{"a\x85b\xffc", `a\x85b\xffc`},
 		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
+		{"acme\u202epohs", `acme\u202epohs`},
+		{"a\u202ab\u202bc\u202cd\u202de\u202ef", `a\u202ab\u202bc\u202cd\u202de\u202ef`},
+		{"a\u2066b\u2067c\u2068d\u2069e", `a\u2066b\u2067c\u2068d\u2069e`},
+		{"a\u200eb\u200fc\u061cd", `a\u200eb\u200fc\u061cd`},
+		// The characters beside them are left as they are: a zero-width joiner, U+200D, an
+		// Arabic letter, U+0628, a narrow no-break space, U+202F, and U+2065 and U+206A.
+		{"a\u200db\u0628c\u202fd\u2065e\u206af", "a\u200db\u0628c\u202fd\u2065e\u206af"},
 	} {
 		if got := oneLine(tc.in); got != tc.want {
 			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
@@ -461,7 +510,11 @@ func approve(local string) error {
 	if state == nil {
 		return fmt.Errorf("the page contains no state:\n%s", b)
 	}
-	resp, err = http.Get(strings.TrimSuffix(local, "/") + "/callback?code=abc&state=" + string(state[1]))
+	u, err := url.Parse(local)
+	if err != nil {
+		return err
+	}
+	resp, err = http.Get(u.Scheme + "://" + u.Host + "/callback?code=abc&state=" + string(state[1]))
 	if err != nil {
 		return err
 	}
@@ -628,6 +681,28 @@ func TestSetupPrintsWhereAMovedKeyIs(t *testing.T) {
 	line := regexp.MustCompile(`\nThe key is in (\S+), since (\S+) could not be written: it exists\.\n`).FindStringSubmatch(out.String())
 	if line == nil || !strings.HasPrefix(line[1], file+".") || line[2] != file || strings.Contains(out.String(), "choose another") {
 		t.Errorf("setup prints\n%s", out.String())
+	}
+}
+
+// TestSetupPrintsWhereAKeyWhoseSyncFailedIs pins the line setup prints when the key file
+// was written and its sync failed, for the error setup's exchange moves the key with
+// (the github package's TestSetupSyncsTheKeyFileBeforeItClosesIt fails a file's sync
+// with EIO and checks the key goes beside it): the file could not be written or synced.
+// A file that could not be written for another reason keeps the line it has.
+func TestSetupPrintsWhereAKeyWhoseSyncFailedIs(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "github-app.pem")
+	beside := file + ".0123456789abcdef"
+	for _, tc := range []struct {
+		moved error
+		want  string
+	}{
+		{fmt.Errorf("the key file could not be synced to disk: %w", &fs.PathError{Op: "sync", Path: file, Err: syscall.EIO}), "\nThe key is in " + beside + ", since " + file + " could not be written or synced: input/output error.\n"},
+		{fmt.Errorf("the key file: %w", &fs.PathError{Op: "write", Path: file, Err: syscall.ENOSPC}), "\nThe key is in " + beside + ", since " + file + " could not be written: " + syscall.ENOSPC.Error() + ".\n"},
+		{fmt.Errorf("the key file: %w", &fs.PathError{Op: "open", Path: file, Err: syscall.EACCES}), "\nThe key is in " + beside + ", since " + file + " could not be written: " + syscall.EACCES.Error() + ".\n"},
+	} {
+		if got := movedLine(beside, file, tc.moved); got != tc.want {
+			t.Errorf("%v: setup prints %q, want %q", tc.moved, got, tc.want)
+		}
 	}
 }
 
