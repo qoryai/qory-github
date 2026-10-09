@@ -37,6 +37,76 @@ func readPage(t *testing.T, local string) (string, map[string]any) {
 	return html.UnescapeString(action[1]), m
 }
 
+// origin is the local page's scheme and host, where GitHub's redirect comes back to.
+func origin(local string) string {
+	u, err := url.Parse(local)
+	if err != nil {
+		panic(err)
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// TestSetupServesItsPageAtARandomPathAlone reads the local page at the URL setup opens,
+// and at every other path a process on the machine might try, and checks that the state
+// the page carries is in the page alone: any other path is not found, the redirect's
+// path without the state is refused, and the page's own path for another host is
+// refused.
+func TestSetupServesItsPageAtARandomPathAlone(t *testing.T) {
+	var opened string
+	s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: Client{API: unreachable(t)}, Open: func(u string) error { opened = u; return nil }, Wait: time.Minute}
+	local, _, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(local)
+	if opened != local || !regexp.MustCompile(`^/[0-9a-f]{32}$`).MatchString(u.Path) {
+		t.Fatalf("setup opened %q and returned %q, want a random path", opened, local)
+	}
+	action, _ := readPage(t, local)
+	a, _ := url.Parse(action)
+	state := a.Query().Get("state")
+	if len(state) != 32 {
+		t.Fatalf("the page's state is %q", state)
+	}
+	paths := []string{"/", "", "/index.html", u.Path + "/", u.Path[:len(u.Path)-1], u.Path + "x", "/" + strings.Repeat("0", 32)}
+	if upper := "/" + strings.ToUpper(u.Path[1:]); upper != u.Path {
+		paths = append(paths, upper)
+	}
+	for _, tc := range []struct {
+		path, host string
+		want       int
+	}{
+		{"/callback", "", http.StatusBadRequest},
+		{u.Path, "qory.attacker.test:" + u.Port(), http.StatusMisdirectedRequest},
+		{u.Path, "localhost:" + u.Port(), http.StatusMisdirectedRequest},
+	} {
+		req, _ := http.NewRequest("GET", origin(local)+tc.path, nil)
+		if tc.host != "" {
+			req.Host = tc.host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.want || strings.Contains(string(b), state) || strings.Contains(string(b), "manifest") {
+			t.Errorf("GET %q for %q answered %d, want %d:\n%s", tc.path, tc.host, resp.StatusCode, tc.want, b)
+		}
+	}
+	for _, path := range paths {
+		resp, err := http.Get(origin(local) + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound || strings.Contains(string(b), state) || strings.Contains(string(b), "manifest") {
+			t.Errorf("GET %q answered %d:\n%s", path, resp.StatusCode, b)
+		}
+	}
+}
+
 func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 	c := serve(t, &fakeGitHub{})
 	file := filepath.Join(t.TempDir(), "app.pem")
@@ -56,18 +126,18 @@ func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 	}
 	perms, _ := json.Marshal(manifest["default_permissions"])
 	hook, _ := manifest["hook_attributes"].(map[string]any)
-	if manifest["public"] != false || hook["active"] != false || string(perms) != `{"contents":"write","metadata":"read","pull_requests":"write"}` || manifest["redirect_url"] != strings.TrimSuffix(local, "/")+"/callback" {
+	if manifest["public"] != false || hook["active"] != false || string(perms) != `{"contents":"write","metadata":"read","pull_requests":"write"}` || manifest["redirect_url"] != origin(local)+"/callback" {
 		t.Errorf("manifest %v", manifest)
 	}
 
-	callback := strings.TrimSuffix(local, "/") + "/callback?state=" + u.Query().Get("state") + "&code="
+	callback := origin(local) + "/callback?state=" + u.Query().Get("state") + "&code="
 	// A redirect without the state the page sent is not answered, nor one whose code is
 	// not a code, nor one for another host than the listener's own address.
 	for _, tc := range []struct {
 		url, host string
 		want      int
 	}{
-		{strings.TrimSuffix(local, "/") + "/callback?code=abc&state=wrong", "", 400},
+		{origin(local) + "/callback?code=abc&state=wrong", "", 400},
 		{callback + "a%20b", "", 400},
 		{callback + "..%2Fx", "", 400},
 		{callback + "abc", "qory.attacker.test:" + u.Port(), 421},
@@ -271,7 +341,7 @@ func TestSetupNeverSaysTheCodeItExchanges(t *testing.T) {
 	}
 	action, _ := readPage(t, local)
 	u, _ := url.Parse(action)
-	resp, err := http.Get(strings.TrimSuffix(local, "/") + "/callback?state=" + u.Query().Get("state") + "&code=" + code)
+	resp, err := http.Get(origin(local) + "/callback?state=" + u.Query().Get("state") + "&code=" + code)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("the redirect answered %v %v", resp.StatusCode, err)
 	}

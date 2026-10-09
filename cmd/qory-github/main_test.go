@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -461,7 +462,11 @@ func approve(local string) error {
 	if state == nil {
 		return fmt.Errorf("the page contains no state:\n%s", b)
 	}
-	resp, err = http.Get(strings.TrimSuffix(local, "/") + "/callback?code=abc&state=" + string(state[1]))
+	u, err := url.Parse(local)
+	if err != nil {
+		return err
+	}
+	resp, err = http.Get(u.Scheme + "://" + u.Host + "/callback?code=abc&state=" + string(state[1]))
 	if err != nil {
 		return err
 	}

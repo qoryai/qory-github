@@ -87,6 +87,12 @@ change what the program does, and notes it under Upgrading.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
   they said the runner and `runner.yaml`.
+- `setup`'s local page, which posts the App's manifest to GitHub with the state
+  GitHub's redirect must return, is served at a random path,
+  `http://127.0.0.1:<port>/<32 hex digits>`, the URL `setup` opens and prints. A request
+  to that address for any other path but the redirect's, `/` among them, is not found;
+  one naming another address is refused, as before. Before, the page was at `/`, so any
+  process on the machine could read the state from it.
 
 ### Upgrading
 

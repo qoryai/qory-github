@@ -88,6 +88,11 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
   `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
   App and the page where you generate a new key.
 - The key is never printed.
+- The page `setup` opens, which posts the App's manifest to GitHub, is served on
+  loopback at a random path, `http://127.0.0.1:<port>/<32 hex digits>`, the URL `setup`
+  prints. A request to that address for any other path but GitHub's redirect back is
+  not found, and one naming another address is refused, so a process on the machine
+  that does not know the URL cannot read the page's state.
 - `--api-url` takes `https://api.github.com` alone, with or without a trailing `/` or
   `:443`, and `--web-url` takes `https://github.com` alone, with or without a trailing
   `/`. For tests, each also takes `http` or `https` on a loopback host (`127.0.0.0/8`,
