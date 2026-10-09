@@ -83,10 +83,11 @@ Creates the GitHub App (private, no webhook, contents and pull requests `write`,
 | `--api-url` | `https://api.github.com`; otherwise only a loopback host, for tests |
 | `--web-url` | `https://github.com`; otherwise only a loopback host, for tests |
 
-- The key file is written with mode 0600. An existing file is never overwritten.
-- GitHub hands out the key once. If the file cannot be written, the key goes to
-  `<file>.<random hex>` and `setup` prints where. If that fails too, the error names the
-  App and the page where you generate a new key.
+- The key file is written with mode 0600, and synced to disk before `setup` says where
+  it is, on a filesystem that can sync a file. An existing file is never overwritten.
+- GitHub hands out the key once. If the file cannot be written or synced to disk, the key
+  goes to `<file>.<random hex>` and `setup` prints where. If that fails too, the error
+  names the App and the page where you generate a new key.
 - The key is never printed.
 - The page `setup` opens, which posts the App's manifest to GitHub, is served on
   loopback at a random path, `http://127.0.0.1:<port>/<32 hex digits>`, the URL `setup`

@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -118,10 +119,31 @@ func (e existsError) Error() string {
 // Is matches [fs.ErrExist].
 func (e existsError) Is(target error) bool { return target == fs.ErrExist }
 
-// writeKeyFile writes a private key where only its owner reads it, and never over a file
-// that exists.
-func writeKeyFile(path string, pemBytes []byte) error {
+// keyFile is the file a key is written to: an [*os.File], or in a test one whose calls
+// fail.
+type keyFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// createKeyFile creates the file a key is written to, 0600, and only where no file
+// exists. A test replaces it.
+var createKeyFile = func(path string) (keyFile, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// writeKeyFile writes a private key where only its owner reads it, and never over a file
+// that exists. GitHub hands the key out once, so it is synced to disk before the file is
+// closed, and then, as far as the system allows, so is the directory the file is in. A
+// file that could not be written whole, or whose sync failed, is removed; a file on a
+// filesystem that cannot sync one, see [syncUnsupported], is kept unsynced.
+func writeKeyFile(path string, pemBytes []byte) error {
+	f, err := createKeyFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return existsError(path)
@@ -133,9 +155,29 @@ func writeKeyFile(path string, pemBytes []byte) error {
 		os.Remove(path)
 		return fmt.Errorf("the key file: %w", err)
 	}
+	if err := f.Sync(); err != nil && !syncUnsupported(err) {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("the key file could not be synced to disk: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		os.Remove(path)
 		return fmt.Errorf("the key file: %w", err)
 	}
+	// The directory's entry for the file is synced too where the system can sync a
+	// directory; where it cannot, the file itself is on disk all the same, so an error
+	// here never fails setup once GitHub has handed out the key.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
 	return nil
+}
+
+// syncUnsupported is whether a file's sync failed because its filesystem cannot sync a
+// file, as some FUSE and network filesystems answer: EINVAL, ENOTSUP, EOPNOTSUPP or
+// ENOSYS. Its key is kept all the same, since a file beside it on the same filesystem
+// would fail the same way, and removing it would leave setup no file to keep the key in.
+func syncUnsupported(err error) bool {
+	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOSYS)
 }

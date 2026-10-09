@@ -3,15 +3,19 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -230,6 +234,134 @@ func TestSetupNeverWritesOverAKeyFile(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(file); string(b) != "someone's" {
 		t.Errorf("the file contains %q", b)
+	}
+}
+
+// recordingFile is a key file that records what writeKeyFile calls on it, in order, and
+// whose Sync fails with syncErr when it is set, as a disk's that cannot keep the key.
+type recordingFile struct {
+	*os.File
+	syncErr error
+	calls   []string
+}
+
+func (r *recordingFile) Write(b []byte) (int, error) {
+	r.calls = append(r.calls, "write")
+	return r.File.Write(b)
+}
+
+func (r *recordingFile) Sync() error {
+	r.calls = append(r.calls, "sync")
+	if r.syncErr != nil {
+		return r.syncErr
+	}
+	return r.File.Sync()
+}
+
+func (r *recordingFile) Close() error {
+	r.calls = append(r.calls, "close")
+	return r.File.Close()
+}
+
+// TestSetupSyncsTheKeyFileBeforeItClosesIt writes a key and checks it is synced to disk
+// before the file is closed. A sync that fails is reported and the file it could not
+// keep is removed, so setup's exchange writes the key beside it; a filesystem that
+// cannot sync a file keeps the key unsynced.
+func TestSetupSyncsTheKeyFileBeforeItClosesIt(t *testing.T) {
+	defer func(c func(string) (keyFile, error)) { createKeyFile = c }(createKeyFile)
+	var file *recordingFile
+	syncErr := func(path string) error { return nil }
+	createKeyFile = func(path string) (keyFile, error) {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		file = &recordingFile{File: f, syncErr: syncErr(path)}
+		return file, nil
+	}
+	failsWith := func(errno syscall.Errno) func(string) error {
+		return func(path string) error { return &fs.PathError{Op: "sync", Path: path, Err: errno} }
+	}
+	dir := t.TempDir()
+	body := strings.Split(string(keyPEM(t)), "\n")[1]
+	kept := filepath.Join(dir, "kept.pem")
+	if err := writeKeyFile(kept, keyPEM(t)); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(file.calls, " "); got != "write sync close" {
+		t.Errorf("writeKeyFile called %s, want write sync close", got)
+	}
+	if k, err := ReadKeyFile(kept); err != nil || !k.Equal(key(t)) {
+		t.Errorf("the key file contains %v", err)
+	}
+
+	// A filesystem that cannot sync a file says so, and the key is kept unsynced.
+	for i, errno := range []syscall.Errno{syscall.EINVAL, syscall.ENOTSUP, syscall.EOPNOTSUPP, syscall.ENOSYS} {
+		unsynced := filepath.Join(dir, "unsynced-"+strconv.Itoa(i)+".pem")
+		syncErr = failsWith(errno)
+		if err := writeKeyFile(unsynced, keyPEM(t)); err != nil {
+			t.Errorf("%v: err %v", errno, err)
+		}
+		if got := strings.Join(file.calls, " "); got != "write sync close" {
+			t.Errorf("%v: writeKeyFile called %s, want write sync close", errno, got)
+		}
+		if k, err := ReadKeyFile(unsynced); err != nil || !k.Equal(key(t)) {
+			t.Errorf("%v: the key file contains %v", errno, err)
+		}
+	}
+
+	// Any other failure is reported, and the file is removed.
+	failing := filepath.Join(dir, "failing.pem")
+	syncErr = failsWith(syscall.EIO)
+	err := writeKeyFile(failing, keyPEM(t))
+	if err == nil || err.Error() != "the key file could not be synced to disk: sync "+failing+": input/output error" || !errors.Is(err, syscall.EIO) {
+		t.Errorf("a failing sync: err %v", err)
+	}
+	if got := strings.Join(file.calls, " "); got != "write sync close" {
+		t.Errorf("a failing sync: writeKeyFile called %s, want write sync close", got)
+	}
+	if _, err := os.Stat(failing); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file whose sync failed is kept: %v", err)
+	}
+
+	// setup's exchange then writes the key beside the file, and runSetup reads why from
+	// the *fs.PathError it wraps.
+	moving := filepath.Join(dir, "moving.pem")
+	syncErr = func(path string) error {
+		if path == moving {
+			return failsWith(syscall.EIO)(path)
+		}
+		return nil
+	}
+	app, err := Setup{KeyFile: moving, Client: serve(t, &fakeGitHub{})}.exchange(context.Background(), "abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pe *fs.PathError
+	if !strings.HasPrefix(app.KeyFile, moving+".") || !errors.Is(app.Moved, syscall.EIO) || !errors.As(app.Moved, &pe) || pe.Err != syscall.EIO {
+		t.Errorf("app %+v", app)
+	}
+	if _, err := os.Stat(moving); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file whose sync failed is kept: %v", err)
+	}
+	if k, err := ReadKeyFile(app.KeyFile); err != nil || !k.Equal(key(t)) {
+		t.Errorf("the key beside it contains %v", err)
+	}
+
+	// When the file beside it cannot be synced either, the error names the App and where
+	// to generate another key, and neither file is left.
+	lost := filepath.Join(dir, "lost.pem")
+	syncErr = failsWith(syscall.EIO)
+	_, err = Setup{Org: "acme", KeyFile: lost, Web: "https://github.com", Client: serve(t, &fakeGitHub{})}.exchange(context.Background(), "abc")
+	want := regexp.MustCompile(`^the App 123456 \(qory-github-test, https://github\.com/apps/qory-github-test\) is created, but its private key could not be written: the key file could not be synced to disk: sync ` + regexp.QuoteMeta(lost) + `: input/output error, and beside it: the key file could not be synced to disk: sync ` + regexp.QuoteMeta(lost) + `\.[0-9a-f]{16}: input/output error; generate a private key at https://github\.com/organizations/acme/settings/apps/qory-github-test$`)
+	if err == nil || !want.MatchString(err.Error()) {
+		t.Errorf("both syncs failing: err %v", err)
+	}
+	if err != nil && (strings.Contains(err.Error(), body) || strings.Contains(err.Error(), "PRIVATE KEY")) {
+		t.Errorf("the error contains the key: %v", err)
+	}
+	if left, _ := filepath.Glob(lost + "*"); len(left) != 0 {
+		t.Errorf("files whose sync failed are kept: %v", left)
 	}
 }
 
