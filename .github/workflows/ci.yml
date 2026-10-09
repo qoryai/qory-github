@@ -5,6 +5,15 @@ on:
     branches: [main, next]
   pull_request:
 
+# A newer commit on a pull request cancels the run it supersedes. Runs from pushes to
+# next and main are never cancelled while they run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   go:
+    # The push to next already runs CI on the commit its pull request shows, so the
+    # pull request's own run is skipped. Every push, and any other pull request, runs.
+    if: github.event_name != 'pull_request' || github.head_ref != 'next'
     uses: qoryai/integrations/.github/workflows/go.yml@v0.2.0
