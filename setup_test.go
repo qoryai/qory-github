@@ -338,7 +338,7 @@ func TestSetupSyncsTheKeyFileBeforeItClosesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var pe *fs.PathError
-	if !strings.HasPrefix(app.KeyFile, moving+".") || !errors.Is(app.Moved, syscall.EIO) || !errors.As(app.Moved, &pe) || pe.Err != syscall.EIO {
+	if !strings.HasPrefix(app.KeyFile, moving+".") || !errors.Is(app.Moved, syscall.EIO) || !errors.As(app.Moved, &pe) || pe.Op != "sync" || pe.Err != syscall.EIO {
 		t.Errorf("app %+v", app)
 	}
 	if _, err := os.Stat(moving); !errors.Is(err, fs.ErrNotExist) {

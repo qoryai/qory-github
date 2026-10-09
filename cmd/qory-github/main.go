@@ -348,15 +348,7 @@ func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
 	}
 	abs, _ := filepath.Abs(app.KeyFile)
 	if app.Moved != nil {
-		why := app.Moved.Error()
-		var pe *fs.PathError
-		switch {
-		case errors.Is(app.Moved, fs.ErrExist):
-			why = "it exists"
-		case errors.As(app.Moved, &pe):
-			why = pe.Err.Error()
-		}
-		fmt.Fprintf(stdout, "\nThe key is in %s, since %s could not be written: %s.\n", abs, s.KeyFile, why)
+		fmt.Fprint(stdout, movedLine(abs, s.KeyFile, app.Moved))
 	}
 	integrations, policy, err := declaration(app.ID, abs)
 	if err != nil {
@@ -377,6 +369,24 @@ run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
 	return nil
+}
+
+// movedLine is the line setup prints when the key is in abs, beside file, since file could
+// not be written, or was written and its sync failed, and why: the error of the
+// [*fs.PathError] that moved wraps, or "it exists".
+func movedLine(abs, file string, moved error) string {
+	what, why := "written", moved.Error()
+	var pe *fs.PathError
+	switch {
+	case errors.Is(moved, fs.ErrExist):
+		why = "it exists"
+	case errors.As(moved, &pe):
+		why = pe.Err.Error()
+		if pe.Op == "sync" {
+			what = "written or synced"
+		}
+	}
+	return fmt.Sprintf("\nThe key is in %s, since %s could not be %s: %s.\n", abs, file, what, why)
 }
 
 // declaration is what setup prints for the App: the integration as the machine's
