@@ -70,19 +70,24 @@ change what the program does, and notes it under Upgrading.
   twice, and `credential` the installation's id.
 - An `installation_id` the settings set is checked before a token is minted: GitHub must
   say it is the App's installation on the account that owns the repositories, its login
-  compared in any case. Another account's installation, and one GitHub does not know of
-  the App, are refused with `installation_id is not the App's installation on the
-  repositories' owner; set that owner's installation, or leave installation_id out`.
-  Before, a token was minted with whatever installation the settings named.
+  compared in ASCII case alone: a login with any other character is refused, so the
+  Kelvin sign, U+212A, is never taken for a k. Another account's
+  installation, and one GitHub does not know of the App, are refused with
+  `installation_id is not the App's installation on the repositories' owner; set that
+  owner's installation, or leave installation_id out`. Before, a token was minted with
+  whatever installation the settings named.
 - No redirect from GitHub's API is followed, whatever `http.Client` a `Client` is handed,
   so the App's token, and the code `setup` exchanges, go nowhere but where they were
-  sent. A redirect answering a mint's request, as GitHub answers for a repository that
-  moved or was renamed, fails with `GitHub answered with a redirect; the repository may
-  have moved or been renamed, so name its new owner/name in the policy's credential
-  argument`, and one answering `setup`'s exchange with `exchanging the code for the App:
-  GitHub answered with a redirect, which setup never follows, so the code is sent
-  nowhere else`. Before, Go's client followed it, and sent the App's token on to a
-  target on the same host.
+  sent. A redirect answering the lookup of a repository's installation, as GitHub
+  answers for a repository that moved or was renamed, fails with `GitHub answered with
+  a redirect; the repository may have moved or been renamed, so name its new owner/name
+  in the policy's credential argument`; one answering the check of `installation_id`
+  with `checking installation_id: GitHub answered with a redirect, which is never
+  followed`; one answering the mint with `minting the installation token: GitHub
+  answered with a redirect, which is never followed`; and one answering `setup`'s
+  exchange with `exchanging the code for the App: GitHub answered with a redirect, which
+  setup never follows, so the code is sent nowhere else`. Before, Go's client followed
+  it, and sent the App's token on to a target on the same host.
 - The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,

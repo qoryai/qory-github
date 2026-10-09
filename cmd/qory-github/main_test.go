@@ -303,6 +303,43 @@ func TestCredentialFollowsNoRedirect(t *testing.T) {
 	}
 }
 
+// TestCredentialSaysARedirectOnTheCheckIsNoMove runs credential with an installation_id
+// that GitHub's API answers the check of with a 301, and checks the one line on standard
+// error says the check was redirected, not that a repository moved, since the check
+// names none, that the redirect's target is never requested and that no token is minted.
+func TestCredentialSaysARedirectOnTheCheckIsNoMove(t *testing.T) {
+	file, _ := keyFile(t)
+	var followed, minted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/app/installations/778899":
+			w.Header().Set("Location", "/app/installations/42")
+			w.WriteHeader(http.StatusMovedPermanently)
+			io.WriteString(w, `{"message":"Moved Permanently","url":"/app/installations/42"}`)
+		case "/app/installations/42":
+			followed.Store(true)
+			io.WriteString(w, `{"id":42,"account":{"login":"acme"}}`)
+		default:
+			if strings.HasSuffix(r.URL.Path, "/access_tokens") {
+				minted.Store(true)
+			}
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"credential", "--settings", settings(t, map[string]any{"private_key_file": file, "installation_id": 778899, "api_url": srv.URL}), "--", "acme/shop"}, &out, &errs)
+	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
+		t.Error(err)
+	}
+	if want := "qory-github credential: checking installation_id: GitHub answered with a redirect, which is never followed\n"; errs.String() != want {
+		t.Errorf("stderr %q, want %q", errs.String(), want)
+	}
+	if followed.Load() || minted.Load() {
+		t.Errorf("the redirect was followed: %v, a token minted: %v", followed.Load(), minted.Load())
+	}
+}
+
 // TestAFailureFromGitHubIsOneLine has GitHub's API refuse the mint with a message that
 // contains control characters and Unicode line separators, and checks that the failure
 // is still one line on standard error, with each of them escaped.
