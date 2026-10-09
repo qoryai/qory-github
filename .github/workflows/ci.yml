@@ -13,7 +13,8 @@ concurrency:
 
 jobs:
   go:
-    # The push to next already runs CI on the commit its pull request shows, so the
-    # pull request's own run is skipped. Every push, and any other pull request, runs.
-    if: github.event_name != 'pull_request' || github.head_ref != 'next'
+    # The push to this repository's next already runs CI on the commit its pull request
+    # shows, so that pull request's own run is skipped. Every push, and any other pull
+    # request, a fork's next among them, runs.
+    if: github.event_name != 'pull_request' || github.head_ref != 'next' || github.event.pull_request.head.repo.full_name != github.repository
     uses: qoryai/integrations/.github/workflows/go.yml@v0.2.0
