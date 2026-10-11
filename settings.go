@@ -221,7 +221,7 @@ func explain(err error) string {
 // /permissions/contents. A name the document chose is quoted, as Go quotes a string,
 // when it contains what quoting escapes, a control character, a line or paragraph
 // separator, a quote or a backslash among them, so the location stays on one line and
-// reads as it is spelled. The schema's own names never need it.
+// reads as it is spelled. The names the schema defines never need it.
 func location(names []string) string {
 	var b strings.Builder
 	for _, name := range names {
@@ -262,7 +262,7 @@ func reasons(v *jsonschema.ValidationError, p *message.Printer) []string {
 		return out
 	}
 	// A refusal is said in words that name what the schema wants, never the value: the
-	// validator's own words for a bound, a length or a number of properties say the
+	// validator's words for a bound, a length or a number of properties say the
 	// value, or its length. Its words are kept for the kinds whose words name only the
 	// schema's wants and the document's names, and any other keyword is named alone.
 	switch k := v.ErrorKind.(type) {

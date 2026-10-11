@@ -173,11 +173,11 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 			http.Error(w, "already done", http.StatusConflict)
 		}
 	})
-	// Only a request for the listener's own address is answered, so a page of another
-	// origin that resolves a name of its own to loopback reaches nothing.
+	// Only a request for the listener's address is answered, so a page of another
+	// origin that resolves a name it controls to loopback reaches nothing.
 	own := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != host {
-			http.Error(w, "qory-github answers its own address alone, "+host, http.StatusMisdirectedRequest)
+			http.Error(w, "qory-github answers only requests to "+host, http.StatusMisdirectedRequest)
 			return
 		}
 		mux.ServeHTTP(w, r)

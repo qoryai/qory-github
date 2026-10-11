@@ -23,7 +23,7 @@ import (
 const (
 	GitHost = "github.com"
 	APIHost = "api.github.com"
-	// APIURL is where the App's own requests go, the installation lookup and the mint.
+	// APIURL is where the App's requests go, the installation lookup and the mint.
 	APIURL = "https://api.github.com"
 )
 
@@ -154,8 +154,8 @@ type Request struct {
 
 // Mint requests from GitHub an installation token that covers the request's repositories,
 // with its permissions and no more, and returns the answer the gateway reads. It refuses
-// an API [CheckAPIURL] refuses before anything else, so the App's own token goes to
-// GitHub's API alone. An installation the request names is minted with only once GitHub
+// an API [CheckAPIURL] refuses before anything else, so the App's token goes only to
+// GitHub's API. An installation the request names is minted with only once GitHub
 // says it is the App's installation on the repositories' owner, so a token is never one
 // of another account's. It keeps nothing: the gateway runs the adapter again before the
 // token expires.
@@ -275,7 +275,7 @@ func moved(err error) error {
 // one GitHub gives, ASCII letters, digits and hyphens, and is compared with the owner's
 // in either case of ASCII alone, as GitHub compares logins: compared as Unicode folds
 // case, the Kelvin sign, U+212A, would be a k. An installation GitHub does not know of
-// the App, a 404, is refused the same way, and a redirect in a line of its own.
+// the App, a 404, is refused the same way, and a redirect with a separate error.
 func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) error {
 	var got struct {
 		Account struct {
@@ -320,7 +320,7 @@ var apiURLShape = sync.OnceValue(func() *regexp.Regexp {
 	return regexp.MustCompile(s.Properties.APIURL.Pattern)
 })
 
-// CheckAPIURL takes the API the App's own token goes to, which can mint a token for
+// CheckAPIURL takes the API the App's token goes to, which can mint a token for
 // every installation of the App: GitHub's, https://api.github.com, with or without a
 // trailing slash or the port 443, and for a test http or https on a loopback host,
 // 127.0.0.0/8, [::1] or localhost, with any port. Nothing else is taken: no other host,

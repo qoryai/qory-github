@@ -550,7 +550,7 @@ func TestMintRefusesAnAppIdThatIsNotOneAndNeverSaysIt(t *testing.T) {
 	}
 }
 
-// apiURLs are URLs of the API and whether the App's own token may go there: GitHub's
+// apiURLs are URLs of the API and whether the App's token may go there: GitHub's
 // API, and for a test a loopback host, and nothing else.
 var apiURLs = map[string]bool{
 	"https://api.github.com":                  true,
