@@ -704,7 +704,7 @@ func TestAKeyFileOthersMayReadIsRefused(t *testing.T) {
 	}
 }
 
-// TestAKeyFileIsReadFromWhatWasOpened pins that what is not the owner's own regular file
+// TestAKeyFileIsReadFromWhatWasOpened pins that what is not a regular file the user owns
 // is refused without being read, and without waiting on a pipe.
 func TestAKeyFileIsReadFromWhatWasOpened(t *testing.T) {
 	dir := t.TempDir()
@@ -847,8 +847,8 @@ func TestReadSettings(t *testing.T) {
 
 // TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue hands in settings that
 // each keyword of the schema refuses, and checks the error says where and what, and
-// never the value: neither secretvalue, nor a case's own value, a number in any of the
-// ways Go writes it among them, nor the validator's own words for a length.
+// never the value: neither secretvalue, nor a case's value, a number in any of the ways
+// Go writes it among them, nor the validator's words for a length.
 func TestReadSettingsRefusesWhatTheSchemaRefusesAndNeverSaysAValue(t *testing.T) {
 	for _, tc := range []struct {
 		doc, want string
