@@ -112,6 +112,10 @@ change what the program does, and notes it under Upgrading.
   for runs that must edit workflows alone. A run may still be granted it: GitHub refuses
   a push that touches `.github/workflows/` without it. They also say that an App
   `setup` creates lacks it until its owner adds it on GitHub.
+- Two texts say plainly what they mean; what the program does is unchanged. `setup`'s
+  loopback listener answers a request that names another address with `qory-github
+  answers only requests to 127.0.0.1:<port>`, and the description of `api_url` begins
+  `GitHub's API, where qory-github sends the App's token`.
 
 ### Upgrading
 
