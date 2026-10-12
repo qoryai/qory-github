@@ -158,7 +158,7 @@ func TestCredentialsHelpSaysWhatItReadsFromItsEnvironment(t *testing.T) {
 func TestAFailureIsOneLineWithNoSecret(t *testing.T) {
 	file, pemBytes := keyFile(t)
 	// noAPI is an API on loopback that settings the command refuses never reach: a
-	// request to it fails the test, and no row falls back to GitHub's own API.
+	// request to it fails the test, and no row falls back to https://api.github.com.
 	noSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("GitHub's API is called for settings that are refused: %s %s", r.Method, r.URL.Path)
 		http.NotFound(w, r)
@@ -706,8 +706,8 @@ func TestSetupPrintsWhereAKeyWhoseSyncFailedIs(t *testing.T) {
 	}
 }
 
-// TestTheReadmesShowWhatSetupPrints pins README.md to what setup prints for a
-// key file of setup's own: the declaration and the policy, and no credential definition.
+// TestTheReadmesShowWhatSetupPrints pins README.md to what setup prints for its default
+// key file: the declaration and the policy, and no credential definition.
 func TestTheReadmesShowWhatSetupPrints(t *testing.T) {
 	readme, err := os.ReadFile("../../README.md")
 	if err != nil {
@@ -730,7 +730,7 @@ func TestTheReadmesShowWhatSetupPrints(t *testing.T) {
 // key, with the adapter [<program>, credential, --settings, <json>, --, "${argument}"],
 // the program qory-<key> when none is declared, <json> the settings, {} when none are
 // declared, as compact JSON with every $ written \u0024, in a single-quoted scalar, and
-// the argument and the hosts of qory-github's description. The contract's own example,
+// the argument and the hosts of qory-github's description. The contract's example,
 // with an integration of another program beside it, is tested in qoryai/integrations.
 func expand(t *testing.T, integrations string) string {
 	t.Helper()

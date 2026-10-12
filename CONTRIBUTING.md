@@ -10,7 +10,7 @@ Thank you for considering a contribution.
   [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1)
   and, for the credential role, Forager's
   [§Credentials](https://github.com/qoryai/forager/tree/main/contracts/forager/v1#credentials);
-  a change to either contract goes to its own repository first.
+  a change to either contract goes to that contract's repository first.
 
 The repository holds one integration: its README, its program's command under
 `cmd/qory-github/`, the package `github` at the root, its description, `description.json`,

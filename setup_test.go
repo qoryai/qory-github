@@ -53,8 +53,7 @@ func origin(local string) string {
 // TestSetupServesItsPageAtARandomPathAlone reads the local page at the URL setup opens,
 // and at every other path a process on the machine might try, and checks that the state
 // the page carries is in the page alone: any other path is not found, the redirect's
-// path without the state is refused, and the page's own path for another host is
-// refused.
+// path without the state is refused, and the page's path for another host is refused.
 func TestSetupServesItsPageAtARandomPathAlone(t *testing.T) {
 	var opened string
 	s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: Client{API: unreachable(t)}, Open: func(u string) error { opened = u; return nil }, Wait: time.Minute}
@@ -136,7 +135,7 @@ func TestSetupCreatesTheAppAndWritesItsKeyForItsOwnerAlone(t *testing.T) {
 
 	callback := origin(local) + "/callback?state=" + u.Query().Get("state") + "&code="
 	// A redirect without the state the page sent is not answered, nor one whose code is
-	// not a code, nor one for another host than the listener's own address.
+	// not a code, nor one for another host than the listener's address.
 	for _, tc := range []struct {
 		url, host string
 		want      int

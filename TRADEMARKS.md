@@ -15,15 +15,16 @@ may do with it without asking.
 
 - Name a fork, a tool or a package Qory, or anything confusable with it,
   such as a different spelling, a prefix or a suffix.
-- Use the Qory wordmark as your own, or in a way that implies
+- Use the Qory wordmark as if it were yours, or in a way that implies
   endorsement by, or affiliation with, the project.
 
 ## Integrations
 
 The `qory-` prefix on a program, `qory-github` say, marks it as one Qory
 publishes and maintains, each in a repository of the `qoryai` organisation. An
-integration kept in a repository of your own takes a name without Qory in it,
-`acme-tracker` say. Saying it is built for Qory is allowed, as above.
+integration kept in a repository outside the `qoryai` organisation takes a
+name without Qory in it, `acme-tracker` say. Saying it is built for Qory is
+allowed, as above.
 
 A renamed fork is allowed. Keep the NOTICE file, as the licence
 requires. For a use this page does not cover, open an issue.

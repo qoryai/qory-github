@@ -125,7 +125,7 @@ role. `qory` calls it to check a declaration. No settings, no network.
 - `0`: success. `describe` and `credential` print one JSON document on standard output.
 - `1`: failure, a flag a command refuses among them. One line on standard error says
   what failed, never the token or the key. `credential` and `setup` print the flag
-  package's own line and their usage before that line when they refuse a flag.
+  parser's message and their usage before that line when they refuse a flag.
 - `2`: no command, an unknown one, or `-h`. Usage or help on standard error.
 
 ## Settings
@@ -138,7 +138,7 @@ Passed as one JSON document in `--settings`, or under `settings:` in `forager.ya
 | `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
 | `installation_id` | no | The App's installation on the repositories' owner. Checked with GitHub before a token is minted: an installation on another account is refused. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
-| `api_url` | no | GitHub's API, where the App's own token goes. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |
+| `api_url` | no | GitHub's API, where qory-github sends the App's token, which can mint a token for any installation of the App. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |
 
 The private key itself (`private_key`) is refused on the command line; use
 `private_key_file`. No setting is read from the environment.
@@ -226,7 +226,7 @@ hosts and paths stay the same; only the token changes.
   owners, or when it lists a repository twice.
 - Git LFS objects are served from other hosts through signed URLs; allow those hosts in
   the policy.
-- No redirect from GitHub's API is followed, so the App's own token goes nowhere else. A
+- No redirect from GitHub's API is followed, so the App's token goes nowhere else. A
   repository that moved or was renamed is refused; name its new owner/name in the
   policy's credential argument.
 - Errors are one line on standard error and never contain the token or the key.

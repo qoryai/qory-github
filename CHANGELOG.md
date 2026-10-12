@@ -25,10 +25,10 @@ change what the program does, and notes it under Upgrading.
   GitHub's API among them: before, a line break alone was replaced.
 - `api_url` takes `https://api.github.com` alone, with or without a trailing `/` or the
   port 443, and for a test `http` or `https` on a loopback host, `127.0.0.0/8`, `[::1]`
-  or `localhost`, with any port: the App's own token goes there, and it can mint a token
-  for every installation of the App, so it never goes to a host the settings choose.
-  Another `https` host, GitHub Enterprise Server among them, a path, a user, a query and
-  a fragment are refused, by the settings' schema and again by `Mint` before anything is
+  or `localhost`, with any port: the App's token goes there, and it can mint a token for
+  every installation of the App, so it never goes to a host the settings choose. Another
+  `https` host, GitHub Enterprise Server among them, a path, a user, a query and a
+  fragment are refused, by the settings' schema and again by `Mint` before anything is
   sent, with an error that names the rule and never the URL.
 - `setup` holds `--api-url` to the same rule, since the code it exchanges there for the
   App yields the App's private key, and `--web-url` to `https://github.com` alone, with
@@ -112,15 +112,19 @@ change what the program does, and notes it under Upgrading.
   for runs that must edit workflows alone. A run may still be granted it: GitHub refuses
   a push that touches `.github/workflows/` without it. They also say that an App
   `setup` creates lacks it until its owner adds it on GitHub.
+- Two texts say plainly what they mean; what the program does is unchanged. `setup`'s
+  loopback listener answers a request that names another address with `qory-github
+  answers only requests to 127.0.0.1:<port>`, and the description of `api_url` begins
+  `GitHub's API, where qory-github sends the App's token`.
 
 ### Upgrading
 
 - Settings whose `api_url` is another `https` API, such as one of GitHub Enterprise
   Server, are now refused, and so is `Client.Mint` with such an `API`. Leave `api_url`
-  out for GitHub's own.
+  out to use `https://api.github.com`.
 - `setup --api-url` and `--web-url` with another host, such as one of GitHub Enterprise
   Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
-  Leave them out for GitHub's own.
+  Leave them out to use `https://github.com` and `https://api.github.com`.
 
 ## [0.1.0] - 2026-09-30
 

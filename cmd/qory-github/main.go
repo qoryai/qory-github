@@ -92,7 +92,7 @@ type help struct {
 }
 
 // parse parses args into fs. -h prints the whole help; a flag fs refuses prints the
-// command's usage and flags alone, after the flag package's own line.
+// command's usage and flags alone, after the flag parser's message.
 func (h help) parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	fs.Usage = func() {}
@@ -332,7 +332,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return runSetup(ctx, s, stdout)
 }
 
-// runSetup is setup past its flags, so a test drives it with a page opener of its own.
+// runSetup is setup past its flags, so a test drives it with a page opener the test supplies.
 func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
 	if err := checkKeyFile(s.KeyFile); err != nil {
 		return err
