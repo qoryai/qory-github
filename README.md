@@ -135,7 +135,7 @@ Passed as one JSON document in `--settings`, or under `settings:` in `forager.ya
 | Setting | Required | Meaning |
 |---|---|---|
 | `app_id` | yes | The App's numeric id, or its client id as a string |
-| `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, not readable by group or others, and not a symbolic link. |
+| `private_key_file` | yes | Path to the App's private key. Must be a regular file owned by the user running the program, with no permission for group or others, and not a symbolic link. |
 | `installation_id` | no | The App's installation on the repositories' owner. Checked with GitHub before a token is minted: an installation on another account is refused. Looked up from the repositories when absent. |
 | `permissions` | no | Permissions for the token, each `read` or `write`. Default: `{"contents": "write", "pull_requests": "write"}` |
 | `api_url` | no | GitHub's API, where qory-github sends the App's token, which can mint a token for any installation of the App. Only `https://api.github.com`, the default, with or without a trailing `/` or `:443`, or for tests `http` or `https` on a loopback host (`127.0.0.0/8`, `[::1]`, `localhost`), any port. No other host, path, user, query or fragment. GitHub Enterprise Server is not supported. |

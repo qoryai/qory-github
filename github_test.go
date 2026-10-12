@@ -679,14 +679,14 @@ func TestMintRefusesAnotherAPIBeforeAnythingIsSent(t *testing.T) {
 	}
 }
 
-func TestAKeyFileOthersMayReadIsRefused(t *testing.T) {
+func TestAKeyFileGroupOrOthersHavePermissionsIsRefused(t *testing.T) {
 	dir := t.TempDir()
-	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610} {
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610, 0o620, 0o601} {
 		open := filepath.Join(dir, "open.pem")
 		os.Remove(open)
 		os.WriteFile(open, keyPEM(t), mode)
 		os.Chmod(open, mode)
-		if _, err := ReadKeyFile(open); err == nil || !strings.Contains(err.Error(), "others may read it") {
+		if _, err := ReadKeyFile(open); err == nil || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0600") {
 			t.Errorf("%s: err %v", mode, err)
 		}
 	}

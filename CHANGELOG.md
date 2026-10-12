@@ -116,6 +116,10 @@ change what the program does, and notes it under Upgrading.
   loopback listener answers a request that names another address with `qory-github
   answers only requests to 127.0.0.1:<port>`, and the description of `api_url` begins
   `GitHub's API, where qory-github sends the App's token`.
+- A private key file that grants group or others any permission is refused with `the
+  private key file <path> is <mode>: group or others have permissions on it; make it
+  0600`. Before, the error said others may read it, even where only the group had a
+  permission, or only to write or run the file.
 
 ### Upgrading
 

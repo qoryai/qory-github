@@ -40,16 +40,16 @@ func ParseKey(b []byte) (*rsa.PrivateKey, error) {
 	return rk, nil
 }
 
-// maxKeyFile is the most of a key file that is read: an RSA key in PEM is a few
-// kilobytes.
+// maxKeyFile is the most a key file may hold; one byte more is read to tell a larger
+// file apart: an RSA key in PEM is a few kilobytes.
 const maxKeyFile = 64 << 10
 
-// ReadKeyFile reads an App's private key from a file that only its owner may read. It
-// opens the file once, never through a symbolic link and without waiting on a pipe, and
-// reads what it opened: a file that is not a regular one, that grants group or others
-// any permission, or that belongs to another user than the one the program runs as is
-// refused before it is read, and one larger than a key is refused having read at most
-// one byte more than a key may hold.
+// ReadKeyFile reads an App's private key from a file that only its owner has any
+// permission on. It opens the file once, never through a symbolic link and without
+// waiting on a pipe, and reads what it opened: a file that is not a regular one, that
+// grants group or others any permission, or that belongs to another user than the one
+// the program runs as is refused before it is read, and one larger than a key is
+// refused having read at most one byte more than a key may hold.
 func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, syscall.ELOOP) {
@@ -67,7 +67,7 @@ func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
 		return nil, fmt.Errorf("the private key file %s is not a regular file", path)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("the private key file %s is %s: others may read it; make it 0600", path, info.Mode().Perm())
+		return nil, fmt.Errorf("the private key file %s is %s: group or others have permissions on it; make it 0600", path, info.Mode().Perm())
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
 		return nil, fmt.Errorf("the private key file %s belongs to another user than the one qory-github runs as", path)
