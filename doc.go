@@ -2,7 +2,7 @@
 // as a library.
 //
 // It plays one role, the gateway's credential adapter
-// (https://github.com/qoryai/forager/tree/main/contracts/forager/v1#credentials): it mints a
+// (https://github.com/qoryai/forager/tree/v0.7.0/contracts/forager/v1#credentials): it mints a
 // GitHub App installation token for the repositories a run works on, and answers with
 // the token, when it expires, and how it is used, the hosts, the schemes and the paths.
 // [Mint] does that; [Answer] is the document the gateway reads.
@@ -12,7 +12,7 @@
 // request whose body refers to a repository, such as a GraphQL query.
 //
 // [Describe] is the integration's description, the integration contract
-// (https://github.com/qoryai/integrations/tree/main/contracts/integration/v1): its name,
+// (https://github.com/qoryai/integrations/tree/v0.3.0/contracts/integration/v1): its name,
 // the settings it takes as a JSON Schema, and the roles it plays. [ReadSettings] reads
 // a settings document against that schema.
 //

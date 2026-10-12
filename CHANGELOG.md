@@ -7,6 +7,8 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
 ### Changed
 
 - An error about settings that are not one JSON document says at which byte the document
@@ -91,6 +93,8 @@ change what the program does, and notes it under Upgrading.
   setup never follows, so the code is sent nowhere else`. Before, Go's client followed
   it, and sent the App's token on to a target on the same host.
 - The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
+- The program is built against `github.com/qoryai/forager` v0.7.0 and
+  `github.com/qoryai/integrations` v0.3.0.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
   they said the runner and `runner.yaml`.
@@ -129,6 +133,13 @@ change what the program does, and notes it under Upgrading.
 - `setup --api-url` and `--web-url` with another host, such as one of GitHub Enterprise
   Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
   Leave them out to use `https://github.com` and `https://api.github.com`.
+- An `installation_id` that is not the App's installation on the account that owns the
+  repositories is now refused before a token is minted; before, a token was minted with
+  it. Set that owner's installation, or leave `installation_id` out to have it looked up
+  from the repositories.
+- A program built without `-X main.version`, by `go install ...@v0.2.0` among others,
+  now reports `program_version` without its leading `v`, `0.2.0` in place of
+  `v0.2.0`. Compare it with a tag without the tag's `v`.
 
 ## [0.1.0] - 2026-09-30
 
@@ -184,5 +195,6 @@ change what the program does, and notes it under Upgrading.
   `go install github.com/qoryai/qory-github/cmd/qory-github@latest` installs it. The App
   `setup` creates links to this repository.
 
-[Unreleased]: https://github.com/qoryai/qory-github/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/qoryai/qory-github/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/qoryai/qory-github/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qoryai/qory-github/releases/tag/v0.1.0

@@ -7,9 +7,9 @@ Thank you for considering a contribution.
 - **A fix**, with the test that shows it.
 - **What the integration does for a run**: a permission, or a host GitHub serves a run
   from. The integration speaks the
-  [integration contract](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1)
+  [integration contract](https://github.com/qoryai/integrations/tree/v0.3.0/contracts/integration/v1)
   and, for the credential role, Forager's
-  [§Credentials](https://github.com/qoryai/forager/tree/main/contracts/forager/v1#credentials);
+  [§Credentials](https://github.com/qoryai/forager/tree/v0.7.0/contracts/forager/v1#credentials);
   a change to either contract goes to that contract's repository first.
 
 The repository holds one integration: its README, its program's command under
