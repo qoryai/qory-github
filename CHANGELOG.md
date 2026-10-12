@@ -58,11 +58,13 @@ change what the program does, and notes it under Upgrading.
   escaped, where it is the location or the property refused.
 - `app_id` as a number, and `installation_id`, are at most 9007199254740991, 2^53 - 1,
   the largest integer every JSON reader holds exactly, so the settings refuse a larger id
-  with `is greater than 9007199254740991`, where before an error from Go, or for `app_id`
-  from `Mint`, said the number. An id written as JSON Schema reads an integer, `42.0` or
-  `4.2e1`, is taken as `42`, as the schema takes it: before, such an `installation_id`
-  was refused with the number in the error, and such an `app_id` went to GitHub as it
-  was written.
+  with `is greater than 9007199254740991`. Before, a larger `installation_id` up to
+  9223372036854775807, 2^63 - 1, and a numeric `app_id` of up to 64 digits were taken
+  without an error and sent to GitHub; a larger `installation_id` was refused by Go's
+  JSON decoder, and an `app_id` of more than 64 digits by `Mint`, with the number in the
+  error. An id written as JSON Schema reads an integer, `42.0` or `4.2e1`, is taken as
+  `42`, as the schema takes it: before, such an `installation_id` was refused with the
+  number in the error, and such an `app_id` went to GitHub as it was written.
 - `Mint` refuses an App id that is not one, and a permission that is neither `read` nor
   `write`, without saying the id or the level.
 - An error from a request to GitHub's API names the request, `minting the installation
@@ -78,8 +80,8 @@ change what the program does, and notes it under Upgrading.
   Kelvin sign, U+212A, is never taken for a k. Another account's
   installation, and one GitHub does not know of the App, are refused with
   `installation_id is not the App's installation on the repositories' owner; set that
-  owner's installation, or leave installation_id out`. Before, a token was minted with
-  whatever installation the settings named.
+  owner's installation, or leave installation_id out`. Before, a token was requested
+  with whatever installation the settings named.
 - No redirect from GitHub's API is followed, whatever `http.Client` a `Client` is handed,
   so the App's token, and the code `setup` exchanges, go nowhere but where they were
   sent. A redirect answering the lookup of a repository's installation, as GitHub
@@ -92,11 +94,12 @@ change what the program does, and notes it under Upgrading.
   exchange with `exchanging the code for the App: GitHub answered with a redirect, which
   setup never follows, so the code is sent nowhere else`. Before, Go's client followed
   it, and sent the App's token on to a target on the same host.
-- The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
-- `go.mod` requires `github.com/qoryai/forager` v0.7.0, in place of
-  `github.com/qoryai/runner` v0.6.0, and `github.com/qoryai/integrations` v0.3.0, in
-  place of v0.2.0. The tests check the credential answer and the description against
-  their contracts at those tags.
+- The module and its tests depend on `github.com/qoryai/forager`, formerly
+  `github.com/qoryai/runner`; the program imports no package of Forager or of
+  `github.com/qoryai/integrations`. `go.mod` requires `github.com/qoryai/forager` v0.7.0,
+  in place of `github.com/qoryai/runner` v0.6.0, and `github.com/qoryai/integrations`
+  v0.3.0, in place of v0.2.0. The tests check the credential answer and the description
+  against their contracts at those tags.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
   they said the runner and `runner.yaml`.
@@ -136,9 +139,14 @@ change what the program does, and notes it under Upgrading.
   Server, are now refused, and so is `Setup.Start` with such a `Web` or `Client.API`.
   Leave them out to use `https://github.com` and `https://api.github.com`.
 - An `installation_id` that is not the App's installation on the account that owns the
-  repositories is now refused before a token is minted; before, a token was minted with
-  it. Set that owner's installation, or leave `installation_id` out to have it looked up
-  from the repositories.
+  repositories is now refused before a token is requested; before, a token was requested
+  with it. Set that owner's installation, or leave `installation_id` out to have it
+  looked up from the repositories.
+- With `installation_id` left out, a repository named by a former owner/name, which
+  GitHub answers with a redirect, now fails with `GitHub answered with a redirect; the
+  repository may have moved or been renamed, so name its new owner/name in the policy's
+  credential argument`; before, the redirect was followed. Name its current owner/name
+  in the policy's credential argument.
 - A program built without `-X main.version`, by `go install ...@v0.2.0` among others,
   now reports `program_version` without its leading `v`, `0.2.0` in place of
   `v0.2.0`. Compare it with a tag without the tag's `v`.
