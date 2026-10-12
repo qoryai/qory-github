@@ -181,7 +181,7 @@ permissions on GitHub and accept the change on the installation.
   the repositories the token covers.
 - To allow fetch but not push, use `"permissions": {"contents": "read"}`, or limit the
   host to the fetch paths in the policy
-  ([Forager contract](https://github.com/qoryai/forager/tree/main/contracts/forager/v1#the-policy)).
+  ([Forager contract](https://github.com/qoryai/forager/tree/v0.7.0/contracts/forager/v1#the-policy)).
 
 ### What the agent sees
 
@@ -241,7 +241,7 @@ go test ./...
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the full checks and the release process. The
 integration contract is in
-[qoryai/integrations](https://github.com/qoryai/integrations/tree/main/contracts/integration/v1).
+[qoryai/integrations](https://github.com/qoryai/integrations/tree/v0.3.0/contracts/integration/v1).
 
 ## Licence
 
