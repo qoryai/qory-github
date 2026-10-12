@@ -93,8 +93,10 @@ change what the program does, and notes it under Upgrading.
   setup never follows, so the code is sent nowhere else`. Before, Go's client followed
   it, and sent the App's token on to a target on the same host.
 - The program depends on `github.com/qoryai/forager`, formerly `github.com/qoryai/runner`.
-- The program is built against `github.com/qoryai/forager` v0.7.0 and
-  `github.com/qoryai/integrations` v0.3.0.
+- `go.mod` requires `github.com/qoryai/forager` v0.7.0 and
+  `github.com/qoryai/integrations` v0.3.0, in place of commits between releases. The
+  tests check the credential answer and the description against their contracts at
+  those tags.
 - The help, `setup`'s printed declaration and the README name the gateway and
   `~/.config/qory/forager.yaml`, with the integration declared under `gateway:`. Before,
   they said the runner and `runner.yaml`.
