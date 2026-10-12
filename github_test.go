@@ -679,9 +679,9 @@ func TestMintRefusesAnotherAPIBeforeAnythingIsSent(t *testing.T) {
 	}
 }
 
-func TestAKeyFileOthersMayReadIsRefused(t *testing.T) {
+func TestAKeyFileGroupOrOthersHavePermissionsIsRefused(t *testing.T) {
 	dir := t.TempDir()
-	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610} {
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610, 0o620, 0o601} {
 		open := filepath.Join(dir, "open.pem")
 		os.Remove(open)
 		os.WriteFile(open, keyPEM(t), mode)

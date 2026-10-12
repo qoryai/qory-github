@@ -44,12 +44,12 @@ func ParseKey(b []byte) (*rsa.PrivateKey, error) {
 // file apart: an RSA key in PEM is a few kilobytes.
 const maxKeyFile = 64 << 10
 
-// ReadKeyFile reads an App's private key from a file that only its owner may read. It
-// opens the file once, never through a symbolic link and without waiting on a pipe, and
-// reads what it opened: a file that is not a regular one, that grants group or others
-// any permission, or that belongs to another user than the one the program runs as is
-// refused before it is read, and one larger than a key is refused having read at most
-// one byte more than a key may hold.
+// ReadKeyFile reads an App's private key from a file that only its owner has any
+// permission on. It opens the file once, never through a symbolic link and without
+// waiting on a pipe, and reads what it opened: a file that is not a regular one, that
+// grants group or others any permission, or that belongs to another user than the one
+// the program runs as is refused before it is read, and one larger than a key is
+// refused having read at most one byte more than a key may hold.
 func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, syscall.ELOOP) {
