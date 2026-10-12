@@ -686,7 +686,7 @@ func TestAKeyFileOthersMayReadIsRefused(t *testing.T) {
 		os.Remove(open)
 		os.WriteFile(open, keyPEM(t), mode)
 		os.Chmod(open, mode)
-		if _, err := ReadKeyFile(open); err == nil || !strings.Contains(err.Error(), "others may read it") {
+		if _, err := ReadKeyFile(open); err == nil || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0600") {
 			t.Errorf("%s: err %v", mode, err)
 		}
 	}
