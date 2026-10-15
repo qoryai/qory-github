@@ -53,6 +53,7 @@ func newWired(t *testing.T, dir string) *wired {
 	w.client.Log = logger
 	w.client.Unlinked = func(ref string, began uint64) { unlinkSince(st, ref, began) }
 	w.client.Ended = endedIn(st, logger)
+	w.client.Answered = answeredIn(st, logger)
 	w.client.ConnectionOf = func(ref string) string { c, _ := connectionOf(st, ref); return c }
 	w.client.Sleep = func(_ context.Context, d time.Duration) error {
 		w.mu.Lock()
@@ -630,17 +631,17 @@ func TestADisconnectOfAConnectionIsSentAgainOn403(t *testing.T) {
 	}{
 		"204 at the third": {func(n int) (int, string) {
 			if n < 3 {
-				return 403, `{"error":"forbidden"}`
+				return 403, `{"error":"connection_unknown"}`
 			}
 			return 0, ""
 		}, 3},
 		"connection_ended at the second": {func(n int) (int, string) {
 			if n < 2 {
-				return 403, `{"error":"forbidden"}`
+				return 403, `{"error":"connection_unknown"}`
 			}
 			return 409, `{"error":"connection_ended"}`
 		}, 2},
-		"403 that lasts": {func(int) (int, string) { return 403, `{"error":"forbidden"}` }, 5},
+		"403 that lasts": {func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }, 5},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkPending)
@@ -739,14 +740,14 @@ func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing
 }
 
 // TestAListingNamesTheConnectionAndMakesItsLinkLive lists a pending installation's
-// repositories: each part names the link's connection, a 403 leaves the link pending,
-// and a signed 204 makes it live.
+// repositories: each part names the link's connection, a 403 leaves the link pending
+// while its connect return lives, and a signed 204 makes it live.
 func TestAListingNamesTheConnectionAndMakesItsLinkLive(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkPending)
+	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.apiary.refuse = func(_ string, n int) (int, string) {
 		if n <= 2 {
-			return 403, `{"error":"forbidden"}`
+			return 403, `{"error":"connection_unknown"}`
 		}
 		return 0, ""
 	}
@@ -1576,7 +1577,7 @@ func TestQoryApiarysRefusals(t *testing.T) {
 	}{
 		{400, `{"error":"invalid_request"}`, true, false},
 		{400, `{"error":"unsupported_contract_version"}`, true, false},
-		{403, `{"error":"forbidden"}`, true, false},
+		{403, `{"error":"connection_unknown"}`, true, false},
 		{413, `{}`, true, false},
 		{409, `{"error":"collection_not_linked"}`, true, false},
 		{401, `{"error":"unauthorized"}`, false, true},
@@ -1752,6 +1753,133 @@ func TestTheWireMatchesTheContractsSignedFixtures(t *testing.T) {
 			if g.Headers[k] != v {
 				t.Errorf("%s: %s %q, want %q", want.Target, k, g.Headers[k], v)
 			}
+		}
+	}
+}
+
+// TestA403ConnectionUnknownForADayEndsALiveConnection notes Qory Apiary's answers about
+// a connection: one 403 connection_unknown ends nothing, and its time survives in the
+// store; 403s that run for a day end it; a 2xx between them starts the day again; a 403
+// with another code never counts; and a pending connection is never ended by them.
+func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	st := openStore(t, dir)
+	Link(st, 42, testConnection, linkLive)
+	at := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	note := func(status int, code string, d time.Duration) bool {
+		t.Helper()
+		end, err := noteAnswer(st, testConnection, status, code, at.Add(d))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return end
+	}
+	if note(403, codeConnectionUnknown, 0) || note(403, codeConnectionUnknown, forbiddenFor-time.Second) {
+		t.Error("a 403 within a day ends the connection")
+	}
+	if b, err := st.Get(nsForbidden, testConnection); err != nil || string(b) != strconv.FormatInt(at.Unix(), 10) {
+		t.Errorf("the first 403 is kept as %q, %v", b, err)
+	}
+	if !note(403, codeConnectionUnknown, forbiddenFor) {
+		t.Error("403s for a day do not end the connection")
+	}
+	// A 2xx starts the day again.
+	if note(204, "", forbiddenFor) || note(403, codeConnectionUnknown, forbiddenFor+time.Hour) || note(403, codeConnectionUnknown, 2*forbiddenFor) {
+		t.Error("a 2xx did not start the day again")
+	}
+	if !note(403, codeConnectionUnknown, 2*forbiddenFor+time.Hour) {
+		t.Error("403s for a day after the 2xx do not end the connection")
+	}
+	// Another code never counts.
+	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	Link(st2, 42, testConnection, linkLive)
+	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+		if end, err := noteAnswer(st2, testConnection, 403, "forbidden", at.Add(d)); end || err != nil {
+			t.Errorf("a 403 forbidden counts: %v, %v", end, err)
+		}
+	}
+	if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
+		t.Error("a 403 forbidden is kept")
+	}
+	// A pending connection is never ended.
+	st3 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	Link(st3, 42, testConnection, linkPending)
+	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+		if end, err := noteAnswer(st3, testConnection, 403, codeConnectionUnknown, at.Add(d)); end || err != nil {
+			t.Errorf("a pending connection ends: %v, %v", end, err)
+		}
+	}
+	// The first 403's time survives a restart.
+	st.Close()
+	st = openStore(t, dir)
+	if end, err := noteAnswer(st, testConnection, 403, codeConnectionUnknown, at.Add(3*forbiddenFor+2*time.Hour)); !end || err != nil {
+		t.Errorf("after a restart: %v, %v", end, err)
+	}
+}
+
+// TestAConnectionRefusedForADayIsDropped has the connection's first 403 kept 25 hours
+// ago: the next 403 connection_unknown to a listing drops the installation's link and
+// logs it.
+func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.st.Put(nsForbidden, testConnection, []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10)), 0)
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	if err := w.adapter.listRepositories(context.Background(), 42); !refusedAs(err, 403, codeConnectionUnknown) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("still linked")
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("the first 403 is kept")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAPendingLinksLastListingDecidesIt lists a pending link past its connect return's
+// expiry and returnSkew more: a signed 204 makes it live; a 403 connection_unknown drops
+// it and logs it; a 409 connection_ended drops it; a 500, an answer not signed under the
+// pin, or a 403 with another code keeps it. Before that moment, a 403
+// connection_unknown keeps it.
+func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
+	past := time.Now().Add(-returnSkew - time.Minute).Unix()
+	for name, tc := range map[string]struct {
+		status   int
+		body     string
+		unsigned bool
+		ret      int64
+		want     string
+	}{
+		"204":                    {0, "", false, past, linkLive},
+		"403 connection_unknown": {403, `{"error":"connection_unknown"}`, false, past, ""},
+		"409 connection_ended":   {409, `{"error":"connection_ended"}`, false, past, ""},
+		"500":                    {500, `{"error":"internal"}`, false, past, linkPending},
+		"not signed":             {0, "", true, past, linkPending},
+		"403 forbidden":          {403, `{"error":"forbidden"}`, false, past, linkPending},
+		"before the moment":      {403, `{"error":"connection_unknown"}`, false, time.Now().Add(returnFor).Unix(), linkPending},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: tc.ret})
+		if tc.status != 0 {
+			w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
+		}
+		if tc.unsigned {
+			w.apiary.signer = newKey(t)
+		}
+		err := w.adapter.listFor(context.Background(), 42, testConnection, false)
+		l, ok, _ := linkOf(w.st, 42)
+		if got := map[bool]string{true: l.State}[ok]; got != tc.want {
+			t.Errorf("%s: the link %q, err %v", name, got, err)
+		}
+		dropped := strings.Contains(w.log.String(), `"msg":"the connection was not made in time, so its pending link is dropped","connection":"`+testConnection+`","installation":42`)
+		if dropped != (name == "403 connection_unknown") {
+			t.Errorf("%s: the log %s", name, w.log.String())
+		}
+		if (err == nil) != (name == "204" || name == "403 connection_unknown") && name != "409 connection_ended" {
+			t.Errorf("%s: err %v", name, err)
 		}
 	}
 }

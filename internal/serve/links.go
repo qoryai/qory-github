@@ -3,11 +3,13 @@ package serve
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/qory-github/internal/store"
@@ -26,6 +28,15 @@ import (
 //     repositories. The installation's link names the connection the repository's
 //     collection belongs to.
 //   - adapter: the instance id, the change feed's cursor and the sync interval.
+//   - connections_forbidden: when Qory Apiary first answered 403 connection_unknown to
+//     a request for a live connection since its last 2xx, by the connection's id, see
+//     [noteAnswer].
+//   - connections_replaced: a pending link a connect for another connection replaced,
+//     by the replaced connection's id, until its last listing, see [keepReplaced].
+//   - installations_deleted: an installation GitHub deleted, by its id, for
+//     [deletedFor], see [keepDeleted].
+//   - connections_passes: the expiry of the newest pass a linked connect return was
+//     minted under, by the connection's id, see [keepPass].
 //   - pulls: when the last pull of a collection that finished without error began, and
 //     when its last listing of open issues began, by its ref in lower case, see
 //     [pullMark].
@@ -35,6 +46,10 @@ const (
 	nsRepositories  = "repositories"
 	nsAdapter       = "adapter"
 	nsPulls         = "pulls"
+	nsForbidden     = "connections_forbidden"
+	nsReplaced      = "connections_replaced"
+	nsPasses        = "connections_passes"
+	nsDeleted       = "installations_deleted"
 
 	keyInstanceID   = "instance_id"
 	keyCursor       = "cursor"
@@ -53,11 +68,15 @@ const (
 // ac_ and 16 characters; the link's state, [linkPending] or [linkLive]; and when the
 // connect pass the link was made under expires, in Unix seconds, or 0 when no pass
 // made it. Qory Apiary issues a connection's passes in order, so the pass that expires
-// later is the newer, see [Connect.link].
+// later is the newer, see [Connect.link]. Return is when the linked connect return
+// minted for the link expires, in Unix seconds, or 0 when none was: a link pending past
+// it and [returnSkew] more is listed once more, and a 403 drops it, see
+// [Adapter.listConnection].
 type link struct {
 	Connection string `json:"connection_id"`
 	State      string `json:"state"`
 	Pass       int64  `json:"pass_expires_at,omitempty"`
+	Return     int64  `json:"return_expires_at,omitempty"`
 }
 
 // connectionShape is a connection's id, the contract's pattern.
@@ -80,7 +99,7 @@ func putLink(st *store.Store, installation int64, l link) error {
 	if installation <= 0 {
 		return errors.New("an installation's id is positive")
 	}
-	if !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 {
+	if !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 {
 		return errors.New("a link names a connection and is pending or live")
 	}
 	b, err := json.Marshal(l)
@@ -114,7 +133,7 @@ func linkOf(st *store.Store, installation int64) (link, bool, error) {
 		return link{}, false, err
 	}
 	var l link
-	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 {
+	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 {
 		return link{}, false, errors.New("the store's entry for an installation is not one")
 	}
 	return l, true, nil
@@ -173,6 +192,12 @@ func dropConnection(st *store.Store, connection string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if err := forgetForbidden(st, connection); err != nil {
+		return false, err
+	}
+	if err := forgetReplaced(st, connection); err != nil {
+		return false, err
+	}
 	dropped := false
 	for _, id := range installations {
 		installMu.Lock()
@@ -187,6 +212,166 @@ func dropConnection(st *store.Store, connection string) (bool, error) {
 		}
 	}
 	return dropped, nil
+}
+
+// forbiddenFor is how long Qory Apiary answers 403 connection_unknown, and no 2xx, to
+// the requests for a live connection before serve takes the connection as ended: Qory
+// Apiary answers so once it no longer holds a connection, as after its organisation is
+// removed, not connection_ended, and such a 403 may also be passing. A day matches how
+// long serve lets other failures last before it says so, see [outageFor]. The first 403
+// is kept in the store, so a restart does not start the day again.
+const forbiddenFor = 24 * time.Hour
+
+// forbiddenMu orders the reads and writes of nsForbidden.
+var forbiddenMu sync.Mutex
+
+// lasting is whether a 403 with the refusal code code counts toward a 403 that lasts:
+// connection_unknown alone does.
+func lasting(code string) bool { return code == codeConnectionUnknown }
+
+// noteAnswer notes Qory Apiary's signed answer, status and refusal code, at at, to a
+// request for connection, and says whether the connection is to be taken as ended, as
+// on 409 connection_ended: a 2xx forgets the connection's first 403; a 403 that
+// [lasting] counts, for a connection an installation is linked to live, is kept as the
+// first, unless one is kept already, and then ends the connection once [forbiddenFor]
+// has passed since it. A pending link is never ended by 403s: Qory Apiary answers its
+// listings 403 until the browser brings the connect return.
+func noteAnswer(st *store.Store, connection string, status int, code string, at time.Time) (bool, error) {
+	forbiddenMu.Lock()
+	defer forbiddenMu.Unlock()
+	if status >= 200 && status < 300 {
+		return false, forgetForbidden(st, connection)
+	}
+	if status != http.StatusForbidden || !lasting(code) {
+		return false, nil
+	}
+	live, err := connectionLive(st, connection)
+	if err != nil || !live {
+		return false, err
+	}
+	b, err := st.Get(nsForbidden, connection)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	since, perr := strconv.ParseInt(string(b), 10, 64)
+	if err != nil || perr != nil || since <= 0 {
+		return false, st.Put(nsForbidden, connection, []byte(strconv.FormatInt(at.Unix(), 10)), 0)
+	}
+	return !at.Before(time.Unix(since, 0).Add(forbiddenFor)), nil
+}
+
+// forgetForbidden forgets the connection's first 403.
+func forgetForbidden(st *store.Store, connection string) error {
+	if ok, err := present(st.Get(nsForbidden, connection)); err != nil || !ok {
+		return err
+	}
+	return st.Delete(nsForbidden, connection)
+}
+
+// connectionLive is whether an installation is linked to connection, live.
+func connectionLive(st *store.Store, connection string) (bool, error) {
+	installations, err := linkedTo(st, connection)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range installations {
+		if l, ok, err := linkOf(st, id); err != nil || (ok && l.Connection == connection && l.State == linkLive) {
+			return err == nil, err
+		}
+	}
+	return false, nil
+}
+
+// replaced is what the store keeps of a pending link a connect for another connection
+// replaced: the installation it linked, and when the connect return minted for it
+// expires, in Unix seconds. Until its last listing, past that and [returnSkew] more,
+// each listing of its connection is complete and names no collection, and a 204 to one
+// ends the connection, see [Adapter.listReplaced].
+type replaced struct {
+	Installation int64 `json:"installation"`
+	Return       int64 `json:"return_expires_at"`
+}
+
+// keepReplaced keeps that the installation's pending link l was replaced.
+func keepReplaced(st *store.Store, installation int64, l link) error {
+	b, err := json.Marshal(replaced{Installation: installation, Return: l.Return})
+	if err != nil {
+		return err
+	}
+	return st.Put(nsReplaced, l.Connection, b, 0)
+}
+
+// replacedOf is what the store keeps of the replaced connection, or false.
+func replacedOf(st *store.Store, connection string) (replaced, bool, error) {
+	b, err := st.Get(nsReplaced, connection)
+	if errors.Is(err, store.ErrNotFound) {
+		return replaced{}, false, nil
+	}
+	if err != nil {
+		return replaced{}, false, err
+	}
+	var r replaced
+	if json.Unmarshal(b, &r) != nil || r.Installation <= 0 || r.Return < 0 {
+		return replaced{}, false, errors.New("the store's entry for a replaced connection is not one")
+	}
+	return r, true, nil
+}
+
+// forgetReplaced forgets the replaced connection.
+func forgetReplaced(st *store.Store, connection string) error {
+	if ok, err := present(st.Get(nsReplaced, connection)); err != nil || !ok {
+		return err
+	}
+	return st.Delete(nsReplaced, connection)
+}
+
+// keepPass keeps pass, a pass's expiry in Unix seconds, as the newest a linked connect
+// return was minted under for connection, in place of an older one. It is kept until
+// that expiry, [sessionFor] and [returnFor] more: a pass that expired before it was
+// accepted before then, and its session has ended by then, so no older pass reaches a
+// link afterwards; the return's lifetime is a margin. A connection's end leaves it.
+// The caller holds installMu, as for the link it writes.
+func keepPass(st *store.Store, connection string, pass int64, now time.Time) error {
+	newest, err := newestPass(st, connection)
+	if err != nil {
+		return err
+	}
+	pass = max(pass, newest)
+	ttl := max(time.Unix(pass, 0).Add(sessionFor+returnFor).Sub(now), time.Second)
+	return st.Put(nsPasses, connection, []byte(strconv.FormatInt(pass, 10)), ttl)
+}
+
+// newestPass is the expiry of the newest pass a linked connect return was minted under
+// for connection, see [keepPass], or 0.
+func newestPass(st *store.Store, connection string) (int64, error) {
+	b, err := st.Get(nsPasses, connection)
+	if errors.Is(err, store.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	pass, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil || pass <= 0 {
+		return 0, errors.New("the store's entry for a connection's newest pass is not one")
+	}
+	return pass, nil
+}
+
+// deletedFor is how long the store keeps that GitHub deleted an installation, see
+// [keepDeleted]: a day, far past any connect under way when it was deleted.
+const deletedFor = 24 * time.Hour
+
+// keepDeleted keeps, for [deletedFor], that GitHub deleted the installation, so a
+// connect that confirmed it before the deletion links nothing after it, see
+// [Connect.link].
+func keepDeleted(st *store.Store, installation int64) error {
+	return st.Put(nsDeleted, strconv.FormatInt(installation, 10), []byte("1"), deletedFor)
+}
+
+// wasDeleted is whether GitHub deleted the installation, see [keepDeleted].
+func wasDeleted(st *store.Store, installation int64) (bool, error) {
+	return present(st.Get(nsDeleted, strconv.FormatInt(installation, 10)))
 }
 
 // dropInstallation drops what the store keeps of the installation: the records of the
@@ -232,7 +417,7 @@ func collectionKey(ref string) string { return strings.ToLower(ref) }
 // of the process. linkMu orders a link and an unlink of one store.
 var (
 	linkClock atomic.Uint64
-	linkedAt  sync.Map // linkMark → uint64
+	linkedAt  sync.Map // linkMark -> uint64
 	linkMu    sync.Mutex
 )
 

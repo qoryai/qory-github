@@ -6,14 +6,17 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"html"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +41,9 @@ type connectRig struct {
 
 	mu    sync.Mutex
 	waits []time.Duration
+	// budget is how much of the waits pass at once; a wait past it holds until its
+	// context is done, as time that has not passed yet.
+	budget time.Duration
 }
 
 func newConnectRig(t *testing.T) *connectRig {
@@ -53,16 +59,29 @@ func newConnectRig(t *testing.T) *connectRig {
 }
 
 // connect is a Connect on st, as Run makes it, whose waits between a first listing's
-// tries are noted and pass at once.
+// tries are noted and pass at once, up to the rig's budget, two minutes unless a test
+// sets it: the waits past it hold until the Connect stops.
 func (rig *connectRig) connect(st *store.Store) *Connect {
 	rig.adapter.Store = st
 	return &Connect{
 		Store: st, Adapter: rig.adapter, Pin: pinOf(rig.signer), AdapterID: testAdapterID, Key: rig.access, ClientID: testClientID, ClientSecret: []byte(clientSecret),
 		PublicURL: "https://qory-github.example.com", ApiaryURL: rig.apiary.srv.URL, Log: rig.adapter.Log,
-		sleep: func(_ context.Context, d time.Duration) error {
+		sleep: func(ctx context.Context, d time.Duration) error {
 			rig.mu.Lock()
-			defer rig.mu.Unlock()
 			rig.waits = append(rig.waits, d)
+			var sum time.Duration
+			for _, w := range rig.waits {
+				sum += w
+			}
+			budget := rig.budget
+			rig.mu.Unlock()
+			if budget == 0 {
+				budget = 2 * time.Minute
+			}
+			if sum > budget {
+				<-ctx.Done()
+				return ctx.Err()
+			}
 			return nil
 		},
 	}
@@ -102,11 +121,13 @@ func (rig *connectRig) passAt(connection string, expires time.Time) string {
 	return p
 }
 
-// browser is one browser: it keeps the connect cookie as the answers set and drop it.
+// browser is one browser: it keeps the connect cookie, and the page's, as the answers
+// set and drop them.
 type browser struct {
 	t      *testing.T
 	h      http.Handler
 	cookie *http.Cookie
+	page   *http.Cookie
 }
 
 func (rig *connectRig) browser(t *testing.T) *browser { return &browser{t: t, h: rig.h} }
@@ -114,34 +135,105 @@ func (rig *connectRig) browser(t *testing.T) *browser { return &browser{t: t, h:
 // get requests target, a path and its query, with the cookie the browser holds.
 func (b *browser) get(target string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(http.MethodGet, target, nil)
-	if b.cookie != nil {
-		r.AddCookie(&http.Cookie{Name: b.cookie.Name, Value: b.cookie.Value})
+	for _, ck := range []*http.Cookie{b.cookie, b.page} {
+		if ck != nil {
+			r.AddCookie(&http.Cookie{Name: ck.Name, Value: ck.Value})
+		}
 	}
 	rec := httptest.NewRecorder()
 	b.h.ServeHTTP(rec, r)
 	for _, ck := range rec.Result().Cookies() {
-		if ck.Name != connectCookie {
+		kept := &b.cookie
+		switch ck.Name {
+		case connectCookie:
+		case pageCookie:
+			kept = &b.page
+		default:
 			continue
 		}
 		if ck.MaxAge < 0 {
-			b.cookie = nil
+			*kept = nil
 		} else {
-			b.cookie = ck
+			*kept = ck
 		}
 	}
 	return rec
 }
 
-// start runs the first step with the pass and returns the state GitHub's sign-in was
-// handed, which it sends back.
+// passRefused brings target, a request that may carry a pass, which must answer 303
+// to the page's address, with no part of the query in it, and the page's cookie, then
+// follows it, which must show the page rf.
+func (b *browser) passRefused(target string, rf refusal) {
+	b.t.Helper()
+	rec := b.get(target)
+	loc := rec.Header().Get("Location")
+	if rec.Code != http.StatusSeeOther || loc != "/v1/connect/refused" || rec.Body.Len() != 0 || rec.Header().Get("Referrer-Policy") != "no-referrer" || rec.Header().Get("Cache-Control") != "no-store" {
+		b.t.Errorf("%d %v %q, want 303 to the page", rec.Code, rec.Header(), rec.Body)
+	}
+	if _, query, _ := strings.Cut(target, "?"); query != "" {
+		for _, part := range strings.FieldsFunc(query, func(r rune) bool { return r == '=' || r == '&' || r == '.' }) {
+			if len(part) >= 8 && strings.Contains(loc, part) {
+				b.t.Errorf("the page's address %s holds %q", loc, part)
+			}
+		}
+	}
+	if b.page == nil || b.page.Value == "" || !b.page.HttpOnly || !b.page.Secure || b.page.MaxAge <= 0 || b.page.MaxAge > 60 || strings.Contains(target, b.page.Value+".") {
+		b.t.Errorf("the page's cookie %+v", b.page)
+	}
+	refused(b.t, b.get("/v1/connect/refused"), rf)
+	if b.page != nil {
+		b.t.Error("the page's cookie is kept")
+	}
+}
+
+// start runs the first step with the pass, which answers 303 to the continue address,
+// and that one, and returns the state GitHub's sign-in was handed, which it sends back.
 func (b *browser) start(pass string) string {
 	b.t.Helper()
 	rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/v1/connect/continue" || rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
+		b.t.Fatalf("connect: %d %v %s", rec.Code, rec.Header(), rec.Body)
+	}
+	rec = b.get("/v1/connect/continue")
 	if rec.Code != http.StatusSeeOther {
-		b.t.Fatalf("connect: %d %s", rec.Code, rec.Body)
+		b.t.Fatalf("continue: %d %s", rec.Code, rec.Body)
 	}
 	u, _ := url.Parse(rec.Header().Get("Location"))
 	return u.Query().Get("state")
+}
+
+// authorize follows rec, a 303 to GitHub's sign-in, as GitHub does for a person who
+// authorised the App: back to the callback URL, with a code and the state.
+func (b *browser) authorize(rec *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	b.t.Helper()
+	u, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || u.Path != "/login/oauth/authorize" {
+		b.t.Fatalf("not sent to GitHub's sign-in: %d %v %s", rec.Code, rec.Header(), rec.Body)
+	}
+	return b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + url.QueryEscape(u.Query().Get("state")))
+}
+
+// bindTarget brings GitHub's Setup URL naming the installation, which must send the
+// browser to GitHub's sign-in again, and returns the callback GitHub sends it back to.
+func (b *browser) bindTarget(installation string) string {
+	b.t.Helper()
+	rec := b.get("/v1/connect/return?installation_id=" + installation + "&setup_action=install")
+	u, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || u.Path != "/login/oauth/authorize" {
+		b.t.Fatalf("not sent to GitHub's sign-in: %d %v %s", rec.Code, rec.Header(), rec.Body)
+	}
+	return "/v1/connect/authorized?code=" + signInCode + "&state=" + url.QueryEscape(u.Query().Get("state"))
+}
+
+// finish brings GitHub's Setup URL with query, and, when it sends the browser to
+// GitHub's sign-in again, follows it, and returns the last answer.
+func (b *browser) finish(query string) *httptest.ResponseRecorder {
+	b.t.Helper()
+	rec := b.get("/v1/connect/return?" + query)
+	if u, _ := url.Parse(rec.Header().Get("Location")); rec.Code == http.StatusSeeOther && u.Path == "/login/oauth/authorize" {
+		return b.authorize(rec)
+	}
+	return rec
 }
 
 // signIn runs the first two steps with the pass and returns the answer to the second,
@@ -153,14 +245,14 @@ func (b *browser) signIn(pass string) *httptest.ResponseRecorder {
 	return b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + url.QueryEscape(state))
 }
 
-// connect runs every step, GitHub's Setup URL naming the installation, and returns the
-// last answer.
+// connect runs every step, GitHub's Setup URL naming the installation, then the second
+// sign-in, and returns the last answer.
 func (b *browser) connect(pass string, installation string) *httptest.ResponseRecorder {
 	b.t.Helper()
 	if rec := b.signIn(pass); rec.Code != http.StatusSeeOther && rec.Code != http.StatusOK {
 		b.t.Fatalf("authorized: %d %s", rec.Code, rec.Body)
 	}
-	return b.get("/v1/connect/return?installation_id=" + installation + "&setup_action=install")
+	return b.finish("installation_id=" + installation + "&setup_action=install")
 }
 
 // refused checks that rec is the refusal rf: its status and its page, plain text,
@@ -309,9 +401,9 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 	}
 	// Each refusal is the page, and starts no session.
 	b := rig.browser(t)
-	refused(t, b.get("/v1/connect?state="+url.QueryEscape(signPass(other, good))), refusePass)
-	refused(t, b.get("/v1/connect"), refusePass)
-	refused(t, b.get("/v1/connect?state=a&state=b"), refusePass)
+	b.passRefused("/v1/connect?state="+url.QueryEscape(signPass(other, good)), refusePass)
+	b.passRefused("/v1/connect", refusePass)
+	b.passRefused("/v1/connect?state=a&state=b", refusePass)
 	if b.cookie != nil {
 		t.Error("a refused pass set a cookie")
 	}
@@ -383,19 +475,19 @@ func TestTheConnectReturnIsTheContractsSignedFixture(t *testing.T) {
 	}
 	at := time.Date(2026, 10, 15, 12, 0, 0, 900_000_000, time.UTC)
 	c := &Connect{Key: access, now: func() time.Time { return at }}
-	ret, err := c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeLinked, "")
+	ret, err := c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeLinked, "", at.Add(returnFor))
 	if err != nil || ret != doc.Token {
 		t.Errorf("the connect return\n%s\nwant\n%s\n%v", ret, doc.Token, err)
 	}
 	b, _ := fs.ReadFile(contracts.FS, "fixtures/adapter/connect-return/refused-grant-taken.json")
 	var want bytes.Buffer
 	json.Compact(&want, b)
-	ret, _ = c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeRefused, reasonGrantTaken)
+	ret, _ = c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeRefused, reasonGrantTaken, at.Add(returnFor))
 	enc, _, _ := strings.Cut(ret, ".")
 	if p, _ := base64.RawURLEncoding.DecodeString(enc); string(p) != want.String() {
 		t.Errorf("the refused return's payload %s, want %s", p, want.String())
 	}
-	ret, _ = c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeCancelled, reasonGrantTaken)
+	ret, _ = c.connectReturn("ac_f1xt0re000000000", "AAECAwQFBgcICQoLDA0ODw", outcomeCancelled, reasonGrantTaken, at.Add(returnFor))
 	enc, _, _ = strings.Cut(ret, ".")
 	if p, _ := base64.RawURLEncoding.DecodeString(enc); strings.Contains(string(p), "reason") || !strings.Contains(string(p), `"outcome":"cancelled"`) {
 		t.Errorf("the cancelled return's payload %s", p)
@@ -408,7 +500,7 @@ func TestAPassIsTakenOnceEvenAfterARestart(t *testing.T) {
 	if rec := rig.browser(t).get("/v1/connect?state=" + url.QueryEscape(pass)); rec.Code != http.StatusSeeOther {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
-	refused(t, rig.browser(t).get("/v1/connect?state="+url.QueryEscape(pass)), refuseUsed)
+	rig.browser(t).passRefused("/v1/connect?state="+url.QueryEscape(pass), refuseUsed)
 	// serve stops and starts again on the same store: the nonce is kept.
 	dir := filepath.Join(t.TempDir(), "state")
 	st, err := store.Open(dir, store.Options{})
@@ -425,31 +517,42 @@ func TestAPassIsTakenOnceEvenAfterARestart(t *testing.T) {
 	st = openStore(t, dir)
 	c = rig.connect(st)
 	defer c.stop()
-	refused(t, (&browser{t: t, h: c.Route(rig.mux)}).get("/v1/connect?state="+url.QueryEscape(pass)), refuseUsed)
+	(&browser{t: t, h: c.Route(rig.mux)}).passRefused("/v1/connect?state="+url.QueryEscape(pass), refuseUsed)
 	rig.noLeak(t)
 }
 
 // TestAPassThatArrivesLateGoesBackAsPassExpired brings a pass that verifies but has
 // expired, as one does past its 15 minutes, or one that expires too far ahead: each
 // goes back to Qory Apiary as a connect return, refused, pass_expired, and starts no
-// session.
+// session. Its expiry is checked before its nonce, which is never kept, so the same
+// pass brought again goes back the same way, never to the page of a pass used.
 func TestAPassThatArrivesLateGoesBackAsPassExpired(t *testing.T) {
 	rig := newConnectRig(t)
 	for _, expires := range []time.Time{time.Now().Add(-time.Second), time.Now().Add(-15 * time.Minute), time.Now().Add(16 * time.Minute)} {
 		pass := signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), expires))
-		b := rig.browser(t)
-		rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
-		r := rig.backTo(t, rec, testConnection)
-		if r.Outcome != outcomeRefused || r.Reason != reasonPassExpired {
-			t.Errorf("the connect return %+v", r)
-		}
-		if b.cookie != nil || len(rec.Result().Cookies()) != 0 {
-			t.Error("a session started")
+		rig.secrets = append(rig.secrets, pass)
+		for range 2 {
+			b := rig.browser(t)
+			rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
+			r := rig.backTo(t, rec, testConnection)
+			if r.Outcome != outcomeRefused || r.Reason != reasonPassExpired {
+				t.Errorf("the connect return %+v", r)
+			}
+			if b.cookie != nil || len(rec.Result().Cookies()) != 0 {
+				t.Error("a session started")
+			}
+			payload, sig, _ := strings.Cut(pass, ".")
+			if loc := rec.Header().Get("Location"); strings.Contains(loc, payload) || strings.Contains(loc, sig) {
+				t.Errorf("the return's address holds the pass: %s", loc)
+			}
 		}
 	}
-	if n := 0; rig.st.Each(nsConnectSessions, func(string, []byte) error { n++; return nil }) != nil || n != 0 {
-		t.Errorf("%d sessions are kept", n)
+	for ns, what := range map[string]string{nsConnectSessions: "sessions", nsConnectNonces: "nonces"} {
+		if n := 0; rig.st.Each(ns, func(string, []byte) error { n++; return nil }) != nil || n != 0 {
+			t.Errorf("%d %s are kept", n, what)
+		}
 	}
+	rig.noLeak(t)
 	if !strings.Contains(rig.log.String(), `"reason":"the pass has expired, or expires too far ahead","outcome":"refused","return_reason":"pass_expired"`) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
@@ -460,8 +563,13 @@ func TestTheSessionsCookie(t *testing.T) {
 	b := rig.browser(t)
 	pass := rig.pass()
 	rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
-	// GitHub's sign-in is asked for: the App's client id, a random state, which the
-	// sign-in brings back, and the callback URL under the public URL.
+	// The pass leaves the address: the browser goes to the continue address.
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/v1/connect/continue" || rec.Body.Len() != 0 || rec.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("%d %v %q", rec.Code, rec.Header(), rec.Body)
+	}
+	rec = b.get("/v1/connect/continue")
+	// GitHub's sign-in is asked for: the App's client id, a random state of 256 bits,
+	// which the sign-in brings back, and the callback URL under the public URL.
 	loc, _ := url.Parse(rec.Header().Get("Location"))
 	q := loc.Query()
 	if rec.Code != http.StatusSeeOther || loc.Scheme+"://"+loc.Host+loc.Path != rig.gh.srv.URL+"/login/oauth/authorize" || len(q) != 3 ||
@@ -472,9 +580,12 @@ func TestTheSessionsCookie(t *testing.T) {
 	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
 		t.Errorf("the headers %v", rec.Header())
 	}
-	// The session holds 30 minutes, whatever the pass's expiry.
+	if p, sig, _ := strings.Cut(pass, "."); strings.Contains(rec.Header().Get("Location"), p) || strings.Contains(rec.Header().Get("Location"), sig) {
+		t.Error("GitHub is sent the pass")
+	}
+	// The session holds 900 seconds, the contract's most, whatever the pass's expiry.
 	ck := b.cookie
-	if ck == nil || ck.Name != "__Secure-qory_github_connect" || !ck.HttpOnly || !ck.Secure || ck.SameSite != http.SameSiteLaxMode || ck.Path != "/v1/connect" || ck.MaxAge != 1800 || !idShape.MatchString(ck.Value) {
+	if ck == nil || ck.Name != "__Secure-qory_github_connect" || !ck.HttpOnly || !ck.Secure || ck.SameSite != http.SameSiteLaxMode || ck.Path != "/v1/connect" || ck.MaxAge != 900 || !idShape.MatchString(ck.Value) {
 		t.Fatalf("the cookie %+v", ck)
 	}
 	if strings.Contains(ck.Value, pass) || strings.Contains(pass, ck.Value) || ck.Value == q.Get("state") {
@@ -577,7 +688,7 @@ func TestTheSavePageIsShownWhenTheAppIsInstalled(t *testing.T) {
 	install := rig.gh.srv.URL + "/apps/" + testSlug + "/installations/new"
 	rec := rig.browser(t).signIn(rig.pass())
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" || rec.Header().Get("Location") != "" ||
-		!strings.Contains(rec.Body.String(), "press Save to finish") || !strings.Contains(rec.Body.String(), `<a href="`+install+`">`) {
+		!strings.Contains(rec.Body.String(), "press Save to finish") || !strings.Contains(rec.Body.String(), `<a href="`+install+`?state=`) {
 		t.Errorf("%d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
 	if rec.Header().Get("Referrer-Policy") != "no-referrer" || rec.Header().Get("Content-Security-Policy") != "default-src 'none'; frame-ancestors 'none'" {
@@ -585,7 +696,10 @@ func TestTheSavePageIsShownWhenTheAppIsInstalled(t *testing.T) {
 	}
 	rig.gh.userInstallations = nil
 	rec = rig.browser(t).signIn(rig.pass())
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != install || rec.Body.Len() != 0 {
+	// GitHub's page to install the App carries a state of 256 bits, which is not the
+	// pass, and which GitHub sends back to the Setup URL.
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || loc.Scheme+"://"+loc.Host+loc.Path != install || len(loc.Query()) != 1 || !idShape.MatchString(loc.Query().Get("state")) || rec.Body.Len() != 0 {
 		t.Errorf("%d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
 	rig.noLeak(t)
@@ -614,7 +728,7 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 		if n <= 4 {
 			// The connection is not made until Qory Apiary takes the return: the first
 			// listing and the part that ends it, then the next try's.
-			return 403, `{"error":"forbidden"}`
+			return 403, `{"error":"connection_unknown"}`
 		}
 		return 0, ""
 	}
@@ -630,11 +744,6 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 	if n := 0; rig.st.Each(nsConnectSessions, func(string, []byte) error { n++; return nil }) != nil || n != 0 {
 		t.Errorf("%d sessions are kept", n)
 	}
-	rig.c.tokenMu.Lock()
-	if len(rig.c.tokens) != 0 {
-		t.Errorf("%d tokens are held", len(rig.c.tokens))
-	}
-	rig.c.tokenMu.Unlock()
 	rig.linked(t, 42, testConnection, linkPending)
 	if _, err := rig.st.Get(nsUnlinked, "42"); err == nil {
 		t.Error("the installation is still kept unlinked")
@@ -662,7 +771,8 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 	if inst, ok, _ := reachOf(rig.st, "acme/widgets"); !ok || inst != 42 {
 		t.Errorf("the repository's installation is %d", inst)
 	}
-	if len(rig.gh.exchanges) != 1 || rig.gh.exchanges[0].Get("redirect_uri") != "https://qory-github.example.com/v1/connect/authorized" {
+	// Two sign-ins: the first before the installation, the second that binds it.
+	if len(rig.gh.exchanges) != 2 || rig.gh.exchanges[0].Get("redirect_uri") != "https://qory-github.example.com/v1/connect/authorized" || rig.gh.exchanges[1].Get("redirect_uri") != "https://qory-github.example.com/v1/connect/authorized" {
 		t.Errorf("exchanged %v", rig.gh.exchanges)
 	}
 	if !strings.Contains(rig.log.String(), `"msg":"connected","installation":42,"connection":"`+testConnection+`","again":false`) {
@@ -679,7 +789,7 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 func TestAUserAccountsInstallationIsLinkedByItsUser(t *testing.T) {
 	rig := newConnectRig(t)
 	// The connection is not made yet: Qory Apiary answers its listing 403.
-	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "7"), testConnection)
 	if r.Outcome != outcomeLinked {
 		t.Errorf("the connect return %+v", r)
@@ -798,7 +908,7 @@ func TestGitHubOutOfReachGoesBackAsSourceUnavailable(t *testing.T) {
 	b := rig.browser(t)
 	b.signIn(rig.pass())
 	rig.gh.userDown = true
-	r = rig.backTo(t, b.get("/v1/connect/return?installation_id=42&setup_action=install"), testConnection)
+	r = rig.backTo(t, b.finish("installation_id=42&setup_action=install"), testConnection)
 	if r.Outcome != outcomeRefused || r.Reason != reasonSourceUnavailable {
 		t.Errorf("%+v", r)
 	}
@@ -810,8 +920,10 @@ func TestGitHubOutOfReachGoesBackAsSourceUnavailable(t *testing.T) {
 
 // TestTheSetupURLsAnswerIsChecked brings back the Setup URL without an installation,
 // with one that is not GitHub's, for an installation that waits for an owner's
-// approval, and before the sign-in: each goes back refused, and nothing is linked. A
-// state the Setup URL carries, or not, changes nothing.
+// approval, with a state that is not the session's, and before the sign-in: each goes
+// back refused, and nothing is linked. Without a state, or with the session's, the
+// candidate is linked after the second sign-in. A restart between the steps changes
+// nothing: the session is in the store, and no token is kept.
 func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 	for query, want := range map[string]contracts.ConnectReturn{
 		"setup_action=request":                                       {Outcome: outcomeRefused, Reason: reasonPersonNotPermitted},
@@ -821,12 +933,23 @@ func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 		"installation_id=42&setup_action=uninstall":                  {Outcome: outcomeRefused, Reason: reasonGrantNotConfirmed},
 		"installation_id=42&installation_id=42&setup_action=install": {Outcome: outcomeRefused, Reason: reasonGrantNotConfirmed},
 		"error=access_denied":                                        {Outcome: outcomeCancelled},
-		"installation_id=42&setup_action=update&state=x":             {Outcome: outcomeLinked},
+		"installation_id=42&setup_action=update":                     {Outcome: outcomeLinked},
+		"installation_id=42&setup_action=update&state=x":             {Outcome: outcomeRefused, Reason: reasonGrantNotConfirmed},
+		"installation_id=42&setup_action=update&state=S&state=S":     {Outcome: outcomeRefused, Reason: reasonGrantNotConfirmed},
+		"installation_id=42&setup_action=install&state=S":            {Outcome: outcomeLinked},
 	} {
 		rig := newConnectRig(t)
+		rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 		b := rig.browser(t)
-		b.signIn(rig.pass())
-		rec := b.get("/v1/connect/return?" + query)
+		// The state GitHub's page to install the App carries, which the Setup URL brings
+		// back.
+		signed := b.signIn(rig.pass())
+		target := signed.Header().Get("Location")
+		if signed.Code == http.StatusOK {
+			target = html.UnescapeString(strings.Split(strings.Split(signed.Body.String(), `href="`)[1], `"`)[0])
+		}
+		u, _ := url.Parse(target)
+		rec := b.finish(strings.ReplaceAll(query, "state=S", "state="+url.QueryEscape(u.Query().Get("state"))))
 		r := rig.backTo(t, rec, testConnection)
 		if r.Outcome != want.Outcome || r.Reason != want.Reason {
 			t.Errorf("%s: %+v", query, r)
@@ -846,19 +969,22 @@ func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 	if r.Outcome != outcomeRefused || r.Reason != reasonGrantNotConfirmed {
 		t.Errorf("before the sign-in: %+v", r)
 	}
-	// The token is held in memory alone: a restart between the steps finds none.
-	b = rig.browser(t)
-	b.signIn(rig.pass())
-	rig.c.tokenMu.Lock()
-	clear(rig.c.tokens)
-	rig.c.tokenMu.Unlock()
-	r = rig.backTo(t, b.get("/v1/connect/return?installation_id=42&setup_action=install"), testConnection)
-	if r.Outcome != outcomeRefused || r.Reason != reasonGrantNotConfirmed {
-		t.Errorf("without the token: %+v", r)
-	}
 	if ok, _ := Linked(rig.st, 42); ok {
 		t.Error("linked")
 	}
+	// A restart between the steps: a new Connect on the store finishes the connect.
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	b = rig.browser(t)
+	b.signIn(rig.pass())
+	rig.c.stop()
+	c := rig.connect(rig.st)
+	defer c.stop()
+	b.h = c.Route(rig.mux)
+	r = rig.backTo(t, b.finish("installation_id=42&setup_action=install"), testConnection)
+	if r.Outcome != outcomeLinked {
+		t.Errorf("after a restart: %+v", r)
+	}
+	rig.linked(t, 42, testConnection, linkPending)
 	for _, s := range []string{userToken} {
 		rig.st.Each(nsConnectSessions, func(_ string, v []byte) error {
 			if strings.Contains(string(v), s) {
@@ -887,9 +1013,10 @@ func TestALiveLinkIsNotTakenByAnotherConnection(t *testing.T) {
 // TestAPendingLinkIsListedBeforeItIsReplaced connects an installation linked to another
 // connection that is pending: a listing for that connection goes first. Answered 204,
 // the connection was made meanwhile, the link is live, and the connect is refused,
-// grant_taken; 403, the link is replaced by the new connection, pending; 409
-// connection_ended, likewise; 409 connection_suspended, refused, grant_taken; any other
-// answer, refused, source_unavailable, a 403 not signed under the pin among them.
+// grant_taken; 403 connection_unknown, the link is replaced by the new connection,
+// pending; 409 connection_ended, likewise; 409 connection_suspended, refused,
+// source_unavailable; any other answer, refused, source_unavailable, a 403 not signed
+// under the pin and a 403 forbidden among them.
 func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status     int
@@ -900,11 +1027,12 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 		unsigned   bool
 	}{
 		"204":                  {0, "", otherConnection, linkLive, reasonGrantTaken, false},
-		"403":                  {403, `{"error":"forbidden"}`, testConnection, linkPending, "", false},
+		"403":                  {403, `{"error":"connection_unknown"}`, testConnection, linkPending, "", false},
 		"connection_ended":     {409, `{"error":"connection_ended"}`, testConnection, linkPending, "", false},
-		"connection_suspended": {409, `{"error":"connection_suspended"}`, otherConnection, linkPending, reasonGrantTaken, false},
+		"connection_suspended": {409, `{"error":"connection_suspended"}`, otherConnection, linkPending, reasonSourceUnavailable, false},
 		"500":                  {500, `oops`, otherConnection, linkPending, reasonSourceUnavailable, false},
-		"403 not signed":       {403, `{"error":"forbidden"}`, otherConnection, linkPending, reasonSourceUnavailable, true},
+		"403 not signed":       {403, `{"error":"connection_unknown"}`, otherConnection, linkPending, reasonSourceUnavailable, true},
+		"403 forbidden":        {403, `{"error":"forbidden"}`, otherConnection, linkPending, reasonSourceUnavailable, false},
 	} {
 		rig := newConnectRig(t)
 		if tc.unsigned {
@@ -923,7 +1051,7 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 			if n <= 2 {
 				return tc.status, tc.body
 			}
-			return 403, `{"error":"forbidden"}`
+			return 403, `{"error":"connection_unknown"}`
 		}
 		r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection)
 		want := outcomeRefused
@@ -967,10 +1095,16 @@ func TestTheReturnGoesToTheEnrolledOriginAlone(t *testing.T) {
 		}
 		return rec
 	}
-	rec := get("/v1/connect?state=" + url.QueryEscape(rig.pass()))
+	get("/v1/connect?state=" + url.QueryEscape(rig.pass()))
+	rec := get("/v1/connect/continue?x=1")
 	u, _ := url.Parse(rec.Header().Get("Location"))
 	get("/v1/connect/authorized?code=" + signInCode + "&state=" + u.Query().Get("state"))
-	rig.backTo(t, get("/v1/connect/return?installation_id=42&setup_action=install"), testConnection)
+	rec = get("/v1/connect/return?installation_id=42&setup_action=install")
+	u, _ = url.Parse(rec.Header().Get("Location"))
+	if !strings.HasPrefix(rec.Header().Get("Location"), rig.gh.srv.URL+"/login/oauth/authorize?") {
+		t.Fatalf("sent to %s", rec.Header().Get("Location"))
+	}
+	rig.backTo(t, get("/v1/connect/authorized?code="+signInCode+"&state="+u.Query().Get("state")), testConnection)
 	// A pass that verifies late goes back to the enrolled origin too.
 	late := signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), time.Now().Add(-time.Hour)))
 	rig.backTo(t, get("/v1/connect?state="+url.QueryEscape(late)), testConnection)
@@ -989,8 +1123,8 @@ func TestTheConnectPagesBounds(t *testing.T) {
 		}
 	}
 	// A query too long, or not one.
-	refused(t, b.get("/v1/connect?state="+strings.Repeat("A", maxConnectQuery)), refuseQuery)
-	refused(t, b.get("/v1/connect?state=%zz"), refuseQuery)
+	b.passRefused("/v1/connect?state="+strings.Repeat("A", maxConnectQuery), refuseQuery)
+	b.passRefused("/v1/connect?state=%zz", refuseQuery)
 	// Nothing the request carries is in a page.
 	rec := b.get("/v1/connect?state=%3Cscript%3Ealert(1)%3C/script%3E")
 	if strings.Contains(rec.Body.String(), "script") {
@@ -1069,7 +1203,7 @@ func TestAConnectThatWaitsPastItsDeadlineForTheLinkGoesBack(t *testing.T) {
 	b.signIn(rig.pass())
 	// Another connect holds the link.
 	rig.c.linking <- struct{}{}
-	r := httptest.NewRequest(http.MethodGet, "/v1/connect/return?installation_id=42&setup_action=install", nil)
+	r := httptest.NewRequest(http.MethodGet, b.bindTarget("42"), nil)
 	r.AddCookie(&http.Cookie{Name: connectCookie, Value: b.cookie.Value})
 	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -1155,7 +1289,7 @@ func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 	}
 	rig.c.stop()
 	rig.c.refill(42)
-	rig.c.listSoon(42, testConnection, true)
+	rig.c.listSoon(42, testConnection, true, time.Now().Add(returnFor))
 	rig.c.fillMu.Lock()
 	n = len(rig.c.refilling)
 	rig.c.fillMu.Unlock()
@@ -1200,68 +1334,70 @@ func (rig *connectRig) held(t *testing.T, installation int64, connection, state 
 
 // TestAConnectionHoldsOneInstallation connects the installation 7 to the connection
 // that the installation 42 is linked to already: live, the page refuses, and nothing
-// changes; pending, a listing for the connection goes first, and the link gives way
-// only to a newer pass while the connection is not made, Qory Apiary's 403; a pass as
-// old or older, or a connection made, Qory Apiary's 204, and the page refuses.
+// changes; pending, the link gives way at once, unlisted, to a newer pass, and to a pass
+// as old or older the page refuses. Qory Apiary failing, or answering unsigned, changes
+// none of that, since the link is not listed.
 func TestAConnectionHoldsOneInstallation(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	older, newer := now.Add(5*time.Minute), now.Add(10*time.Minute)
 	for name, tc := range map[string]struct {
 		state    string
 		pass     time.Time
-		listing  int
 		replaced bool
+		status   int
+		unsigned bool
 	}{
-		"live, a newer pass":              {linkLive, newer, 403, false},
-		"pending, a newer pass, 403":      {linkPending, newer, 403, true},
-		"pending, an older pass, 403":     {linkPending, older.Add(-time.Minute), 403, false},
-		"pending, a pass as old, 403":     {linkPending, older, 403, false},
-		"pending, a newer pass, 204":      {linkPending, newer, 0, false},
-		"pending, a newer pass, suspends": {linkPending, newer, 409, false},
+		"live, a newer pass":    {linkLive, newer, false, 403, false},
+		"pending, a newer pass": {linkPending, newer, true, 403, false},
+		"pending, an older one": {linkPending, older.Add(-time.Minute), false, 403, false},
+		"pending, one as old":   {linkPending, older, false, 403, false},
+		// Qory Apiary failing, or answering under a key the pin does not list, changes
+		// nothing: the link is not listed, and the passes alone decide.
+		"pending, a newer pass, Qory Apiary failing": {linkPending, newer, true, 500, false},
+		"pending, a newer pass, answers not signed":  {linkPending, newer, true, 403, true},
+		"pending, one as old, Qory Apiary failing":   {linkPending, older, false, 500, false},
+		"live, a newer pass, answers not signed":     {linkLive, newer, false, 403, true},
 	} {
 		rig := newConnectRig(t)
-		putLink(rig.st, 42, link{Connection: testConnection, State: tc.state, Pass: older.Unix()})
-		rig.apiary.refuse = func(route string, _ int) (int, string) {
-			switch {
-			case route != routeCollections:
-				return 0, ""
-			case tc.listing == 409:
-				return 409, `{"error":"connection_suspended"}`
-			case tc.listing == 403:
-				return 403, `{"error":"forbidden"}`
-			}
-			return 0, ""
+		putLink(rig.st, 42, link{Connection: testConnection, State: tc.state, Pass: older.Unix(), Return: time.Now().Add(returnFor).Unix()})
+		setReach(rig.st, "acme/widgets", 42)
+		rig.apiary.refuse = func(string, int) (int, string) { return tc.status, `{"error":"connection_unknown"}` }
+		if tc.unsigned {
+			rig.apiary.signer = newKey(t)
 		}
 		b := rig.browser(t)
 		rec := b.connect(rig.passAt(testConnection, tc.pass), "7")
+		rig.gh.mu.Lock()
+		mints := len(rig.gh.mints)
+		rig.gh.mu.Unlock()
+		if mints != 0 {
+			t.Errorf("%s: the installation 42 is listed", name)
+		}
 		if tc.replaced {
 			if r := rig.backTo(t, rec, testConnection); r.Outcome != outcomeLinked {
 				t.Errorf("%s: %+v", name, r)
 			}
 			rig.held(t, 7, testConnection, linkPending, tc.pass.Unix())
 			rig.linked(t, 42, "", "")
-			if refs, _ := reachedBy(rig.st, 42); len(refs) != 0 {
-				t.Errorf("%s: the replaced installation's repositories are kept: %v", name, refs)
+			if inst, ok, _ := reachOf(rig.st, "acme/widgets"); ok && inst == 42 {
+				t.Errorf("%s: the replaced installation's repositories are kept", name)
+			}
+			if !strings.Contains(rig.log.String(), `"msg":"a newer pass for the connection replaces its pending link","connection":"`+testConnection+`","installation":42`) {
+				t.Errorf("%s: the log: %s", name, rig.log.String())
+			}
+			if _, ok, _ := replacedOf(rig.st, testConnection); ok {
+				t.Errorf("%s: the connection is kept as replaced", name)
 			}
 		} else {
 			refused(t, rec, refuseHeld)
 			if b.cookie != nil {
 				t.Errorf("%s: the cookie is kept", name)
 			}
-			state := tc.state
-			if tc.listing == 0 {
-				state = linkLive
-			}
-			rig.held(t, 42, testConnection, state, older.Unix())
+			rig.held(t, 42, testConnection, tc.state, older.Unix())
 			rig.linked(t, 7, "", "")
-		}
-		sent := rig.apiary.sent(routeCollections)
-		if want := 1; tc.state == linkLive {
-			if len(sent) != 0 {
-				t.Errorf("%s: a live link is listed, %d", name, len(sent))
+			if n := len(rig.apiary.sent(routeCollections)); n != 0 {
+				t.Errorf("%s: %d listings", name, n)
 			}
-		} else if len(sent) < want || sent[0].body["connection_id"] != testConnection {
-			t.Errorf("%s: the first listing %v", name, sent)
 		}
 		rig.c.stop()
 		rig.noLeak(t)
@@ -1296,7 +1432,7 @@ func TestTwoPassesForOneConnectionLinkOneInstallation(t *testing.T) {
 			if route != routeCollections {
 				return 0, ""
 			}
-			return 403, `{"error":"forbidden"}`
+			return 403, `{"error":"connection_unknown"}`
 		}
 		var linked step
 		for i, s := range steps {
@@ -1353,7 +1489,7 @@ func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 			// Qory Apiary made the other connection and takes its listing.
 			return 0, ""
 		}
-		return 403, `{"error":"forbidden"}`
+		return 403, `{"error":"connection_unknown"}`
 	}
 	listed := make(chan error, 1)
 	go func() { listed <- rig.adapter.listConnection(context.Background(), 42, otherConnection) }()
@@ -1361,7 +1497,8 @@ func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 	b := rig.browser(t)
 	b.signIn(rig.pass())
 	answered := make(chan *httptest.ResponseRecorder, 1)
-	go func() { answered <- b.get("/v1/connect/return?installation_id=42&setup_action=install") }()
+	target := b.bindTarget("42")
+	go func() { answered <- b.get(target) }()
 	select {
 	case <-waiting:
 	case rec := <-answered:
@@ -1380,27 +1517,129 @@ func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 		t.Errorf("%d listings", n)
 	}
 
-	// A pending link replaced: the replaced connection's listing sends nothing.
-	rig = newConnectRig(t)
-	Link(rig.st, 42, otherConnection, linkPending)
-	rig.apiary.refuse = func(route string, _ int) (int, string) {
-		if route != routeCollections {
-			return 0, ""
+}
+
+// TestAReplacedConnectionIsListedEmptyUntilItsLastListing replaces the installation 42's
+// pending link to another connection with a connect: from then on each listing of the
+// replaced connection, the first listing's tries still running for it among them, is
+// complete and names no collection, and never the installation's repositories, and a
+// 403 connection_unknown keeps it until its last listing, which forgets it; a 204 to one
+// ends the connection, POST /v1/connections/disconnect, and forgets it; and the round
+// sends the last listing once its moment has come.
+func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
+	forbid := func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	replace := func(t *testing.T) *connectRig {
+		rig := newConnectRig(t)
+		putLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		rig.apiary.refuse = forbid
+		if r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
 		}
-		return 403, `{"error":"forbidden"}`
+		rig.c.stop()
+		if r, ok, _ := replacedOf(rig.st, otherConnection); !ok || r.Installation != 42 {
+			t.Fatalf("the replaced connection %+v %v", r, ok)
+		}
+		return rig
 	}
-	if r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection); r.Outcome != outcomeLinked {
-		t.Fatalf("%+v", r)
+	// empty checks every listing of the replaced connection from the one numbered from
+	// on is complete, in one part, and names no collection.
+	empty := func(t *testing.T, rig *connectRig, from int) int {
+		t.Helper()
+		n := 0
+		for _, s := range rig.apiary.sent(routeCollections)[from:] {
+			if s.body["connection_id"] != otherConnection {
+				continue
+			}
+			n++
+			var req contracts.SourceCollections
+			json.Unmarshal(s.raw, &req)
+			if len(req.Collections) != 0 || !req.Listing.Complete || req.Listing.Part != 1 {
+				t.Errorf("a listing of the replaced connection names collections: %s", s.raw)
+			}
+		}
+		return n
 	}
-	rig.c.stop()
+
+	rig := replace(t)
 	before := len(rig.apiary.sent(routeCollections))
+	// A first listing's tries still running for the replaced connection.
+	rig.c = rig.connect(rig.st)
+	rig.c.listSoon(42, otherConnection, false, time.Now().Add(returnFor))
+	eventually(t, "the first listing's tries", func() bool {
+		n := 0
+		for _, s := range rig.apiary.sent(routeCollections)[before:] {
+			if s.body["connection_id"] == otherConnection {
+				n++
+			}
+		}
+		return n >= 3
+	})
+	rig.c.stop()
+	if err := rig.adapter.listConnection(context.Background(), 42, otherConnection); !refusedAs(err, 403, codeConnectionUnknown) {
+		t.Errorf("err %v", err)
+	}
+	if n := empty(t, rig, before); n < 4 {
+		t.Errorf("%d listings of the replaced connection", n)
+	}
+	if _, ok, _ := replacedOf(rig.st, otherConnection); !ok {
+		t.Error("a 403 before the last listing forgot the replaced connection")
+	}
+	rig.linked(t, 42, testConnection, linkPending)
+	// The last listing: a 403 forgets it.
+	before = len(rig.apiary.sent(routeCollections))
+	if err := rig.adapter.listFor(context.Background(), 42, otherConnection, true); err != nil {
+		t.Errorf("err %v", err)
+	}
+	if n := empty(t, rig, before); n != 1 {
+		t.Errorf("%d last listings", n)
+	}
+	if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+		t.Error("the replaced connection is kept past its last listing")
+	}
+	if !strings.Contains(rig.log.String(), `"msg":"the replaced connection was not made, so it is forgotten","connection":"`+otherConnection+`","installation":42`) {
+		t.Errorf("the log: %s", rig.log.String())
+	}
+	if n := len(rig.apiary.sent(routeConnectionsDisconnect)); n != 0 {
+		t.Errorf("%d disconnects", n)
+	}
+
+	// A 204: the replaced connection was made meanwhile, and is ended.
+	rig = replace(t)
+	rig.apiary.refuse = nil
+	before = len(rig.apiary.sent(routeCollections))
 	if err := rig.adapter.listConnection(context.Background(), 42, otherConnection); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range rig.apiary.sent(routeCollections)[before:] {
-		t.Errorf("a listing for the replaced connection is sent: %s", s.raw)
+	empty(t, rig, before)
+	sent := rig.apiary.sent(routeConnectionsDisconnect)
+	if len(sent) != 1 || sent[0].body["connection_id"] != otherConnection {
+		t.Errorf("the disconnects %v", sent)
+	}
+	if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+		t.Error("the ended connection is kept as replaced")
 	}
 	rig.linked(t, 42, testConnection, linkPending)
+
+	// The round sends the last listing once its moment has come, and not before.
+	rig = replace(t)
+	clock := &pullClock{t: time.Now()}
+	p := &puller{adapter: rig.adapter, store: rig.st, log: rig.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}
+	before = len(rig.apiary.sent(routeCollections))
+	p.listReplaced(context.Background())
+	p.rounds.Wait()
+	if n := empty(t, rig, before); n != 0 {
+		t.Errorf("%d listings before the moment", n)
+	}
+	clock.sleep(context.Background(), returnFor+returnSkew+time.Second)
+	rig.adapter.now = clock.now
+	p.listReplaced(context.Background())
+	p.rounds.Wait()
+	if n := empty(t, rig, before); n != 1 {
+		t.Errorf("%d listings at the moment", n)
+	}
+	if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+		t.Error("the replaced connection is kept past its last listing")
+	}
 }
 
 // TestABusyLinkIsWaitedForBriefly holds the link while a connect reaches it: freed
@@ -1408,23 +1647,25 @@ func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 // source_unavailable, though its request's deadline is far.
 func TestABusyLinkIsWaitedForBriefly(t *testing.T) {
 	rig := newConnectRig(t)
-	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	b := rig.browser(t)
 	b.signIn(rig.pass())
+	target := b.bindTarget("42")
 	rig.c.linking <- struct{}{}
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		<-rig.c.linking
 	}()
-	if r := rig.backTo(t, b.get("/v1/connect/return?installation_id=42&setup_action=install"), testConnection); r.Outcome != outcomeLinked {
+	if r := rig.backTo(t, b.get(target), testConnection); r.Outcome != outcomeLinked {
 		t.Errorf("%+v", r)
 	}
 	rig.c.linkWait = 50 * time.Millisecond
 	b = rig.browser(t)
 	b.signIn(rig.pass())
+	target = b.bindTarget("7")
 	rig.c.linking <- struct{}{}
 	began := time.Now()
-	r := rig.backTo(t, b.get("/v1/connect/return?installation_id=7&setup_action=install"), testConnection)
+	r := rig.backTo(t, b.get(target), testConnection)
 	if r.Outcome != outcomeRefused || r.Reason != reasonSourceUnavailable || time.Since(began) > 5*time.Second {
 		t.Errorf("%+v after %v", r, time.Since(began))
 	}
@@ -1447,25 +1688,6 @@ func TestALiveAnswerChangesOnlyTheLinkOfItsConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	rig.held(t, 42, testConnection, linkLive, 1234)
-}
-
-// TestAnExpiredTokenIsForgottenAtEachLookup holds a token for a session that has
-// expired: the next lookup, of any session, forgets it.
-func TestAnExpiredTokenIsForgottenAtEachLookup(t *testing.T) {
-	rig := newConnectRig(t)
-	rig.c.holdToken(strings.Repeat("A", 43), userToken, time.Now().Add(-time.Second))
-	rig.c.holdToken(strings.Repeat("B", 43), "another-token", time.Now().Add(time.Minute))
-	rig.c.tokenMu.Lock()
-	rig.c.tokens[sessionKey(strings.Repeat("C", 43))] = heldToken{token: "a-third-token", expires: time.Now().Add(-time.Second)}
-	rig.c.tokenMu.Unlock()
-	if _, ok := rig.c.tokenOf(strings.Repeat("D", 43)); ok {
-		t.Error("a session without a token holds one")
-	}
-	rig.c.tokenMu.Lock()
-	defer rig.c.tokenMu.Unlock()
-	if len(rig.c.tokens) != 1 {
-		t.Errorf("%d tokens are held", len(rig.c.tokens))
-	}
 }
 
 // TestThePagesSayTheUsersWords pins each page's line as the user approved it, and
@@ -1499,4 +1721,441 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 		!strings.Contains(line, ">Continue on GitHub</a>") {
 		t.Errorf("the Save page %s", rec.Body)
 	}
+}
+
+// spent checks rec, a connect return, clears the session's cookie, Max-Age=0 on its name
+// and path, so the binding serves one flow.
+func spent(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == connectCookie && ck.MaxAge < 0 && ck.Path == "/v1/connect" && ck.Value == "" {
+			return
+		}
+	}
+	t.Errorf("the return keeps the cookie: %v", rec.Header()["Set-Cookie"])
+}
+
+// TestEveryReturnSpendsThePass mints a connect return at each step, linked, refused
+// and cancelled, and checks each clears the cookie and ends the session, so the same
+// browser brings nothing more under the pass: the step brought again, with the cookie
+// it had, finds no session.
+func TestEveryReturnSpendsThePass(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	for name, prepare := range map[string]func(b *browser) string{
+		"linked": func(b *browser) string {
+			b.signIn(rig.pass())
+			return b.bindTarget("7")
+		},
+		"refused at the Setup URL": func(b *browser) string {
+			b.signIn(rig.pass())
+			return "/v1/connect/return?installation_id=42&setup_action=install&state=x"
+		},
+		"cancelled at the sign-in": func(b *browser) string {
+			return "/v1/connect/authorized?error=access_denied&state=" + b.start(rig.pass())
+		},
+		"refused at the second sign-in": func(b *browser) string {
+			b.signIn(rig.pass())
+			b.bindTarget("99")
+			return "/v1/connect/authorized?code=" + signInCode + "&state=" + strings.Repeat("A", 43)
+		},
+		"refused at the continue address": func(b *browser) string {
+			b.signIn(rig.pass())
+			return "/v1/connect/continue"
+		},
+	} {
+		b := rig.browser(t)
+		target := prepare(b)
+		cookie := b.cookie
+		rec := b.get(target)
+		rig.backTo(t, rec, testConnection)
+		spent(t, rec)
+		if b.cookie != nil {
+			t.Errorf("%s: the cookie is kept", name)
+		}
+		b.cookie = cookie
+		refused(t, b.get(target), refuseNoSession)
+	}
+	rig.noLeak(t)
+}
+
+// TestTheGrantIsBoundToTheStateAndTheCookie checks the Setup URL links nothing: its
+// installation is a candidate, linked only on the second sign-in, which needs the
+// session's cookie and its state; a wrong state at either sign-in, or the first
+// sign-in brought again, goes back refused; another browser, without the cookie, gets
+// the page; and a sign-in brought again after the return finds no session.
+func TestTheGrantIsBoundToTheStateAndTheCookie(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	b := rig.browser(t)
+	first := b.start(rig.pass())
+	b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + first)
+	target := b.bindTarget("42")
+	if ok, _ := Linked(rig.st, 42); ok || len(rig.gh.exchanges) != 1 {
+		t.Errorf("the Setup URL linked, or signed in: %v, %d", ok, len(rig.gh.exchanges))
+	}
+	// Another browser, without the cookie: the page.
+	refused(t, rig.browser(t).get(target), refuseNoSession)
+	refused(t, rig.browser(t).get("/v1/connect/return?installation_id=42&setup_action=install"), refuseNoSession)
+	// The second sign-in links.
+	cookie := b.cookie
+	if r := rig.backTo(t, b.get(target), testConnection); r.Outcome != outcomeLinked {
+		t.Errorf("%+v", r)
+	}
+	rig.linked(t, 42, testConnection, linkPending)
+	// Brought again, with the cookie it had: no session.
+	b.cookie = cookie
+	refused(t, b.get(target), refuseNoSession)
+
+	for name, bring := range map[string]func(b *browser, first, target string) *httptest.ResponseRecorder{
+		"a wrong state at the second sign-in": func(b *browser, _, target string) *httptest.ResponseRecorder {
+			return b.get(strings.Split(target, "&state=")[0] + "&state=" + strings.Repeat("A", 43))
+		},
+		"the first sign-in brought again": func(b *browser, first, _ string) *httptest.ResponseRecorder {
+			return b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + first)
+		},
+		"the first sign-in's state on the Setup URL": func(b *browser, first, _ string) *httptest.ResponseRecorder {
+			return b.get("/v1/connect/return?installation_id=42&setup_action=install&state=" + first)
+		},
+	} {
+		rig := newConnectRig(t)
+		b := rig.browser(t)
+		first := b.start(rig.pass())
+		b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + first)
+		var target string
+		if !strings.Contains(name, "Setup URL") {
+			target = b.bindTarget("42")
+		}
+		rec := bring(b, first, target)
+		if r := rig.backTo(t, rec, testConnection); r.Outcome != outcomeRefused || r.Reason != reasonGrantNotConfirmed {
+			t.Errorf("%s: %+v", name, r)
+		}
+		spent(t, rec)
+		if ok, _ := Linked(rig.st, 42); ok {
+			t.Errorf("%s: linked", name)
+		}
+	}
+	rig.noLeak(t)
+}
+
+// TestAWaitForTheInstallationsLockPastTheDeadlineGoesBack holds the installation's
+// lock, as a listing of it does, while a connect for it reaches its link: past its
+// deadline it goes back refused, source_unavailable, and links nothing.
+func TestAWaitForTheInstallationsLockPastTheDeadlineGoesBack(t *testing.T) {
+	rig := newConnectRig(t)
+	b := rig.browser(t)
+	b.signIn(rig.pass())
+	unlock, err := rig.adapter.lockInstallation(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, b.bindTarget("42"), nil)
+	r.AddCookie(&http.Cookie{Name: connectCookie, Value: b.cookie.Value})
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	rig.h.ServeHTTP(rec, r.WithContext(ctx))
+	unlock()
+	if ret := rig.backTo(t, rec, testConnection); ret.Outcome != outcomeRefused || ret.Reason != reasonSourceUnavailable {
+		t.Errorf("%+v", ret)
+	}
+	if ok, _ := Linked(rig.st, 42); ok {
+		t.Error("linked")
+	}
+}
+
+// TestAFirstListingEndsWithTheLastListing lists a pending link whose connect return
+// expired now: the tries wait 8 seconds, doubling, up to 64, and the last wait ends at
+// the expiry and returnSkew more, where the last listing is sent. Its 403
+// connection_unknown drops the link; a 500 keeps it, and its tries go on, the waits
+// doubling up to an hour.
+func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
+	before := []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second, 64 * time.Second, 64 * time.Second}
+	for _, status := range []int{403, 500} {
+		rig := newConnectRig(t)
+		rig.budget = 4 * time.Hour
+		rig.apiary.refuse = func(string, int) (int, string) {
+			if status == 403 {
+				return 403, `{"error":"connection_unknown"}`
+			}
+			return 500, `{"error":"internal"}`
+		}
+		expires := time.Now()
+		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: expires.Unix()})
+		rig.c.listSoon(42, testConnection, false, expires)
+		sum := func() (s time.Duration) {
+			rig.mu.Lock()
+			defer rig.mu.Unlock()
+			for _, w := range rig.waits {
+				s += w
+			}
+			return s
+		}
+		if status == 403 {
+			eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
+			rig.c.stop()
+		} else {
+			eventually(t, "the waits past the budget", func() bool { return sum() > rig.budget })
+			rig.c.stop()
+			rig.linked(t, 42, testConnection, linkPending)
+		}
+		rig.mu.Lock()
+		waits := slices.Clone(rig.waits)
+		rig.mu.Unlock()
+		if len(waits) < 7 || !slices.Equal(waits[:6], before) {
+			t.Fatalf("%d: waited %v", status, waits)
+		}
+		// The seventh wait ends at the expiry and returnSkew more, to within the second
+		// the test took to begin.
+		var upTo time.Duration
+		for _, w := range waits[:7] {
+			upTo += w
+		}
+		if upTo < returnSkew-5*time.Second || upTo > returnSkew {
+			t.Errorf("%d: the last listing after %v", status, upTo)
+		}
+		if status == 403 {
+			if len(waits) != 7 {
+				t.Errorf("waited past the last listing: %v", waits)
+			}
+			continue
+		}
+		after := waits[7:]
+		want := []time.Duration{64 * time.Second, 128 * time.Second, 256 * time.Second, 512 * time.Second, 1024 * time.Second, 2048 * time.Second, time.Hour}
+		if len(after) < len(want)+1 || !slices.Equal(after[:len(want)], want) || after[len(want)] != time.Hour {
+			t.Errorf("waited after the last listing %v", after)
+		}
+	}
+}
+
+// TestAPassOneSecondPastFifteenMinutesAheadIsRefused brings, on a clock at a whole
+// second, a pass that expires 15 minutes and one second ahead, as Qory Apiary issues
+// one a second after the connection's previous pass after quick presses: it goes back
+// refused, pass_expired, and its nonce is not kept; one that expires 15 minutes ahead
+// is accepted.
+func TestAPassOneSecondPastFifteenMinutesAheadIsRefused(t *testing.T) {
+	rig := newConnectRig(t)
+	now := time.Now().Truncate(time.Second)
+	rig.c.now = func() time.Time { return now }
+	pass := rig.passAt(testConnection, now.Add(passAhead+time.Second))
+	b := rig.browser(t)
+	rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
+	if r := rig.backTo(t, rec, testConnection); r.Outcome != outcomeRefused || r.Reason != reasonPassExpired {
+		t.Errorf("the connect return %+v", r)
+	}
+	if n := 0; rig.st.Each(nsConnectNonces, func(string, []byte) error { n++; return nil }) != nil || n != 0 || b.cookie != nil {
+		t.Errorf("%d nonces are kept, or a session started", n)
+	}
+	rec = rig.browser(t).get("/v1/connect?state=" + url.QueryEscape(rig.passAt(testConnection, now.Add(passAhead))))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/v1/connect/continue" {
+		t.Errorf("a pass 15 minutes ahead: %d %v", rec.Code, rec.Header())
+	}
+	rig.noLeak(t)
+}
+
+// twoOrgs has the person administer octo-org's installation 9 and acme's 42, and Qory
+// Apiary answer every listing 403 connection_unknown until made is set, then 204, as
+// once it has taken a linked return and made the connection.
+func twoOrgs(rig *connectRig, made *atomic.Bool) {
+	rig.gh.userInstallations = []ghInstallation{{id: 9, account: octoOrg, permissions: allPermissions()}, {id: 42, account: acme, permissions: allPermissions()}}
+	rig.gh.memberships = map[string]ghMembership{
+		"acme":     {state: "active", role: "admin", org: acme.ID, person: alice.ID},
+		"octo-org": {state: "active", role: "admin", org: octoOrg.ID, person: alice.ID},
+	}
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route != routeCollections || made.Load() {
+			return 0, ""
+		}
+		return 403, `{"error":"connection_unknown"}`
+	}
+}
+
+// TestAPassNoNewerThanTheConnectionsNewestIsRefused has the newest pass a linked return
+// was minted under for the connection outlive every link that pass made: a pass whose
+// expiry is no later than it, as late or earlier, gets the page refuseHeld, links
+// nothing, and mints no return, whether the installation that pass linked has since
+// been re-linked elsewhere, deleted, or re-connected under it; so a return that newest
+// pass minted, delivered later, never makes another installation live.
+func TestAPassNoNewerThanTheConnectionsNewestIsRefused(t *testing.T) {
+	// (a) octo-org's 9 linked under p1 and re-connected under p2; then acme's 42 under
+	// pv, between them, or under p2's expiry, the same.
+	for _, pv := range []time.Duration{7 * time.Minute, 10 * time.Minute, 4 * time.Minute} {
+		rig := newConnectRig(t)
+		var made atomic.Bool
+		twoOrgs(rig, &made)
+		now := time.Now().Truncate(time.Second)
+		p1, p2 := now.Add(5*time.Minute), now.Add(10*time.Minute)
+		for _, p := range []time.Time{p1, p2} {
+			if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, p), "9"), testConnection); r.Outcome != outcomeLinked {
+				t.Fatalf("%+v", r)
+			}
+		}
+		rig.held(t, 9, testConnection, linkPending, p2.Unix())
+		b := rig.browser(t)
+		refused(t, b.connect(rig.passAt(testConnection, now.Add(pv)), "42"), refuseHeld)
+		if b.cookie != nil {
+			t.Errorf("%v: the cookie is kept", pv)
+		}
+		made.Store(true)
+		rig.c.stop()
+		rig.adapter.listRepositories(context.Background(), 42)
+		rig.linked(t, 42, "", "")
+		rig.held(t, 9, testConnection, linkPending, p2.Unix())
+		rig.noLeak(t)
+	}
+	// (b) octo-org's 9 linked under the newer pass; then the connection freed, by a
+	// connect of 9 to another connection, or GitHub deleting 9; then acme's 42 under
+	// the older pass, or one as new.
+	for _, free := range []string{"re-linked elsewhere", "deleted"} {
+		for _, as := range []string{"older", "as new"} {
+			rig := newConnectRig(t)
+			var made atomic.Bool
+			twoOrgs(rig, &made)
+			now := time.Now().Truncate(time.Second)
+			newer := now.Add(10 * time.Minute)
+			victim := rig.browser(t)
+			if as == "older" {
+				victim.signIn(rig.passAt(testConnection, now.Add(5*time.Minute)))
+			}
+			if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, newer), "9"), testConnection); r.Outcome != outcomeLinked {
+				t.Fatalf("%+v", r)
+			}
+			switch free {
+			case "re-linked elsewhere":
+				if r := rig.backTo(t, rig.browser(t).connect(rig.passFor(otherConnection), "9"), otherConnection); r.Outcome != outcomeLinked {
+					t.Fatalf("%+v", r)
+				}
+			case "deleted":
+				rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 9}})
+			}
+			if held, _ := linkedTo(rig.st, testConnection); len(held) != 0 {
+				t.Fatalf("%s: the connection holds %v", free, held)
+			}
+			var rec *httptest.ResponseRecorder
+			if as == "older" {
+				rec = victim.finish("installation_id=42&setup_action=install")
+			} else {
+				rec = victim.connect(rig.passAt(testConnection, newer), "42")
+			}
+			refused(t, rec, refuseHeld)
+			made.Store(true)
+			rig.c.stop()
+			rig.adapter.listRepositories(context.Background(), 42)
+			rig.linked(t, 42, "", "")
+			rig.noLeak(t)
+		}
+	}
+}
+
+// TestAReConnectUnderANewerPassRaisesTheLinksPass re-connects acme's 42 under p2 after
+// p1: the link holds p2's expiry, and octo-org's 9 under p1.5, between them, gets the
+// page refuseHeld, and the connection holds 42 alone.
+func TestAReConnectUnderANewerPassRaisesTheLinksPass(t *testing.T) {
+	rig := newConnectRig(t)
+	var made atomic.Bool
+	twoOrgs(rig, &made)
+	now := time.Now().Truncate(time.Second)
+	p1, p15, p2 := now.Add(5*time.Minute), now.Add(7*time.Minute), now.Add(10*time.Minute)
+	for _, p := range []time.Time{p1, p2} {
+		if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, p), "42"), testConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
+		}
+	}
+	rig.held(t, 42, testConnection, linkPending, p2.Unix())
+	refused(t, rig.browser(t).connect(rig.passAt(testConnection, p15), "9"), refuseHeld)
+	if held, _ := linkedTo(rig.st, testConnection); len(held) != 1 || held[0] != 42 {
+		t.Errorf("the connection holds %v", held)
+	}
+	rig.linked(t, 9, "", "")
+	// A live link's pass is raised too.
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkLive, Pass: p2.Unix()})
+	p3 := now.Add(12 * time.Minute)
+	if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, p3), "42"), testConnection); r.Outcome != outcomeLinked {
+		t.Fatalf("%+v", r)
+	}
+	rig.held(t, 42, testConnection, linkLive, p3.Unix())
+	rig.c.stop()
+}
+
+// TestALockHeldPastLinkWaitGoesBackSourceUnavailable holds, as a listing in flight
+// does, the lock of the installation a connect links, or of the installation linked to
+// the connection pending, which a newer pass would replace: past linkWait, while the
+// request's context lives on, the connect goes back refused, source_unavailable, and
+// nothing changes.
+func TestALockHeldPastLinkWaitGoesBackSourceUnavailable(t *testing.T) {
+	for _, held := range []int64{42, 9} {
+		rig := newConnectRig(t)
+		var made atomic.Bool
+		twoOrgs(rig, &made)
+		rig.c.linkWait = 50 * time.Millisecond
+		now := time.Now().Truncate(time.Second)
+		putLink(rig.st, 9, link{Connection: testConnection, State: linkPending, Pass: now.Add(5 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
+		unlock, err := rig.adapter.lockInstallation(context.Background(), held)
+		if err != nil {
+			t.Fatal(err)
+		}
+		began := time.Now()
+		rec := rig.browser(t).connect(rig.passAt(testConnection, now.Add(10*time.Minute)), "42")
+		unlock()
+		if r := rig.backTo(t, rec, testConnection); r.Outcome != outcomeRefused || r.Reason != reasonSourceUnavailable {
+			t.Errorf("%d: %+v", held, r)
+		}
+		if d := time.Since(began); d > 5*time.Second {
+			t.Errorf("%d: waited %v", held, d)
+		}
+		rig.linked(t, 42, "", "")
+		rig.held(t, 9, testConnection, linkPending, now.Add(5*time.Minute).Unix())
+		rig.c.stop()
+	}
+}
+
+// TestAnInstallationDeletedDuringAConnectIsNotLinked has GitHub delete acme's 42 while
+// a connect for it is under way: deleted before the connect links, the connect goes
+// back refused, grant_not_confirmed, and links nothing; deleted while the connect holds
+// the installation's lock, the deletion waits for it, then drops the link the connect
+// wrote, and ends its connection.
+func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	b := rig.browser(t)
+	b.signIn(rig.pass())
+	target := b.bindTarget("42")
+	rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if r := rig.backTo(t, b.get(target), testConnection); r.Outcome != outcomeRefused || r.Reason != reasonGrantNotConfirmed {
+		t.Errorf("%+v", r)
+	}
+	rig.linked(t, 42, "", "")
+
+	rig = newConnectRig(t)
+	unlock, err := rig.adapter.lockInstallation(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits := make(chan int64, 1)
+	rig.adapter.lockWaits = func(id int64) { waits <- id }
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	}()
+	select {
+	case id := <-waits:
+		if id != 42 {
+			t.Fatalf("waited for %d", id)
+		}
+	case <-done:
+		unlock()
+		t.Fatal("the deletion did not wait for the installation's lock")
+	}
+	// What a connect writes holding the lock.
+	installMu.Lock()
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
+	installMu.Unlock()
+	unlock()
+	<-done
+	rig.linked(t, 42, "", "")
+	if sent := rig.apiary.sent(routeConnectionsDisconnect); len(sent) != 1 || sent[0].body["connection_id"] != testConnection {
+		t.Errorf("disconnects %v", sent)
+	}
+	rig.c.stop()
 }

@@ -348,6 +348,7 @@ func (p *puller) round(ctx context.Context, start time.Time, interval time.Durat
 		targets[r.Installation] = append(targets[r.Installation], pullTarget{ref: r.Ref, offset: p.random(spread)})
 	}
 	p.forgetGone(installations, targets)
+	p.listReplaced(ctx)
 	for _, id := range installations {
 		p.mu.Lock()
 		if p.busy[id] {
@@ -371,6 +372,34 @@ func (p *puller) round(ctx context.Context, start time.Time, interval time.Durat
 				p.mu.Unlock()
 			}()
 			p.installationRound(ctx, id, ts, start, p.random(spread))
+		}()
+	}
+}
+
+// listReplaced sends, without waiting for it, the last listing of each connection a
+// connect replaced whose moment has come, see [Adapter.listReplaced], which [Connect]
+// sends too, unless serve stopped meanwhile: so a restart settles it as well.
+func (p *puller) listReplaced(ctx context.Context) {
+	var connections []string
+	if err := p.store.Each(nsReplaced, func(key string, _ []byte) error {
+		connections = append(connections, key)
+		return nil
+	}); err != nil {
+		p.failed("reading the replaced connections", err)
+		return
+	}
+	for _, connection := range connections {
+		r, ok, err := replacedOf(p.store, connection)
+		if err != nil || !ok || p.clock().Before(time.Unix(r.Return, 0).Add(returnSkew)) {
+			continue
+		}
+		p.rounds.Add(1)
+		go func() {
+			defer p.rounds.Done()
+			if err := p.adapter.listFor(ctx, r.Installation, connection, true); err != nil {
+				// placeholder: wording waits for the user
+				p.report(ctx, slog.String("connection", connection), "listing a replaced connection", err)
+			}
 		}()
 	}
 }

@@ -86,6 +86,11 @@ const (
 	// on its periodic check.
 	codeConnectionEnded     = "connection_ended"
 	codeConnectionSuspended = "connection_suspended"
+	// codeConnectionUnknown is a 403 for a connection Qory Apiary does not hold for the
+	// adapter, or, in a listing, one still pending: only one that lasts, for a live
+	// connection, ends it, see [noteAnswer]. A 403 forbidden, a request outside the
+	// access key's rights, never ends a connection.
+	codeConnectionUnknown = "connection_unknown"
 )
 
 // The tries of POST /v1/connections/disconnect that Qory Apiary answers 403, as it
@@ -139,6 +144,11 @@ type Apiary struct {
 	// answer speaks of the connection the request was sent for.
 	Ended        func(connection string)
 	ConnectionOf func(collectionRef string) string
+	// Answered, when set, is called with a connection's id, the status and the refusal's
+	// code, or "", of each signed answer to a request of that connection, or of a
+	// collection of it, and the time it came, so serve times a 403 that lasts, see
+	// [noteAnswer].
+	Answered func(connection string, status int, code string, at time.Time)
 	// Log takes the throttled line for a 401; nil logs nothing.
 	Log *slog.Logger
 
@@ -437,6 +447,7 @@ func retryWait(err error) (time.Duration, bool) {
 //     never taken as the key's revocation;
 //   - an answer whose signature does not verify under the pin is an [Outage], and its
 //     body is never parsed;
+//   - a signed answer for a connection is told to [Apiary.Answered];
 //   - 409 collection_not_linked calls [Apiary.Unlinked] with collection and began,
 //     and 409 connection_ended calls [Apiary.Ended] with connection; 409
 //     connection_suspended changes nothing, and the periodic check sends the request
@@ -458,12 +469,17 @@ func (a *Apiary) judge(what string, ans *answer, collection, connection string, 
 	if !ans.signed {
 		return Outage(fmt.Errorf("%s: Qory Apiary's answer, %d, is not signed under a key of apiary_public_key, so it is not used", what, ans.status))
 	}
+	var refusal contracts.Refusal
+	if ans.status < 200 || ans.status >= 300 {
+		if json.Unmarshal(ans.body, &refusal) != nil || !refusalShape.MatchString(refusal.Error) {
+			refusal.Error = ""
+		}
+	}
+	if connection != "" && a.Answered != nil {
+		a.Answered(connection, ans.status, refusal.Error, a.now())
+	}
 	if ans.status >= 200 && ans.status < 300 {
 		return nil
-	}
-	var refusal contracts.Refusal
-	if json.Unmarshal(ans.body, &refusal) != nil || !refusalShape.MatchString(refusal.Error) {
-		refusal.Error = ""
 	}
 	var err error = &refusedError{what: what, status: ans.status, code: refusal.Error}
 	switch ans.status {
