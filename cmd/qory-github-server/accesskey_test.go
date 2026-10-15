@@ -239,7 +239,7 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{f.url, c}, "--secret-file is required"},
 	} {
 		status, out, errs := enrolRun(t, tc.args...)
-		if status != 1 || out != "" || errs != "qory-github access-key: "+tc.want+"\n" {
+		if status != 1 || out != "" || errs != "qory-github-server access-key: "+tc.want+"\n" {
 			t.Errorf("%v: exit %d, stdout %q, stderr %q", tc.args, status, out, errs)
 		}
 		noLeak(t, "", c, out, errs)
@@ -273,7 +273,7 @@ func fixtureSigner(t *testing.T) *accesskey.Key {
 // without the secret or the code. {fp} in want is the new key's fingerprint.
 func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 	other, _ := accesskey.Generate()
-	const unverified = "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer did not verify (HTTP %d); no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"
+	const unverified = "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary's answer did not verify (HTTP %d); no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"
 	// corrupt flips one bit of the answer's signature, which is otherwise the right one.
 	corrupt := func(s int, b []byte, sig string) (int, []byte, string) {
 		raw, _ := base64.RawURLEncoding.DecodeString(sig)
@@ -300,21 +300,21 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 		"an answer larger than 64 KiB": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", pad: accesskey.MaxAnswer},
 			want: fmt.Sprintf(unverified, 201)},
 		"a node's code": {reply: reply{status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef"},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the node nd_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the node nd_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
 		"a gateway's code": {reply: reply{status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef"},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the gateway ng_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the gateway ng_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
 		"a kind that does not match the id": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "nd_0123456789abcdef"},
-			want: "access key fingerprint {fp}\nqory-github access-key: the enrolment did not complete: the enrolment answer: node_kind \"adapter\" does not match the node id nd_0123456789abcdef; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: the enrolment did not complete: the enrolment answer: node_kind \"adapter\" does not match the node id nd_0123456789abcdef; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"},
 		"a fixture key pinned": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", signer: fixtureSigner(t)},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}\n"},
 		"a used code": {reply: reply{status: http.StatusUnauthorized},
-			want: "access key fingerprint {fp}\nqory-github access-key: the server at {server} answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at {server}, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: the server at {server} answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at {server}, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled\n"},
 		"a key refused": {reply: reply{status: http.StatusConflict, refusal: "key_invalid"},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the key; the code is not used: the same command, run within the code's 15 minutes, makes a new key\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary refused the key; the code is not used: the same command, run within the code's 15 minutes, makes a new key\n"},
 		"two keys held": {reply: reply{status: http.StatusConflict, refusal: "key_limit"},
-			want: "access key fingerprint {fp}\nqory-github access-key: the integration already holds two keys: have an owner or administrator in Qory Apiary revoke one, then run the same command again within the code's 15 minutes\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: the integration already holds two keys: have an owner or administrator in Qory Apiary revoke one, then run the same command again within the code's 15 minutes\n"},
 		"too many attempts": {reply: reply{status: http.StatusTooManyRequests, refusal: "rate_limited"},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes\n"},
+			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeApiary(t, tc.reply)
@@ -412,7 +412,7 @@ func TestCheckServerTakesAnASCIIHostAlone(t *testing.T) {
 	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
 	status, out, errs := enrolRun(t, "--secret-file", file, "https://qa%E2%84%AA_x", code(f.signer))
-	if status != 1 || out != "" || errs != "qory-github access-key: "+notASCII+"\n" || f.requests.Load() != 0 {
+	if status != 1 || out != "" || errs != "qory-github-server access-key: "+notASCII+"\n" || f.requests.Load() != 0 {
 		t.Errorf("exit %d, stdout %q, stderr %q, %d requests", status, out, errs, f.requests.Load())
 	}
 }
@@ -457,7 +457,7 @@ func TestEnrolRefusesAServerOnlyItsOriginShowsACodeIn(t *testing.T) {
 	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
 	status, out, errs := enrolRun(t, "--secret-file", file, server, code(f.signer))
-	if status != 1 || out != "" || errs != "qory-github access-key: "+serverShape+"\n" || f.requests.Load() != 0 {
+	if status != 1 || out != "" || errs != "qory-github-server access-key: "+serverShape+"\n" || f.requests.Load() != 0 {
 		t.Errorf("exit %d, stdout %q, stderr %q, %d requests", status, out, errs, f.requests.Load())
 	}
 }
@@ -472,7 +472,7 @@ func TestEnrolRefusesARelativePathThatBecomesACodeOrSecret(t *testing.T) {
 	}
 	t.Chdir(dir)
 	status, out, errs := enrolRun(t, "--secret-file", "secret", f.url, code(f.signer))
-	if want := "qory-github access-key: the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file\n"; status != 1 || out != "" || errs != want || f.requests.Load() != 0 {
+	if want := "qory-github-server access-key: the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file\n"; status != 1 || out != "" || errs != want || f.requests.Load() != 0 {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
@@ -492,7 +492,7 @@ func TestEnrolRefusesAProbeItCannotRemove(t *testing.T) {
 		return &os.PathError{Op: "remove", Path: p, Err: syscall.EBUSY}
 	}
 	status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, code(f.signer))
-	want := "qory-github access-key: the secret file's directory " + dir + ": the file " + probe + " made to check it can be written could not be removed: " + syscall.EBUSY.Error() + "\n"
+	want := "qory-github-server access-key: the secret file's directory " + dir + ": the file " + probe + " made to check it can be written could not be removed: " + syscall.EBUSY.Error() + "\n"
 	if status != 1 || out != "" || errs != want || f.requests.Load() != 0 || filepath.Dir(probe) != dir {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
@@ -509,7 +509,7 @@ func TestEnrolNeverWritesThroughALinkPlantedMeanwhile(t *testing.T) {
 	rp.hook = func() { os.Symlink(target, file) }
 	f := newFakeApiary(t, rp)
 	status, out, errs := enrolRun(t, "--secret-file", file, f.url, code(f.signer))
-	if status != 1 || out != "" || !strings.Contains(errs, "\nqory-github access-key: the key is enrolled as ak_0123456789abcdef, and the secret file "+file+" exists; choose another or move it away; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key ") {
+	if status != 1 || out != "" || !strings.Contains(errs, "\nqory-github-server access-key: the key is enrolled as ak_0123456789abcdef, and the secret file "+file+" exists; choose another or move it away; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key ") {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
 	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
@@ -528,7 +528,7 @@ func TestEnrolRefusesADirectoryItCannotWriteBeforeAnyRequest(t *testing.T) {
 	os.Mkdir(dir, 0o500)
 	t.Cleanup(func() { os.Chmod(dir, 0o700) })
 	status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, code(f.signer))
-	if want := "qory-github access-key: the secret file's directory " + dir + " cannot be written: permission denied\n"; status != 1 || out != "" || errs != want {
+	if want := "qory-github-server access-key: the secret file's directory " + dir + " cannot be written: permission denied\n"; status != 1 || out != "" || errs != want {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
 	if n := f.requests.Load(); n != 0 {
@@ -565,7 +565,7 @@ func TestEnrolSaysASecretItCouldNotWrite(t *testing.T) {
 	}
 	c := code(f.signer)
 	status, out, errs := enrolRun(t, "--secret-file", file, f.url, c)
-	want := "qory-github access-key: the key is enrolled as ak_0123456789abcdef, and the secret file: no space left on device; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key " + made.Fingerprint() + "\n"
+	want := "qory-github-server access-key: the key is enrolled as ak_0123456789abcdef, and the secret file: no space left on device; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key " + made.Fingerprint() + "\n"
 	if status != 1 || out != "" || !strings.HasSuffix(errs, want) {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
@@ -589,27 +589,9 @@ func TestWriteSecretFileNeverWritesOverAFile(t *testing.T) {
 	}
 }
 
-// usageWithoutFactory is the usage as it was before access-key, which it stays without
-// factory.
-const usageWithoutFactory = `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
-GitHub and never holds the access token.
-
-usage:
-  qory-github <command> [flags]
-
-commands:
-  describe     Print the integration's description, for qory
-  credential   Mint an access token for a run's repositories
-  setup        Create the GitHub App and write its private key
-
-qory-github <command> -h prints a command's help.
-
-More: https://github.com/qoryai/qory-github/blob/main/README.md
-`
-
 // TestAccessKeyIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory,
-// access-key is in no usage, which is as it was, and is answered as a command the
-// program does not know.
+// access-key is in no usage and is answered as a command the program does not know, and
+// sends nothing.
 func TestAccessKeyIsAbsentWithoutFactory(t *testing.T) {
 	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
@@ -634,18 +616,18 @@ func TestAccessKeyIsAbsentWithoutFactory(t *testing.T) {
 func TestAccessKeyIsPresentWithFactory(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "\n  serve        Take the GitHub App's webhook deliveries\n  access-key   Enrol the integration's access key with a code from Qory Apiary\n\n") {
-		t.Errorf("exit %d, the usage lists no access-key:\n%s", code, errs.String())
+	if code := run(context.Background(), nil, &out, &errs); code != 2 || errs.String() != usageWithFactory {
+		t.Errorf("exit %d, the usage:\n%s", code, errs.String())
 	}
 	for _, args := range [][]string{{"access-key", "-h"}, {"access-key", "enrol", "-h"}} {
 		errs.Reset()
-		if code := run(context.Background(), args, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github access-key enrol --secret-file FILE [--] SERVER CODE") || !strings.Contains(errs.String(), "\nflags:\n  -secret-file string\n    \twhere the access key's secret is written; a file that exists is refused (required)\n") || strings.Contains(errs.String(), "More:") {
+		if code := run(context.Background(), args, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github-server access-key enrol --secret-file FILE [--] SERVER CODE") || !strings.Contains(errs.String(), "\nflags:\n  -secret-file string\n    \twhere the access key's secret is written; a file that exists is refused (required)\n") || strings.Contains(errs.String(), "More:") {
 			t.Errorf("%v exits %d:\n%s", args, code, errs.String())
 		}
 	}
 	for _, args := range [][]string{{"access-key"}, {"access-key", "create"}} {
 		errs.Reset()
-		if code := run(context.Background(), args, io.Discard, &errs); code != 1 || errs.String() != "qory-github access-key: access-key has one command, enrol: qory-github access-key enrol --secret-file FILE SERVER CODE\n" {
+		if code := run(context.Background(), args, io.Discard, &errs); code != 1 || errs.String() != "qory-github-server access-key: access-key has one command, enrol: qory-github-server access-key enrol --secret-file FILE SERVER CODE\n" {
 			t.Errorf("%v exits %d: %q", args, code, errs.String())
 		}
 	}
