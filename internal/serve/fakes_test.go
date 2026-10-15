@@ -74,8 +74,8 @@ type apiaryRequest struct {
 
 // fakeApiary is Qory Apiary as the adapter reaches it. It verifies every request's
 // signature under the adapter's public key and its headers, records it, and signs its
-// answer under its server key: a refusal its refuse function chooses, or 200 {} for a
-// POST and the page of its change feed after the cursor for a GET.
+// answer under its server key: a refusal its refuse function chooses, or a 204 and no
+// body for a POST and the page of its change feed after the cursor for a GET.
 type fakeApiary struct {
 	t       *testing.T
 	srv     *httptest.Server

@@ -99,6 +99,9 @@ type Apiary struct {
 	// which is always unsigned, and a 413, 415 or 400 bad_request, which may be
 	// unsigned. No unsigned answer is acted on but a 401, which is [Held]: any other
 	// answer not signed under the pin is an [Outage], and its body is never parsed.
+	// An answer larger than its bound, maxPostAnswer or maxChangesAnswer, is refused
+	// before its status or its signature is checked, so it is neither: it is a plain
+	// error.
 	Pin accesskey.Pin
 	// InstanceID is serve's instance id, i_ and 22 characters, kept in the store.
 	InstanceID string
@@ -382,7 +385,7 @@ func retryWait(err error) (time.Duration, bool) {
 //     a clock that is off or a replay, is [Held] and logged once a minute at most,
 //     never taken as the key's revocation;
 //   - an answer whose signature does not verify under the pin is an [Outage], and its
-//     body is never read;
+//     body is never parsed;
 //   - 409 collection_not_linked calls [Apiary.Unlinked] with collection and began,
 //     and is [Permanent], and so are 400, 403, 409 and 413;
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
