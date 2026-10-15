@@ -444,6 +444,71 @@ func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
 	}
 }
 
+// holdMint is a transport that holds the first mint of an installation token until
+// release is closed, once it has closed minting, and passes every other request on.
+type holdMint struct {
+	once             *sync.Once
+	minting, release chan struct{}
+}
+
+func (h holdMint) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access_tokens") {
+		held := false
+		h.once.Do(func() { held = true })
+		if held {
+			close(h.minting)
+			<-h.release
+		}
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestATokenMintedAcrossAForgetIsNotKept holds a mint of the installation's listing
+// token in flight while its tokens are dropped: the token is handed to the request
+// that minted it, and not kept, so the next request mints again; a token minted after
+// the drop is kept.
+func TestATokenMintedAcrossAForgetIsNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
+	w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+	type result struct {
+		token string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		tok, err := w.adapter.token(context.Background(), 42, github.Repository{}, "")
+		done <- result{tok, err}
+	}()
+	<-h.minting
+	w.adapter.forgetTokens(42)
+	close(h.release)
+	if r := <-done; r.token != ghToken || r.err != nil {
+		t.Fatalf("the token minted in flight: %v", r.err)
+	}
+	w.adapter.mu.Lock()
+	n := len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d tokens kept, the one minted across the drop among them", n)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, github.Repository{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, github.Repository{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	w.adapter.mu.Lock()
+	n = len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if mints != 2 || n != 1 {
+		t.Errorf("%d mints and %d tokens kept, want 2 and 1", mints, n)
+	}
+}
+
 // TestDeliveriesOfAnEventWithoutAHandlerAreNotKept posts many deliveries of push and
 // pull_request, and one each of workflow_run and an event GitHub may add, which no
 // handler takes: each is answered 202, as a delivery kept is, and logged unhandled,

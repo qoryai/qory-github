@@ -43,6 +43,9 @@ type Adapter struct {
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
+	// gens are the installations' token generations, which [Adapter.forgetTokens]
+	// moves on: a token minted across a move is used and not kept.
+	gens map[int64]uint64
 	// turns are the collections' turns, see [Adapter.collectionTurn], by key. now is
 	// the clock a fill's start is read from; nil is time.Now.
 	turns map[string]chan struct{}
@@ -126,11 +129,13 @@ func (a *Adapter) pacer(installation int64) *github.Pacer {
 
 // token is an installation token for installation, limited to repo, or, when repo is
 // empty, the listing token that reads which repositories it reaches; permission is the
-// one it grants on issues. A token is kept until shortly before it expires.
+// one it grants on issues. A token is kept until shortly before it expires, unless the
+// installation's tokens were dropped while it was minted.
 func (a *Adapter) token(ctx context.Context, installation int64, repo github.Repository, permission string) (string, error) {
 	key := strconv.FormatInt(installation, 10) + " " + strings.ToLower(repo.String()) + " " + permission
 	a.mu.Lock()
 	t, ok := a.tokens[key]
+	gen := a.gens[installation]
 	a.mu.Unlock()
 	if ok && time.Until(t.ExpiresAt) > tokenMargin {
 		return t.Token, nil
@@ -146,6 +151,9 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.gens[installation] != gen {
+		return t.Token, nil
+	}
 	if a.tokens == nil {
 		a.tokens = map[string]github.InstallationToken{}
 	}
@@ -162,11 +170,16 @@ func (a *Adapter) forgetOn401(installation int64, err error) error {
 	return err
 }
 
-// forgetTokens drops the installation's tokens, so the next request mints a new one.
+// forgetTokens drops the installation's tokens, so the next request mints a new one,
+// and moves its generation on, so a mint in flight does not keep its token.
 func (a *Adapter) forgetTokens(installation int64) {
 	prefix := strconv.FormatInt(installation, 10) + " "
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.gens == nil {
+		a.gens = map[int64]uint64{}
+	}
+	a.gens[installation]++
 	for key := range a.tokens {
 		if strings.HasPrefix(key, prefix) {
 			delete(a.tokens, key)

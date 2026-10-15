@@ -818,6 +818,8 @@ func TestAnAccountIsLookedUpWithoutAToken(t *testing.T) {
 			io.WriteString(w, `{"login":"mona-bot","type":"Bot"}`)
 		case "/users/other":
 			io.WriteString(w, `{"login":"someone-else","type":"User"}`)
+		case "/users/kelvin":
+			io.WriteString(w, `{"login":"\u212Aelvin","type":"User"}`)
 		case "/users/down":
 			w.WriteHeader(http.StatusBadGateway)
 			io.WriteString(w, `{"message":"Bad Gateway"}`)
@@ -831,14 +833,15 @@ func TestAnAccountIsLookedUpWithoutAToken(t *testing.T) {
 	for _, tc := range []struct{ handle, login, kind string }{
 		{"ACME", "acme", AccountOrganization},
 		{"octocat", "octocat", AccountUser},
-		{"other", "other", AccountUser},
 	} {
 		login, kind, err := c.Account(context.Background(), tc.handle)
 		if login != tc.login || kind != tc.kind || err != nil {
 			t.Errorf("%s: %q %q %v", tc.handle, login, kind, err)
 		}
 	}
-	for _, handle := range []string{"nobody", "mona-bot"} {
+	// "other" answers another account's login, and "kelvin" one whose K is the Kelvin
+	// sign, which folds to k in Unicode alone.
+	for _, handle := range []string{"nobody", "mona-bot", "other", "kelvin"} {
 		if _, _, err := c.Account(context.Background(), handle); err != ErrNoAccount {
 			t.Errorf("%s: %v", handle, err)
 		}
@@ -850,7 +853,7 @@ func TestAnAccountIsLookedUpWithoutAToken(t *testing.T) {
 		}
 	}
 	if _, _, err := c.Account(context.Background(), strings.Repeat("a", 39)); err != ErrNoAccount || len(paths) != 1 {
-		t.Errorf("39 letters: %v, %v", err, paths)
+		t.Fatalf("39 letters: %v, %v", err, paths)
 	}
 	if paths[0] != "GET /users/"+strings.Repeat("a", 39) {
 		t.Errorf("handles not of GitHub's shape were sent: %v", paths)

@@ -67,7 +67,8 @@ type Setup struct {
 	KeyFile string
 	// Web is GitHub's web URL, which [CheckWebURL] takes; empty is [WebURL].
 	Web string
-	// Client reaches the API to exchange the redirect's code for the App.
+	// Client reaches the API to exchange the redirect's code for the App, and setup's
+	// command looks the App's account up through it, see [Client.Account].
 	Client Client
 	// Open receives the local page's URL to open in a browser; nil opens nothing, and
 	// the caller prints the URL.
@@ -173,8 +174,9 @@ var handleShape = regexp.MustCompile(`^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`)
 
 // Account looks the account handle up with GitHub, GET /users/{handle} without a
 // token, and returns its login, as GitHub writes it, and its kind, [AccountOrganization]
-// or [AccountUser]. A handle not of GitHub's shape is never sent: it, GitHub's 404 and
-// an account of another kind are [ErrNoAccount]. Any other answer, or an API that
+// or [AccountUser]. A handle not of GitHub's shape is never sent: it, GitHub's 404, an
+// account of another kind and a login that is not the handle apart from case are
+// [ErrNoAccount]. Any other answer, or an API that
 // cannot be reached, is an error as every other request's.
 func (c Client) Account(ctx context.Context, handle string) (login, kind string, err error) {
 	if len(handle) > 39 || !handleShape.MatchString(handle) {
@@ -184,7 +186,6 @@ func (c Client) Account(ctx context.Context, handle string) (login, kind string,
 		Login string `json:"login"`
 		Type  string `json:"type"`
 	}
-	// placeholder: wording waits for the user
 	if err := c.call(ctx, "looking up the GitHub account", http.MethodGet, "/users/"+url.PathEscape(handle), "", nil, http.StatusOK, &got); err != nil {
 		var answered *answerError
 		if errors.As(err, &answered) && answered.status == http.StatusNotFound {
@@ -196,12 +197,13 @@ func (c Client) Account(ctx context.Context, handle string) (login, kind string,
 		return "", "", ErrNoAccount
 	}
 	// GitHub writes the login as its account has it, which may differ from the handle
-	// in case alone; anything else is not the account asked for, and the handle stays.
-	login = handle
-	if strings.EqualFold(got.Login, handle) {
-		login = got.Login
+	// in case alone. A login not of GitHub's shape, or that differs otherwise, is not
+	// the account asked for. Both are ASCII once the shape passes, so the fold is
+	// ASCII's.
+	if len(got.Login) > 39 || !handleShape.MatchString(got.Login) || !strings.EqualFold(got.Login, handle) {
+		return "", "", ErrNoAccount
 	}
-	return login, got.Type, nil
+	return got.Login, got.Type, nil
 }
 
 var codeShape = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)

@@ -125,8 +125,6 @@ policy that selects it.`,
 
 // setupPublicHelp is the paragraph setup's help adds after the App's description where
 // QORY_FEATURES names factory, see [cli.Factory], for the App --public-url makes.
-//
-// placeholder: wording waits for the user
 const setupPublicHelp = `With --public-url, the App is instead public, with a webhook at the public URL and
 ` + github.WebhookPath + `, the events issues, issue_comment, workflow_run, pull_request and
 push, and actions, checks, contents, issues and pull requests write, administration,
@@ -241,7 +239,6 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	help := setupHelp
 	if cli.Factory() {
 		help.Long = setupLong()
-		// placeholder: wording waits for the user
 		fs.Lookup("name").Usage = "the App's name (default qory-github- and six random hex digits, or with --public-url qory- and the account's handle)"
 		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, webhook, events and permissions, and its client secret and webhook secret are written beside the key")
 	}
