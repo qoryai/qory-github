@@ -31,9 +31,7 @@ type fakeIssues struct {
 	issues   []map[string]any
 	comments map[int][]map[string]any
 	repos    []map[string]any
-	// repoComments are the repository's comments, as GitHub lists them all.
-	repoComments []map[string]any
-	pageSize     int
+	pageSize int
 	// failIssues and failComments answer that page of issues, or of any issue's
 	// comments, with a 500; zero never does.
 	failIssues, failComments int
@@ -112,8 +110,6 @@ func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case m != nil:
 		n, _ := strconv.Atoi(m[1])
 		serve(f.comments[n], f.failComments, list)
-	case r.URL.Path == "/repos/acme/widgets/issues/comments":
-		serve(f.repoComments, 0, list)
 	case r.URL.Path == "/installation/repositories":
 		serve(f.repos, 0, func(s []map[string]any) any { return map[string]any{"total_count": len(f.repos), "repositories": s} })
 	default:
