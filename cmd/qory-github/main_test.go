@@ -877,6 +877,17 @@ run reaches:
 ` + policy
 }
 
+// setupPrintedServe is what setup prints with factory and --public-url, before serve's
+// settings, for the App 123456 whose key is in file: the App and where to install it,
+// and no declaration.
+func setupPrintedServe(file string) string {
+	return `The App 123456 (qory-github-test) is created, and its private key is in ` + file + `.
+
+Install it on the repositories your agents work on:
+  https://github.com/apps/qory-github-test/installations/new
+`
+}
+
 // manifestBefore is the manifest setup posted at ce7d970, before Connect, with the
 // redirect URL redirect.
 func manifestBefore(redirect string) string {
@@ -942,7 +953,8 @@ func TestSetupWithoutFactoryIsAsItWas(t *testing.T) {
 // TestSetupWithFactoryKeepsTheClientSecretForConnect pins that with factory and
 // --public-url the App is the one serve needs, its client secret and the webhook secret
 // setup sets on it are written beside the key for its owner alone and never printed,
-// serve reads the webhook secret file, and setup prints serve's settings for both.
+// serve reads the webhook secret file, and setup prints the App, where to install it
+// and serve's settings for both, with no declaration.
 func TestSetupWithFactoryKeepsTheClientSecretForConnect(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	resetHook(t)
@@ -954,7 +966,7 @@ func TestSetupWithFactoryKeepsTheClientSecretForConnect(t *testing.T) {
 	path, _ := json.Marshal(secretFile)
 	webhookPath, _ := json.Marshal(webhookFile)
 	_, printed, _ := strings.Cut(out, "\n\n")
-	want := setupPrinted(t, file) + `
+	want := setupPrintedServe(file) + `
 The App's client secret is in ` + secretFile + ` and its webhook secret in ` + webhookFile + `, files only you may
 read. Add these settings to qory-github-server serve's settings, for Connect and the
 App's webhook:
@@ -1027,8 +1039,7 @@ App's webhook:
 func manifestServe(public, redirect string) string {
 	return `{"callback_urls":["` + public + `/v1/connect/authorized"],"default_events":["issues","issue_comment","workflow_run"],` +
 		`"default_permissions":{"actions":"write","contents":"read","issues":"write","metadata":"read"},` +
-		`"description":"Qory lists your repositories' open issues in Qory Apiary, where you choose what its factory works on. It reads code and issues, comments once on an issue it takes in, and starts runs in your runner repository.",` +
-		`"hook_attributes":{"active":true,"url":"` + public + `/github/webhook"},"name":"qory-github-test","public":false,"redirect_url":"` + redirect + `",` +
+		`"hook_attributes":{"active":true,"url":"` + public + `/github/webhook"},"name":"qory-github-test","public":true,"redirect_url":"` + redirect + `",` +
 		`"request_oauth_on_install":false,"setup_on_update":true,"setup_url":"` + public + `/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
 }
 
@@ -1065,9 +1076,9 @@ func TestSetupWithFactoryKeepsTheWebhookSecretGitHubHandsOut(t *testing.T) {
 }
 
 // TestSetupSaysAfterItsOutputThatTheWebhookSecretIsNotSet pins that when setting the
-// webhook secret fails, setup prints the App, the declaration and serve's settings for
-// the client secret as it did before, writes no webhook secret file, and then fails
-// saying the secret could not be set and what to do, never the secret.
+// webhook secret is not confirmed, setup prints the App, its install page and serve's
+// settings for the client secret, writes no webhook secret file, and then fails saying
+// GitHub did not confirm the secret and what to do, never the secret.
 func TestSetupSaysAfterItsOutputThatTheWebhookSecretIsNotSet(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	resetHook(t)
@@ -1081,14 +1092,14 @@ func TestSetupSaysAfterItsOutputThatTheWebhookSecretIsNotSet(t *testing.T) {
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
 	path, _ := json.Marshal(secretFile)
 	_, printed, _ := strings.Cut(out, "\n\n")
-	want := setupPrinted(t, file) + `
+	want := setupPrintedServe(file) + `
 The App's client secret is in ` + secretFile + `, which only you may read. Add these settings to
 qory-github-server serve's settings, for Connect:
 
   "client_id": "Iv1.test",
   "client_secret_file": ` + string(path) + `
 `
-	wantErr := "qory-github setup: the App's webhook secret could not be set, so no webhook secret file is written: setting the App's webhook secret: GitHub answered 500: Server Error; set a webhook secret at https://github.com/settings/apps/qory-github-test and write the same secret to " + webhookFile + ", 0600: until then qory-github-server serve takes none of the App's deliveries\n"
+	wantErr := "qory-github setup: GitHub did not confirm the App's webhook secret, so no webhook secret file is written: setting the App's webhook secret: GitHub answered 500: Server Error; set a webhook secret at https://github.com/settings/apps/qory-github-test, write the same secret to " + webhookFile + ", 0600, and name that file as webhook_secret_file in qory-github-server serve's settings: until then serve takes none of the App's deliveries\n"
 	sent := hookSent(t)
 	if len(sent) != 1 || sent[0] == "" {
 		t.Fatalf("setup set %d webhook secrets", len(sent))
@@ -1102,9 +1113,9 @@ qory-github-server serve's settings, for Connect:
 }
 
 // TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept pins that when GitHub answers
-// without a client secret, setup still prints the App, its install page, the
-// declaration and serve's setting for the webhook secret, then fails saying where to
-// generate the client secret.
+// without a client secret, setup still prints the App, its install page and serve's
+// setting for the webhook secret, then fails saying where to generate the client
+// secret.
 func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	resetHook(t)
@@ -1116,7 +1127,7 @@ func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
 	_, printed, _ := strings.Cut(out, "\n\n")
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
 	webhookPath, _ := json.Marshal(webhookFile)
-	want := setupPrinted(t, file) + `
+	want := setupPrintedServe(file) + `
 The App's webhook secret is in ` + webhookFile + `, which only you may read. Add this setting to
 qory-github-server serve's settings, for the App's webhook:
 
@@ -1150,8 +1161,8 @@ func TestAnotherUsersFileNamesQoryGithub(t *testing.T) {
 }
 
 // TestSetupSaysOnOneLineThatNeitherSecretIsKept pins that when neither the client
-// secret nor the webhook secret is kept, setup prints the App, its install page and the
-// declaration, no settings for serve, and then fails saying both on one line.
+// secret nor the webhook secret is kept, setup prints the App and its install page, no
+// settings for serve, and then fails saying both on one line.
 func TestSetupSaysOnOneLineThatNeitherSecretIsKept(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	resetHook(t)
@@ -1164,9 +1175,9 @@ func TestSetupSaysOnOneLineThatNeitherSecretIsKept(t *testing.T) {
 	file := filepath.Join(dir, "github-app.pem")
 	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
 	_, printed, _ := strings.Cut(out, "\n\n")
-	if code != 1 || printed != setupPrinted(t, file) || strings.Count(errs, "\n") != 1 ||
+	if code != 1 || printed != setupPrintedServe(file) || strings.Count(errs, "\n") != 1 ||
 		!strings.HasPrefix(errs, "qory-github setup: the App's client secret was not kept: ") ||
-		!strings.Contains(errs, "; and the App's webhook secret could not be set, so no webhook secret file is written: ") {
+		!strings.Contains(errs, "; and GitHub did not confirm the App's webhook secret, so no webhook secret file is written: ") {
 		t.Errorf("exit %d, stderr %q, setup prints\n%s", code, errs, out)
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
@@ -1197,9 +1208,10 @@ policy that selects it.
 func TestSetupHelpSaysWhatAppPublicURLMakes(t *testing.T) {
 	withFactory := strings.Replace(setupLongBefore, "setup waits ten minutes at most.\n\n", `setup waits ten minutes at most.
 
-With --public-url, the App instead gets a webhook at the public URL and
+With --public-url, the App is instead public, with a webhook at the public URL and
 /github/webhook, the events issues, issue_comment and workflow_run, and actions and
-issues write, contents and metadata read.
+issues write, contents and metadata read. It is qory-github-server's App: setup then
+prints qory-github-server serve's settings in place of the declaration and the policy.
 
 `, 1)
 	for features, want := range map[string]string{"": setupLongBefore, "all": setupLongBefore, "factory": withFactory} {

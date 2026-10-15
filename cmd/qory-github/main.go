@@ -124,9 +124,10 @@ policy that selects it.`,
 
 // setupPublicHelp is the paragraph setup's help adds after the App's description where
 // QORY_FEATURES names factory, see [cli.Factory], for the App --public-url makes.
-const setupPublicHelp = `With --public-url, the App instead gets a webhook at the public URL and
+const setupPublicHelp = `With --public-url, the App is instead public, with a webhook at the public URL and
 ` + github.WebhookPath + `, the events issues, issue_comment and workflow_run, and actions and
-issues write, contents and metadata read.`
+issues write, contents and metadata read. It is qory-github-server's App: setup then
+prints qory-github-server serve's settings in place of the declaration and the policy.`
 
 // setupLong is setup's help where QORY_FEATURES names factory: [setupHelp]'s, with
 // [setupPublicHelp] after its paragraph on the App.
@@ -295,11 +296,21 @@ func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
 	if app.Moved != nil {
 		fmt.Fprint(stdout, movedLine(abs, s.KeyFile, app.Moved))
 	}
-	integrations, policy, err := declaration(app.ID, abs)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, `
+	// The App --public-url makes is qory-github-server's: it lacks the permissions a
+	// run's token needs, so no declaration is printed for it.
+	if s.PublicURL != "" {
+		fmt.Fprintf(stdout, `
+The App %d (%s) is created, and its private key is in %s.
+
+Install it on the repositories your agents work on:
+  %s
+`, app.ID, app.Slug, abs, app.InstallURL(s.Web))
+	} else {
+		integrations, policy, err := declaration(app.ID, abs)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, `
 The App %d (%s) is created, and its private key is in %s.
 
 Install it on the repositories your agents work on:
@@ -313,6 +324,7 @@ with the repositories the run works on, and allows GitHub's hosts beside the oth
 run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
+	}
 	// serve's settings for the secrets that are kept are printed, and then why the
 	// others are not.
 	if app.ClientSecretFile != "" || app.WebhookSecretFile != "" {

@@ -35,12 +35,12 @@ const WebhookPath = github.WebhookPath
 const MaxBody = 25 << 20
 
 // maxSecretFile is the most a webhook secret file may hold; one byte more is read to
-// tell a larger file apart. A secret is far shorter.
-const maxSecretFile = 4 << 10
+// tell a larger file apart. A secret is far shorter. setup keeps to it too.
+const maxSecretFile = github.MaxWebhookSecretFile
 
 // minSecret is the shortest webhook secret taken, in bytes: a shorter one is guessed
-// sooner, and the signature it makes proves less.
-const minSecret = 16
+// sooner, and the signature it makes proves less. setup keeps to it too.
+const minSecret = github.MinWebhookSecret
 
 // readBudget is how many bytes of bodies the receiver holds at once, eight times
 // [MaxBody]. A body is read before its signature can be checked, so a sender with no

@@ -77,7 +77,19 @@ type fakeGitHub struct {
 	hookAuth      []string // the Authorization of each PATCH /app/hook/config
 	hookBodies    []string // the body of each PATCH /app/hook/config
 	hookEcho      bool     // a failing PATCH /app/hook/config says the body it received
-	hookPlain     bool     // PATCH /app/hook/config answers 200 with a body that is not JSON
+	hookAnswer    string   // the body of PATCH /app/hook/config's 200, when set; "" is GitHub's
+	hookNoBody    bool     // PATCH /app/hook/config answers 200 with no body
+	// exchangeDelay and hookDelay are how long the exchange's answer and PATCH
+	// /app/hook/config's take, or until the request is given up.
+	exchangeDelay, hookDelay time.Duration
+}
+
+// delay waits d, or until r is given up.
+func delay(r *http.Request, d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-r.Context().Done():
+	}
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +128,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]any{"token": fakeToken, "expires_at": "2026-09-25T21:00:00Z"})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app-manifests/"):
+		delay(r, f.exchangeDelay)
 		w.WriteHeader(201)
 		var webhookSecret any
 		if f.webhookSecret != "" {
@@ -123,6 +136,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": webhookSecret})
 	case r.Method == "PATCH" && r.URL.Path == "/app/hook/config":
+		delay(r, f.hookDelay)
 		b, _ := io.ReadAll(r.Body)
 		f.hookAuth = append(f.hookAuth, r.Header.Get("Authorization"))
 		f.hookBodies = append(f.hookBodies, string(b))
@@ -135,8 +149,8 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"message": message})
 			return
 		}
-		if f.hookPlain {
-			io.WriteString(w, "ok")
+		if f.hookAnswer != "" || f.hookNoBody {
+			io.WriteString(w, f.hookAnswer)
 			return
 		}
 		io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/github/webhook"}`)

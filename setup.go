@@ -112,7 +112,7 @@ func (a App) InstallURL(web string) string {
 // Manifest is the App Setup requests from GitHub without [Setup.PublicURL]: private,
 // with no webhook, allowed to read and write repository contents and pull requests and
 // to read metadata, which is the most a run's token can then be granted. With it,
-// [serveManifest] changes it to the App serve needs.
+// [serveManifest] changes it to the public App serve needs.
 func Manifest(name, redirect string) map[string]any {
 	return map[string]any{
 		"name":                name,
@@ -129,19 +129,22 @@ func Manifest(name, redirect string) map[string]any {
 // URL; serve's receiver listens on it.
 const WebhookPath = "/github/webhook"
 
-// appDescription is the App's description with [Setup.PublicURL].
-//
-// PLACEHOLDER awaiting the user's wording (T1).
-const appDescription = "Qory lists your repositories' open issues in Qory Apiary, where you choose what its factory works on. It reads code and issues, comments once on an issue it takes in, and starts runs in your runner repository."
+// The bounds of a webhook secret serve's receiver takes, which setup keeps to:
+// MinWebhookSecret is the shortest secret, in bytes, and MaxWebhookSecretFile the most
+// its file may hold, the secret and a line break.
+const (
+	MinWebhookSecret     = 16
+	MaxWebhookSecretFile = 4 << 10
+)
 
 // serveManifest changes the manifest m to the App serve needs, under serve's public
-// URL publicURL: what Connect needs, see [ConnectManifest]; a description; a webhook,
-// active, at [WebhookPath], for the events issues, issue_comment and workflow_run; and
-// the permissions actions write, issues write, contents read and metadata read, in place
-// of those [Manifest] sets.
+// URL publicURL: public, so it can be installed on an account other than its owner's;
+// what Connect needs, see [ConnectManifest]; a webhook, active, at [WebhookPath], for
+// the events issues, issue_comment and workflow_run; and the permissions actions write,
+// issues write, contents read and metadata read, in place of those [Manifest] sets.
 func serveManifest(m map[string]any, publicURL string) {
 	ConnectManifest(m, publicURL)
-	m["description"] = appDescription
+	m["public"] = true
 	m["hook_attributes"] = map[string]any{"url": publicURL + WebhookPath, "active": true}
 	m["default_events"] = []string{"issues", "issue_comment", "workflow_run"}
 	m["default_permissions"] = map[string]string{"actions": "write", "issues": "write", "contents": "read", "metadata": "read"}
@@ -240,12 +243,14 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	done := func() (*App, error) {
 		defer srv.Close()
-		ctx, cancel := context.WithTimeout(ctx, wait)
+		approval, cancel := context.WithTimeout(ctx, wait)
 		defer cancel()
 		select {
 		case code := <-codes:
+			// The calls after the approval are bound by ctx and by
+			// [afterApprovalTimeout] each, never by what is left of the wait.
 			return s.exchange(ctx, code)
-		case <-ctx.Done():
+		case <-approval.Done():
 			return nil, fmt.Errorf("no App was created within %s", wait)
 		}
 	}
@@ -257,6 +262,13 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	return local + pagePath, done, nil
 }
+
+// afterApprovalTimeout is how long each call setup makes once the person has approved
+// the App may take, the exchange of the code and the setting of the webhook secret:
+// 30 seconds, as long as the API client gives one request, so a slow answer fails
+// rather than leaving setup waiting, and an approval near the end of the wait still
+// leaves each call the whole of it. A test shortens it.
+var afterApprovalTimeout = 30 * time.Second
 
 // randomHex is 16 random bytes from crypto/rand in hex, 32 digits, which no one guesses.
 func randomHex() string {
@@ -270,7 +282,8 @@ func randomHex() string {
 // key goes to a new file beside it, and when that cannot be written either, the error
 // identifies the App and where to generate another key. Neither contains the key. With
 // [Setup.PublicURL], once the key is kept, it keeps the App's client secret, then its
-// webhook secret, see [Setup.keepWebhookSecret].
+// webhook secret, see [Setup.keepWebhookSecret]. Each call it makes has
+// [afterApprovalTimeout] within ctx.
 func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	var got struct {
 		ID       int64  `json:"id"`
@@ -283,7 +296,9 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		ClientSecret  string `json:"client_secret"`
 		WebhookSecret string `json:"webhook_secret"`
 	}
-	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
+	exchanging, cancel := context.WithTimeout(ctx, afterApprovalTimeout)
+	defer cancel()
+	if err := s.Client.call(exchanging, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
 		// GitHub does not redirect the exchange; should it, the code is not sent on.
 		var answered *answerError
 		if errors.As(err, &answered) && answered.redirect() {
@@ -373,20 +388,20 @@ func (s Setup) keepClientSecret(app *App, secret string) {
 // written as their hex, 64 digits, which serve's receiver takes as it is.
 const webhookSecretBytes = 32
 
-// minWebhookSecret is the shortest webhook secret setup keeps, in bytes, as serve's
-// receiver refuses a shorter one.
-const minWebhookSecret = 16
-
 // keepWebhookSecret writes the App's webhook secret to [Setup.WebhookSecretFile], 0600,
 // and sets where it is on app. GitHub's answer holds the secret, or null when the App
 // has none: setup then makes one, 32 random bytes from crypto/rand in hex, sets it on
 // the App's webhook with PATCH /app/hook/config, authenticated as the App with key, and
-// only once GitHub has it writes the file. When that fails, no file is written: the
-// App's webhook then has no secret setup knows, and serve takes none of its deliveries
-// until one is set on the App and written to the file. When the
-// secret cannot be kept, [App.WebhookSecretErr] says why and what to do on the App's
-// settings page, where a webhook secret is set, and the App is kept all the same, its
-// key kept. The error never contains the secret.
+// only once GitHub has confirmed it writes the file. When GitHub does not confirm it, no
+// file is written: whether the App's webhook has the secret is not known, and serve
+// takes none of its deliveries until a secret is set on the App and written to the
+// file. A secret in GitHub's answer that serve's receiver would refuse, shorter than
+// [MinWebhookSecret], too large for [MaxWebhookSecretFile] or with white space or a
+// control character in it, is not kept. When the secret is not kept,
+// [App.WebhookSecretErr] says why and what to do: set a secret on the App's settings
+// page, write it to a file, and name that file in serve's settings, since the settings
+// setup prints then lack it; the App is kept all the same, its key kept. The error
+// never contains the secret.
 func (s Setup) keepWebhookSecret(ctx context.Context, app *App, key *rsa.PrivateKey, secret string) {
 	switch {
 	case secret == "":
@@ -394,23 +409,23 @@ func (s Setup) keepWebhookSecret(ctx context.Context, app *App, key *rsa.Private
 		rand.Read(b)
 		secret = hex.EncodeToString(b)
 		if err := s.setWebhookSecret(ctx, app.ID, key, secret); err != nil {
-			app.WebhookSecretErr = fmt.Errorf("the App's webhook secret could not be set, so no webhook secret file is written: %v; set a webhook secret at %s and write the same secret to %s, 0600: until then qory-github-server serve takes none of the App's deliveries", err, s.keysURL(app.Slug), s.WebhookSecretFile)
+			app.WebhookSecretErr = fmt.Errorf("GitHub did not confirm the App's webhook secret, so no webhook secret file is written: %v; set a webhook secret at %s, write the same secret to %s, 0600, and name that file as webhook_secret_file in qory-github-server serve's settings: until then serve takes none of the App's deliveries", err, s.keysURL(app.Slug), s.WebhookSecretFile)
 			return
 		}
-	case len(secret) < minWebhookSecret || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
-		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: GitHub's answer holds a webhook secret qory-github-server serve cannot use; set a webhook secret at %s and write the same secret to %s, 0600", s.keysURL(app.Slug), s.WebhookSecretFile)
+	case len(secret) < MinWebhookSecret || len(secret)+1 > MaxWebhookSecretFile || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
+		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: GitHub's answer holds a webhook secret qory-github-server serve cannot use; set a webhook secret at %s, write the same secret to %s, 0600, and name that file as webhook_secret_file in qory-github-server serve's settings", s.keysURL(app.Slug), s.WebhookSecretFile)
 		return
 	}
 	if err := writeOwnerFile(s.WebhookSecretFile, "the webhook secret file", []byte(secret+"\n")); err != nil {
-		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: %v; set a new webhook secret at %s and write the same secret to a file only you may read", err, s.keysURL(app.Slug))
+		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: %v; set a new webhook secret at %s, write the same secret to a file only you may read, and name that file as webhook_secret_file in qory-github-server serve's settings", err, s.keysURL(app.Slug))
 		return
 	}
 	app.WebhookSecretFile = s.WebhookSecretFile
 }
 
 // setWebhookSecret sets secret on the App's webhook, PATCH /app/hook/config,
-// authenticated as the App appID with key. GitHub's 200 is enough: an answer that is
-// not JSON is not a failure. The error never contains the secret.
+// authenticated as the App appID with key, within [afterApprovalTimeout]. GitHub's 200
+// is enough: its body is not read. The error never contains the secret.
 func (s Setup) setWebhookSecret(ctx context.Context, appID int64, key *rsa.PrivateKey, secret string) error {
 	const what = "setting the App's webhook secret"
 	now := time.Now
@@ -421,10 +436,9 @@ func (s Setup) setWebhookSecret(ctx context.Context, appID int64, key *rsa.Priva
 	if err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
-	var config struct{}
-	err = s.Client.call(ctx, what, http.MethodPatch, "/app/hook/config", jwt, map[string]string{"secret": secret}, http.StatusOK, &config)
-	var syntax *json.SyntaxError
-	if err != nil && !errors.As(err, &syntax) {
+	ctx, cancel := context.WithTimeout(ctx, afterApprovalTimeout)
+	defer cancel()
+	if err := s.Client.call(ctx, what, http.MethodPatch, "/app/hook/config", jwt, map[string]string{"secret": secret}, http.StatusOK, nil); err != nil {
 		if strings.Contains(err.Error(), secret) {
 			return errors.New(strings.ReplaceAll(err.Error(), secret, "[the secret]"))
 		}
