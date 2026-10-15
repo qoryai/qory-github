@@ -74,8 +74,8 @@ type apiaryRequest struct {
 
 // fakeApiary is Qory Apiary as the adapter reaches it. It verifies every request's
 // signature under the adapter's public key and its headers, records it, and signs its
-// answer under its server key: a refusal its refuse function chooses, or 200 {} for a
-// POST and the page of its change feed after the cursor for a GET.
+// answer under its server key: a refusal its refuse function chooses, or a 204 and no
+// body for a POST and the page of its change feed after the cursor for a GET.
 type fakeApiary struct {
 	t       *testing.T
 	srv     *httptest.Server
@@ -200,8 +200,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			n++
 		}
 	}
-	status, body := http.StatusOK, `{}`
+	status, body := http.StatusNoContent, ``
 	if r.Method == http.MethodGet {
+		status = http.StatusOK
 		body = f.page(r.URL.Query().Get("after"))
 	}
 	refuse, refuseGet := f.refuse, f.refuseGet
@@ -216,7 +217,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status, body = s, b
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
+	if body != "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	if status != http.StatusUnauthorized {
 		signer := f.server
 		if f.signer != nil {

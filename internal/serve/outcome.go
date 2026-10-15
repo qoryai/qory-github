@@ -84,9 +84,12 @@ func IsHeld(err error) bool {
 }
 
 // Outage marks err as Qory Apiary's outage: it could not be reached, its answer could
-// not be read, or it answered a 5xx or an answer not signed under the pin, as a deploy
-// or a proxy in front of it does for a while. The [Worker] tries such a delivery again
-// for longer than another error, see [outageFor]. nil stays nil.
+// not be read, or it answered, within the answer's bound, maxPostAnswer or
+// maxChangesAnswer, a 5xx or an answer not signed under the pin. An answer larger than
+// its bound is a plain error, not an outage. A deploy or a proxy in front of it answers
+// a 5xx or an unsigned answer for a while, and under the contract Qory Apiary itself
+// may answer a 413, 415 or 400 bad_request unsigned. The [Worker] tries such a
+// delivery again for longer than another error, see [outageFor]. nil stays nil.
 func Outage(err error) error {
 	if err == nil {
 		return nil

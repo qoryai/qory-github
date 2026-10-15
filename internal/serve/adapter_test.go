@@ -920,6 +920,22 @@ func TestAnAnswerNotSignedUnderThePinIsRefused(t *testing.T) {
 	}
 }
 
+// TestASuccessNotSignedUnderThePinIsAnOutage has Qory Apiary answer a POST with its
+// success, a 204 and no body, signed under a key the pin does not list, and checks the
+// answer is not taken as a success: the POST fails as an [Outage], not for good.
+func TestASuccessNotSignedUnderThePinIsAnOutage(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.signer = newKey(t)
+	linkCollection(w.st, "acme/widgets")
+	err := w.client.Items(context.Background(), widgetsItem())
+	if err == nil || !IsOutage(err) || IsPermanent(err) || !strings.Contains(err.Error(), "204, is not signed under a key of apiary_public_key") {
+		t.Errorf("err %v", err)
+	}
+	if got := w.apiary.sent("/v1/source-items"); len(got) != 1 {
+		t.Errorf("sent %d", len(got))
+	}
+}
+
 // TestTheFeedRefusesAnotherRevision checks a page of another revision, or none, is
 // refused and its cursor not kept.
 func TestTheFeedRefusesAnotherRevision(t *testing.T) {
