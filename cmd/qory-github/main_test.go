@@ -19,20 +19,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 	"unicode"
 
-	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/conformance"
-	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
-	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
 )
 
@@ -375,32 +370,6 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 	}
 }
 
-// TestOneLine pins how an error's text is written on its line: a line break as a space,
-// every other control character, a line or paragraph separator, a bidirectional
-// formatting character and a byte that is not UTF-8 escaped, and the rest as it is.
-func TestOneLine(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
-		{`/permissions/"a\u2028b": a quote " and a backslash \ stay`, `/permissions/"a\u2028b": a quote " and a backslash \ stay`},
-		{"one\ntwo\r\nthree", "one two three"},
-		{"a\rb\tc\x00d\x1be\x7ff", `a\rb\tc\x00d\x1be\x7ff`},
-		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
-		{"a\x85b\xffc", `a\x85b\xffc`},
-		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
-		{"acme\u202epohs", `acme\u202epohs`},
-		{"a\u202ab\u202bc\u202cd\u202de\u202ef", `a\u202ab\u202bc\u202cd\u202de\u202ef`},
-		{"a\u2066b\u2067c\u2068d\u2069e", `a\u2066b\u2067c\u2068d\u2069e`},
-		{"a\u200eb\u200fc\u061cd", `a\u200eb\u200fc\u061cd`},
-		// The characters beside them are left as they are: a zero-width joiner, U+200D, an
-		// Arabic letter, U+0628, a narrow no-break space, U+202F, and U+2065 and U+206A.
-		{"a\u200db\u0628c\u202fd\u2065e\u206af", "a\u200db\u0628c\u202fd\u2065e\u206af"},
-	} {
-		if got := oneLine(tc.in); got != tc.want {
-			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
 // TestDescribeConformsAndIsPinned checks what describe prints against the integration
 // contract and pins it to testdata/describe.json, so a change to the description is a
 // change to that file too. The contract's fixture fixtures/github.json is the
@@ -429,58 +398,6 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	code := run(context.Background(), []string{"describe", "--settings", "{}"}, &out, &errs)
 	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
 		t.Errorf("describe with settings: %v", err)
-	}
-}
-
-// TestProgramVersionFallsBackToTheModuleVersion pins the program's version: the one
-// set with ldflags first, as it is given, then the module version go install records,
-// a release or a pseudo-version, without its leading v, as the integration contract
-// reports a release's version, which the contract's schema accepts, and "dev" for a
-// build whose module version is (devel) or empty, or with no build info.
-func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
-	pseudo := "0.2.1-0.20261006195344-0f167ba9a536"
-	for _, tc := range []struct {
-		ldflags, module string
-		info            bool
-		want            string
-	}{
-		{"1.2.3", "v0.1.0", true, "1.2.3"},
-		{"v1.2.3", "v0.1.0", true, "v1.2.3"},
-		{"", "v0.1.0", true, "0.1.0"},
-		{"", "v" + pseudo, true, pseudo},
-		{"", "v1", true, "1"},
-		{"", "0.1.0", true, "0.1.0"},
-		{"", "vv0.1.0", true, "vv0.1.0"},
-		{"", "version", true, "version"},
-		{"", "v", true, "v"},
-		{"", "(devel)", true, "dev"},
-		{"", "", true, "dev"},
-		{"", "", false, "dev"},
-	} {
-		read := func() (*debug.BuildInfo, bool) {
-			if !tc.info {
-				return nil, false
-			}
-			return &debug.BuildInfo{Main: debug.Module{Path: "github.com/qoryai/qory-github", Version: tc.module}}, true
-		}
-		if got := programVersion(tc.ldflags, read); got != tc.want {
-			t.Errorf("ldflags %q, module %q, build info %v: %q, want %q", tc.ldflags, tc.module, tc.info, got, tc.want)
-		}
-	}
-	schema, err := contracts.Compile("description.schema.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := json.Marshal(github.Describe(pseudo))
-	if err != nil {
-		t.Fatal(err)
-	}
-	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := schema.Validate(doc); err != nil {
-		t.Errorf("the contract refuses the pseudo-version %s: %v", pseudo, err)
 	}
 }
 
@@ -807,114 +724,44 @@ func TestNoCommandIsUsage(t *testing.T) {
 	}
 }
 
-// TestServeIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory, serve
-// is in no usage and is answered as a command the program does not know.
-func TestServeIsAbsentWithoutFactory(t *testing.T) {
-	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
-		t.Setenv("QORY_FEATURES", features)
-		var unknownOut, unknownErrs bytes.Buffer
-		unknown := run(context.Background(), []string{"bogus"}, &unknownOut, &unknownErrs)
-		for _, args := range [][]string{{"serve"}, {"serve", "-h"}, {"serve", "--settings", "/none.json"}} {
-			var out, errs bytes.Buffer
-			code := run(context.Background(), args, &out, &errs)
-			if code != unknown || errs.String() != unknownErrs.String() || out.Len() != 0 {
-				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q; an unknown command: exit %d, %q", features, args, code, errs.String(), unknown, unknownErrs.String())
-			}
-		}
-		if strings.Contains(unknownErrs.String(), "serve") {
-			t.Errorf("QORY_FEATURES=%q: the usage lists serve:\n%s", features, unknownErrs.String())
-		}
-	}
-}
+// usageBefore is the usage as it was before serve and access-key, which it is whatever
+// QORY_FEATURES says.
+const usageBefore = `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
+GitHub and never holds the access token.
 
-func TestServeIsPresentWithFactory(t *testing.T) {
-	for _, features := range []string{"factory", "observability, factory ", " factory,", "observability,security,secrets,factory"} {
+usage:
+  qory-github <command> [flags]
+
+commands:
+  describe     Print the integration's description, for qory
+  credential   Mint an access token for a run's repositories
+  setup        Create the GitHub App and write its private key
+
+qory-github <command> -h prints a command's help.
+
+More: https://github.com/qoryai/qory-github/blob/main/README.md
+`
+
+// TestQoryGithubHasNoServeOrAccessKey pins that serve and access-key, which are
+// qory-github-server's, are in no usage of qory-github and are answered as commands it
+// does not know, whatever QORY_FEATURES says, factory on among them.
+func TestQoryGithubHasNoServeOrAccessKey(t *testing.T) {
+	for _, features := range []string{"", "all", "all-security,factory", "factory2", "factory,all", "factory", "observability, factory ", " factory,"} {
 		t.Setenv("QORY_FEATURES", features)
 		var out, errs bytes.Buffer
-		if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "\n  serve        ") {
-			t.Errorf("QORY_FEATURES=%q: exit %d, the usage lists no serve:\n%s", features, code, errs.String())
+		if code := run(context.Background(), nil, &out, &errs); code != 2 || errs.String() != usageBefore || out.Len() != 0 {
+			t.Errorf("QORY_FEATURES=%q: exit %d, usage:\n%s", features, code, errs.String())
 		}
-		errs.Reset()
-		if code := run(context.Background(), []string{"serve", "-h"}, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github serve --settings FILE") || strings.Contains(errs.String(), "More:") {
-			t.Errorf("QORY_FEATURES=%q: serve -h exits %d:\n%s", features, code, errs.String())
-		}
-		errs.Reset()
-		if code := run(context.Background(), []string{"serve"}, &out, &errs); code != 1 || errs.String() != "qory-github serve: --settings is required\n" {
-			t.Errorf("QORY_FEATURES=%q: serve exits %d: %q", features, code, errs.String())
+		for _, args := range [][]string{
+			{"serve"}, {"serve", "-h"}, {"serve", "--settings", "/none.json"},
+			{"access-key"}, {"access-key", "-h"}, {"access-key", "enrol", "-h"}, {"access-key", "enrol", "--secret-file", "/none", "https://apiary.example.com", "qec_0"},
+		} {
+			var out, errs bytes.Buffer
+			if code := run(context.Background(), args, &out, &errs); code != 2 || errs.String() != usageBefore || out.Len() != 0 {
+				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q", features, args, code, errs.String())
+			}
 		}
 	}
-}
-
-func TestServeRefusesSettingsItDoesNotKnow(t *testing.T) {
-	t.Setenv("QORY_FEATURES", "factory")
-	file := filepath.Join(t.TempDir(), "serve.json")
-	os.WriteFile(file, []byte(`{"app_id":1,"private_key_file":"/k","webhook_secret_file":"/s","listen":":0","state_dir":"/d","github_url":"https://api.github.com"}`), 0o600)
-	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "github_url"`) || out.Len() != 0 {
-		t.Errorf("exit %d: %q", code, errs.String())
-	}
-}
-
-// TestServeStopsOnItsContext runs serve whole, and stops it as a signal does.
-func TestServeStopsOnItsContext(t *testing.T) {
-	t.Setenv("QORY_FEATURES", "factory")
-	dir := t.TempDir()
-	key, _ := keyFile(t)
-	secret := filepath.Join(dir, "secret")
-	os.WriteFile(secret, []byte("s3cr3t-0123456789abcdef\n"), 0o600)
-	access, _ := accesskey.Generate()
-	server, _ := accesskey.Generate()
-	accessFile := filepath.Join(dir, "access-key")
-	os.WriteFile(accessFile, []byte(access.Secret()+"\n"), 0o600)
-	clientFile := filepath.Join(dir, "client-secret")
-	os.WriteFile(clientFile, []byte("c1ient-s3cr3t\n"), 0o600)
-	// Qory Apiary is a loopback port nothing listens on: serve serves all the same,
-	// and declares the adapter again after a wait.
-	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state"),
-		"app_slug": "qory-acme", "apiary_url": "http://127.0.0.1:1", "public_url": "https://qory-github.example.com", "access_key_id": "ak_0123456789abcdef",
-		"access_key_secret_file": accessFile, "apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": server.PublicKey().String()}},
-		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.acme", "client_secret_file": clientFile})
-	file := filepath.Join(dir, "serve.json")
-	os.WriteFile(file, settings, 0o600)
-	ctx, cancel := context.WithCancel(context.Background())
-	var out bytes.Buffer
-	errs := &lockedBuffer{}
-	done := make(chan int, 1)
-	go func() { done <- run(ctx, []string{"serve", "--settings", file}, &out, errs) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(errs.String(), `"msg":"serving"`) {
-		if time.Now().After(deadline) {
-			t.Fatalf("serve does not serve: %s", errs.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-	select {
-	case code := <-done:
-		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") || strings.Contains(errs.String(), access.Secret()) || strings.Contains(errs.String(), "c1ient") {
-			t.Errorf("exit %d, stdout %q, stderr %s", code, out.String(), errs.String())
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("serve does not stop")
-	}
-}
-
-// lockedBuffer is a buffer serve writes while a test reads it.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuffer) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuffer) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
 }
 
 // setupWhole runs setup whole, with the flags args after the fake API and the App's
@@ -1039,7 +886,7 @@ func TestSetupWithFactoryKeepsTheClientSecretForConnect(t *testing.T) {
 	_, printed, _ := strings.Cut(out, "\n\n")
 	want := setupPrinted(t, file) + `
 The App's client secret is in ` + secretFile + `, which only you may read. Add these settings to
-serve's settings, for Connect:
+qory-github-server serve's settings, for Connect:
 
   "client_id": "Iv1.test",
   "client_secret_file": ` + string(path) + `

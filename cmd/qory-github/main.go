@@ -14,22 +14,19 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/qoryai/qory-github"
-	"github.com/qoryai/qory-github/internal/serve"
+	"github.com/qoryai/qory-github/internal/cli"
 )
 
 func main() {
@@ -41,44 +38,13 @@ func main() {
 
 // version is the program's version, set when it is built with
 // -ldflags "-X main.version=...", or else by init to the version of the module it was
-// built from.
+// built from, see [cli.ProgramVersion].
 var version string
 
-func init() { version = programVersion(version, debug.ReadBuildInfo) }
+func init() { version = cli.ProgramVersion(version, debug.ReadBuildInfo) }
 
-// programVersion is the version set with ldflags when there is one, as it is given, or
-// else the main module's version from the build info without its leading v, as the
-// integration contract's releases have it, the tag without its v: go records v0.1.0
-// for go install ...@v0.1.0, reported as 0.1.0, or a pseudo-version for a commit,
-// v0.2.1-0.20261006195344-0f167ba9a536 reported as 0.2.1-0.20261006195344-0f167ba9a536.
-// Only a v followed by a digit is dropped; any other version is reported as recorded.
-// A build whose module version is (devel) or empty is "dev".
-func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string {
-	if ldflags != "" {
-		return ldflags
-	}
-	info, ok := read()
-	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
-		return "dev"
-	}
-	v := info.Main.Version
-	if len(v) > 1 && v[0] == 'v' && '0' <= v[1] && v[1] <= '9' {
-		return v[1:]
-	}
-	return v
-}
-
-// more is where the program's page is; each command's help links to a section of it.
-const more = "https://github.com/qoryai/qory-github/blob/main/README.md"
-
-// usage is what the command prints when it is run without a command it knows. serve and
-// access-key are listed only where QORY_FEATURES names factory, see [factory].
+// usage is what the command prints when it is run without a command it knows.
 func usage() string {
-	serve := ""
-	if factory() {
-		serve = "  serve        " + serveHelp.short + "\n" +
-			"  access-key   " + accessKeyHelp.short + "\n"
-	}
 	return `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
 GitHub and never holds the access token.
 
@@ -86,86 +52,19 @@ usage:
   qory-github <command> [flags]
 
 commands:
-  describe     ` + describeHelp.short + `
-  credential   ` + credentialHelp.short + `
-  setup        ` + setupHelp.short + `
-` + serve + `
+  describe     ` + describeHelp.Short + `
+  credential   ` + credentialHelp.Short + `
+  setup        ` + setupHelp.Short + `
+
 qory-github <command> -h prints a command's help.
 
-More: ` + more
+More: ` + cli.More
 }
 
-// factory is whether the environment variable QORY_FEATURES switches on factory, the
-// command serve, the webhook receiver, and the command access-key, which enrols its
-// access key for Qory Apiary. Qory Apiary's factory is an opt-in feature of the same
-// name, and qory-github reads the variable by the rules Qory Apiary applies to the name
-// of an opt-in feature:
-//
-//   - unset, blank, all, and all- followed by the features left out, all-security,factory
-//     among them, leave factory off;
-//   - a list of the features on, names separated by commas with white space around
-//     each ignored, switches factory on when it names factory;
-//   - a list that names all or all-… among its features, which Qory Apiary refuses,
-//     leaves factory off.
-//
-// Any other name in the list is ignored.
-func factory() bool {
-	v := strings.TrimSpace(os.Getenv("QORY_FEATURES"))
-	if v == "all" || strings.HasPrefix(v, "all-") {
-		return false
-	}
-	on := false
-	for _, name := range strings.Split(v, ",") {
-		name = strings.TrimSpace(name)
-		if name == "all" || strings.HasPrefix(name, "all-") {
-			return false
-		}
-		on = on || name == "factory"
-	}
-	return on
-}
-
-// help is one command's help. short is its line in usage; -h prints the rest, and the
-// command's flags, on standard error.
-type help struct {
-	short, use, long, example, section string
-}
-
-// parse parses args into fs. -h prints the whole help; a flag fs refuses prints the
-// command's usage and flags alone, after the flag parser's message.
-func (h help) parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
-	fs.SetOutput(stderr)
-	fs.Usage = func() {}
-	err := fs.Parse(args)
-	switch {
-	case errors.Is(err, flag.ErrHelp):
-		fmt.Fprintf(stderr, "%s\n\n", h.long)
-		h.usage(stderr, fs)
-		fmt.Fprintf(stderr, "\nexamples:\n%s\n", h.example)
-		if h.section != "" {
-			fmt.Fprintf(stderr, "\nMore: %s#%s\n", more, h.section)
-		}
-	case err != nil:
-		h.usage(stderr, fs)
-	}
-	return err
-}
-
-// usage prints the command's usage line, and the flags of fs when it has any.
-func (h help) usage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintf(w, "usage:\n  %s\n", h.use)
-	flags := false
-	fs.VisitAll(func(*flag.Flag) { flags = true })
-	if flags {
-		fmt.Fprint(w, "\nflags:\n")
-		fs.PrintDefaults()
-	}
-}
-
-var describeHelp = help{
-	short: "Print the integration's description, for qory",
-	use:   "qory-github describe",
-	long: `Print the integration's description: one JSON document, as the integration contract
+var describeHelp = cli.Help{
+	Short: "Print the integration's description, for qory",
+	Use:   "qory-github describe",
+	Long: `Print the integration's description: one JSON document, as the integration contract
 defines it.
 
 It contains the settings qory-github takes, as a JSON Schema, with the private key
@@ -174,15 +73,15 @@ argument may list, and the hosts the access token is for. qory runs describe, an
 the declaration's settings against it.
 
 It takes no settings and reaches no network.`,
-	example: `  qory-github describe                  # the whole description
+	Example: `  qory-github describe                  # the whole description
   qory-github describe | jq .settings   # the settings, as a JSON Schema`,
-	section: "describe",
+	Section: "describe",
 }
 
-var credentialHelp = help{
-	short: "Mint an access token for a run's repositories",
-	use:   "qory-github credential --settings JSON [--] owner/name[,owner/name...]",
-	long: `Mint a GitHub App access token for the repositories listed, and print the gateway's
+var credentialHelp = cli.Help{
+	Short: "Mint an access token for a run's repositories",
+	Use:   "qory-github credential --settings JSON [--] owner/name[,owner/name...]",
+	Long: `Mint a GitHub App access token for the repositories listed, and print the gateway's
 credential document: the access token, its expiry, and where it goes.
 
 The gateway runs credential outside the container, as a credential's adapter. qory
@@ -195,15 +94,15 @@ setting and no secret from its environment.
 
 The repositories follow --, one owner's, separated by commas. The access token covers
 them alone, with the permissions of the settings and no more.`,
-	example: `  qory-github credential --settings "$settings" -- acme/shop            # one repository
+	Example: `  qory-github credential --settings "$settings" -- acme/shop            # one repository
   qory-github credential --settings "$settings" -- acme/shop,acme/lib   # two of one owner's`,
-	section: "credential",
+	Section: "credential",
 }
 
-var setupHelp = help{
-	short: "Create the GitHub App and write its private key",
-	use:   "qory-github setup [--org ORG] [--name NAME] [--key-file FILE]",
-	long: `Create the GitHub App that qory-github mints access tokens with, and write its private
+var setupHelp = cli.Help{
+	Short: "Create the GitHub App and write its private key",
+	Use:   "qory-github setup [--org ORG] [--name NAME] [--key-file FILE]",
+	Long: `Create the GitHub App that qory-github mints access tokens with, and write its private
 key.
 
 setup opens GitHub in the browser with the App filled in: private, no webhook, contents
@@ -216,36 +115,10 @@ file cannot be written, the key goes beside it, and setup prints where.
 
 Then setup prints where to install the App, the declaration for forager.yaml, and a
 policy that selects it.`,
-	example: `  qory-github setup                                       # under your account
+	Example: `  qory-github setup                                       # under your account
   qory-github setup --org acme                            # under the organisation acme
   qory-github setup --name qory-github-acme               # the App's name`,
-	section: "setup",
-}
-
-// serveHelp is serve's help, which has no section on the program's page: the command is
-// switched on by QORY_FEATURES alone, see [factory].
-var serveHelp = help{
-	short: "Take the GitHub App's webhook deliveries",
-	use:   "qory-github serve --settings FILE",
-	long: `Take the GitHub App's webhook deliveries at POST /github/webhook, on plain HTTP: a
-proxy in front terminates TLS.
-
-serve checks each delivery's signature with the App's webhook secret, keeps it in a
-store in the state directory and answers GitHub at once; it handles the delivery
-after. For each installation linked to Qory Apiary it sends the repositories, issues
-and comments to Qory Apiary, and it reads Qory Apiary's change feed and writes on GitHub
-what the feed says. It runs until it is stopped with SIGINT or SIGTERM.
-
-serve also answers the connect page under public_url, /v1/connect, where Qory Apiary
-sends a person who connects the App's installation.
-
-The settings are one JSON document in FILE: app_id, private_key_file,
-webhook_secret_file, listen, state_dir, app_slug, apiary_url, public_url,
-access_key_id, access_key_secret_file, apiary_public_key, adapter_id, client_id and
-client_secret_file, and api_url, which may be left out for GitHub's API. The private
-key, the webhook secret, the access key's secret and the App's client secret are each
-in a file only its owner may read.`,
-	example: `  qory-github serve --settings /etc/qory-github/serve.json`,
+	Section: "setup",
 }
 
 // run is the command, with its streams, so a test runs it whole. It returns the exit
@@ -263,20 +136,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = setup(ctx, args[1:], stdout, stderr)
 	case "describe":
 		err = describe(args[1:], stdout, stderr)
-	case "serve":
-		// Without factory, serve is a command the program does not know.
-		if !factory() {
-			fmt.Fprintln(stderr, usage())
-			return 2
-		}
-		err = runServe(ctx, args[1:], stderr)
-	case "access-key":
-		// Without factory, access-key is a command the program does not know.
-		if !factory() {
-			fmt.Fprintln(stderr, usage())
-			return 2
-		}
-		err = accessKey(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage())
 		return 2
@@ -285,45 +144,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], oneLine(err.Error()))
+		fmt.Fprintf(stderr, "qory-github %s: %s\n", args[0], cli.OneLine(err.Error()))
 		return 1
 	}
 	return 0
 }
 
-// oneLine is an error's text as the one line it is written on: a line break, \n or
-// \r\n, is a space, and every other control character, C0, DEL or C1, the Unicode line
-// and paragraph separators, and the bidirectional formatting characters, Unicode's
-// Bidi_Control, U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F and U+061C, which
-// reorder what a terminal shows, are escaped as Go escapes them in a string, \r, \x7f,
-// \u2028, \u202e, and so is a byte that is not UTF-8, wherever the text comes from,
-// GitHub's answer among them. The rest is left as it is, a quote or a backslash too, so
-// a name the settings' error already quoted reads the same.
-func oneLine(s string) string {
-	s = strings.ReplaceAll(s, "\r\n", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
-	var b strings.Builder
-	for len(s) > 0 {
-		r, size := utf8.DecodeRuneInString(s)
-		switch {
-		case r == utf8.RuneError && size == 1:
-			fmt.Fprintf(&b, `\x%02x`, s[0])
-		case unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Bidi_Control, r):
-			q := strconv.QuoteRune(r)
-			b.WriteString(q[1 : len(q)-1])
-		default:
-			b.WriteString(s[:size])
-		}
-		s = s[size:]
-	}
-	return b.String()
-}
-
 // describe prints the integration's description, one JSON document. It takes no
 // settings and reaches no network. -h alone prints its help instead.
 func describe(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 1 && slices.Contains([]string{"-h", "-help", "--h", "--help"}, args[0]) {
-		return describeHelp.parse(flag.NewFlagSet("describe", flag.ContinueOnError), args, stderr)
+	if cli.HelpAlone(args) {
+		return describeHelp.Parse(flag.NewFlagSet("describe", flag.ContinueOnError), args, stderr)
 	}
 	if len(args) != 0 {
 		return errors.New("describe takes no arguments")
@@ -342,7 +173,7 @@ func describe(args []string, stdout, stderr io.Writer) error {
 func credential(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("credential", flag.ContinueOnError)
 	doc := fs.String("settings", "", "the settings, one JSON document (required)")
-	if err := credentialHelp.parse(fs, args, stderr); err != nil {
+	if err := credentialHelp.Parse(fs, args, stderr); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -375,28 +206,6 @@ func credential(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	return err
 }
 
-// runServe takes the App's webhook deliveries until ctx is done, a signal. It writes
-// its lines, one JSON object each, on standard error, and nothing on standard output.
-func runServe(ctx context.Context, args []string, stderr io.Writer) error {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	file := fs.String("settings", "", "the settings file, one JSON document (required)")
-	if err := serveHelp.parse(fs, args, stderr); err != nil {
-		return err
-	}
-	if fs.NArg() != 0 {
-		return errors.New("serve takes no arguments")
-	}
-	if *file == "" {
-		return errors.New("--settings is required")
-	}
-	s, err := serve.ReadSettings(*file)
-	if err != nil {
-		return err
-	}
-	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	return serve.Run(ctx, s, serve.Options{Log: log})
-}
-
 // setup creates the App with a person's approval in the browser, writes its key and
 // prints what to do next.
 func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -406,13 +215,13 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	keyFile := fs.String("key-file", "", "where the private key is written (default ~/.config/qory/github-app.pem)")
 	api := fs.String("api-url", github.APIURL, "GitHub's API: https://api.github.com, or for a test http or https on a loopback host")
 	web := fs.String("web-url", github.WebURL, "GitHub's website: https://github.com, or for a test http or https on a loopback host")
-	// --public-url exists only where QORY_FEATURES names factory, see [factory]:
+	// --public-url exists only where QORY_FEATURES names factory, see [cli.Factory]:
 	// without it setup's flags, its App and what it prints are as they were.
 	var publicURL *string
-	if factory() {
-		publicURL = fs.String("public-url", "", "where serve is reached from outside, https: the App then gets serve's Connect, and its client secret is written beside the key")
+	if cli.Factory() {
+		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, and its client secret is written beside the key")
 	}
-	if err := setupHelp.parse(fs, args, stderr); err != nil {
+	if err := setupHelp.Parse(fs, args, stderr); err != nil {
 		return err
 	}
 	// The URLs are checked before anything is created, listened on or opened.
@@ -499,7 +308,7 @@ run reaches:
 		}
 		fmt.Fprintf(stdout, `
 The App's client secret is in %s, which only you may read. Add these settings to
-serve's settings, for Connect:
+qory-github-server serve's settings, for Connect:
 
 %s`, fragment.file, fragment.members)
 	}

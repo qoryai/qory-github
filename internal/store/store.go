@@ -1,6 +1,6 @@
-// Package store is what qory-github serve keeps on its machine: one file in its state
-// directory, a bbolt database, which only the user it runs as may read. It keeps the
-// webhook deliveries GitHub sent, each until it is handled and then its GUID for
+// Package store is what qory-github-server serve keeps on its machine: one file in its
+// state directory, a bbolt database, which only the user it runs as may read. It keeps
+// the webhook deliveries GitHub sent, each until it is handled and then its GUID for
 // [DeliveryRetention], so a delivery GitHub sends again is dropped; and values that
 // other parts of serve keep under a namespace, each with an expiry or none.
 //
@@ -122,7 +122,7 @@ func Open(dir string, opts Options) (*Store, error) {
 		return nil, fmt.Errorf("the store %s was replaced while it was opened", path)
 	}
 	if errors.Is(err, bolt.ErrTimeout) {
-		return nil, fmt.Errorf("the store %s is open in another process; one qory-github serve runs on a state directory", path)
+		return nil, fmt.Errorf("the store %s is open in another process; one qory-github-server serve runs on a state directory", path)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("the store %s: %w", path, err)
