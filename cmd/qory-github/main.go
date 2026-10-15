@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -28,6 +29,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/serve"
 )
 
 func main() {
@@ -69,8 +71,14 @@ func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 // more is where the program's page is; each command's help links to a section of it.
 const more = "https://github.com/qoryai/qory-github/blob/main/README.md"
 
-// usage is what the command prints when it is run without a command it knows.
-var usage = `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
+// usage is what the command prints when it is run without a command it knows. serve is
+// listed only where QORY_FEATURES names factory, see [factory].
+func usage() string {
+	serve := ""
+	if factory() {
+		serve = "  serve        " + serveHelp.short + "\n"
+	}
+	return `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
 GitHub and never holds the access token.
 
 usage:
@@ -80,10 +88,26 @@ commands:
   describe     ` + describeHelp.short + `
   credential   ` + credentialHelp.short + `
   setup        ` + setupHelp.short + `
-
+` + serve + `
 qory-github <command> -h prints a command's help.
 
 More: ` + more
+}
+
+// factory is whether the environment variable QORY_FEATURES names factory, which
+// switches on the command serve, the webhook receiver. QORY_FEATURES is the list that
+// Qory Apiary reads too: names separated by commas, white space around each ignored.
+// factory is on only where the list names it: like Qory Apiary's opt-in features, all
+// and all-<features> leave it off. A name qory-github does not know is ignored, since
+// other programs read the same variable.
+func factory() bool {
+	for _, name := range strings.Split(os.Getenv("QORY_FEATURES"), ",") {
+		if strings.TrimSpace(name) == "factory" {
+			return true
+		}
+	}
+	return false
+}
 
 // help is one command's help. short is its line in usage; -h prints the rest, and the
 // command's flags, on standard error.
@@ -101,7 +125,10 @@ func (h help) parse(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 	case errors.Is(err, flag.ErrHelp):
 		fmt.Fprintf(stderr, "%s\n\n", h.long)
 		h.usage(stderr, fs)
-		fmt.Fprintf(stderr, "\nexamples:\n%s\n\nMore: %s#%s\n", h.example, more, h.section)
+		fmt.Fprintf(stderr, "\nexamples:\n%s\n", h.example)
+		if h.section != "" {
+			fmt.Fprintf(stderr, "\nMore: %s#%s\n", more, h.section)
+		}
 	case err != nil:
 		h.usage(stderr, fs)
 	}
@@ -179,11 +206,29 @@ policy that selects it.`,
 	section: "setup",
 }
 
+// serveHelp is serve's help, which has no section on the program's page: the command is
+// switched on by QORY_FEATURES alone, see [factory].
+var serveHelp = help{
+	short: "Take the GitHub App's webhook deliveries",
+	use:   "qory-github serve --settings FILE",
+	long: `Take the GitHub App's webhook deliveries at POST /github/webhook, on plain HTTP: a
+proxy in front terminates TLS.
+
+serve checks each delivery's signature with the App's webhook secret, keeps it in a
+store in the state directory and answers GitHub at once; it handles the delivery
+after. It runs until it is stopped with SIGINT or SIGTERM.
+
+The settings are one JSON document in FILE: app_id, private_key_file,
+webhook_secret_file, listen and state_dir. The private key and the webhook secret are
+each in a file only its owner may read.`,
+	example: `  qory-github serve --settings /etc/qory-github/serve.json`,
+}
+
 // run is the command, with its streams, so a test runs it whole. It returns the exit
 // status; an error is one line on stderr describing what failed, never a secret.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, usage)
+		fmt.Fprintln(stderr, usage())
 		return 2
 	}
 	var err error
@@ -194,8 +239,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = setup(ctx, args[1:], stdout, stderr)
 	case "describe":
 		err = describe(args[1:], stdout, stderr)
+	case "serve":
+		// Without factory, serve is a command the program does not know.
+		if !factory() {
+			fmt.Fprintln(stderr, usage())
+			return 2
+		}
+		err = runServe(ctx, args[1:], stderr)
 	default:
-		fmt.Fprintln(stderr, usage)
+		fmt.Fprintln(stderr, usage())
 		return 2
 	}
 	if errors.Is(err, flag.ErrHelp) {
@@ -290,6 +342,28 @@ func credential(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	_, err = fmt.Fprintf(stdout, "%s\n", b)
 	return err
+}
+
+// runServe takes the App's webhook deliveries until ctx is done, a signal. It writes
+// its lines, one JSON object each, on standard error, and nothing on standard output.
+func runServe(ctx context.Context, args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	file := fs.String("settings", "", "the settings file, one JSON document (required)")
+	if err := serveHelp.parse(fs, args, stderr); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("serve takes no arguments")
+	}
+	if *file == "" {
+		return errors.New("--settings is required")
+	}
+	s, err := serve.ReadSettings(*file)
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	return serve.Run(ctx, s, serve.Options{Handlers: &serve.Handlers{}, Log: log})
 }
 
 // setup creates the App with a person's approval in the browser, writes its key and
