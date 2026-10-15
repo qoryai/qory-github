@@ -37,6 +37,13 @@ func commentBy(login, typ, body string) takeInComment {
 	return c
 }
 
+// fakeAnswer is one answer the fake gives a request in place of what it would.
+type fakeAnswer struct {
+	status int
+	header map[string]string
+	body   string
+}
+
 // fakeTakeIn is GitHub's API as far as a take in uses it, for the issue acme/widgets#7.
 // It records every request it receives.
 type fakeTakeIn struct {
@@ -47,6 +54,7 @@ type fakeTakeIn struct {
 	pageSize    int // comments to a page; zero is a hundred
 	issueStatus int // the status of every request on the issue, when set: 404 or 410
 	nextHost    string
+	answers     map[string]fakeAnswer // by method and path: what GitHub answers instead
 	mu          sync.Mutex
 	requests    []string // method and path with its query
 	auth        []string
@@ -60,6 +68,14 @@ func (f *fakeTakeIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	b, _ := io.ReadAll(r.Body)
 	f.bodies = append(f.bodies, string(b))
+	if a, ok := f.answers[r.Method+" "+r.URL.Path]; ok {
+		for k, v := range a.header {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(a.status)
+		io.WriteString(w, a.body)
+		return
+	}
 	const issue = "/repos/acme/widgets/issues/7"
 	if f.issueStatus != 0 && strings.HasPrefix(r.URL.Path, issue) {
 		w.WriteHeader(f.issueStatus)
@@ -142,7 +158,7 @@ func serveTakeIn(t *testing.T, f *fakeTakeIn) (Client, TokenFunc, *[]Repository)
 
 var takenIn = Change{WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: StatusTakenIn, URL: "https://apiary.example.com/work-items/wi_42"}
 
-const takenInComment = "<!-- qory:work-item wi_42 -->\nQory took this into Factory: https://apiary.example.com/work-items/wi_42"
+const takenInComment = "<!-- qory:work-item wi_42 -->\nQory took this into Factory: <https://apiary.example.com/work-items/wi_42>"
 
 // posts are the comments the App's bot has posted.
 func (f *fakeTakeIn) posts() []string {
@@ -388,6 +404,11 @@ func TestAnInvalidChangeIsRefusedBeforeAnything(t *testing.T) {
 		{"bidi override", func(e *Change) { e.URL = "https://apiary.example.com/‮" }, "url"},
 		{"user", func(e *Change) { e.URL = "https://user:secretvalue@apiary.example.com/" }, "url"},
 		{"not UTF-8", func(e *Change) { e.URL = "https://apiary.example.com/\xff" }, "url"},
+		{"not ASCII", func(e *Change) { e.URL = "https://apiary.example.com/caf\u00e9" }, "url"},
+		{"an image", func(e *Change) { e.URL = "https://apiary.example.com/<img/src=https://evil.example/p.png>" }, "url"},
+		{"an HTML comment", func(e *Change) { e.URL = "https://apiary.example.com/x<!--" }, "url"},
+		{"a broken escape", func(e *Change) { e.URL = "https://apiary.example.com/%zz" }, "url"},
+		{"a short escape", func(e *Change) { e.URL = "https://apiary.example.com/%4" }, "url"},
 	} {
 		for _, status := range []string{StatusTakenIn, StatusUndone} {
 			tr := &sentTransport{}
@@ -443,7 +464,175 @@ func TestATokenThatCannotBeHadSendsNothing(t *testing.T) {
 	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), empty, takeInSlug, takenIn); err == nil || tr.sent {
 		t.Errorf("an empty token: err %v, sent %v", err, tr.sent)
 	}
-	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), token, "qory test", takenIn); err == nil || tr.sent {
+	working := func(context.Context, Repository) (string, error) { return takeInToken, nil }
+	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), working, takeInSlug+"]", takenIn); err == nil || !strings.HasPrefix(err.Error(), "the App's slug is not one") || tr.sent {
 		t.Errorf("a slug that is not one: err %v, sent %v", err, tr.sent)
+	}
+}
+
+// TestAURLHoldsOnlyWhatRFC3986Allows refuses a work item URL with each character RFC
+// 3986 leaves out of a URI, and takes one with each it allows, which the comment then
+// writes as an autolink, where neither Markdown nor HTML is read: a Markdown link in
+// the URL stays part of the one link.
+func TestAURLHoldsOnlyWhatRFC3986Allows(t *testing.T) {
+	for _, c := range []string{"<", ">", `"`, "`", `\`, "{", "}", "|", "^", " ", "\t", "\n", "\x00", "\x7f", "é", "‮"} {
+		if err := checkChangeURL("https://apiary.example.com/a" + c + "b"); err == nil {
+			t.Errorf("%q is taken", c)
+		}
+	}
+	for _, allowed := range []string{
+		"https://apiary.example.com/work-items/wi_42/a-b._~:@!$&'()*+,;=[]%20?x=1&y=(2)#f",
+		"https://apiary.example.com/x)[Approve](https://evil.example)",
+	} {
+		if err := checkChangeURL(allowed); err != nil {
+			t.Fatalf("%s: %v", allowed, err)
+		}
+		f := &fakeTakeIn{}
+		c, token, _ := serveTakeIn(t, f)
+		e := takenIn
+		e.URL = allowed
+		if err := c.ApplyChange(context.Background(), token, takeInSlug, e); err != nil {
+			t.Fatal(err)
+		}
+		if want := "<!-- qory:work-item wi_42 -->\nQory took this into Factory: <" + allowed + ">"; len(f.posts()) != 1 || f.posts()[0] != want {
+			t.Errorf("the comment is %q, want %q", f.posts(), want)
+		}
+	}
+}
+
+// toServer is a transport that sends every request to a test server, over HTTP,
+// whatever its URL, and records the hosts the requests were for.
+type toServer struct {
+	addr  string
+	mu    sync.Mutex
+	hosts []string
+}
+
+func (s *toServer) RoundTrip(r *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.hosts = append(s.hosts, r.URL.Host)
+	s.mu.Unlock()
+	r = r.Clone(r.Context())
+	r.URL.Scheme, r.URL.Host = "http", s.addr
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestTheDefaultPortIsTheSameAPI pages the comments with the API written with and
+// without :443, and the next page GitHub names written the other way, and checks that
+// the next page is read and the comment found.
+func TestTheDefaultPortIsTheSameAPI(t *testing.T) {
+	for _, tc := range []struct{ api, next string }{
+		{"https://api.github.com:443", "https://api.github.com"},
+		{"https://api.github.com", "https://api.github.com:443"},
+		{"https://api.github.com:443", "https://api.github.com:443"},
+	} {
+		f := &fakeTakeIn{pageSize: 1, nextHost: tc.next, comments: []takeInComment{commentBy("someone", "User", "first"), commentBy(takeInBot, "Bot", takenInComment)}}
+		_, token, _ := serveTakeIn(t, f)
+		tr := &toServer{addr: strings.TrimPrefix(f.srv.URL, "http://")}
+		c := Client{API: tc.api, HTTP: &http.Client{Transport: tr}}
+		if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+			t.Errorf("%s, next on %s: %v", tc.api, tc.next, err)
+		}
+		if len(f.posts()) != 0 || !slices.Contains(f.requests, "GET /repositories/1/issues/7/comments?per_page=100&page=2") {
+			t.Errorf("%s, next on %s: requests %v", tc.api, tc.next, f.requests)
+		}
+	}
+	for _, next := range []string{"https://api.github.com:8443", "http://api.github.com"} {
+		f := &fakeTakeIn{pageSize: 1, nextHost: next, comments: []takeInComment{commentBy("someone", "User", "first"), commentBy("someone", "User", "second")}}
+		_, token, _ := serveTakeIn(t, f)
+		c := Client{API: "https://api.github.com:443", HTTP: &http.Client{Transport: &toServer{addr: strings.TrimPrefix(f.srv.URL, "http://")}}}
+		if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err == nil || !strings.Contains(err.Error(), "the next page GitHub names is not on the API") {
+			t.Errorf("next on %s: err %v", next, err)
+		}
+	}
+}
+
+// TestWhatAskingAgainWouldNotChangeIsPermanent has GitHub answer a step of a take in, or
+// an undo, with an answer asking again would get, and with one that passes, and checks
+// which permanent error, if any, each wraps, and that no redirect is followed.
+func TestWhatAskingAgainWouldNotChangeIsPermanent(t *testing.T) {
+	const (
+		labels   = "POST /repos/acme/widgets/labels"
+		add      = "POST /repos/acme/widgets/issues/7/labels"
+		read     = "GET /repos/acme/widgets/issues/7/comments"
+		post     = "POST /repos/acme/widgets/issues/7/comments"
+		remove   = "DELETE /repos/acme/widgets/issues/7/labels/qory"
+		moved    = `{"message":"Moved Permanently","url":"/moved"}`
+		refused  = `{"message":"Resource not accessible by integration"}`
+		limited  = `{"message":"You have exceeded a secondary rate limit."}`
+		notFound = `{"message":"Not Found"}`
+	)
+	for _, tc := range []struct {
+		at     string
+		answer fakeAnswer
+		want   error // nil is an error that is neither
+	}{
+		{labels, fakeAnswer{status: 404, body: notFound}, ErrUnreachable},
+		{labels, fakeAnswer{status: 403, body: refused}, nil},
+		{add, fakeAnswer{status: 403, body: refused}, ErrUnreachable},
+		{post, fakeAnswer{status: 403, body: refused}, ErrUnreachable},
+		{add, fakeAnswer{status: 403, body: limited}, nil},
+		{post, fakeAnswer{status: 403, header: map[string]string{"Retry-After": "60"}, body: refused}, nil},
+		{post, fakeAnswer{status: 403, header: map[string]string{"X-RateLimit-Remaining": "0"}, body: refused}, nil},
+		{read, fakeAnswer{status: 403, body: refused}, nil},
+		{add, fakeAnswer{status: 404, body: notFound}, ErrIssueGone},
+		{post, fakeAnswer{status: 410, body: `{"message":"Gone"}`}, ErrIssueGone},
+		{labels, fakeAnswer{status: 500, body: `{"message":"Server Error"}`}, nil},
+		{remove, fakeAnswer{status: 403, body: refused}, nil},
+	} {
+		for _, status := range []int{0, 301, 308, 302, 307} {
+			a := tc.answer
+			want := tc.want
+			if status != 0 {
+				a = fakeAnswer{status: status, header: map[string]string{"Location": "/moved"}, body: moved}
+				want = nil
+				if status == 301 || status == 308 {
+					want = ErrUnreachable
+				}
+			}
+			f := &fakeTakeIn{answers: map[string]fakeAnswer{tc.at: a}}
+			c, token, _ := serveTakeIn(t, f)
+			e := takenIn
+			if tc.at == remove {
+				e.Status = StatusUndone
+			}
+			err := c.ApplyChange(context.Background(), token, takeInSlug, e)
+			if err == nil {
+				t.Errorf("%s answered %d: no error", tc.at, a.status)
+				continue
+			}
+			for _, permanent := range []error{ErrIssueGone, ErrUnreachable} {
+				if errors.Is(err, permanent) != (permanent == want) {
+					t.Errorf("%s answered %d: err %v, want it to wrap %v", tc.at, a.status, err, want)
+				}
+			}
+			if strings.Contains(err.Error(), takeInToken) || slices.Contains(f.requests, "GET /moved") || slices.Contains(f.requests, "POST /moved") || slices.Contains(f.requests, "DELETE /moved") {
+				t.Errorf("%s answered %d: err %v, requests %v", tc.at, a.status, err, f.requests)
+			}
+		}
+	}
+}
+
+// TestSendFollowsNoRedirect has GitHub answer with each redirect, to a path on the same
+// server, and checks that send hands the redirect back, does not follow it, and so
+// never sends the token on, whatever client it is handed.
+func TestSendFollowsNoRedirect(t *testing.T) {
+	for _, status := range []int{301, 302, 303, 307, 308} {
+		for _, hc := range []*http.Client{nil, {}} {
+			var followed bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/moved" {
+					followed = true
+					return
+				}
+				w.Header().Set("Location", "/moved")
+				w.WriteHeader(status)
+			}))
+			a, err := Client{API: srv.URL, HTTP: hc}.send(context.Background(), "reading", http.MethodGet, "/repos/acme/widgets/issues/7/comments", takeInToken, nil)
+			srv.Close()
+			if err != nil || a.status != status || followed {
+				t.Errorf("%d: err %v, followed %v", status, err, followed)
+			}
+		}
 	}
 }
