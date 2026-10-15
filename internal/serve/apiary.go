@@ -47,6 +47,10 @@ const (
 	minimumSyncInterval = 900
 )
 
+// maximumSyncInterval is the longest interval the contract allows, a day: a longer one
+// in the change feed is taken as a day.
+const maximumSyncInterval = 86400
+
 // The bounds of Qory Apiary's answers. A POST is answered within postTimeout, and its
 // answer, a refusal at most, is read up to maxPostAnswer. Qory Apiary holds a read of
 // the change feed up to 25 seconds while nothing follows its cursor, so changesTimeout

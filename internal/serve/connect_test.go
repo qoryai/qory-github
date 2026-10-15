@@ -599,6 +599,26 @@ func TestAConnectThatWaitsPastItsDeadlineForTheLinkIsRefused(t *testing.T) {
 	rig.noLeak(t)
 }
 
+// TestALinkThatIsFreeIsTakenEvenPastTheDeadline checks a connect whose deadline has
+// passed takes the link when no other holds it, each time, so its refusal never says
+// another held it; and does not take it when another does.
+func TestALinkThatIsFreeIsTakenEvenPastTheDeadline(t *testing.T) {
+	rig := newConnectRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 200 {
+		if !rig.c.takeLink(ctx) {
+			t.Fatal("a free link was not taken")
+		}
+		<-rig.c.linking
+	}
+	rig.c.linking <- struct{}{}
+	if rig.c.takeLink(ctx) {
+		t.Error("a link another holds was taken")
+	}
+	<-rig.c.linking
+}
+
 func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 	rig := newConnectRig(t)
 	Link(rig.st, 42)

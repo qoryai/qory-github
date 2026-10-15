@@ -23,12 +23,15 @@ import (
 // does, is read again. A collection's open issues are listed once each listEvery. The
 // wait for the next round is cut into steps of pullCheck at most, each of which reads
 // the sync interval again, so a new interval counts from the round that began last. A
-// failed pull is logged once each pullFailEvery at most, the lines held back counted.
+// failure of the pull rounds is logged once each pullFailEvery at most, the lines held
+// back counted. A pull that keeps failing is logged again once it has failed for
+// pullStuckFor.
 const (
 	pullOverlap   = 5 * time.Minute
 	listEvery     = 24 * time.Hour
 	pullCheck     = time.Minute
 	pullFailEvery = time.Minute
+	pullStuckFor  = 24 * time.Hour
 )
 
 // errNotLinked stops a pull whose collection is no longer linked.
@@ -68,7 +71,8 @@ func keepPulled(st *store.Store, ref string, m pullMark) error {
 }
 
 // syncInterval is how often serve pulls from GitHub: the interval the change feed's last
-// sync entry set, or the default when none did, never less than the minimum.
+// sync entry set, or the default when none did, never less than the minimum or more
+// than the contract's maximum.
 func syncInterval(st *store.Store) (time.Duration, error) {
 	seconds := defaultSyncInterval
 	b, err := st.Get(nsAdapter, keySyncInterval)
@@ -81,7 +85,7 @@ func syncInterval(st *store.Store) (time.Duration, error) {
 			seconds = n
 		}
 	}
-	return time.Duration(max(seconds, minimumSyncInterval)) * time.Second, nil
+	return time.Duration(min(max(seconds, minimumSyncInterval), maximumSyncInterval)) * time.Second, nil
 }
 
 // collectionTurn is the collection's turn: a fill or a pull of it holds the turn while
@@ -195,6 +199,16 @@ type puller struct {
 
 	once  sync.Once
 	fails *throttle
+	// failing is the failures of each target whose last pull or listing failed, by
+	// the key of its line's attr, see [puller.report]; mu guards it.
+	failing map[string]*failure
+}
+
+// failure is a target's failures: when the first of them came since the target last
+// passed, and whether the line for a day of them is logged.
+type failure struct {
+	since time.Time
+	told  bool
 }
 
 func (p *puller) clock() time.Time {
@@ -231,11 +245,12 @@ func (p *puller) random(d time.Duration) time.Duration {
 	return rand.N(d)
 }
 
-// failLog is the throttle of the lines for pulls that failed.
+// failLog is the throttle of the lines for what failed in the pull rounds: a pull, a
+// listing of an installation's repositories, or a read of the store.
 func (p *puller) failLog() *throttle {
 	p.once.Do(func() {
-		p.fails = &throttle{every: pullFailEvery, flush: func(dropped int) {
-			p.log.LogAttrs(context.Background(), slog.LevelError, "failed pulls dropped", slog.Int("failed_dropped", dropped))
+		p.fails = &throttle{every: pullFailEvery, now: p.now, flush: func(dropped int) {
+			p.log.LogAttrs(context.Background(), slog.LevelError, "failures of the pull rounds dropped", slog.Int("failed_dropped", dropped))
 		}}
 	})
 	return p.fails
@@ -329,6 +344,7 @@ func (p *puller) round(ctx context.Context, start time.Time, interval time.Durat
 		}
 		targets[r.Installation] = append(targets[r.Installation], pullTarget{ref: r.Ref, offset: p.random(spread)})
 	}
+	p.forgetGone(installations, targets)
 	for _, id := range installations {
 		p.mu.Lock()
 		if p.busy[id] {
@@ -363,38 +379,102 @@ func (p *puller) installationRound(ctx context.Context, installation int64, targ
 	if p.wait(ctx, start.Add(begin).Sub(p.clock())) != nil {
 		return
 	}
+	listing := slog.Int64("installation", installation)
 	if err := p.adapter.listRepositories(ctx, installation); err != nil {
-		p.report(ctx, slog.Int64("installation", installation), "listing the installation's repositories failed", err)
+		p.report(ctx, listing, "listing the installation's repositories", err)
+	} else {
+		p.passed(listing)
 	}
 	for _, t := range targets {
 		if p.wait(ctx, start.Add(t.offset).Sub(p.clock())) != nil {
 			return
 		}
 		if err := p.pull(ctx, t.ref, installation); err != nil {
-			p.report(ctx, slog.String("collection", t.ref), "pulling the collection failed", err)
+			p.report(ctx, slog.String("collection", t.ref), "pulling the collection", err)
 		}
 	}
 }
 
-// report logs a round's error: nothing for a stop; a line for a collection that is no
-// longer linked; a line, each round, for a repository gone or moved and for a token
-// GitHub refuses to mint for good, which the next round tries again; and a line
-// throttled for any other error, what failed.
+// report logs a round's error, what failed of the target attr names: nothing for a
+// stop; a line for a collection that is no longer linked; and for any other error, a
+// line at the target's first failure since it last passed, then none while it keeps
+// failing, round after round, and one more once it has failed for pullStuckFor. The
+// first line is throttled, unless GitHub answers that the repository is gone or moved,
+// or refuses to mint a token for good. The next round tries the target again whatever
+// the error. The failures are timed in memory alone, so a restart times them from the
+// next failure again.
 func (p *puller) report(ctx context.Context, attr slog.Attr, what string, err error) {
 	switch {
 	case ctx.Err() != nil:
+		return
 	case errors.Is(err, errNotLinked):
+		p.passed(attr)
 		p.log.Info("the collection is not linked, so its pull stops", attr)
+		return
+	}
+	first, day := p.fail(attr)
+	switch {
+	case day:
+		p.log.Error(what+" has failed for a day, and the next round tries again", attr, slog.String("error", err.Error()))
+	case !first:
 	case errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused):
-		p.log.Warn(what+": GitHub answers it is gone, moved or out of the App's reach, and the next round tries again", attr, slog.String("error", err.Error()))
+		p.log.Warn(what+" failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again", attr, slog.String("error", err.Error()))
 	default:
-		p.failed(what, err, attr)
+		p.failed(what+" failed", err, attr)
 	}
 }
 
-// pull pulls one collection that the installation reaches, unless a fill of it runs,
-// which sends it already. It sends the items and comments that changed since the last
-// pull that finished without error began, less pullOverlap, see
+// fail notes a failure of the target attr names, and says whether it is the first
+// since the target last passed, and whether it is the first once the target has failed
+// for pullStuckFor.
+func (p *puller) fail(attr slog.Attr) (first, day bool) {
+	now := p.clock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f, ok := p.failing[attr.String()]
+	if !ok {
+		if p.failing == nil {
+			p.failing = map[string]*failure{}
+		}
+		p.failing[attr.String()] = &failure{since: now}
+		return true, false
+	}
+	if !f.told && now.Sub(f.since) >= pullStuckFor {
+		f.told = true
+		return false, true
+	}
+	return false, false
+}
+
+// passed forgets the failures of the target attr names.
+func (p *puller) passed(attr slog.Attr) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.failing, attr.String())
+}
+
+// forgetGone forgets the failures of the targets a round no longer has: installations
+// no longer linked and collections no longer reached.
+func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarget) {
+	keep := map[string]bool{}
+	for _, id := range installations {
+		keep[slog.Int64("installation", id).String()] = true
+		for _, t := range targets[id] {
+			keep[slog.String("collection", t.ref).String()] = true
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.failing {
+		if !keep[key] {
+			delete(p.failing, key)
+		}
+	}
+}
+
+// pull pulls one collection that the installation reaches, unless a fill or another
+// pull of it runs, which sends it already. It sends the items and comments that
+// changed since the last pull that finished without error began, less pullOverlap, see
 // [github.Lister.ListChanged]; and, once each listEvery, the open issues and their
 // comments, as the fill does. A collection that has no pull and no fill kept, as one
 // linked before serve pulled, is listed as the fill lists it. The pull's start is kept
@@ -414,7 +494,7 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 	}
 	done, ok := a.takeTurn(ref)
 	if !ok {
-		p.log.Info("a fill of the collection runs, so it is not pulled this round", slog.String("collection", ref))
+		p.log.Info("a fill or another pull of the collection runs, so it is not pulled this round", slog.String("collection", ref))
 		return nil
 	}
 	defer done()
@@ -451,7 +531,11 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 	if ok, err := collectionLinked(p.store, ref); err != nil || !ok {
 		return err
 	}
-	return keepPulled(p.store, ref, next)
+	if err := keepPulled(p.store, ref, next); err != nil {
+		return err
+	}
+	p.passed(slog.String("collection", ref))
+	return nil
 }
 
 // reachRecord is what the store keeps of the repository whose key is key, or false when

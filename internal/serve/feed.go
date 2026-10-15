@@ -316,7 +316,7 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	case contracts.ChangeSync:
 		interval := defaultSyncInterval
 		if ch.Interval != nil {
-			interval = max(*ch.Interval, minimumSyncInterval)
+			interval = min(max(*ch.Interval, minimumSyncInterval), maximumSyncInterval)
 		}
 		return f.store.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(interval)), 0)
 	}

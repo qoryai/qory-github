@@ -482,13 +482,11 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 		c.refuse(w, r, refuseNoAccess, id, attrs...)
 		return
 	}
-	select {
-	case c.linking <- struct{}{}:
-		defer func() { <-c.linking }()
-	case <-ctx.Done():
+	if !c.takeLink(ctx) {
 		c.refuse(w, r, refuseBusy, id, attrs...)
 		return
 	}
+	defer func() { <-c.linking }()
 	other, err := linkedOther(c.Store, installation)
 	if err != nil {
 		c.failed(w, r, id, "reading the links", err)
@@ -719,6 +717,28 @@ func (c *Connect) end(w http.ResponseWriter, id string) {
 		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: connectCookie, Value: "", Path: c.base, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+// takeLink takes the linking token, waiting for it while another connect holds it until
+// ctx is done, and says whether it took it. A token that is free is taken even when ctx
+// is done, so false says another connect held it all the while.
+func (c *Connect) takeLink(ctx context.Context) bool {
+	select {
+	case c.linking <- struct{}{}:
+		return true
+	default:
+	}
+	select {
+	case c.linking <- struct{}{}:
+		return true
+	case <-ctx.Done():
+	}
+	select {
+	case c.linking <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 // refuse answers the refusal's page, ends the session id names when the refusal ends
