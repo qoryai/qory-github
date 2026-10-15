@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, next]
+    branches: [main, next, factory]
   pull_request:
 
 # Each push run has a separate group, so no run from a push to next or main is ever
