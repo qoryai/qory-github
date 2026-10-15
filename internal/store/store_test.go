@@ -270,9 +270,11 @@ func TestAStoreFileReplacedBetweenTheOpensIsRefused(t *testing.T) {
 		}
 		t.Errorf("err %v", err)
 	}
+	// The new file is made beside the store's and renamed over it, so both exist at once
+	// and their inodes differ on every system.
 	betweenOpens = func(path string) {
-		os.Remove(path)
-		os.WriteFile(path, nil, 0o600)
+		os.WriteFile(path+".new", nil, 0o600)
+		os.Rename(path+".new", path)
 	}
 	dir = filepath.Join(t.TempDir(), "state")
 	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "was replaced") {
@@ -280,5 +282,18 @@ func TestAStoreFileReplacedBetweenTheOpensIsRefused(t *testing.T) {
 			s.Close()
 		}
 		t.Errorf("a new file: %v", err)
+	}
+	// A file removed and created again can be given the freed inode and pass as the one
+	// checked; it is still held to what the first open checked. The same file made 0640
+	// stands for one.
+	betweenOpens = func(path string) {
+		os.Chmod(path, 0o640)
+	}
+	dir = filepath.Join(t.TempDir(), "state")
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "the store "+filepath.Join(dir, FileName)+" is -rw-r-----: group or others have permissions on it; make it 0600") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("the same inode made 0640: %v", err)
 	}
 }
