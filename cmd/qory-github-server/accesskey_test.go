@@ -265,6 +265,55 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 // notACode is the error of a code that is not an enrolment code.
 const notACode = "the code is not an enrolment code: qeci_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"
 
+// TestEnrolRefusesACodeOfAnotherKind pins that a node's, a node pool's or a gateway's
+// code, its prefix in either case, is refused with one line that names its kind and
+// not the code, before the secret file's directory is probed, a key is made or
+// anything is sent, and that an integration's code in either case is taken.
+func TestEnrolRefusesACodeOfAnotherKind(t *testing.T) {
+	f := newFakeApiary(t, adapterEnrolled)
+	defer func(g func() (*accesskey.Key, error)) { generateKey = g }(generateKey)
+	generated := 0
+	generateKey = func() (*accesskey.Key, error) {
+		generated++
+		return accesskey.Generate()
+	}
+	defer func(r func(string) error) { removeProbe = r }(removeProbe)
+	probed := 0
+	removeProbe = func(p string) error {
+		probed++
+		return os.Remove(p)
+	}
+	for prefix, what := range map[string]string{
+		accesskey.CodePrefixNode:    "a node",
+		accesskey.CodePrefixPool:    "a node pool",
+		accesskey.CodePrefixGateway: "a gateway",
+	} {
+		for _, p := range []string{prefix, strings.ToUpper(prefix)} {
+			dir := t.TempDir()
+			c := codeOf(p, f.signer)
+			status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, c)
+			want := "qory-github-server access-key: this code is for " + what + ": use a code from the integration's Access key tab\n"
+			if status != 1 || out != "" || errs != want {
+				t.Errorf("%s: exit %d, stdout %q, stderr %q; want %q", p, status, out, errs, want)
+			}
+			noLeak(t, "", c, out, errs)
+			if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+				t.Errorf("%s: the directory holds %v", p, entries)
+			}
+		}
+	}
+	if n := f.requests.Load(); n != 0 || generated != 0 || probed != 0 {
+		t.Errorf("%d requests were sent, %d keys made and %d probes made", n, generated, probed)
+	}
+	for _, p := range []string{accesskey.CodePrefixAdapter, strings.ToUpper(accesskey.CodePrefixAdapter)} {
+		before := f.requests.Load()
+		status, _, errs := enrolRun(t, "--secret-file", filepath.Join(t.TempDir(), "secret"), f.url, codeOf(p, f.signer))
+		if status != 0 || f.requests.Load() != before+1 {
+			t.Errorf("%s: exit %d, %d requests, stderr %q", p, status, f.requests.Load()-before, errs)
+		}
+	}
+}
+
 // TestEnrolRefusesWhatIsNotAnEnrolmentCode pins that a code with the prefix enrolment
 // codes had before, qec_, one with an unknown prefix, and a malformed code of each kind
 // are refused with the one error that quotes no part of the code, and nothing is sent.
@@ -280,6 +329,9 @@ func TestEnrolRefusesWhatIsNotAnEnrolmentCode(t *testing.T) {
 		"qeci_" + codeCore + "Z." + fp,
 		"qeci_" + codeCore[:25] + "." + fp,
 		"qeci_" + codeCore,
+		"qecn_" + codeCore + "U." + fp,
+		"qecp_" + codeCore + ".!" + fp,
+		"QECG_" + codeCore + "." + fp + "." + fp + "." + fp,
 	} {
 		file := filepath.Join(t.TempDir(), "secret")
 		status, out, errs := enrolRun(t, "--secret-file", file, f.url, c)

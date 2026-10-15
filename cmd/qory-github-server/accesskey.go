@@ -115,6 +115,20 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return notACode
 	}
+	// Only an integration's code, an adapter's, is taken. The code's prefix names its
+	// kind, and a code of another kind is refused here, before the secret file's
+	// directory is probed, a key is made or anything is sent.
+	kind, err := accesskey.CodeKind(code)
+	if err != nil {
+		return notACode
+	}
+	if kind != "adapter" {
+		what, ok := codeKindNames[kind]
+		if !ok {
+			return notACode
+		}
+		return fmt.Errorf("this code is for %s: use a code from the integration's Access key tab", what)
+	}
 	// The secret file is checked before the code is sent: its path, that no file is
 	// there, and that its directory exists and can be written. Qory Apiary's 201 spends
 	// the code, and a refusal leaves it as it was, so a secret that cannot be written
@@ -173,6 +187,14 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fmt.Fprint(stdout, fragment)
 	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the integration's Access key tab in Organisation settings; the key is active\n", fingerprint)
 	return nil
+}
+
+// codeKindNames words the kinds of key a code enrols that enrol refuses, by the
+// node_kind [accesskey.CodeKind] returns.
+var codeKindNames = map[string]string{
+	"node":    "a node",
+	"pool":    "a node pool",
+	"gateway": "a gateway",
 }
 
 // notAnIntegration is the error of a key Qory Apiary enrolled as the access key id in
