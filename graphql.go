@@ -269,15 +269,15 @@ func rateLimited(errs []gqlError) bool {
 }
 
 // ListOpenIssuesComplete lists the repository's open issues by GraphQL's cursor, oldest
-// first, and their comments, and sends them to Qory Apiary as [Lister.ListIssues] does:
-// the same items, cut and skipped by the same rules, in parts of at most 100 items and
-// 1 MiB, each part's comments after it, read by REST as ListIssues reads them, the App's
-// work item comment left out. It reads at most 2,000 pages of 100 issues.
+// first, and their comments, and sends them to Qory Apiary; the fill and the daily
+// listing of open issues use it. Items go in parts of at most 100 items and 1 MiB, and
+// after each part the comments of its items, for an issue that has any, read by REST in
+// requests of at most 100 comments and 1 MiB, the App's work item comment left out. It
+// reads at most 2,000 pages of 100 issues, and 100 pages of an issue's comments.
 //
-// The last part says the listing is complete, since paging by cursor is meant not to
-// skip an issue, so Qory Apiary closes every item of the collection the listing left
-// out and did not hear of since it started. Neither the fill nor the daily listing uses
-// it yet. An item skipped, as Qory Apiary would refuse it,
+// The last part says the listing is complete, since paging by cursor does not skip an
+// issue, so Qory Apiary closes every item of the collection the listing left out and
+// did not hear of since it started. An item skipped, as Qory Apiary would refuse it,
 // leaves the listing not complete, so Qory Apiary never closes an open issue for that.
 // Comments are no part of complete: no request of comments says it is complete.
 //

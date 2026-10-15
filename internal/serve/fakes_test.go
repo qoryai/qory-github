@@ -299,12 +299,22 @@ type fakeGitHub struct {
 	posted   []string
 	mints    []string
 	requests []string
-	// unauthorized answers the listing of acme/widgets's issues 401, as GitHub answers
-	// a token it no longer takes; issuesDown answers it 502. goneComments answers that
-	// issue's comments 404, as for an issue deleted while it is listed.
-	// reposDown answers every request under /repos/ 502.
+	// unauthorized answers the listings of acme/widgets's issues, by REST and by
+	// GraphQL, 401, as GitHub answers a token it no longer takes; issuesDown answers
+	// them 502. goneComments answers that issue's comments 404, as for an issue deleted
+	// while it is listed. reposDown answers every request under /repos/, and GraphQL's,
+	// 502.
 	unauthorized, issuesDown, reposDown bool
 	goneComments                        int
+	// gqlFailOn answers that page of GraphQL's listing, counted from 1, as gqlFail
+	// says: "errors", a 200 whose errors say the query failed; "limited", a 200 that
+	// says GraphQL's rate limit, for that page and every try after it; or "502".
+	// onPage, when set, is called with each page's number and request before the page
+	// is answered, without f.mu held. gqlPages counts the pages asked for.
+	gqlFailOn int
+	gqlFail   string
+	onPage    func(page int, r *http.Request)
+	gqlPages  int
 	// userInstallations and userRepos are what the person signed in with Connect
 	// reaches: the installations, and the repositories of the installation 42, which
 	// GitHub lists one on each page. exchanges are the forms of the sign-in's codes'
@@ -358,6 +368,8 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(repos), "repositories": repos})
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+	case r.Method == "POST" && r.URL.Path == "/graphql":
+		f.graphql(w, r, b)
 	case f.reposDown && strings.HasPrefix(r.URL.Path, "/repos/"):
 		w.WriteHeader(502)
 		io.WriteString(w, `{"message":"Bad Gateway"}`)
@@ -430,6 +442,113 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
 		io.WriteString(w, `{"message":"Not Found"}`)
 	}
+}
+
+// graphql answers the listing of a repository's open issues by GraphQL's cursor:
+// acme/widgets's issues, open ones alone, first to a page after the cursor, which is
+// the issue's place in f.issues; acme/moved as GitHub names it since it was renamed;
+// and any other repository as one GraphQL cannot resolve. f.mu is held.
+func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
+	var req struct {
+		Variables struct {
+			Owner string  `json:"owner"`
+			Name  string  `json:"name"`
+			First int     `json:"first"`
+			After *string `json:"after"`
+		} `json:"variables"`
+	}
+	if err := json.Unmarshal(b, &req); err != nil || req.Variables.First <= 0 {
+		w.WriteHeader(400)
+		io.WriteString(w, `{"message":"Problems parsing JSON"}`)
+		return
+	}
+	v := req.Variables
+	f.gqlPages++
+	page := f.gqlPages
+	if f.onPage != nil {
+		on := f.onPage
+		f.mu.Unlock()
+		on(page, r)
+		f.mu.Lock()
+	}
+	switch {
+	case f.unauthorized:
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"Bad credentials"}`)
+		return
+	case f.issuesDown || f.reposDown || f.gqlFailOn != 0 && page >= f.gqlFailOn && f.gqlFail == "502":
+		w.WriteHeader(502)
+		io.WriteString(w, `{"message":"Bad Gateway"}`)
+		return
+	case f.gqlFailOn != 0 && page >= f.gqlFailOn && f.gqlFail == "limited":
+		io.WriteString(w, `{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`)
+		return
+	case f.gqlFailOn != 0 && page == f.gqlFailOn && f.gqlFail == "errors":
+		io.WriteString(w, `{"data":null,"errors":[{"type":"SERVICE_UNAVAILABLE","message":"Something went wrong while executing your query."}]}`)
+		return
+	}
+	name := v.Owner + "/" + v.Name
+	switch name {
+	case "acme/widgets":
+	case "acme/moved":
+		name = "acme/renamed"
+	default:
+		io.WriteString(w, `{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name '`+name+`'."}]}`)
+		return
+	}
+	from := 0
+	if v.After != nil {
+		from, _ = strconv.Atoi(strings.TrimPrefix(*v.After, "cursor:"))
+	}
+	nodes := []any{}
+	more := false
+	var end any
+	if name == "acme/widgets" {
+		for i, is := range f.issues {
+			if i < from || is["state"] != "open" {
+				continue
+			}
+			if len(nodes) == v.First {
+				more = true
+				break
+			}
+			nodes = append(nodes, gqlNode(is))
+			end = "cursor:" + strconv.Itoa(i+1)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
+		"nameWithOwner": name,
+		"url":           "https://github.com/" + name,
+		"issues": map[string]any{
+			"pageInfo": map[string]any{"hasNextPage": more, "endCursor": end},
+			"nodes":    nodes,
+		},
+	}}})
+}
+
+// gqlNode is an issue as REST says it, as GraphQL says it.
+func gqlNode(is map[string]any) map[string]any {
+	n := map[string]any{
+		"number": is["number"], "url": is["html_url"], "title": is["title"], "body": is["body"],
+		"state": strings.ToUpper(is["state"].(string)), "stateReason": nil,
+		"labels":    map[string]any{"nodes": is["labels"]},
+		"createdAt": is["created_at"], "updatedAt": is["updated_at"],
+		"comments": map[string]any{"totalCount": is["comments"]},
+	}
+	if n["body"] == nil {
+		n["body"] = ""
+	}
+	if r, ok := is["state_reason"].(string); ok {
+		n["stateReason"] = strings.ToUpper(r)
+	}
+	if u, ok := is["user"].(map[string]any); ok {
+		login, _ := u["login"].(string)
+		if u["type"] == "Bot" {
+			login = strings.TrimSuffix(login, "[bot]")
+		}
+		n["author"] = map[string]any{"login": login, "__typename": u["type"]}
+	}
+	return n
 }
 
 // postedComments are the comments posted on issue 7.

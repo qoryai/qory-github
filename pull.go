@@ -30,16 +30,19 @@ type ghRepoComment struct {
 // ListChanged sends Qory Apiary what changed in the repository at or after since, which
 // is how the adapter catches what the webhooks missed: the issues GitHub says changed,
 // in every state, pull requests left out, and then the comments on the repository's
-// issues that changed. Unlike [Lister.ListIssues], it sends a closed issue too, with its
-// state and its reason, so Qory Apiary learns of a close whose webhook it missed.
+// issues that changed. Unlike [Lister.ListOpenIssuesComplete], it sends a closed issue
+// too, with its state and its reason, so Qory Apiary learns of a close whose webhook it
+// missed.
 //
 // Every request is an event's, an upsert: none is a listing's part and none says it is
 // complete, so Qory Apiary closes and drops nothing for it. Items go in requests of at
 // most 100 items and 1 MiB. Comments go after every item, grouped by their item on each
 // page GitHub answers, in requests of at most 100 comments and 1 MiB; a comment on a pull
 // request and the App's work item comment are left out. The skip and cut rules are the
-// listing's. GitHub lists neither a deleted comment nor an issue deleted or transferred,
-// so those reach Qory Apiary only by the webhooks' events.
+// listing's. GitHub lists neither a deleted comment nor an issue deleted or transferred:
+// a deleted comment reaches Qory Apiary only by its webhook's event; such an issue
+// reaches it by its webhook's event, or Qory Apiary closes it after the next daily
+// listing of open issues, which says it is complete and leaves it out.
 //
 // Both are read oldest change first, by time rather than by page number, see
 // [changedPages]: each page is asked for from the latest change the page before it
@@ -49,9 +52,10 @@ type ghRepoComment struct {
 // more than a page of entries share: that second's entries are read by page number, and
 // an edit to one of them while they are read can shift another onto a page already read,
 // which skips it. Such an entry stays as Qory Apiary has it until it changes again, or,
-// for an open issue, until the next daily listing of open issues sends it. Each is read
-// in at most 2,000 pages; a pull that would read more fails, and so does one GitHub
-// answers that the repository is gone or moved, with an error that wraps
+// for an issue, until the next daily listing of open issues, which sends it when it is
+// open and, since that listing says it is complete, has Qory Apiary close it when it is
+// not. Each is read in at most 2,000 pages; a pull that would read more fails, and so
+// does one GitHub answers that the repository is gone or moved, with an error that wraps
 // [ErrRepositoryGone]. It stops at the first error, and sends nothing more.
 func (l Lister) ListChanged(ctx context.Context, repo Repository, since time.Time) error {
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {

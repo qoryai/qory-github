@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 )
@@ -29,10 +31,11 @@ type fakeGraphQL struct {
 	nodes []map[string]any
 	// name is the repository as GitHub names it; "" is acme/widgets.
 	name string
-	// limited answers that many requests with GraphQL's rate limit, and limitHeaders
-	// says with them that no request remains until a minute after t0.
-	limited      int
-	limitHeaders bool
+	// limited answers that many requests with GraphQL's rate limit, from the page
+	// limitFrom on, counted from 1, and limitHeaders says with them that no request
+	// remains until a minute after t0.
+	limited, limitFrom int
+	limitHeaders       bool
 	// errorOn answers that page, counted from 1, with a GraphQL error, statusOn with
 	// status; notFound answers that the repository cannot be resolved.
 	errorOn, statusOn, status int
@@ -42,6 +45,9 @@ type fakeGraphQL struct {
 	sameCursor, noCursor, nullNode bool
 	// renameOn names the repository otherwise from that page on.
 	renameOn int
+	// onPage, when set, is called with each page's number and request before the page
+	// is answered, without g.mu held.
+	onPage   func(page int, r *http.Request)
 	mu       sync.Mutex
 	vars     []map[string]any
 	answered int
@@ -88,7 +94,7 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.answered++
-	if g.limited > 0 {
+	if g.limited > 0 && g.pages+1 >= g.limitFrom {
 		g.limited--
 		if g.limitHeaders {
 			w.Header().Set("X-Ratelimit-Limit", "5000")
@@ -101,6 +107,11 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.vars = append(g.vars, req.Variables)
 	g.pages++
 	page := g.pages
+	if on := g.onPage; on != nil {
+		g.mu.Unlock()
+		on(page, r)
+		g.mu.Lock()
+	}
 	if page == g.statusOn {
 		w.WriteHeader(g.status)
 		io.WriteString(w, `{"message":"Bad credentials"}`)
@@ -364,26 +375,64 @@ func TestAGraphQLIssueMapsAsRESTsDoes(t *testing.T) {
 	}
 }
 
-// TestTheCompleteListingIsSentInPartsOfAHundred lists 250 issues, 100 to a page, and
-// checks they go in three parts, numbered from 1, of which the last alone says the
-// listing is complete, and every request fits the contract.
-func TestTheCompleteListingIsSentInPartsOfAHundred(t *testing.T) {
-	g := &fakeGraphQL{}
-	for i := 1; i <= 250; i++ {
-		g.nodes = append(g.nodes, node(i, 0))
-	}
-	s := &sink{}
-	var logs []string
-	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
-		t.Fatal(err)
-	}
-	refs, parts := sentParts(s)
-	if len(refs) != 250 || len(parts) != 3 || parts[0].Complete || parts[1].Complete || !parts[2].Complete || parts[2].Part != 3 || parts[0].ID != parts[2].ID {
-		t.Errorf("%d items, parts %+v", len(refs), parts)
-	}
-	if strings.Join(g.afters(), " ") != "- cursor:100 cursor:200" {
-		t.Errorf("after %v", g.afters())
+// TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte lists 250 small
+// issues, 100 to a page, a hundred, none, and 40 with long bodies, and checks the parts:
+// at most 100 items and 1 MiB of JSON each, numbered from 1, one listing, the last
+// alone complete, and every item sent once. A repository with no open issue sends no
+// part, since the contract refuses one without items.
+func TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
+	long := strings.Repeat("ü", 60_000)
+	for _, tc := range []struct {
+		name   string
+		n      int
+		body   string
+		parts  []int
+		afters string
+	}{
+		{"small", 250, "", []int{100, 100, 50}, "- cursor:100 cursor:200"},
+		{"exactly a hundred", 100, "", []int{100}, "-"},
+		{"none", 0, "", []int{}, "-"},
+		{"long bodies", 40, long, nil, "-"},
+	} {
+		g := &fakeGraphQL{}
+		for i := 1; i <= tc.n; i++ {
+			n := node(i, 0)
+			if tc.body != "" {
+				n["body"] = tc.body
+			}
+			g.nodes = append(g.nodes, n)
+		}
+		s := &sink{}
+		var logs []string
+		l, _ := g.lister(t, s, &logs)
+		if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+			t.Fatal(err)
+		}
+		items := s.items()
+		sizes := []int{}
+		total := 0
+		for i, req := range items {
+			// The sink sets the time as it sends.
+			req.Time = "2026-01-02T03:04:05Z"
+			b, _ := json.Marshal(req)
+			if len(b) > contracts.MaxRequest {
+				t.Errorf("%s: part %d is %d bytes", tc.name, i+1, len(b))
+			}
+			if req.Listing.Part != i+1 || req.Listing.Complete != (i == len(items)-1) || req.Listing.ID != items[0].Listing.ID {
+				t.Errorf("%s: part %d says %+v", tc.name, i+1, req.Listing)
+			}
+			sizes = append(sizes, len(req.Items))
+			total += len(req.Items)
+		}
+		if tc.parts != nil && !slices.Equal(sizes, tc.parts) {
+			t.Errorf("%s: parts of %v, want %v", tc.name, sizes, tc.parts)
+		}
+		if tc.parts == nil && (len(items) < 2 || total != tc.n) {
+			t.Errorf("%s: parts of %v", tc.name, sizes)
+		}
+		if got := strings.Join(g.afters(), " "); got != tc.afters {
+			t.Errorf("%s: after %v", tc.name, got)
+		}
 	}
 }
 
@@ -520,5 +569,425 @@ func TestTheCompleteListingReadsABoundedNumberOfPages(t *testing.T) {
 	refs, parts := sentParts(s)
 	if len(refs) != 2000 || len(parts) == 0 || parts[len(parts)-1].Complete {
 		t.Errorf("%d items, %d parts", len(refs), len(parts))
+	}
+}
+
+// many is n open issues of acme/widgets as GraphQL says them, each with comments
+// comments.
+func many(n, comments int) []map[string]any {
+	var out []map[string]any
+	for i := 1; i <= n; i++ {
+		out = append(out, node(i, comments))
+	}
+	return out
+}
+
+// TestTheCompleteListingReadsCommentsWhereThereAreAny lists three issues and checks
+// their comments are read, paged, only for an issue that has any; the App's work item
+// comment is left out, whatever the case of its bot's login, while a person's comment
+// with the same words is kept; the items come before their comments; and no request of
+// comments says it is complete.
+func TestTheCompleteListingReadsCommentsWhereThereAreAny(t *testing.T) {
+	g := &fakeGraphQL{
+		fakeIssues: &fakeIssues{pageSize: 2, comments: map[int][]map[string]any{
+			1: {
+				comment(11, "qory-test[bot]", "Bot", "<!-- qory:work-item 7 -->\nThis issue is work in Qory Apiary."),
+				comment(12, "bob", "User", "<!-- qory:work-item 7 --> copied by a person"),
+				comment(13, "dependabot[bot]", "Bot", "An automation's comment."),
+			},
+			6: {comment(61, "QORY-TEST[bot]", "Bot", "<!-- qory:work-item 8 -->")},
+		}},
+		nodes: []map[string]any{node(1, 3), node(2, 0), node(6, 1)},
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"POST /graphql",
+		"/repos/acme/widgets/issues/1/comments?per_page=100",
+		"/repos/acme/widgets/issues/1/comments?page=2&per_page=100",
+		"/repos/acme/widgets/issues/6/comments?per_page=100",
+	}
+	if got := g.requested(); !reflect.DeepEqual(got, want) {
+		t.Errorf("requested\n%v\nwant\n%v", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	for _, a := range g.auth {
+		if a != "Bearer "+fakeToken {
+			t.Errorf("authorization %q", a)
+		}
+	}
+	refs, parts := sentParts(s)
+	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#2 acme/widgets#6" || len(parts) != 1 || !parts[0].Complete {
+		t.Errorf("items %v, parts %+v", refs, parts)
+	}
+	// #6 has only the work item comment, so nothing is sent for it.
+	cs := s.comments()
+	if len(cs) != 1 {
+		t.Fatalf("comments requests %+v", cs)
+	}
+	var got []string
+	for _, c := range cs[0].Comments {
+		got = append(got, c.Ref+" "+c.Author.Name+" "+c.Author.Kind)
+	}
+	if cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
+		t.Errorf("comments on #1: %+v, %v", cs[0], got)
+	}
+	if _, ok := s.reqs[0].(contracts.SourceItems); !ok {
+		t.Errorf("first request %T", s.reqs[0])
+	}
+	if len(logs) != 0 {
+		t.Errorf("logged %v", logs)
+	}
+}
+
+// TestAnItemsCommentsGoInRequestsOfAMebibyte lists an issue with many long comments
+// and checks they go in several requests of at most 1 MiB, none complete.
+func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
+	long := strings.Repeat("x", 60_000)
+	g := &fakeGraphQL{fakeIssues: &fakeIssues{comments: map[int][]map[string]any{}}, nodes: many(1, 40)}
+	for i := range 40 {
+		g.comments[1] = append(g.comments[1], comment(100+i, "bob", "User", long))
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	cs := s.comments()
+	total := 0
+	for i, c := range cs {
+		c.Time = "2026-01-02T03:04:05Z"
+		b, _ := json.Marshal(c)
+		if len(b) > contracts.MaxRequest || c.Complete != nil {
+			t.Errorf("request %d: %d bytes, complete %v", i, len(b), c.Complete)
+		}
+		total += len(c.Comments)
+	}
+	if len(cs) < 2 || total != 40 {
+		t.Errorf("%d requests, %d comments", len(cs), total)
+	}
+}
+
+func TestCommentsGoInRequestsOfAHundred(t *testing.T) {
+	g := &fakeGraphQL{fakeIssues: &fakeIssues{comments: map[int][]map[string]any{}}, nodes: many(1, 250)}
+	for i := range 250 {
+		g.comments[1] = append(g.comments[1], comment(i+1, "bob", "User", "c"))
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	var sizes []int
+	for _, c := range s.comments() {
+		sizes = append(sizes, len(c.Comments))
+	}
+	if !reflect.DeepEqual(sizes, []int{100, 100, 50}) {
+		t.Errorf("requests of %v", sizes)
+	}
+}
+
+// TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef lists issues and a comment with
+// a field that cannot be cut into the contract, and checks they are left out, logged by
+// their ref alone, the rest are sent, and the listing does not say it is complete.
+func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
+	secret := "SECRETTEXT"
+	noTitle, httpURL := node(3, 0), node(5, 0)
+	noTitle["title"] = ""
+	noTitle["body"] = secret
+	httpURL["url"] = "http://github.com/acme/widgets/issues/5"
+	httpURL["body"] = secret
+	httpComment := comment(10, "bob", "User", secret)
+	httpComment["html_url"] = "http://github.com/acme/widgets/issues/1#issuecomment-10"
+	g := &fakeGraphQL{
+		fakeIssues: &fakeIssues{comments: map[int][]map[string]any{1: {httpComment, comment(11, "bob", "User", "fine")}}},
+		nodes:      []map[string]any{node(1, 2), noTitle, httpURL, node(6, 0)},
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	refs, parts := sentParts(s)
+	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#6" || len(parts) != 1 || parts[0].Complete {
+		t.Errorf("items %v, parts %+v", refs, parts)
+	}
+	cs := s.comments()
+	if len(cs) != 1 || len(cs[0].Comments) != 1 || cs[0].Comments[0].Ref != "11" {
+		t.Errorf("comments %+v", cs)
+	}
+	want := []string{
+		"skipped the item acme/widgets#3: its title is empty",
+		"skipped the item acme/widgets#5: its URL is not https or is longer than 2048 characters",
+		"skipped the comment 10 on acme/widgets#1: its URL is not https or is longer than 2048 characters",
+	}
+	if !reflect.DeepEqual(logs, want) {
+		t.Errorf("logged\n%s", strings.Join(logs, "\n"))
+	}
+}
+
+// TestATextPastItsLimitIsCutToIt lists issues and a comment whose texts are longer than
+// the contract takes, and checks each is cut to its limit on a character's boundary,
+// labels left empty or the same as one before are dropped, the labels past 100 are
+// dropped, nothing is skipped, so the listing is complete, and each cut is logged by
+// ref, field and length, never by its text.
+func TestATextPastItsLimitIsCutToIt(t *testing.T) {
+	secret := "SECRETTEXT"
+	longBody, longTitle, manyLabels, longName, atLimit := node(2, 1), node(3, 0), node(4, 0), node(5, 0), node(6, 0)
+	longBody["body"] = secret + strings.Repeat("ü", 70_000-len(secret))
+	longTitle["title"] = strings.Repeat("ü", 1030)
+	labels := []any{
+		map[string]any{"name": strings.Repeat("a", 100) + "1"},
+		map[string]any{"name": ""},
+		map[string]any{"name": strings.Repeat("a", 100) + "2"},
+		map[string]any{"name": "b"},
+		map[string]any{"name": "b"},
+	}
+	for i := range 120 {
+		labels = append(labels, map[string]any{"name": "l" + strconv.Itoa(i)})
+	}
+	manyLabels["labels"] = map[string]any{"nodes": labels}
+	longName["author"] = map[string]any{"login": strings.Repeat("n", 300), "__typename": "User"}
+	atLimit["body"] = strings.Repeat("ü", 65_536)
+	g := &fakeGraphQL{
+		fakeIssues: &fakeIssues{comments: map[int][]map[string]any{2: {comment(20, strings.Repeat("m", 300), "Bot", strings.Repeat("c", 70_000))}}},
+		nodes:      []map[string]any{longBody, longTitle, manyLabels, longName, atLimit},
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	wantLogs := []string{
+		"cut the body of acme/widgets#2, 70000 long, to the contract's limit",
+		"cut the title of acme/widgets#3, 1030 long, to the contract's limit",
+		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
+		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
+		"cut the labels of acme/widgets#4, 125 long, to the contract's limit",
+		"cut the filed_by.name of acme/widgets#5, 300 long, to the contract's limit",
+		"cut the author.name of 20, 300 long, to the contract's limit",
+		"cut the body of 20, 70000 long, to the contract's limit",
+	}
+	if !reflect.DeepEqual(logs, wantLogs) {
+		t.Errorf("logged\n%s", strings.Join(logs, "\n"))
+	}
+	items := s.items()
+	if len(items) != 1 || len(items[0].Items) != 5 || !items[0].Listing.Complete {
+		t.Fatalf("items %+v", items)
+	}
+	got := items[0].Items
+	if got[0].Body != secret+strings.Repeat("ü", 65_536-len(secret)) {
+		t.Errorf("body of %d characters", utf8.RuneCountInString(got[0].Body))
+	}
+	if got[1].Title != strings.Repeat("ü", 1024) {
+		t.Errorf("title of %d characters", utf8.RuneCountInString(got[1].Title))
+	}
+	want := []string{strings.Repeat("a", 100), "b"}
+	for i := range 98 {
+		want = append(want, "l"+strconv.Itoa(i))
+	}
+	if !reflect.DeepEqual(got[2].Labels, want) {
+		t.Errorf("labels %q", got[2].Labels)
+	}
+	if got[3].FiledBy != (contracts.Person{Name: strings.Repeat("n", 100), Kind: KindPerson}) {
+		t.Errorf("filed by %+v", got[3].FiledBy)
+	}
+	if got[4].Body != strings.Repeat("ü", 65_536) {
+		t.Errorf("a body at the limit is changed")
+	}
+	cs := s.comments()
+	if len(cs) != 1 || len(cs[0].Comments) != 1 {
+		t.Fatalf("comments %+v", cs)
+	}
+	if c := cs[0].Comments[0]; c.Body != strings.Repeat("c", 65_536) || c.Author != (contracts.Person{Name: strings.Repeat("m", 100), Kind: KindAutomation}) {
+		t.Errorf("comment of %d characters by %+v", utf8.RuneCountInString(c.Body), c.Author)
+	}
+}
+
+// TestACompleteListingStoppedEarlyNeverSaysComplete stops listings part-way, after
+// GitHub's answers have filled a part or more, and checks each returns its error and
+// sends the items it read and had not sent as a last part, and that no part says it is
+// complete: a status, GraphQL's errors in a 200, a rate limit that holds through every
+// try, Qory Apiary failing a part, comments failing before the last part, a context
+// cancelled, and a context whose deadline passes while GitHub answers.
+func TestACompleteListingStoppedEarlyNeverSaysComplete(t *testing.T) {
+	const what = "listing the open issues of acme/widgets: "
+	twoComments := map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}
+	for _, tc := range []struct {
+		name  string
+		g     *fakeGraphQL
+		sink  *sink
+		ctx   func(g *fakeGraphQL) (context.Context, context.CancelFunc)
+		err   string
+		is    error
+		parts []int
+	}{
+		{name: "a status after two parts", g: &fakeGraphQL{nodes: many(250, 0), statusOn: 3, status: 502}, err: what + "GitHub answered 502: Bad credentials", parts: []int{100, 100}},
+		{name: "GraphQL's errors in a 200 after two parts", g: &fakeGraphQL{nodes: many(250, 0), errorOn: 3}, err: what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", parts: []int{100, 100}},
+		{name: "GraphQL's errors in a 200 on the second page", g: &fakeGraphQL{nodes: many(150, 0), errorOn: 2}, err: what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", parts: []int{100}},
+		{name: "a rate limit that holds after two parts", g: &fakeGraphQL{nodes: many(250, 0), limited: 5, limitFrom: 3}, err: what + "GitHub answered an error, RATE_LIMITED: API rate limit exceeded", parts: []int{100, 100}},
+		{name: "a rate limit that holds on the second page", g: &fakeGraphQL{nodes: many(150, 0), limited: 5, limitFrom: 2}, err: what + "GitHub answered an error, RATE_LIMITED: API rate limit exceeded", parts: []int{100}},
+		{name: "Qory Apiary fails a part", g: &fakeGraphQL{nodes: many(150, 0)}, sink: &sink{failAt: 1}, err: "Qory Apiary is not reachable", parts: []int{100}},
+		{name: "comments fail before the last part", g: &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: twoComments, failComments: 2}, nodes: many(150, 1)}, err: "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", parts: []int{100}},
+		{name: "a context cancelled", g: &fakeGraphQL{nodes: many(150, 0)}, ctx: func(g *fakeGraphQL) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			g.onPage = func(page int, r *http.Request) {
+				if page == 2 {
+					// The page is answered once the listing gave up on it.
+					cancel()
+					select {
+					case <-r.Context().Done():
+					case <-time.After(10 * time.Second):
+					}
+				}
+			}
+			return ctx, cancel
+		}, is: context.Canceled, parts: []int{100}},
+		{name: "a deadline passed", g: &fakeGraphQL{nodes: many(150, 0)}, ctx: func(g *fakeGraphQL) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			g.onPage = func(page int, r *http.Request) {
+				if page == 2 {
+					select {
+					case <-r.Context().Done():
+					case <-time.After(10 * time.Second):
+					}
+				}
+			}
+			return ctx, cancel
+		}, is: context.DeadlineExceeded, parts: []int{100}},
+	} {
+		s := tc.sink
+		if s == nil {
+			s = &sink{}
+		}
+		var logs []string
+		l, _ := tc.g.lister(t, s, &logs)
+		ctx, cancel := context.Background(), context.CancelFunc(func() {})
+		if tc.ctx != nil {
+			ctx, cancel = tc.ctx(tc.g)
+		}
+		err := l.ListOpenIssuesComplete(ctx, widgets)
+		cancel()
+		if err == nil || tc.err != "" && err.Error() != tc.err || tc.is != nil && !errors.Is(err, tc.is) {
+			t.Errorf("%s: err %v", tc.name, err)
+		}
+		sizes := []int{}
+		for i, req := range s.items() {
+			if req.Listing.Complete || req.Listing.Part != i+1 {
+				t.Errorf("%s: part %d says %+v", tc.name, i+1, req.Listing)
+			}
+			sizes = append(sizes, len(req.Items))
+		}
+		if !slices.Equal(sizes, tc.parts) {
+			t.Errorf("%s: parts of %v, want %v", tc.name, sizes, tc.parts)
+		}
+		for _, c := range s.comments() {
+			if c.Complete != nil {
+				t.Errorf("%s: comments on %s said complete", tc.name, c.ItemRef)
+			}
+		}
+	}
+}
+
+// TestCommentsThatFailAfterTheLastPartLeaveItAsSent lists an issue whose comments
+// GitHub answers 500 once its part is sent, and checks the listing returns the error,
+// sends nothing after it, and its one part says it is complete all the same: every open
+// issue was read, and comments are no part of complete.
+func TestCommentsThatFailAfterTheLastPartLeaveItAsSent(t *testing.T) {
+	g := &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, failComments: 2, comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}}, nodes: many(1, 2)}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	err := l.ListOpenIssuesComplete(context.Background(), widgets)
+	if err == nil || err.Error() != "listing the comments on acme/widgets#1: GitHub answered 500: Server Error" {
+		t.Errorf("err %v", err)
+	}
+	if _, parts := sentParts(s); len(s.reqs) != 1 || len(parts) != 1 || !parts[0].Complete {
+		t.Errorf("requests %+v", s.reqs)
+	}
+}
+
+// TestAnItemsCommentsAreReadInABoundedNumberOfPages checks a listing stops with its
+// error at 100 pages of an issue's comments, and when a next page of comments repeats
+// one it read.
+func TestAnItemsCommentsAreReadInABoundedNumberOfPages(t *testing.T) {
+	manyComments := map[int][]map[string]any{1: {}}
+	for i := range 101 {
+		manyComments[1] = append(manyComments[1], comment(i+1, "bob", "User", "c"))
+	}
+	for _, tc := range []struct {
+		name     string
+		g        *fakeGraphQL
+		err      string
+		requests int
+	}{
+		{"a hundred pages", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments}, nodes: many(1, 101)}, "listing the comments on acme/widgets#1: GitHub has more than 100 pages, which a listing never reads", 1 + 100},
+		{"a repeated page", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments, again: true}, nodes: many(1, 101)}, "listing the comments on acme/widgets#1: GitHub's next page repeats one already read", 1 + 1},
+	} {
+		s := &sink{}
+		var logs []string
+		l, _ := tc.g.lister(t, s, &logs)
+		err := l.ListOpenIssuesComplete(context.Background(), widgets)
+		if err == nil || err.Error() != tc.err || len(tc.g.requested()) != tc.requests {
+			t.Errorf("%s: err %v, %d requests", tc.name, err, len(tc.g.requested()))
+		}
+	}
+}
+
+// TestAnIssueGoneWhileListedLosesOnlyItsComments lists 150 open issues, the first of
+// which GitHub answers 404 for its comments, as for an issue deleted while it is listed,
+// and checks every issue is sent, the others' comments too, the skip is logged by its
+// ref, and the listing is complete: comments are no part of complete.
+func TestAnIssueGoneWhileListedLosesOnlyItsComments(t *testing.T) {
+	g := &fakeGraphQL{fakeIssues: &fakeIssues{comments: map[int][]map[string]any{}, goneComments: 1}, nodes: many(150, 1)}
+	for i := 1; i <= 150; i++ {
+		g.comments[i] = []map[string]any{comment(1000+i, "bob", "User", "c")}
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	refs, parts := sentParts(s)
+	comments := 0
+	for _, req := range s.comments() {
+		comments += len(req.Comments)
+		if req.ItemRef == "acme/widgets#1" {
+			t.Errorf("comments sent on the issue gone")
+		}
+	}
+	if len(refs) != 150 || comments != 149 || len(parts) != 2 || !parts[1].Complete {
+		t.Errorf("%d items, %d comments, parts %+v", len(refs), comments, parts)
+	}
+	if !reflect.DeepEqual(logs, []string{"skipped the comments on acme/widgets#1: GitHub answers that the issue is gone or moved"}) {
+		t.Errorf("logged %v", logs)
+	}
+}
+
+// TestAMintsNotFoundIsNotARepositoryGone has GitHub answer the token's mint 404, and
+// checks the listing's error does not wrap ErrRepositoryGone, nor does a 404 GraphQL
+// answers as a status.
+func TestAMintsNotFoundIsNotARepositoryGone(t *testing.T) {
+	g := &fakeGraphQL{nodes: many(1, 0)}
+	var logs []string
+	l, _ := g.lister(t, &sink{}, &logs)
+	l.Token = func(context.Context) (string, error) {
+		return "", &answerError{what: "minting the installation token", status: 404, message: "Not Found"}
+	}
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a mint's 404: err %v", err)
+	}
+	g = &fakeGraphQL{nodes: many(1, 0), statusOn: 1, status: 404}
+	l, _ = g.lister(t, &sink{}, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a 404: err %v", err)
 	}
 }

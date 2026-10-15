@@ -404,11 +404,16 @@ func (a *Adapter) sendLinked(ctx context.Context, collection, what string, send 
 // listing of an installation's repositories named it.
 var errNoInstallation = errors.New("no installation is known to reach the repository")
 
-// fill sends Qory Apiary the open issues of a collection it linked, and their comments.
-// A repository GitHub answers is gone or moved, [github.ErrRepositoryGone], or for which
-// GitHub refuses to mint a token for good, [github.ErrMintRefused], fails for good, so
-// the change feed passes it. It waits for a pull of the collection that runs, and once
-// it has sent everything, the next pull reads what changed from when it began.
+// fill sends Qory Apiary the open issues of a collection it linked, and their comments,
+// by [github.Lister.ListOpenIssuesComplete]: its last part says the listing is complete
+// unless an item was skipped, so Qory Apiary closes every item of the collection the
+// listing left out and did not hear of since it started. A fill that fails or is
+// stopped sends no part that says it is complete, and a repository with no open issue
+// sends nothing. A repository GitHub answers is gone or moved,
+// [github.ErrRepositoryGone], or for which GitHub refuses to mint a token for good,
+// [github.ErrMintRefused], fails for good, so the change feed passes it. It waits for a
+// pull of the collection that runs, and once it has sent everything, the next pull
+// reads what changed from when it began.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	repo, err := repository(ref)
 	if err != nil {
@@ -436,7 +441,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		Logf:   a.logf,
 		LogCut: a.logCut,
 	}
-	err = a.forgetOn401(installation, l.ListIssues(ctx, repo))
+	err = a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, repo))
 	if errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused) {
 		return Permanent(err)
 	}

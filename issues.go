@@ -33,10 +33,10 @@ import (
 // contracts.TimeLayout's form, is as long as the layout itself.
 const timeWidth = contracts.TimeLayout
 
-// The most pages a listing reads: a repository's issues, every state's, pull requests
-// among them, since GitHub lists both and the adapter drops pull requests after reading
-// them; one issue's comments; and the installation's repositories. A listing that would
-// read more stops, as does one whose next page repeats a page it read.
+// The most pages a listing reads: a repository's open issues, see
+// [Lister.ListOpenIssuesComplete]; one issue's comments; and the installation's
+// repositories. A listing that would read more stops, as does one whose next page
+// repeats a page it read.
 const (
 	maxIssuePages      = 2000
 	maxCommentPages    = 100
@@ -495,8 +495,9 @@ type Lister struct {
 	// Pacer is the installation's, shared with every other caller for it; nil is one
 	// for each listing.
 	Pacer *Pacer
-	// Token returns an installation token for the listing: for [Lister.ListIssues]
-	// one that reads the repository's issues, such as [Client.MintInstallationToken]
+	// Token returns an installation token for the listing: for
+	// [Lister.ListOpenIssuesComplete] and [Lister.ListChanged] one that reads the
+	// repository's issues, such as [Client.MintInstallationToken]
 	// mints, and for [Lister.ListRepositories] one that reads which repositories the
 	// installation reaches, such as [Client.MintListingToken] mints. It is called before
 	// every request, so it keeps a token until shortly before it expires.
@@ -591,15 +592,18 @@ func (p *pages) read(path string) error {
 	return nil
 }
 
-// A listing reads GitHub's pages by number, and a page's contents shift when an
-// earlier one loses an entry, so a listing can miss one. [Lister.ListIssues] and the
-// listings of an issue's comments never say they are complete, then: they add and
-// update what they see, never close or drop what they do not, and closing and deleting
-// come from webhooks' events alone. Two listings do say it: a listing of the
-// installation's repositories that GitHub answers with one page and that skips none,
-// which nothing can shift, see [Lister.ListRepositories]; and the listing of open
-// issues by GraphQL's cursor, which does not skip one, see
-// [Lister.ListOpenIssuesComplete].
+// A REST listing reads the next page GitHub's Link header names. GitHub documents its
+// REST listings as paged by number, and a page's contents shift when an earlier one
+// loses an entry, so a listing by number can miss one. GitHub's REST listing of issues,
+// as GitHub answers it today, names its next page by a cursor, after, as well as by
+// number, but GitHub's documentation still describes page numbers alone, so the adapter
+// does not rely on that cursor: the listing of open issues reads them by GraphQL's
+// cursor instead, which does not skip one, and says it is complete unless it skipped an
+// item, see [Lister.ListOpenIssuesComplete]. The listings of an issue's comments never
+// say they are complete: they add and update what they see, never drop what they do
+// not, and a comment's deletion comes from webhooks' events alone. A listing of the
+// installation's repositories says it is complete when GitHub answers it with one page
+// and it skips none, which nothing can shift, see [Lister.ListRepositories].
 
 // listingEnd is how long the request that ends a listing stopped early may take,
 // even when the listing stopped because its context is done.
@@ -711,79 +715,9 @@ type listed struct {
 	comments int
 }
 
-// ListIssues lists the repository's open issues, pull requests left out, and their
-// comments, and sends them to Qory Apiary: items in parts of at most 100 items and
-// 1 MiB, and after each part the comments of its items, for an issue that has any, in
-// requests of at most 100 comments and 1 MiB. The App's work item comment is left out.
-//
-// It reads every issue, in every state, oldest first, and sends the open ones alone:
-// closing an issue then moves none of the others from one page to another, as it
-// would in a list of open issues, which deleting or transferring one still does. It
-// reads at most 2,000 pages of issues and 100 of an issue's comments.
-//
-// No part says the listing is complete, nor do an item's comments, so Qory Apiary closes
-// and drops nothing a listing does not see. What that leaves is a limit: an issue a
-// listing missed, as one deleted or transferred while it was listed makes it miss one,
-// and an issue closed while its repository was not mirrored, stay as Qory Apiary has
-// them until that issue next changes on GitHub, and its webhook event brings it. A
-// listing stopped early, by an error or its context, still sends the items it read
-// and had not sent, as its last part; one that cannot read the repository sends
-// nothing. A part is never empty, since the contract refuses one without items, so a
-// repository with no open issue sends none, which loses nothing: no part says the
-// listing is complete. A repository GitHub answers is gone or moved, as it answers the
-// read of the repository or of a page of its issues, stops the listing with an error
-// that wraps [ErrRepositoryGone]; an issue whose comments GitHub answers so, deleted or
-// moved while it was listed, has its comments skipped and logged by its ref, and the
-// listing goes on.
-func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
-	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
-		return fmt.Errorf("%q is not owner/name", repo.String())
-	}
-	if l.Sink == nil || l.Token == nil || l.Slug == "" {
-		return errors.New("the lister has no sink, no token or no App slug")
-	}
-	p := l.pacerOr()
-	// The listing starts before its first request to GitHub: Qory Apiary disconnects
-	// what a complete listing left out and did not hear of since it started, so a
-	// later start would drop a collection that changed meanwhile.
-	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
-	var r ghRepo
-	if _, err := l.get(ctx, p, "reading the repository "+repo.String(), "/repos/"+repo.String(), &r); err != nil {
-		return repositoryGone(err)
-	}
-	coll := collectionOf(r)
-	if why := checkCollection(coll); why != "" {
-		return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
-	}
-	o := l.openParts(p, repo, listing, coll)
-	what := "listing the issues of " + repo.String()
-	read := pages{what: what, max: maxIssuePages}
-	path := "/repos/" + repo.String() + "/issues?state=all&sort=created&direction=asc&per_page=100"
-	for path != "" {
-		if err := read.read(path); err != nil {
-			return o.stop(ctx, err)
-		}
-		var page []ghIssue
-		next, err := l.get(ctx, p, what, path, &page)
-		if err != nil {
-			return o.stop(ctx, repositoryGone(err))
-		}
-		for _, is := range page {
-			if is.PullRequest != nil || is.State != StateOpen {
-				continue
-			}
-			if err := o.add(ctx, r, is); err != nil {
-				return o.stop(ctx, err)
-			}
-		}
-		path = next
-	}
-	return o.end(ctx, false)
-}
-
 // openParts sends the open issues a listing reads to Qory Apiary, in parts of at most
 // 100 items and 1 MiB, and after each part the comments of its items; see
-// [Lister.ListIssues].
+// [Lister.ListOpenIssuesComplete].
 type openParts struct {
 	l       Lister
 	p       *Pacer
@@ -886,8 +820,9 @@ func (o *openParts) stop(ctx context.Context, err error) error {
 }
 
 // listComments reads and sends the comments of the items that have any. An item's
-// comments are read by page number too, oldest first, and a comment deleted while they
-// are read shifts the pages after it, so no request says they are complete.
+// comments are read oldest first, by REST's pages, which GitHub documents by number, and
+// a comment deleted while they are read can shift the pages after it, so no request
+// says they are complete.
 func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, items []listed) error {
 items:
 	for _, x := range items {

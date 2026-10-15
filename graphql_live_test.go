@@ -23,11 +23,11 @@ import (
 // paging, holds every issue open for the whole listing exactly once while issues are
 // closed, created, edited, reopened and deleted between its pages; that is what lets
 // that listing say it is complete. The same scenarios run against REST's listing of
-// issues as [Lister.ListIssues] reads it, every state, and of the open issues alone,
-// each following the next page GitHub's Link header names, for contrast: those results
-// are logged, never failed on. GitHub's Link header names the next page by a cursor,
-// after, as well as by number, so these too read by cursor; neither is the listing by
-// page number alone, which this test does not run.
+// issues, oldest first, of every state, and of the open issues alone, each following
+// the next page GitHub's Link header names, for contrast: those results are logged,
+// never failed on. GitHub's Link header names the next page by a cursor, after, as well
+// as by number, so these too read by cursor; neither is the listing by page number
+// alone, which this test does not run.
 //
 // It runs only with the build tag githublive, and only when QORY_GITHUB_LIVE_REPO names
 // a repository, owner/name, that the token in QORY_GITHUB_LIVE_TOKEN may write issues

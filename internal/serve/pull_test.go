@@ -23,8 +23,9 @@ import (
 // pullGitHub is the fake GitHub a pull reads: acme/widgets's comments as GitHub lists a
 // repository's, and acme/gadgets, with the issues gadgets, in front of a [fakeGitHub],
 // which answers the rest. It records what it is asked for. hold, when set, holds each
-// request for acme/widgets's issues until it is closed, and says on held that one
-// waits; onComments is called as acme/widgets's comments are read.
+// request for acme/widgets's issues, by REST or by GraphQL, until it is closed, and says
+// on held that one waits; onComments is called as acme/widgets's comments are read.
+// unchanged answers that none of acme/widgets's issues changed.
 type pullGitHub struct {
 	gh  *fakeGitHub
 	srv *httptest.Server
@@ -35,6 +36,7 @@ type pullGitHub struct {
 	requests   []string
 	hold, held chan struct{}
 	onComments func()
+	unchanged  bool
 }
 
 func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +47,7 @@ func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
-	case "/repos/acme/widgets/issues":
+	case "/repos/acme/widgets/issues", "/graphql":
 		if hold != nil {
 			held <- struct{}{}
 			select {
@@ -53,6 +55,10 @@ func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case <-r.Context().Done():
 				return
 			}
+		}
+		if f.unchanged && r.URL.Path == "/repos/acme/widgets/issues" {
+			io.WriteString(w, `[]`)
+			return
 		}
 		f.gh.ServeHTTP(w, r)
 	case "/repos/acme/widgets/issues/comments":
@@ -71,13 +77,15 @@ func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// asked are the requests made whose path is path, with their queries.
+// asked are the requests made whose path is path, with their queries, and without
+// their method.
 func (f *pullGitHub) asked(path string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []string
 	for _, r := range f.requests {
-		if p, _, _ := strings.Cut(strings.TrimPrefix(r, "GET "), "?"); p == path {
+		_, r, _ = strings.Cut(r, " ")
+		if p, _, _ := strings.Cut(r, "?"); p == path {
 			out = append(out, r)
 		}
 	}
@@ -257,10 +265,11 @@ func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 	}
 }
 
-// TestTheDailyListingIsSentAndIsNotComplete pulls a collection listed more than a day
-// ago, and checks its open issues are listed as the fill lists them, not complete, and
-// the listing's start kept; and that a collection with no pull kept is listed alone.
-func TestTheDailyListingIsSentAndIsNotComplete(t *testing.T) {
+// TestTheDailyListingIsSentAndIsComplete pulls a collection listed more than a day
+// ago, and checks its open issues are listed as the fill lists them, by GraphQL's
+// cursor, in one part that says the listing is complete, and the listing's start kept;
+// and that a collection with no pull kept is listed alone.
+func TestTheDailyListingIsSentAndIsComplete(t *testing.T) {
 	w, f, p, _ := pulling(t)
 	last := pullStart.Add(-time.Hour)
 	keepPulled(w.st, "acme/widgets", pullMark{Since: last, Listed: pullStart.Add(-25 * time.Hour)})
@@ -268,33 +277,41 @@ func TestTheDailyListingIsSentAndIsNotComplete(t *testing.T) {
 	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
 		t.Fatal(err)
 	}
-	var listings []contracts.SourceItems
-	for _, r := range w.apiary.sent(routeItems) {
-		var req contracts.SourceItems
-		json.Unmarshal(r.raw, &req)
-		if req.Listing != nil {
-			listings = append(listings, req)
-		}
-	}
-	if len(listings) != 1 || listings[0].Listing.Complete || len(listings[0].Items) != 2 {
+	listings := listingParts(w)
+	if len(listings) != 1 || !listings[0].Listing.Complete || listings[0].Listing.Part != 1 || len(listings[0].Items) != 2 {
 		t.Errorf("listed %+v", listings)
+	}
+	if len(f.asked("/graphql")) != 1 {
+		t.Errorf("asked GraphQL %d times", len(f.asked("/graphql")))
 	}
 	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(pullStart) {
 		t.Errorf("kept %+v", m)
 	}
 
 	w.st.Delete(nsPulls, "acme/widgets")
-	before := len(f.asked("/repos/acme/widgets/issues"))
+	before, rest := len(f.asked("/graphql")), len(f.asked("/repos/acme/widgets/issues"))
 	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
 		t.Fatal(err)
 	}
-	asked := f.asked("/repos/acme/widgets/issues")[before:]
-	if len(asked) != 1 || strings.Contains(asked[0], "since=") || len(f.asked("/repos/acme/widgets/issues/comments")) != 1 {
-		t.Errorf("a collection with no pull kept asked %v", asked)
+	if len(f.asked("/graphql")) != before+1 || len(f.asked("/repos/acme/widgets/issues")) != rest || len(f.asked("/repos/acme/widgets/issues/comments")) != 1 {
+		t.Errorf("a collection with no pull kept asked %v", f.requests)
 	}
 	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(pullStart) {
 		t.Errorf("kept %+v", m)
 	}
+}
+
+// listingParts are the items requests sent to Qory Apiary that are a listing's parts.
+func listingParts(w *wired) []contracts.SourceItems {
+	var out []contracts.SourceItems
+	for _, r := range w.apiary.sent(routeItems) {
+		var req contracts.SourceItems
+		json.Unmarshal(r.raw, &req)
+		if req.Listing != nil {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 // TestTheFirstPullAfterAFillStartsFromTheFill links a collection through the feed, which
@@ -316,8 +333,8 @@ func TestTheFirstPullAfterAFillStartsFromTheFill(t *testing.T) {
 		t.Fatal(err)
 	}
 	asked := f.asked("/repos/acme/widgets/issues")
-	if len(asked) != 2 || !sinceOf(t, asked[1]).Equal(pullStart.Add(-5*time.Minute)) {
-		t.Errorf("asked %v", asked)
+	if len(asked) != 1 || !sinceOf(t, asked[0]).Equal(pullStart.Add(-5*time.Minute)) || len(f.asked("/graphql")) != 1 {
+		t.Errorf("asked %v", f.requests)
 	}
 }
 
@@ -657,5 +674,166 @@ func TestTheSyncIntervalIsADayAtMost(t *testing.T) {
 	}
 	if d := p.interval(); d != 24*time.Hour {
 		t.Errorf("the interval kept as 999999 seconds is %v", d)
+	}
+}
+
+// listingCallers are the two callers of the listing of open issues: the fill, for a
+// collection with no pull kept, and the daily listing, for one last listed more than a
+// day ago, each on the rig [pulling] makes. GitHub's pacer for the installation runs on
+// the rig's clock, so a rate limit waits for nothing.
+var listingCallers = []struct {
+	name string
+	run  func(ctx context.Context, w *wired, p *puller) error
+}{
+	{"the fill", func(ctx context.Context, w *wired, _ *puller) error {
+		return w.adapter.fill(ctx, "acme/widgets")
+	}},
+	{"the daily listing", func(ctx context.Context, w *wired, p *puller) error {
+		keepPulled(w.st, "acme/widgets", pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)})
+		return p.pull(ctx, "acme/widgets", 42)
+	}},
+}
+
+// listingRig is the rig [pulling] makes, with GitHub's pacer on its clock and n open
+// issues of acme/widgets, none of which changed since the last pull.
+func listingRig(t *testing.T, n int) (*wired, *puller) {
+	t.Helper()
+	w, f, p, clock := pulling(t)
+	f.unchanged = true
+	w.adapter.pacers = map[int64]*github.Pacer{42: {Now: clock.now, Sleep: clock.sleep}}
+	for i := 1; i <= n; i++ {
+		w.gh.issues = append(w.gh.issues, ghIssue(i, 0))
+	}
+	return w, p
+}
+
+// partsOf are the listing's parts as their sizes and whether each says complete.
+func partsOf(w *wired) string {
+	var out []string
+	for _, req := range listingParts(w) {
+		out = append(out, strconv.Itoa(len(req.Items))+" "+strconv.FormatBool(req.Listing.Complete))
+	}
+	return strings.Join(out, ", ")
+}
+
+// TestTheFillAndTheDailyListingPassTheListingThrough lists 250 open issues by the fill
+// and by the daily listing, and checks each sends the listing's parts as it makes them,
+// the last alone complete; and that with an issue Qory Apiary would refuse, skipped, no
+// part says complete.
+func TestTheFillAndTheDailyListingPassTheListingThrough(t *testing.T) {
+	for _, c := range listingCallers {
+		for _, skip := range []bool{false, true} {
+			w, p := listingRig(t, 250)
+			want := "100 false, 100 false, 50 true"
+			if skip {
+				w.gh.issues[0]["title"] = ""
+				want = "100 false, 100 false, 49 false"
+			}
+			if err := c.run(context.Background(), w, p); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if got := partsOf(w); got != want {
+				t.Errorf("%s, skipped %v: parts %s, want %s", c.name, skip, got, want)
+			}
+			if m := markOf(t, w); !m.Listed.Equal(pullStart) {
+				t.Errorf("%s: kept %+v", c.name, m)
+			}
+		}
+	}
+}
+
+// TestAListingThatFailsOrStopsNeverSaysComplete lists 150 open issues, 100 to a page,
+// by the fill and by the daily listing, and stops each on the second page: GitHub
+// answers 502, GraphQL answers errors in a 200, GraphQL's rate limit holds through every
+// try, the context is cancelled, or its deadline passes. It checks each returns its
+// error, sends the first page's items as a part that does not say complete, sends no
+// part that does, and keeps no listing's start, so the next pull lists again.
+func TestAListingThatFailsOrStopsNeverSaysComplete(t *testing.T) {
+	hold := func(r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		fail string
+		ctx  func(w *wired) (context.Context, context.CancelFunc)
+		err  string
+		is   error
+	}{
+		{name: "GitHub answers 502", fail: "502", err: "GitHub answered 502"},
+		{name: "GraphQL's errors in a 200", fail: "errors", err: "GitHub answered an error, SERVICE_UNAVAILABLE"},
+		{name: "a rate limit that holds", fail: "limited", err: "GitHub answered an error, RATE_LIMITED"},
+		{name: "a context cancelled", ctx: func(w *wired) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			w.gh.onPage = func(page int, r *http.Request) {
+				if page == 2 {
+					// The page is answered once the listing gave up on it.
+					cancel()
+					hold(r)
+				}
+			}
+			return ctx, cancel
+		}, is: context.Canceled},
+		{name: "a deadline passed", ctx: func(w *wired) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			w.gh.onPage = func(page int, r *http.Request) {
+				if page == 2 {
+					hold(r)
+				}
+			}
+			return ctx, cancel
+		}, is: context.DeadlineExceeded},
+	} {
+		for _, c := range listingCallers {
+			w, p := listingRig(t, 150)
+			if tc.fail != "" {
+				w.gh.gqlFailOn, w.gh.gqlFail = 2, tc.fail
+			}
+			ctx, cancel := context.Background(), context.CancelFunc(func() {})
+			if tc.ctx != nil {
+				ctx, cancel = tc.ctx(w)
+			}
+			err := c.run(ctx, w, p)
+			cancel()
+			if err == nil || tc.err != "" && !strings.Contains(err.Error(), tc.err) || tc.is != nil && !errors.Is(err, tc.is) {
+				t.Errorf("%s, %s: err %v", tc.name, c.name, err)
+			}
+			if got := partsOf(w); got != "100 false" {
+				t.Errorf("%s, %s: parts %s", tc.name, c.name, got)
+			}
+			if m := markOf(t, w); !m.Listed.Before(pullStart) {
+				t.Errorf("%s, %s: kept %+v", tc.name, c.name, m)
+			}
+		}
+	}
+}
+
+// TestARepositoryWithNoOpenIssueSendsNoPart lists a repository whose one issue is
+// closed, by the fill and by the daily listing, and checks no part is sent, no items
+// request without items, and no line says a listing was sent; the listing's start is
+// kept, since it finished.
+func TestARepositoryWithNoOpenIssueSendsNoPart(t *testing.T) {
+	for _, c := range listingCallers {
+		w, p := listingRig(t, 0)
+		w.gh.issues = []map[string]any{closedIssue(1)}
+		if err := c.run(context.Background(), w, p); err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := partsOf(w); got != "" {
+			t.Errorf("%s: parts %s", c.name, got)
+		}
+		for _, r := range w.apiary.sent(routeItems) {
+			if items, _ := r.body["items"].([]any); len(items) == 0 {
+				t.Errorf("%s: an items request without items: %s", c.name, r.raw)
+			}
+		}
+		if log := w.log.String(); strings.Contains(log, "listing") || strings.Contains(log, "listed") {
+			t.Errorf("%s: the log %s", c.name, log)
+		}
+		if m := markOf(t, w); !m.Listed.Equal(pullStart) {
+			t.Errorf("%s: kept %+v", c.name, m)
+		}
 	}
 }
