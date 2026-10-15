@@ -200,8 +200,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			n++
 		}
 	}
-	status, body := http.StatusOK, `{}`
+	status, body := http.StatusNoContent, ``
 	if r.Method == http.MethodGet {
+		status = http.StatusOK
 		body = f.page(r.URL.Query().Get("after"))
 	}
 	refuse, refuseGet := f.refuse, f.refuseGet
@@ -216,7 +217,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status, body = s, b
 		}
 	}
-	w.Header().Set("Content-Type", "application/json")
+	if body != "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	if status != http.StatusUnauthorized {
 		signer := f.server
 		if f.signer != nil {
