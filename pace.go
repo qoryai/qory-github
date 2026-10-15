@@ -195,6 +195,23 @@ func (p *Pacer) observe(resp *http.Response) bool {
 	return true
 }
 
+// limited marks a request GitHub refused for a rate limit in its answer's body rather
+// than its status, as GraphQL answers 200 with an error of type RATE_LIMITED: the next
+// request waits until the reset when GitHub said no request remains, else for
+// secondaryWait, as for a secondary rate limit.
+func (p *Pacer) limited() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	until := now.Add(secondaryWait)
+	if p.limit > 0 && p.remaining == 0 && p.reset.After(now) {
+		until = p.reset
+	}
+	if until.After(p.until) {
+		p.until = until
+	}
+}
+
 // retryAfter reads retry-after, seconds or an HTTP date, and takes more than an hour
 // as an hour; the seconds are cut before they are multiplied, so they never overflow.
 func retryAfter(v string, now time.Time) (time.Duration, bool) {
