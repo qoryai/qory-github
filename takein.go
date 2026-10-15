@@ -62,6 +62,21 @@ var ErrIssueGone = errors.New("the issue is deleted or out of the App's reach")
 // same answer, so a caller drops the change instead of retrying it.
 var ErrUnreachable = errors.New("the repository or issue moved, or the App cannot write it")
 
+// ErrInvalidChange is what [Client.ApplyChange] wraps when it refuses a change as it
+// checks it: a ref, work_item_id or url that is not one, see [Change]. The same change
+// is refused every time, so a caller drops it instead of retrying it.
+var ErrInvalidChange = errors.New("the change is not one the adapter can apply")
+
+// invalidChange is a change refused as it is checked, with the rule it fails; it
+// matches [ErrInvalidChange].
+type invalidChange string
+
+// Error is the rule the change fails.
+func (e invalidChange) Error() string { return string(e) }
+
+// Is matches [ErrInvalidChange].
+func (e invalidChange) Is(target error) bool { return target == ErrInvalidChange }
+
 var (
 	// workItemIDShape is a work item's id. Qory Apiary's code sets no format for one
 	// yet, so this is a bounded shape that keeps the comment's marker one line and
@@ -110,18 +125,18 @@ func (i issueRef) path() string {
 func parseChange(e Change) (issueRef, error) {
 	repoPart, number, ok := strings.Cut(e.Ref, "#")
 	if !ok || !issueNumberShape.MatchString(number) {
-		return issueRef{}, errors.New("the change's ref is not owner/name#number")
+		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
 	}
 	repos, err := ParseRepositories(repoPart)
 	if err != nil || len(repos) != 1 {
-		return issueRef{}, errors.New("the change's ref is not owner/name#number")
+		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
 	}
 	n, err := strconv.ParseInt(number, 10, 64)
 	if err != nil {
-		return issueRef{}, errors.New("the change's ref is not owner/name#number")
+		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
 	}
 	if !workItemIDShape.MatchString(e.WorkItemID) {
-		return issueRef{}, errors.New("the change's work_item_id is not wi_ and 1 to 64 letters, digits, underscores or hyphens")
+		return issueRef{}, invalidChange("the change's work_item_id is not wi_ and 1 to 64 letters, digits, underscores or hyphens")
 	}
 	if err := checkChangeURL(e.URL); err != nil {
 		return issueRef{}, err
@@ -138,11 +153,11 @@ func parseChange(e Change) (issueRef, error) {
 func checkChangeURL(s string) error {
 	const rule = "the change's url is not an https URL of at most 2,048 characters that RFC 3986 allows, without a user"
 	if len(s) > maxChangeURL || !changeURLShape.MatchString(s) {
-		return errors.New(rule)
+		return invalidChange(rule)
 	}
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" {
-		return errors.New(rule)
+		return invalidChange(rule)
 	}
 	return nil
 }
@@ -164,12 +179,14 @@ func marker(workItemID string) string {
 // is returned. Each step is one a repeat finds done, so a change applied again after a
 // failure or a crash writes nothing twice. The comment is never edited nor deleted.
 //
-// Two errors are permanent, since asking again would get the same answer, and a caller
-// drops the change rather than retry it: one that wraps [ErrIssueGone], a 404 or 410
-// for the issue during a take in, and one that wraps [ErrUnreachable], see there.
-// During an undo a 404 or 410 leaves the issue without the label, so it is done. A
-// change refused as it is checked is refused again; every other error may pass, and
-// the change can be applied again. No error contains the token.
+// Three errors are permanent, since asking again would get the same answer, and a
+// caller drops the change rather than retry it: one that wraps [ErrInvalidChange], a
+// change refused as it is checked; one that wraps [ErrIssueGone], a 404 or 410 for the
+// issue during a take in; and one that wraps [ErrUnreachable], see there. During an
+// undo a 404 or 410 leaves the issue without the label, so it is done. Every other
+// error may pass, and the change can be applied again; a slug that is not one is among
+// them, since it is the caller's setting and not the change. No error contains the
+// token.
 func (c Client) ApplyChange(ctx context.Context, token TokenFunc, slug string, e Change) error {
 	if e.Status != StatusTakenIn && e.Status != StatusUndone {
 		return nil

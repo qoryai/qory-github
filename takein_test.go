@@ -418,7 +418,7 @@ func TestAnInvalidChangeIsRefusedBeforeAnything(t *testing.T) {
 			e.Status = status
 			tc.edit(&e)
 			err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), token, takeInSlug, e)
-			if err == nil || !strings.HasPrefix(err.Error(), "the change's "+tc.want+" ") {
+			if err == nil || !strings.HasPrefix(err.Error(), "the change's "+tc.want+" ") || !errors.Is(err, ErrInvalidChange) {
 				t.Errorf("%s, %s: err %v, want the change's %s", tc.name, status, err, tc.want)
 			}
 			if tr.sent || asked {
@@ -634,5 +634,31 @@ func TestSendFollowsNoRedirect(t *testing.T) {
 				t.Errorf("%d: err %v, followed %v", status, err, followed)
 			}
 		}
+	}
+}
+
+// TestARefusedChangeIsPermanent refuses a change for each field it checks, and checks
+// that each error wraps ErrInvalidChange, and that an error that is not the change's, a
+// slug that is not one or a token that cannot be had, does not.
+func TestARefusedChangeIsPermanent(t *testing.T) {
+	token := func(context.Context, Repository) (string, error) { return takeInToken, nil }
+	c := Client{HTTP: &http.Client{Transport: &sentTransport{}}}
+	for _, edit := range []func(*Change){
+		func(e *Change) { e.Ref = "acme/widgets#0" },
+		func(e *Change) { e.WorkItemID = "42" },
+		func(e *Change) { e.URL = "http://apiary.example.com/work-items/wi_42" },
+	} {
+		e := takenIn
+		edit(&e)
+		if err := c.ApplyChange(context.Background(), token, takeInSlug, e); !errors.Is(err, ErrInvalidChange) {
+			t.Errorf("%+v: err %v, want ErrInvalidChange", e, err)
+		}
+	}
+	if err := c.ApplyChange(context.Background(), token, "qory test", takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
+		t.Errorf("a slug that is not one: err %v", err)
+	}
+	failing := func(context.Context, Repository) (string, error) { return "", errors.New("no installation") }
+	if err := c.ApplyChange(context.Background(), failing, takeInSlug, takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
+		t.Errorf("a token that cannot be had: err %v", err)
 	}
 }
