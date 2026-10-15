@@ -130,8 +130,9 @@ const setupPublicHelp = `With --public-url, the App is instead public, with a we
 push, and actions, checks, contents, issues and pull requests write, administration,
 members and metadata read. It is qory-github-server's App: setup then prints
 qory-github-server serve's settings in place of the declaration and the policy.
-setup asks which GitHub account the App is for, and suggests the name qory- and its
-handle, which you can change on GitHub's form.`
+Without --org, setup asks which GitHub account the App is for. Unless --name gives a
+name, setup suggests qory- and the account's handle, which you can change on
+GitHub's form.`
 
 // setupLong is setup's help where QORY_FEATURES names factory: [setupHelp]'s, with
 // [setupPublicHelp] after its paragraph on the App.
