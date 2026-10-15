@@ -91,9 +91,15 @@ func (c Client) MintListingToken(ctx context.Context, appID string, key *rsa.Pri
 	return c.mintFor(ctx, Request{AppID: appID, Key: key, InstallationID: installationID, Permissions: map[string]string{"metadata": "read"}})
 }
 
+// ErrMintRefused is wrapped in the error of a mint GitHub refuses for good: the
+// installation is not the App's on the repositories' owner, or GitHub answers the mint
+// 404 or 422, as it answers for an installation gone or a repository it no longer
+// reaches, renamed or removed from it. Asking again does not change it.
+var ErrMintRefused = errors.New("GitHub refuses to mint the installation token")
+
 // mintFor mints the token req asks for, once its installation is checked: limited to
 // its repositories, or to none when it names none, and to its permissions. req is
-// checked already.
+// checked already. A mint refused for good wraps [ErrMintRefused].
 func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, error) {
 	now := time.Now
 	if c.Now != nil {
@@ -104,6 +110,9 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 		return InstallationToken{}, err
 	}
 	if err := c.checkInstallation(ctx, jwt, req.InstallationID, req.Repositories); err != nil {
+		if err == errNotTheOwners {
+			err = fmt.Errorf("%w: %w", ErrMintRefused, err)
+		}
 		return InstallationToken{}, err
 	}
 	var got struct {
@@ -123,6 +132,9 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 		var answered *answerError
 		if errors.As(err, &answered) && answered.redirect() {
 			return InstallationToken{}, errMintRedirected
+		}
+		if errors.As(err, &answered) && (answered.status == http.StatusNotFound || answered.status == http.StatusUnprocessableEntity) {
+			err = fmt.Errorf("%w: %w", ErrMintRefused, err)
 		}
 		return InstallationToken{}, err
 	}

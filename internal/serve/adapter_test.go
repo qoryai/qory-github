@@ -428,18 +428,22 @@ func TestAFeedEntryThatFailsForGoodIsPassed(t *testing.T) {
 }
 
 // TestAnEntryForAnIssueOrARepositoryGoneIsPassed reads a work item whose issue GitHub
-// answers 404, one in a repository GitHub answers 301, and a linked collection whose
-// repository GitHub answers 404 or 301, each before an entry serve can apply, and checks
-// each is passed, the entry after it applied and the cursor moved.
+// answers 404, one in a repository GitHub answers 301, a linked collection whose
+// repository GitHub answers 404 or 301, and a work item and a linked collection of a
+// repository the installation no longer reaches, whose token's mint GitHub answers 422,
+// each before an entry serve can apply, and checks each is passed, the entry after it
+// applied and the cursor moved.
 func TestAnEntryForAnIssueOrARepositoryGoneIsPassed(t *testing.T) {
 	for name, gone := range map[string]contracts.Change{
 		"a work item whose issue is gone":       {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_8", Ref: "acme/widgets#8", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_8"},
 		"a work item whose repository moved":    {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_9", Ref: "acme/moved#9", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_9"},
-		"a collection whose repository is gone": {Kind: contracts.ChangeCollection, CollectionRef: "acme/old", Status: "linked"},
+		"a collection whose repository is gone": {Kind: contracts.ChangeCollection, CollectionRef: "acme/gone", Status: "linked"},
 		"a collection whose repository moved":   {Kind: contracts.ChangeCollection, CollectionRef: "acme/moved", Status: "linked"},
+		"a collection out of reach":             {Kind: contracts.ChangeCollection, CollectionRef: "acme/old", Status: "linked"},
+		"a work item out of reach":              {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_10", Ref: "acme/old#9", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_10"},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		for _, repo := range []string{"acme/widgets", "acme/moved", "acme/old"} {
+		for _, repo := range []string{"acme/widgets", "acme/moved", "acme/old", "acme/gone"} {
 			setReach(w.st, repo, 42)
 		}
 		w.apiary.add(gone, contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
@@ -456,6 +460,75 @@ func TestAnEntryForAnIssueOrARepositoryGoneIsPassed(t *testing.T) {
 		if !strings.Contains(w.log.String(), "a change of the feed failed, and is passed") {
 			t.Errorf("%s: the log %s", name, w.log.String())
 		}
+	}
+}
+
+// TestAFillLosesOnlyTheCommentsOfAnIssueGone links a collection of 150 open issues, the
+// first of which GitHub answers 404 for its comments, and checks every issue is sent,
+// the others' comments too, and the entry passes.
+func TestAFillLosesOnlyTheCommentsOfAnIssueGone(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.goneComments = 1
+	for i := 1; i <= 150; i++ {
+		w.gh.issues = append(w.gh.issues, ghIssue(i, 1))
+		w.gh.comments[i] = []map[string]any{{
+			"id": 1000 + i, "html_url": "https://github.com/acme/widgets/issues/" + strconv.Itoa(i) + "#issuecomment-1", "body": "c",
+			"user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+		}}
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items := 0
+	for _, r := range w.apiary.sent(routeItems) {
+		items += len(r.body["items"].([]any))
+	}
+	if comments := len(w.apiary.sent(routeComments)); items != 150 || comments != 149 {
+		t.Errorf("%d items, %d comments requests", items, comments)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	if !strings.Contains(w.log.String(), "skipped the comments on acme/widgets#1: GitHub answers that the issue is gone or moved") {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAnEntryIsPassedOnceItHasFailedForADay links a collection whose issues GitHub
+// answers 502, on a clock that moves on between the reads, and checks the entry keeps
+// the cursor until it has failed for a day, and is then logged and passed, the entry
+// after it applied.
+func TestAnEntryIsPassedOnceItHasFailedForADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.issuesDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"}, contracts.Change{Kind: contracts.ChangeSync})
+	for _, d := range []time.Duration{0, time.Hour, 22*time.Hour + 59*time.Minute} {
+		now = now.Add(d)
+		err := w.feed.step(context.Background())
+		if err == nil || IsPermanent(err) || !strings.Contains(err.Error(), "GitHub answered 502") {
+			t.Fatalf("after %v: err %v", d, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v: the cursor is kept", d)
+		}
+	}
+	now = now.Add(time.Minute)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "3600" {
+		t.Errorf("the entry after it is not applied: %q", v)
+	}
+	if !strings.Contains(w.log.String(), `"level":"ERROR","msg":"a change of the feed has failed for a day, and is passed","kind":"collection"`) {
+		t.Errorf("the log %s", w.log.String())
 	}
 }
 

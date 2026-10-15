@@ -390,8 +390,9 @@ func (a *Adapter) sendLinked(ctx context.Context, collection, what string, send 
 var errNoInstallation = errors.New("no installation is known to reach the repository")
 
 // fill sends Qory Apiary the open issues of a collection it linked, and their comments.
-// A repository GitHub answers is gone or moved, as [github.Gone] says, fails for good,
-// so the change feed passes it.
+// A repository GitHub answers is gone or moved, [github.ErrRepositoryGone], or for which
+// GitHub refuses to mint a token for good, [github.ErrMintRefused], fails for good, so
+// the change feed passes it.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	repo, err := repository(ref)
 	if err != nil {
@@ -414,7 +415,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		LogCut: a.logCut,
 	}
 	err = a.forgetOn401(installation, l.ListIssues(ctx, repo))
-	if github.Gone(err) {
+	if errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused) {
 		return Permanent(err)
 	}
 	return err
@@ -422,6 +423,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 
 // applyChange writes on GitHub what a work_item entry of the feed says, with a token
 // that writes the issues of that one repository, from the installation that reaches it.
+// A token GitHub refuses to mint for good, [github.ErrMintRefused], fails it for good.
 func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 	collection, _, _ := strings.Cut(ch.Ref, "#")
 	installation, ok, err := reachOf(a.Store, collection)
@@ -434,7 +436,11 @@ func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 	token := func(ctx context.Context, repo github.Repository) (string, error) {
 		return a.token(ctx, installation, repo, "write")
 	}
-	return a.forgetOn401(installation, a.GitHub.ApplyChange(ctx, a.pacer(installation), token, a.Slug, github.Change{WorkItemID: ch.WorkItemID, Ref: ch.Ref, Status: ch.Status, URL: ch.URL}))
+	err = a.forgetOn401(installation, a.GitHub.ApplyChange(ctx, a.pacer(installation), token, a.Slug, github.Change{WorkItemID: ch.WorkItemID, Ref: ch.Ref, Status: ch.Status, URL: ch.URL}))
+	if errors.Is(err, github.ErrMintRefused) {
+		return Permanent(err)
+	}
+	return err
 }
 
 // repository is a collection's ref as a repository, owner/name.

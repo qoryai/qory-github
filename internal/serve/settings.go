@@ -27,8 +27,9 @@ import (
 type Settings struct {
 	// AppID is the App's numeric id or its client id.
 	AppID string
-	// PrivateKeyFile is a file that contains the App's private key, read with
-	// [github.ReadKeyFile].
+	// PrivateKeyFile is a file that contains the App's private key, read as
+	// [github.ReadKeyFile] reads one, with errors that name the setting and never the
+	// path.
 	PrivateKeyFile string
 	// WebhookSecretFile is a file that contains the App's webhook secret, read with
 	// [ReadWebhookSecret].

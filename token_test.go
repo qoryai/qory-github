@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -83,7 +84,7 @@ func TestMintInstallationTokenChecksTheInstallationAndNeverSaysTheToken(t *testi
 	f := &fakeGitHub{accounts: map[int64]string{7: "otherlogin"}}
 	c := serve(t, f)
 	_, err := c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"issues": "write"}})
-	if err != errNotTheOwners || f.mintPath != "" {
+	if !errors.Is(err, errNotTheOwners) || !errors.Is(err, ErrMintRefused) || f.mintPath != "" {
 		t.Errorf("err %v, minted at %q", err, f.mintPath)
 	}
 	f = &fakeGitHub{accounts: map[int64]string{7: "acme"}, status: 401}

@@ -721,7 +721,7 @@ func TestAKeyFileIsReadFromWhatWasOpened(t *testing.T) {
 	sub := filepath.Join(dir, "dir.pem")
 	os.Mkdir(sub, 0o700)
 	large := filepath.Join(dir, "large.pem")
-	os.WriteFile(large, append(keyPEM(t), make([]byte, maxKeyFile)...), 0o600)
+	os.WriteFile(large, append(keyPEM(t), make([]byte, MaxKeyFile)...), 0o600)
 	for path, want := range map[string]string{
 		link:                           "symbolic link",
 		fifo:                           "not a regular file",

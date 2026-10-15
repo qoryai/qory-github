@@ -38,6 +38,10 @@ type fakeIssues struct {
 	// elsewhere is set to make the first page of issues link its next on another host,
 	// and again to make every page link its next to the first.
 	elsewhere, again bool
+	// goneComments answers the comments of that issue 404, as GitHub answers for an
+	// issue deleted while it is listed; goneStatus answers the repository with that
+	// status instead of the repository.
+	goneComments, goneStatus int
 	// afterIssues, when set, is called after a page of issues is answered, with its
 	// number, as GitHub changes between two pages.
 	afterIssues func(page int)
@@ -78,6 +82,12 @@ func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	list := func(s []map[string]any) any { return s }
 	switch m := commentsPath.FindStringSubmatch(r.URL.Path); {
+	case f.goneStatus != 0 && r.URL.Path == "/repos/acme/widgets":
+		w.WriteHeader(f.goneStatus)
+		io.WriteString(w, `{"message":"Not Found"}`)
+	case m != nil && m[1] == strconv.Itoa(f.goneComments):
+		w.WriteHeader(404)
+		io.WriteString(w, `{"message":"Not Found"}`)
 	case r.URL.Path == "/repos/acme/widgets":
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets","private":true}`)
 	case r.URL.Path == "/repos/acme/widgets/issues":
@@ -1033,5 +1043,78 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 		if !tc.fail && total != tc.n {
 			t.Errorf("%s: %d collections", tc.name, total)
 		}
+	}
+}
+
+// TestAnIssueGoneWhileListedLosesOnlyItsComments lists 150 open issues, the first of
+// which GitHub answers 404 for its comments, as for an issue deleted while it is listed,
+// and checks every issue is sent, the others' comments too, and the skip is logged by
+// its ref.
+func TestAnIssueGoneWhileListedLosesOnlyItsComments(t *testing.T) {
+	f := &fakeIssues{comments: map[int][]map[string]any{}, goneComments: 1}
+	for i := 1; i <= 150; i++ {
+		f.issues = append(f.issues, issue(i, 1))
+		f.comments[i] = []map[string]any{comment(1000+i, "bob", "User", "c")}
+	}
+	s := &sink{}
+	var logs []string
+	if err := f.lister(t, s, &logs).ListIssues(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	items, comments := 0, 0
+	for _, req := range s.items() {
+		items += len(req.Items)
+	}
+	for _, req := range s.comments() {
+		comments += len(req.Comments)
+		if req.ItemRef == "acme/widgets#1" {
+			t.Errorf("comments sent on the issue gone")
+		}
+	}
+	if items != 150 || comments != 149 {
+		t.Errorf("%d items, %d comments", items, comments)
+	}
+	if !reflect.DeepEqual(logs, []string{"skipped the comments on acme/widgets#1: GitHub answers that the issue is gone or moved"}) {
+		t.Errorf("logged %v", logs)
+	}
+}
+
+// TestARepositoryGoneStopsTheListing has GitHub answer the repository 404, 410, 301 or
+// 308, and checks the listing's error wraps ErrRepositoryGone; and that a 500 on a page
+// of issues, or a mint GitHub answers 404, does not.
+func TestARepositoryGoneStopsTheListing(t *testing.T) {
+	for _, status := range []int{404, 410, 301, 308} {
+		f := &fakeIssues{goneStatus: status}
+		var logs []string
+		err := f.lister(t, &sink{}, &logs).ListIssues(context.Background(), widgets)
+		if !errors.Is(err, ErrRepositoryGone) {
+			t.Errorf("%d: err %v", status, err)
+		}
+	}
+	f := &fakeIssues{issues: []map[string]any{issue(1, 0)}, failIssues: 1}
+	var logs []string
+	if err := f.lister(t, &sink{}, &logs).ListIssues(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a 500: err %v", err)
+	}
+	f = &fakeIssues{}
+	l := f.lister(t, &sink{}, &logs)
+	l.Token = func(context.Context) (string, error) {
+		return "", &answerError{what: "minting the installation token", status: 404, message: "Not Found"}
+	}
+	if err := l.ListIssues(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a mint's 404: err %v", err)
+	}
+}
+
+// TestGone checks which of GitHub's answers say what was asked for is gone or moved.
+func TestGone(t *testing.T) {
+	for status, want := range map[int]bool{404: true, 410: true, 301: true, 308: true, 302: false, 307: false, 401: false, 403: false, 422: false, 500: false, 502: false} {
+		err := fmt.Errorf("listing: %w", &answerError{what: "reading", status: status, message: "m"})
+		if Gone(err) != want {
+			t.Errorf("%d: gone %v", status, !want)
+		}
+	}
+	if Gone(nil) || Gone(errors.New("GitHub answered 404")) {
+		t.Error("an error that is not GitHub's answer is gone")
 	}
 }

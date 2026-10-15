@@ -291,8 +291,10 @@ type fakeGitHub struct {
 	mints    []string
 	requests []string
 	// unauthorized answers the listing of acme/widgets's issues 401, as GitHub answers
-	// a token it no longer takes.
-	unauthorized bool
+	// a token it no longer takes; issuesDown answers it 502. goneComments answers that
+	// issue's comments 404, as for an issue deleted while it is listed.
+	unauthorized, issuesDown bool
+	goneComments             int
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -323,6 +325,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == "GET" && r.URL.Path == "/app/installations/42":
 		io.WriteString(w, `{"id":42,"account":{"login":"acme"}}`)
+	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && strings.Contains(string(b), `"old"`):
+		// The installation no longer reaches acme/old.
+		w.WriteHeader(422)
+		io.WriteString(w, `{"message":"There is at least one repository that does not exist or is not accessible to the parent installation."}`)
 	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens":
 		f.mints = append(f.mints, string(b))
 		w.WriteHeader(201)
@@ -335,6 +341,12 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(repos), "repositories": repos})
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+	case r.Method == "GET" && r.URL.Path == widgets+"/issues" && f.issuesDown:
+		w.WriteHeader(502)
+		io.WriteString(w, `{"message":"Bad Gateway"}`)
+	case r.Method == "GET" && r.URL.Path == widgets+"/issues/"+strconv.Itoa(f.goneComments)+"/comments":
+		w.WriteHeader(404)
+		io.WriteString(w, `{"message":"Not Found"}`)
 	case r.Method == "GET" && r.URL.Path == widgets+"/issues" && f.unauthorized:
 		w.WriteHeader(401)
 		io.WriteString(w, `{"message":"Bad credentials"}`)

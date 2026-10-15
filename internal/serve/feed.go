@@ -24,6 +24,9 @@ const (
 	feedMaxBackoff   = time.Minute
 	feedFloor        = time.Second
 	unknownEvery     = time.Minute
+	// stuckFor is how long one entry may fail, not for good, before it is logged and
+	// passed, so no entry stops the feed for ever.
+	stuckFor = 24 * time.Hour
 )
 
 // feed reads Qory Apiary's change feed and applies its entries, after it has declared
@@ -36,8 +39,19 @@ type feed struct {
 	store     *store.Store
 	publicURL string
 	log       *slog.Logger
-	// sleep waits d or until ctx is done; nil waits on a timer.
+	// sleep waits d or until ctx is done; nil waits on a timer. now is the clock an
+	// entry's failures are timed by; nil is time.Now.
 	sleep func(ctx context.Context, d time.Duration) error
+	now   func() time.Time
+
+	// stuck is the entry that failed last, not for good: the cursor its page was read
+	// after, its place in the page, and when it first failed. It is kept in memory
+	// alone, so a restart times the entry from its next failure again.
+	stuck struct {
+		after string
+		index int
+		since time.Time
+	}
 
 	once    sync.Once
 	unknown *throttle
@@ -73,9 +87,10 @@ func (f *feed) unknownLog() *throttle {
 // longer, a wait that doubles. The cursor is kept in the store, and moves only once
 // every entry of the page it ends is applied, or failed for good and logged, so an
 // entry is never skipped by a stop or a restart, and one may be applied again, which
-// does no harm: every entry's action is one a repeat finds done. An answer that holds
-// an entry serve cannot apply is refused whole, see [feed.step], and read again after
-// the wait.
+// does no harm: every entry's action is one a repeat finds done. An entry that fails,
+// not for good, is read again after the wait, and passed and logged once it has failed
+// for stuckFor, so no entry stops the feed for ever. An answer that holds an entry
+// serve cannot apply is refused whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
 	backoff := feedFirstBackoff
@@ -129,8 +144,8 @@ func (f *feed) run(ctx context.Context) {
 // maxLogged is the most characters of an entry's kind or status a line says.
 const maxLogged = 64
 
-// first is s cut to at most n characters, on a character's boundary.
-func first(s string, n int) string {
+// prefixOf is s cut to at most n characters, on a character's boundary.
+func prefixOf(s string, n int) string {
 	for i := range s {
 		if n == 0 {
 			return s[:i]
@@ -166,7 +181,9 @@ func known(ch contracts.Change) bool {
 
 // step reads one page of the feed after the cursor kept, applies its entries in order,
 // and keeps the page's cursor. An entry that fails for good is logged and passed; any
-// other error stops the page, whose cursor is not kept, to be read again. A page that
+// other error stops the page, whose cursor is not kept, to be read again, unless the
+// entry has failed since stuckFor ago or longer, first failing in this process, when
+// it is logged and passed too. A page that
 // holds an entry serve does not know is refused whole, an [*unknownChange], before any
 // of its entries is applied, and its cursor is not kept: Qory Apiary sends only the
 // kinds and statuses of the contract's revision, which serve implements, so such an
@@ -182,20 +199,36 @@ func (f *feed) step(ctx context.Context) error {
 	}
 	for _, ch := range page.Changes {
 		if !known(ch) {
-			return &unknownChange{after: string(cursor), kind: first(ch.Kind, maxLogged), status: first(ch.Status, maxLogged)}
+			return &unknownChange{after: string(cursor), kind: prefixOf(ch.Kind, maxLogged), status: prefixOf(ch.Status, maxLogged)}
 		}
 	}
-	for _, ch := range page.Changes {
+	for i, ch := range page.Changes {
 		err := f.apply(ctx, ch)
 		if IsPermanent(err) {
 			f.log.Error("a change of the feed failed, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
 			continue
 		}
 		if err != nil {
-			return err
+			if f.stuckSince(string(cursor), i) < stuckFor {
+				return err
+			}
+			f.log.Error("a change of the feed has failed for a day, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
 		}
 	}
 	return f.store.Put(nsAdapter, keyCursor, []byte(page.Cursor), 0)
+}
+
+// stuckSince is how long the entry at index of the page read after the cursor after
+// has failed, timed from its first failure this process saw in a row.
+func (f *feed) stuckSince(after string, index int) time.Duration {
+	now := time.Now()
+	if f.now != nil {
+		now = f.now()
+	}
+	if f.stuck.after != after || f.stuck.index != index || f.stuck.since.IsZero() {
+		f.stuck.after, f.stuck.index, f.stuck.since = after, index, now
+	}
+	return now.Sub(f.stuck.since)
 }
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for

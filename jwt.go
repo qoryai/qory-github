@@ -41,9 +41,9 @@ func ParseKey(b []byte) (*rsa.PrivateKey, error) {
 	return rk, nil
 }
 
-// maxKeyFile is the most a key file may hold; one byte more is read to tell a larger
+// MaxKeyFile is the most a key file may hold; one byte more is read to tell a larger
 // file apart: an RSA key in PEM is a few kilobytes.
-const maxKeyFile = 64 << 10
+const MaxKeyFile = 64 << 10
 
 // ReadKeyFile reads an App's private key from a file that only its owner has any
 // permission on. It opens the file once, never through a symbolic link and without
@@ -52,7 +52,7 @@ const maxKeyFile = 64 << 10
 // the program runs as is refused before it is read, and one larger than a key is
 // refused having read at most one byte more than a key may hold.
 func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
-	b, err := ownerfile.ReadFile(path, maxKeyFile, "the private key file", "a key")
+	b, err := ownerfile.ReadFile(path, MaxKeyFile, "the private key file", "a key")
 	if err != nil {
 		return nil, err
 	}

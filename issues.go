@@ -535,9 +535,38 @@ func (l Lister) logCuts(cuts []Cut) {
 func (l Lister) get(ctx context.Context, p *Pacer, what, path string, out any) (string, error) {
 	token, err := l.Token(ctx)
 	if err != nil {
-		return "", fmt.Errorf("%s: the installation token: %w", what, err)
+		return "", fmt.Errorf("%s: the installation token: %w", what, &tokenError{err})
 	}
 	return l.Client.get(ctx, p, true, what, path, token, out)
+}
+
+// tokenError is the error of a listing's token, so GitHub's answer to the mint is never
+// taken for its answer to the listing's request.
+type tokenError struct{ err error }
+
+func (e *tokenError) Error() string { return e.err.Error() }
+func (e *tokenError) Unwrap() error { return e.err }
+
+// ErrRepositoryGone is wrapped in the error of a listing whose repository GitHub
+// answers is gone or moved, [Gone], as it answers the read of the repository or of a
+// page of its issues: deleted, renamed, transferred or out of the App's reach. Asking
+// again does not change it.
+var ErrRepositoryGone = errors.New("the repository is deleted, moved or out of the App's reach")
+
+// answeredGone is whether err is GitHub's answer to a listing's request, not to its
+// token's mint, that what was asked for is gone or moved.
+func answeredGone(err error) bool {
+	var t *tokenError
+	return Gone(err) && !errors.As(err, &t)
+}
+
+// repositoryGone is err, wrapping [ErrRepositoryGone] when GitHub answered that the
+// repository is gone or moved.
+func repositoryGone(err error) error {
+	if answeredGone(err) {
+		return fmt.Errorf("%w: %w", ErrRepositoryGone, err)
+	}
+	return err
 }
 
 // pages keeps a listing to at most max pages, none read twice.
@@ -699,7 +728,11 @@ type listed struct {
 // and had not sent, as its last part; one that cannot read the repository sends
 // nothing. A part is never empty, since the contract refuses one without items, so a
 // repository with no open issue sends none, which loses nothing: no part says the
-// listing is complete.
+// listing is complete. A repository GitHub answers is gone or moved, as it answers the
+// read of the repository or of a page of its issues, stops the listing with an error
+// that wraps [ErrRepositoryGone]; an issue whose comments GitHub answers so, deleted or
+// moved while it was listed, has its comments skipped and logged by its ref, and the
+// listing goes on.
 func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
 		return fmt.Errorf("%q is not owner/name", repo.String())
@@ -714,7 +747,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
 	var r ghRepo
 	if _, err := l.get(ctx, p, "reading the repository "+repo.String(), "/repos/"+repo.String(), &r); err != nil {
-		return err
+		return repositoryGone(err)
 	}
 	coll := collectionOf(r)
 	if why := checkCollection(coll); why != "" {
@@ -763,7 +796,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 		var page []ghIssue
 		next, err := l.get(ctx, p, what, path, &page)
 		if err != nil {
-			return stop(err)
+			return stop(repositoryGone(err))
 		}
 		for _, is := range page {
 			if is.PullRequest != nil || is.State != StateOpen {
@@ -805,6 +838,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 // comments are read by page number too, oldest first, and a comment deleted while they
 // are read shifts the pages after it, so no request says they are complete.
 func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, items []listed) error {
+items:
 	for _, x := range items {
 		if x.comments <= 0 {
 			continue
@@ -821,6 +855,12 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, ite
 			}
 			var page []ghComment
 			next, err := l.get(ctx, p, what, path, &page)
+			if answeredGone(err) {
+				// The issue was deleted or moved while it was listed: its comments are
+				// left, and the listing goes on.
+				l.logf("skipped the comments on %s: GitHub answers that the issue is gone or moved", x.item.Ref)
+				continue items
+			}
 			if err != nil {
 				return err
 			}

@@ -90,14 +90,10 @@ func ReadWebhookSecret(path string) ([]byte, error) {
 	return b, nil
 }
 
-// maxKeyFile is the most the file private_key_file names may hold, as
-// [github.ReadKeyFile] reads one.
-const maxKeyFile = 64 << 10
-
 // readKey reads the App's private key from the file private_key_file names, as
 // [github.ReadKeyFile] reads it, with an error that names the setting, never the path.
 func readKey(path string) (*rsa.PrivateKey, error) {
-	b, err := ownerfile.ReadNamed(path, maxKeyFile, "the file private_key_file names", "a key")
+	b, err := ownerfile.ReadNamed(path, github.MaxKeyFile, "the file private_key_file names", "a key")
 	if err != nil {
 		return nil, err
 	}
