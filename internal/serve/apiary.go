@@ -95,7 +95,10 @@ type Apiary struct {
 	// KeyID and Key are the adapter's access key: its id and its secret.
 	KeyID string
 	Key   *accesskey.Key
-	// Pin are Qory Apiary's public keys, which every answer but a 401 is signed under.
+	// Pin are Qory Apiary's public keys. Every answer is signed under them but a 401,
+	// which is always unsigned, and a 413, 415 or 400 bad_request, which may be
+	// unsigned. No unsigned answer is acted on but a 401, which is [Held]: any other
+	// answer not signed under the pin is an [Outage], and its body is never parsed.
 	Pin accesskey.Pin
 	// InstanceID is serve's instance id, i_ and 22 characters, kept in the store.
 	InstanceID string
