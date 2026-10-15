@@ -26,8 +26,9 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// WebhookPath is where GitHub sends the App's webhook deliveries, by POST.
-const WebhookPath = "/github/webhook"
+// WebhookPath is where GitHub sends the App's webhook deliveries, by POST: the path
+// setup gives the App's webhook under serve's public URL, [github.WebhookPath].
+const WebhookPath = github.WebhookPath
 
 // MaxBody is the largest delivery the receiver takes, 25 MiB: GitHub caps a payload at
 // 25 MB and sends none larger.

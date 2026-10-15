@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -74,11 +75,13 @@ type Setup struct {
 	// Wait is how long a person has to approve; zero is ten minutes.
 	Wait time.Duration
 	// PublicURL, when set, is where serve is reached from outside, which
-	// [CheckPublicURL] takes: the App then gets what Connect needs, see
-	// [ConnectManifest], and its client secret is written to ClientSecretFile, which
-	// must be set then. Only serve uses them, where QORY_FEATURES names factory.
-	PublicURL        string
-	ClientSecretFile string
+	// [CheckPublicURL] takes: the App then gets what serve needs, see [serveManifest],
+	// its client secret is written to ClientSecretFile and its webhook secret to
+	// WebhookSecretFile, which must both be set then. Only serve uses them, where
+	// QORY_FEATURES names factory.
+	PublicURL         string
+	ClientSecretFile  string
+	WebhookSecretFile string
 }
 
 // App is the App [Setup] created.
@@ -95,6 +98,10 @@ type App struct {
 	// and ClientSecretErr, when set, is why it is not kept.
 	ClientSecretFile string
 	ClientSecretErr  error
+	// WebhookSecretFile is where its webhook secret is, when [Setup.PublicURL] is set,
+	// and WebhookSecretErr, when set, is why it is not kept.
+	WebhookSecretFile string
+	WebhookSecretErr  error
 }
 
 // InstallURL is where a person installs the App on the repositories runs work on.
@@ -102,9 +109,10 @@ func (a App) InstallURL(web string) string {
 	return webBase(web) + "/apps/" + url.PathEscape(a.Slug) + "/installations/new"
 }
 
-// Manifest is the App Setup requests from GitHub: private, with no webhook, allowed to
-// read and write repository contents and pull requests and to read metadata, which is
-// the most a run's token can then be granted.
+// Manifest is the App Setup requests from GitHub without [Setup.PublicURL]: private,
+// with no webhook, allowed to read and write repository contents and pull requests and
+// to read metadata, which is the most a run's token can then be granted. With it,
+// [serveManifest] changes it to the App serve needs.
 func Manifest(name, redirect string) map[string]any {
 	return map[string]any{
 		"name":                name,
@@ -115,6 +123,28 @@ func Manifest(name, redirect string) map[string]any {
 		"default_permissions": map[string]string{"contents": "write", "pull_requests": "write", "metadata": "read"},
 		"default_events":      []string{},
 	}
+}
+
+// WebhookPath is where serve receives the App's webhook deliveries, under its public
+// URL; serve's receiver listens on it.
+const WebhookPath = "/github/webhook"
+
+// appDescription is the App's description with [Setup.PublicURL].
+//
+// PLACEHOLDER awaiting the user's wording (T1).
+const appDescription = "Qory lists your repositories' open issues in Qory Apiary, where you choose what its factory works on. It reads code and issues, comments once on an issue it takes in, and starts runs in your runner repository."
+
+// serveManifest changes the manifest m to the App serve needs, under serve's public
+// URL publicURL: what Connect needs, see [ConnectManifest]; a description; a webhook,
+// active, at [WebhookPath], for the events issues, issue_comment and workflow_run; and
+// the permissions actions write, issues write, contents read and metadata read, in place
+// of those [Manifest] sets.
+func serveManifest(m map[string]any, publicURL string) {
+	ConnectManifest(m, publicURL)
+	m["description"] = appDescription
+	m["hook_attributes"] = map[string]any{"url": publicURL + WebhookPath, "active": true}
+	m["default_events"] = []string{"issues", "issue_comment", "workflow_run"}
+	m["default_permissions"] = map[string]string{"actions": "write", "issues": "write", "contents": "read", "metadata": "read"}
 }
 
 var codeShape = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
@@ -167,7 +197,7 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	m := Manifest(s.Name, local+"/callback")
 	if s.PublicURL != "" {
 		public, _ := CheckPublicURL(s.PublicURL)
-		ConnectManifest(m, public)
+		serveManifest(m, public)
 	}
 	manifest, _ := json.Marshal(m)
 	action := web + "/settings/apps/new?state=" + state
@@ -238,7 +268,9 @@ func randomHex() string {
 // exchange turns the redirect's code into the App, and writes its key. GitHub hands the
 // key out once, so it is never dropped: when [Setup.KeyFile] cannot be written, the
 // key goes to a new file beside it, and when that cannot be written either, the error
-// identifies the App and where to generate another key. Neither contains the key.
+// identifies the App and where to generate another key. Neither contains the key. With
+// [Setup.PublicURL], once the key is kept, it keeps the App's client secret, then its
+// webhook secret, see [Setup.keepWebhookSecret].
 func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	var got struct {
 		ID       int64  `json:"id"`
@@ -246,8 +278,10 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		ClientID string `json:"client_id"`
 		HTMLURL  string `json:"html_url"`
 		PEM      string `json:"pem"`
-		// ClientSecret is read only when [Setup.PublicURL] is set.
-		ClientSecret string `json:"client_secret"`
+		// ClientSecret and WebhookSecret are read only when [Setup.PublicURL] is set;
+		// GitHub answers a webhook_secret of null when the App has none.
+		ClientSecret  string `json:"client_secret"`
+		WebhookSecret string `json:"webhook_secret"`
 	}
 	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
 		// GitHub does not redirect the exchange; should it, the code is not sent on.
@@ -261,12 +295,13 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		return nil, errors.New("exchanging the code for the App: GitHub answered without the App")
 	}
 	app := &App{ID: got.ID, Slug: got.Slug, ClientID: got.ClientID, KeyFile: s.KeyFile}
-	if _, err := ParseKey([]byte(got.PEM)); err != nil {
+	key, err := ParseKey([]byte(got.PEM))
+	if err != nil {
 		return nil, fmt.Errorf("the App %d (%s) is created, but its key: %w; generate a private key at %s", got.ID, got.Slug, err, s.keysURL(got.Slug))
 	}
-	err := writeKeyFile(s.KeyFile, []byte(got.PEM))
+	err = writeKeyFile(s.KeyFile, []byte(got.PEM))
 	if err == nil {
-		return s.keepClientSecret(app, got.ClientSecret)
+		return s.keepSecrets(ctx, app, key, got.ClientSecret, got.WebhookSecret), nil
 	}
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -274,15 +309,26 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	app.Moved = err
 	if err2 := writeKeyFile(app.KeyFile, []byte(got.PEM)); err2 != nil {
 		if s.PublicURL != "" {
-			return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v, so its client secret was not kept either; generate a private key and a client secret at %s", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
+			return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v, so neither its client secret nor its webhook secret was kept; generate a private key and a client secret at %s, and set a webhook secret there", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
 		}
 		return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v; generate a private key at %s", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
 	}
-	return s.keepClientSecret(app, got.ClientSecret)
+	return s.keepSecrets(ctx, app, key, got.ClientSecret, got.WebhookSecret), nil
+}
+
+// keepSecrets keeps the App's client secret, then its webhook secret, when
+// [Setup.PublicURL] is set, and returns app with where they are or why they are not.
+func (s Setup) keepSecrets(ctx context.Context, app *App, key *rsa.PrivateKey, clientSecret, webhookSecret string) *App {
+	if s.PublicURL == "" {
+		return app
+	}
+	s.keepClientSecret(app, clientSecret)
+	s.keepWebhookSecret(ctx, app, key, webhookSecret)
+	return app
 }
 
 // checkConnect refuses, before anything is created, a public URL [CheckPublicURL]
-// refuses, no client secret file, or one that exists.
+// refuses, no client secret file or no webhook secret file, or one that exists.
 func (s Setup) checkConnect() error {
 	if _, err := CheckPublicURL(s.PublicURL); err != nil {
 		return fmt.Errorf("the public URL %w", err)
@@ -295,28 +341,96 @@ func (s Setup) checkConnect() error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("the client secret file: %w", err)
 	}
+	if s.WebhookSecretFile == "" {
+		return errors.New("no webhook secret file")
+	}
+	if _, err := os.Lstat(s.WebhookSecretFile); err == nil {
+		return fmt.Errorf("the webhook secret file %s exists; choose another or move it away", s.WebhookSecretFile)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the webhook secret file: %w", err)
+	}
 	return nil
 }
 
 // keepClientSecret writes the App's client secret to [Setup.ClientSecretFile], 0600,
-// when [Setup.PublicURL] is set, and returns app with where it is. GitHub shows a client
-// secret once, but a new one can be generated on the App's settings page: when the
-// secret cannot be kept, [App.ClientSecretErr] says why and names that page, and the
-// App is returned all the same, its key kept. The error never contains the secret.
-func (s Setup) keepClientSecret(app *App, secret string) (*App, error) {
-	if s.PublicURL == "" {
-		return app, nil
-	}
+// and sets where it is on app. GitHub shows a client secret once, but a new one can be
+// generated on the App's settings page: when the secret cannot be kept,
+// [App.ClientSecretErr] says why and names that page, and the App is kept all the
+// same, its key kept. The error never contains the secret.
+func (s Setup) keepClientSecret(app *App, secret string) {
 	if app.ClientID == "" || secret == "" || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }) {
 		app.ClientSecretErr = fmt.Errorf("the App's client secret was not kept: GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at %s", s.keysURL(app.Slug))
-		return app, nil
+		return
 	}
 	if err := writeOwnerFile(s.ClientSecretFile, "the client secret file", []byte(secret+"\n")); err != nil {
 		app.ClientSecretErr = fmt.Errorf("the App's client secret was not kept: %v; generate a client secret at %s", err, s.keysURL(app.Slug))
-		return app, nil
+		return
 	}
 	app.ClientSecretFile = s.ClientSecretFile
-	return app, nil
+}
+
+// webhookSecretBytes is how many random bytes a webhook secret setup makes holds; it is
+// written as their hex, 64 digits, which serve's receiver takes as it is.
+const webhookSecretBytes = 32
+
+// minWebhookSecret is the shortest webhook secret setup keeps, in bytes, as serve's
+// receiver refuses a shorter one.
+const minWebhookSecret = 16
+
+// keepWebhookSecret writes the App's webhook secret to [Setup.WebhookSecretFile], 0600,
+// and sets where it is on app. GitHub's answer holds the secret, or null when the App
+// has none: setup then makes one, 32 random bytes from crypto/rand in hex, sets it on
+// the App's webhook with PATCH /app/hook/config, authenticated as the App with key, and
+// only once GitHub has it writes the file. When that fails, no file is written: the
+// App's webhook then has no secret setup knows, and serve takes none of its deliveries
+// until one is set on the App and written to the file. When the
+// secret cannot be kept, [App.WebhookSecretErr] says why and what to do on the App's
+// settings page, where a webhook secret is set, and the App is kept all the same, its
+// key kept. The error never contains the secret.
+func (s Setup) keepWebhookSecret(ctx context.Context, app *App, key *rsa.PrivateKey, secret string) {
+	switch {
+	case secret == "":
+		b := make([]byte, webhookSecretBytes)
+		rand.Read(b)
+		secret = hex.EncodeToString(b)
+		if err := s.setWebhookSecret(ctx, app.ID, key, secret); err != nil {
+			app.WebhookSecretErr = fmt.Errorf("the App's webhook secret could not be set, so no webhook secret file is written: %v; set a webhook secret at %s and write the same secret to %s, 0600: until then qory-github-server serve takes none of the App's deliveries", err, s.keysURL(app.Slug), s.WebhookSecretFile)
+			return
+		}
+	case len(secret) < minWebhookSecret || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
+		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: GitHub's answer holds a webhook secret qory-github-server serve cannot use; set a webhook secret at %s and write the same secret to %s, 0600", s.keysURL(app.Slug), s.WebhookSecretFile)
+		return
+	}
+	if err := writeOwnerFile(s.WebhookSecretFile, "the webhook secret file", []byte(secret+"\n")); err != nil {
+		app.WebhookSecretErr = fmt.Errorf("the App's webhook secret was not kept: %v; set a new webhook secret at %s and write the same secret to a file only you may read", err, s.keysURL(app.Slug))
+		return
+	}
+	app.WebhookSecretFile = s.WebhookSecretFile
+}
+
+// setWebhookSecret sets secret on the App's webhook, PATCH /app/hook/config,
+// authenticated as the App appID with key. GitHub's 200 is enough: an answer that is
+// not JSON is not a failure. The error never contains the secret.
+func (s Setup) setWebhookSecret(ctx context.Context, appID int64, key *rsa.PrivateKey, secret string) error {
+	const what = "setting the App's webhook secret"
+	now := time.Now
+	if s.Client.Now != nil {
+		now = s.Client.Now
+	}
+	jwt, err := AppJWT(strconv.FormatInt(appID, 10), key, now())
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	var config struct{}
+	err = s.Client.call(ctx, what, http.MethodPatch, "/app/hook/config", jwt, map[string]string{"secret": secret}, http.StatusOK, &config)
+	var syntax *json.SyntaxError
+	if err != nil && !errors.As(err, &syntax) {
+		if strings.Contains(err.Error(), secret) {
+			return errors.New(strings.ReplaceAll(err.Error(), secret, "[the secret]"))
+		}
+		return err
+	}
+	return nil
 }
 
 // keysURL is the App's settings page on GitHub, where a private key is generated.

@@ -6,6 +6,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -219,7 +220,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// without it setup's flags, its App and what it prints are as they were.
 	var publicURL *string
 	if cli.Factory() {
-		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, and its client secret is written beside the key")
+		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, webhook, events and permissions, and its client secret and webhook secret are written beside the key")
 	}
 	if err := setupHelp.Parse(fs, args, stderr); err != nil {
 		return err
@@ -257,7 +258,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
 	if public != "" {
-		s.PublicURL, s.ClientSecretFile = public, clientSecretFile(*keyFile)
+		s.PublicURL, s.ClientSecretFile, s.WebhookSecretFile = public, clientSecretFile(*keyFile), webhookSecretFile(*keyFile)
 	}
 	return runSetup(ctx, s, stdout)
 }
@@ -298,43 +299,72 @@ with the repositories the run works on, and allows GitHub's hosts beside the oth
 run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
-	if app.ClientSecretErr != nil {
-		return app.ClientSecretErr
-	}
-	if app.ClientSecretFile != "" {
-		fragment, err := connectSettings(app.ClientID, app.ClientSecretFile)
+	// serve's settings for the secrets that are kept are printed, and then why the
+	// others are not.
+	if app.ClientSecretFile != "" || app.WebhookSecretFile != "" {
+		block, err := serveSettings(app)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, `
-The App's client secret is in %s, which only you may read. Add these settings to
-qory-github-server serve's settings, for Connect:
-
-%s`, fragment.file, fragment.members)
+		fmt.Fprint(stdout, block)
 	}
-	return nil
+	if app.ClientSecretErr != nil && app.WebhookSecretErr != nil {
+		return fmt.Errorf("%w; and %w", app.ClientSecretErr, app.WebhookSecretErr)
+	}
+	return cmp.Or(app.ClientSecretErr, app.WebhookSecretErr)
 }
 
-// connectFragment is what setup prints for serve's Connect: where the client secret
-// is, and the settings' members, one per line, with no braces around them.
-type connectFragment struct{ file, members string }
-
-// connectSettings is setup's [connectFragment] for the client id and the file the
-// client secret is in, made absolute.
-func connectSettings(clientID, file string) (connectFragment, error) {
-	abs, err := filepath.Abs(file)
-	if err != nil {
-		return connectFragment{}, err
+// serveSettings is what setup prints for qory-github-server serve's settings: where
+// the App's client secret and webhook secret are, those of them that are kept, made
+// absolute, and the settings' members, one per line, with no braces around them.
+func serveSettings(app *github.App) (string, error) {
+	var client, webhook string
+	var members []string
+	if app.ClientSecretFile != "" {
+		abs, err := filepath.Abs(app.ClientSecretFile)
+		if err != nil {
+			return "", err
+		}
+		id, _ := json.Marshal(app.ClientID)
+		path, _ := json.Marshal(abs)
+		client = abs
+		members = append(members, fmt.Sprintf(`  "client_id": %s`, id), fmt.Sprintf(`  "client_secret_file": %s`, path))
 	}
-	id, _ := json.Marshal(clientID)
-	path, _ := json.Marshal(abs)
-	return connectFragment{file: abs, members: fmt.Sprintf("  \"client_id\": %s,\n  \"client_secret_file\": %s\n", id, path)}, nil
+	if app.WebhookSecretFile != "" {
+		abs, err := filepath.Abs(app.WebhookSecretFile)
+		if err != nil {
+			return "", err
+		}
+		path, _ := json.Marshal(abs)
+		webhook = abs
+		members = append(members, fmt.Sprintf(`  "webhook_secret_file": %s`, path))
+	}
+	var intro string
+	switch {
+	case webhook == "":
+		intro = fmt.Sprintf(`The App's client secret is in %s, which only you may read. Add these settings to
+qory-github-server serve's settings, for Connect:`, client)
+	case client == "":
+		intro = fmt.Sprintf(`The App's webhook secret is in %s, which only you may read. Add this setting to
+qory-github-server serve's settings, for the App's webhook:`, webhook)
+	default:
+		intro = fmt.Sprintf(`The App's client secret is in %s and its webhook secret in %s, files only you may
+read. Add these settings to qory-github-server serve's settings, for Connect and the
+App's webhook:`, client, webhook)
+	}
+	return "\n" + intro + "\n\n" + strings.Join(members, ",\n") + "\n", nil
 }
 
 // clientSecretFile is where setup writes the App's client secret, beside the key file:
 // its name without .pem, and .client-secret.
 func clientSecretFile(keyFile string) string {
 	return strings.TrimSuffix(keyFile, ".pem") + ".client-secret"
+}
+
+// webhookSecretFile is where setup writes the App's webhook secret, beside the key
+// file: its name without .pem, and .webhook-secret.
+func webhookSecretFile(keyFile string) string {
+	return strings.TrimSuffix(keyFile, ".pem") + ".webhook-secret"
 }
 
 // movedLine is the line setup prints when the key is in abs, beside file, since file could

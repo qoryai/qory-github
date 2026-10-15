@@ -72,6 +72,12 @@ type fakeGitHub struct {
 	mintPath      string
 	lookups       []string
 	checks        []string // the installations' paths read
+	webhookSecret string   // the exchange's webhook_secret; empty answers null
+	hookStatus    int      // the status of PATCH /app/hook/config; zero is 200
+	hookAuth      []string // the Authorization of each PATCH /app/hook/config
+	hookBodies    []string // the body of each PATCH /app/hook/config
+	hookEcho      bool     // a failing PATCH /app/hook/config says the body it received
+	hookPlain     bool     // PATCH /app/hook/config answers 200 with a body that is not JSON
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -111,7 +117,29 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"token": fakeToken, "expires_at": "2026-09-25T21:00:00Z"})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app-manifests/"):
 		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": nil})
+		var webhookSecret any
+		if f.webhookSecret != "" {
+			webhookSecret = f.webhookSecret
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": webhookSecret})
+	case r.Method == "PATCH" && r.URL.Path == "/app/hook/config":
+		b, _ := io.ReadAll(r.Body)
+		f.hookAuth = append(f.hookAuth, r.Header.Get("Authorization"))
+		f.hookBodies = append(f.hookBodies, string(b))
+		if f.hookStatus != 0 {
+			w.WriteHeader(f.hookStatus)
+			message := "Resource not accessible by integration"
+			if f.hookEcho {
+				message = "Invalid request: " + string(b)
+			}
+			json.NewEncoder(w).Encode(map[string]string{"message": message})
+			return
+		}
+		if f.hookPlain {
+			io.WriteString(w, "ok")
+			return
+		}
+		io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/github/webhook"}`)
 	default:
 		w.WriteHeader(404)
 	}
