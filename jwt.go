@@ -11,12 +11,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/qoryai/qory-github/internal/ownerfile"
 )
 
 // ParseKey reads an App's private key from PEM: PKCS #1, the form GitHub hands out, or
@@ -51,33 +52,9 @@ const maxKeyFile = 64 << 10
 // the program runs as is refused before it is read, and one larger than a key is
 // refused having read at most one byte more than a key may hold.
 func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if errors.Is(err, syscall.ELOOP) {
-		return nil, fmt.Errorf("the private key file %s is a symbolic link; use the path of the file itself", path)
-	}
+	b, err := ownerfile.ReadFile(path, maxKeyFile, "the private key file", "a key")
 	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("the private key file %s is not a regular file", path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("the private key file %s is %s: group or others have permissions on it; make it 0600", path, info.Mode().Perm())
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
-		return nil, fmt.Errorf("the private key file %s belongs to another user than the one qory-github runs as", path)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxKeyFile+1))
-	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	if len(b) > maxKeyFile {
-		return nil, fmt.Errorf("the private key file %s is larger than a key", path)
+		return nil, err
 	}
 	return ParseKey(b)
 }

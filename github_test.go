@@ -742,6 +742,56 @@ func TestAKeyFileIsReadFromWhatWasOpened(t *testing.T) {
 	}
 }
 
+// TestAKeyFilesPathIsOpenedAsItIsGiven pins what release 0.2.0 does with each of these
+// paths, its errors word for word: the path is opened as it is given, so the system
+// resolves each .. through the links before it, linkdir/../k.pem reaching b/k.pem, and
+// a trailing slash opens no file.
+func TestAKeyFilesPathIsOpenedAsItIsGiven(t *testing.T) {
+	root := t.TempDir()
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	os.MkdirAll(filepath.Join(b, "c"), 0o700)
+	os.Mkdir(a, 0o700)
+	os.WriteFile(filepath.Join(a, "k.pem"), keyPEM(t), 0o600)
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(b, "k.pem"), pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(other)}), 0o600)
+	os.Symlink("k.pem", filepath.Join(a, "link.pem"))
+	os.WriteFile(filepath.Join(a, "loose.pem"), keyPEM(t), 0o644)
+	os.Chmod(filepath.Join(a, "loose.pem"), 0o644)
+	os.Symlink("../b/c", filepath.Join(a, "linkdir"))
+	t.Chdir(a)
+	notDir, noFile := syscall.ENOTDIR.Error(), syscall.ENOENT.Error()
+	for _, tc := range []struct {
+		path string
+		want *rsa.PrivateKey
+		err  string
+	}{
+		{"k.pem", key(t), ""},
+		{"k.pem/", nil, "the private key file: open k.pem/: " + notDir},
+		{"missing/../k.pem", nil, "the private key file: open missing/../k.pem: " + noFile},
+		{"a/../../a/k.pem", nil, "the private key file: open a/../../a/k.pem: " + noFile},
+		{"link.pem", nil, "the private key file link.pem is a symbolic link; use the path of the file itself"},
+		{"link.pem/", nil, "the private key file: open link.pem/: " + notDir},
+		{"loose.pem", nil, "the private key file loose.pem is -rw-r--r--: group or others have permissions on it; make it 0600"},
+		{"loose.pem/", nil, "the private key file: open loose.pem/: " + notDir},
+		{"linkdir", nil, "the private key file linkdir is a symbolic link; use the path of the file itself"},
+		{"linkdir/", nil, "the private key file linkdir/ is not a regular file"},
+		{"linkdir/../k.pem", other, ""},
+		{"none.pem", nil, "the private key file: open none.pem: " + noFile},
+	} {
+		k, err := ReadKeyFile(tc.path)
+		got := ""
+		if err != nil {
+			got = err.Error()
+		}
+		if got != tc.err || (tc.want == nil) != (k == nil) || (k != nil && !k.Equal(tc.want)) {
+			t.Errorf("%s: key %v, err %q, want %q", tc.path, k != nil, got, tc.err)
+		}
+	}
+}
+
 // TestAKeyFileOfAnotherUserIsRefused needs root to change a file's owner, which CI's
 // container is.
 func TestAKeyFileOfAnotherUserIsRefused(t *testing.T) {

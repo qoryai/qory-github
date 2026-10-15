@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -791,4 +792,103 @@ func TestNoCommandIsUsage(t *testing.T) {
 	if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "usage:") {
 		t.Errorf("exit %d: %s", code, errs.String())
 	}
+}
+
+// TestServeIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory, serve
+// is in no usage and is answered as a command the program does not know.
+func TestServeIsAbsentWithoutFactory(t *testing.T) {
+	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
+		t.Setenv("QORY_FEATURES", features)
+		var unknownOut, unknownErrs bytes.Buffer
+		unknown := run(context.Background(), []string{"bogus"}, &unknownOut, &unknownErrs)
+		for _, args := range [][]string{{"serve"}, {"serve", "-h"}, {"serve", "--settings", "/none.json"}} {
+			var out, errs bytes.Buffer
+			code := run(context.Background(), args, &out, &errs)
+			if code != unknown || errs.String() != unknownErrs.String() || out.Len() != 0 {
+				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q; an unknown command: exit %d, %q", features, args, code, errs.String(), unknown, unknownErrs.String())
+			}
+		}
+		if strings.Contains(unknownErrs.String(), "serve") {
+			t.Errorf("QORY_FEATURES=%q: the usage lists serve:\n%s", features, unknownErrs.String())
+		}
+	}
+}
+
+func TestServeIsPresentWithFactory(t *testing.T) {
+	for _, features := range []string{"factory", "observability, factory ", " factory,", "observability,security,secrets,factory"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "\n  serve        ") {
+			t.Errorf("QORY_FEATURES=%q: exit %d, the usage lists no serve:\n%s", features, code, errs.String())
+		}
+		errs.Reset()
+		if code := run(context.Background(), []string{"serve", "-h"}, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github serve --settings FILE") || strings.Contains(errs.String(), "More:") {
+			t.Errorf("QORY_FEATURES=%q: serve -h exits %d:\n%s", features, code, errs.String())
+		}
+		errs.Reset()
+		if code := run(context.Background(), []string{"serve"}, &out, &errs); code != 1 || errs.String() != "qory-github serve: --settings is required\n" {
+			t.Errorf("QORY_FEATURES=%q: serve exits %d: %q", features, code, errs.String())
+		}
+	}
+}
+
+func TestServeRefusesSettingsItDoesNotKnow(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	file := filepath.Join(t.TempDir(), "serve.json")
+	os.WriteFile(file, []byte(`{"app_id":1,"private_key_file":"/k","webhook_secret_file":"/s","listen":":0","state_dir":"/d","api_url":"https://api.github.com"}`), 0o600)
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "api_url"`) || out.Len() != 0 {
+		t.Errorf("exit %d: %q", code, errs.String())
+	}
+}
+
+// TestServeStopsOnItsContext runs serve whole, and stops it as a signal does.
+func TestServeStopsOnItsContext(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	dir := t.TempDir()
+	key, _ := keyFile(t)
+	secret := filepath.Join(dir, "secret")
+	os.WriteFile(secret, []byte("s3cr3t-0123456789abcdef\n"), 0o600)
+	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state")})
+	file := filepath.Join(dir, "serve.json")
+	os.WriteFile(file, settings, 0o600)
+	ctx, cancel := context.WithCancel(context.Background())
+	var out bytes.Buffer
+	errs := &lockedBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, []string{"serve", "--settings", file}, &out, errs) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(errs.String(), `"msg":"serving"`) {
+		if time.Now().After(deadline) {
+			t.Fatalf("serve does not serve: %s", errs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") {
+			t.Errorf("exit %d, stdout %q, stderr %s", code, out.String(), errs.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve does not stop")
+	}
+}
+
+// lockedBuffer is a buffer serve writes while a test reads it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
