@@ -179,6 +179,7 @@ loop:
 	<-fed
 	// A count of lines held back is logged before serve stops.
 	rc.stopLog()
+	adapter.stopLog()
 	apiary.init()
 	apiary.unauthorized.stop()
 	limited.full.stop()

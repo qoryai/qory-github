@@ -42,6 +42,11 @@ type Adapter struct {
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
+
+	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
+	// receiver logs its refusals, once each refusalEvery at most.
+	cutsOnce sync.Once
+	cuts     *throttle
 }
 
 func (a *Adapter) log() *slog.Logger {
@@ -136,6 +141,36 @@ func (a *Adapter) logf(format string, args ...any) {
 	a.log().Info(fmt.Sprintf(format, args...))
 }
 
+func (a *Adapter) cutLog() *throttle {
+	a.cutsOnce.Do(func() {
+		a.cuts = &throttle{every: refusalEvery, flush: func(dropped int) {
+			a.log().LogAttrs(context.Background(), slog.LevelWarn, "cuts dropped", slog.Int("cuts_dropped", dropped))
+		}}
+	})
+	return a.cuts
+}
+
+// logCut logs a text GitHub sent past the contract's limit, cut to it: the ref, the
+// field and its length before the cut, never the text. It is not expected, since
+// GitHub's limits fit inside the contract's, and the lines are throttled as the
+// receiver's refusals are, a burst's count logged on the next line or after it.
+func (a *Adapter) logCut(c github.Cut) {
+	ok, dropped := a.cutLog().allow()
+	if !ok {
+		return
+	}
+	attrs := []slog.Attr{slog.String("ref", c.Ref), slog.String("field", c.Field), slog.Int("length", c.Length)}
+	if dropped > 0 {
+		attrs = append(attrs, slog.Int("cuts_dropped", dropped))
+	}
+	a.log().LogAttrs(context.Background(), slog.LevelWarn, "cut to the contract's limit", attrs...)
+}
+
+// stopLog logs the count of cuts held back, if any, as [throttle.stop] does.
+func (a *Adapter) stopLog() {
+	a.cutLog().stop()
+}
+
 // reachSink is the adapter's sink for a listing of an installation's repositories: it
 // keeps which installation reaches each repository it lists before it sends them.
 type reachSink struct {
@@ -163,6 +198,7 @@ func (a *Adapter) listRepositories(ctx context.Context, installation int64) erro
 		Slug:   a.Slug,
 		Sink:   reachSink{Sink: a.Sink, st: a.Store, installation: installation},
 		Logf:   a.logf,
+		LogCut: a.logCut,
 	}
 	return l.ListRepositories(ctx)
 }
@@ -279,6 +315,9 @@ func (a *Adapter) send(ctx context.Context, t github.ToSend) error {
 	for _, s := range t.Skipped {
 		a.log().Info("skipped", slog.String("ref", s.Ref), slog.String("why", s.Why))
 	}
+	for _, c := range t.Cut {
+		a.logCut(c)
+	}
 	for _, req := range t.Items {
 		if err := a.sendLinked(ctx, req.CollectionRef, func() error { return a.Sink.Items(ctx, req) }); err != nil {
 			return err
@@ -335,6 +374,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		Slug:   a.Slug,
 		Sink:   a.Sink,
 		Logf:   a.logf,
+		LogCut: a.logCut,
 	}
 	return l.ListIssues(ctx, repo)
 }

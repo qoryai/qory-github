@@ -10,20 +10,23 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 )
 
 // Qory Apiary refuses a whole request when one field in it breaks the contract's
 // limits, [contractLimits], and cuts nothing, so the adapter never sends a field that
-// does. A text that is only too long is cut to the limit: a title, a body, a person's
-// name, a label, a reason and a collection's title. A label left empty is dropped, a
-// label the same as one before it is dropped, and the labels past the most an item has
-// are dropped. A field that cannot be cut into the contract, a ref, a URL, a target's
-// path or an empty title, skips its item, comment or collection, which is logged by
-// its ref, never by its text, and the rest are sent. A request is at most
-// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
-// collections.
+// does. GitHub's limits fit inside the contract's, so a text past its limit is not
+// expected; one that is anyway is cut to the limit, as [cut] says, and the cut is
+// logged as a [Cut]: a title, a body, a person's name, a label, a reason and a
+// collection's title. An empty label is dropped, a label the same as one before it is
+// dropped, and the labels past the most an item has are dropped, which is logged too.
+// A field that cannot be cut into the contract, a ref, a URL, a target's path, an
+// empty title or a time that is not RFC 3339, skips its item, comment or collection,
+// which is logged by its ref, never by its text, and the rest are sent. A request is
+// at most contracts.MaxRequest bytes, and lists at most the contract's most items,
+// comments or collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -120,13 +123,31 @@ func (c Client) WebHost() string {
 	return h
 }
 
-// authorOf is who a user is on the wire: a bot is an automation, anyone else a person.
-// The name is cut to the contract's limit. A user GitHub no longer has, or one without
-// a login, is its ghost.
-func authorOf(u *ghUser) contracts.Person {
+// Cut is a text cut to the contract's limit, for the log: the ref of its item, comment
+// or collection, the field, and its length before the cut, in characters, or in labels
+// for the labels past the most an item has. It never holds the text.
+type Cut struct {
+	Ref, Field string
+	Length     int
+}
+
+// fit is s cut to n characters, and when it is cut, a [Cut] of the field of ref added
+// to cuts.
+func fit(cuts *[]Cut, ref, field, s string, n int) string {
+	if !tooLong(s, n) {
+		return s
+	}
+	*cuts = append(*cuts, Cut{Ref: ref, Field: field, Length: utf8.RuneCountInString(s)})
+	return cut(s, n)
+}
+
+// authorOf is who a user is on the wire, the field of ref: a bot is an automation,
+// anyone else a person. The name is fitted to the contract's limit. A user GitHub no
+// longer has, or one without a login, is its ghost.
+func authorOf(u *ghUser, cuts *[]Cut, ref, field string) contracts.Person {
 	p := contracts.Person{Kind: KindPerson}
 	if u != nil {
-		p.Name = cut(u.Login, contractLimits().name)
+		p.Name = fit(cuts, ref, field, u.Login, contractLimits().name)
 		if u.Type == "Bot" {
 			p.Kind = KindAutomation
 		}
@@ -137,24 +158,25 @@ func authorOf(u *ghUser) contracts.Person {
 	return p
 }
 
-// collectionOf is a repository's issues as a collection, without a target, its title
-// cut to the contract's limit.
+// collectionOf is a repository's issues as a collection, without a target. A listing
+// fits its title to the contract's limit; an event sends only its ref.
 func collectionOf(r ghRepo) contracts.Collection {
-	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: cut(r.FullName, contractLimits().title)}
+	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: r.FullName}
 }
 
-// labelsOf are an issue's labels as the contract takes them: each cut to the limit of a
-// label, an empty one dropped, one the same as a label before it dropped, and none past
-// the most labels an item has.
-func labelsOf(ls []ghLabel) []string {
+// labelsOf are the labels of the issue ref as the contract takes them: each fitted to
+// the limit of a label, an empty one dropped, one the same as a label before it
+// dropped, and none past the most labels an item has, which is a [Cut] of labels.
+func labelsOf(ls []ghLabel, cuts *[]Cut, ref string) []string {
 	lim := contractLimits()
 	labels := make([]string, 0, min(len(ls), lim.labels))
 	seen := make(map[string]bool, cap(labels))
 	for _, l := range ls {
 		if len(labels) == lim.labels {
+			*cuts = append(*cuts, Cut{Ref: ref, Field: "labels", Length: len(ls)})
 			break
 		}
-		name := cut(l.Name, lim.label)
+		name := fit(cuts, ref, "label", l.Name, lim.label)
 		if name == "" || seen[name] {
 			continue
 		}
@@ -167,14 +189,14 @@ func labelsOf(ls []ghLabel) []string {
 // stateReasons words GitHub's reasons an issue is closed for.
 var stateReasons = map[string]string{"completed": "Completed", "not_planned": "Not planned", "duplicate": "Duplicate"}
 
-// stateReason is why a closed issue is closed, in words, or nil: an open issue has no
-// reason, and a reason without words is left out.
-func stateReason(state string, reason *string) *string {
+// stateReason is why the closed issue ref is closed, in words, or nil: an open issue
+// has no reason, and a reason without words is left out.
+func stateReason(state string, reason *string, cuts *[]Cut, ref string) *string {
 	if state != StateClosed || reason == nil {
 		return nil
 	}
 	if w, ok := stateReasons[*reason]; ok {
-		w = cut(w, contractLimits().stateReason)
+		w = fit(cuts, ref, "state_reason", w, contractLimits().stateReason)
 		return &w
 	}
 	return nil
@@ -190,9 +212,11 @@ func utc(s string) (string, bool) {
 }
 
 // itemOf is an issue of the repository r as an item whose target is on system, or why
-// it is skipped.
-func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
+// it is skipped, and the texts cut to fit it.
+func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut) {
 	lim := contractLimits()
+	var cuts []Cut
+	ref := r.FullName + "#" + strconv.FormatInt(is.Number, 10)
 	state := StateOpen
 	if is.State == StateClosed {
 		state = StateClosed
@@ -202,16 +226,16 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
 		body = *is.Body
 	}
 	it := contracts.Item{
-		Ref:          r.FullName + "#" + strconv.FormatInt(is.Number, 10),
+		Ref:          ref,
 		URL:          is.HTMLURL,
-		Title:        cut(is.Title, lim.title),
-		Body:         cut(body, lim.body),
+		Title:        fit(&cuts, ref, "title", is.Title, lim.title),
+		Body:         fit(&cuts, ref, "body", body, lim.body),
 		BodyFormat:   FormatMarkdown,
 		Type:         "issue",
 		State:        state,
-		StateReason:  stateReason(state, is.StateReason),
-		Labels:       labelsOf(is.Labels),
-		FiledBy:      authorOf(is.User),
+		StateReason:  stateReason(state, is.StateReason, &cuts, ref),
+		Labels:       labelsOf(is.Labels, &cuts, ref),
+		FiledBy:      authorOf(is.User, &cuts, ref, "filed_by.name"),
 		CommentCount: max(is.Comments, 0),
 		Target:       &contracts.Target{System: system, Path: r.FullName},
 	}
@@ -220,49 +244,58 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
 	it.UpdatedAt, ok2 = utc(is.UpdatedAt)
 	switch {
 	case !ok1 || !ok2:
-		return it, "a time is not RFC 3339"
+		return it, "a time is not RFC 3339", nil
 	case it.Title == "":
-		return it, "its title is empty"
+		return it, "its title is empty", nil
 	}
 	if why := checkRef(it.Ref); why != "" {
-		return it, why
+		return it, why, nil
 	}
 	if why := checkPath(it.Target.Path); why != "" {
-		return it, why
+		return it, why, nil
 	}
-	return it, checkURL(it.URL)
+	if why := checkURL(it.URL); why != "" {
+		return it, why, nil
+	}
+	return it, "", cuts
 }
 
-// commentOf is a comment as the wire says it, its body cut to the contract's limit, or
-// why it is skipped.
-func commentOf(c ghComment) (contracts.Comment, string) {
+// commentOf is a comment as the wire says it, or why it is skipped, and the texts cut
+// to fit it.
+func commentOf(c ghComment) (contracts.Comment, string, []Cut) {
+	var cuts []Cut
+	ref := strconv.FormatInt(c.ID, 10)
 	body := ""
 	if c.Body != nil {
 		body = *c.Body
 	}
 	sc := contracts.Comment{
-		Ref:        strconv.FormatInt(c.ID, 10),
+		Ref:        ref,
 		URL:        c.HTMLURL,
-		Author:     authorOf(c.User),
-		Body:       cut(body, contractLimits().body),
+		Author:     authorOf(c.User, &cuts, ref, "author.name"),
+		Body:       fit(&cuts, ref, "body", body, contractLimits().body),
 		BodyFormat: FormatMarkdown,
 	}
 	var ok1, ok2 bool
 	sc.CreatedAt, ok1 = utc(c.CreatedAt)
 	sc.UpdatedAt, ok2 = utc(c.UpdatedAt)
 	if !ok1 || !ok2 {
-		return sc, "a time is not RFC 3339"
+		return sc, "a time is not RFC 3339", nil
 	}
 	if why := checkRef(sc.Ref); why != "" {
-		return sc, why
+		return sc, why, nil
 	}
-	return sc, checkURL(sc.URL)
+	if why := checkURL(sc.URL); why != "" {
+		return sc, why, nil
+	}
+	return sc, "", cuts
 }
 
-// checkCollection is why a collection is skipped, or "".
+// checkCollection is why a collection is skipped, or "". A listing has fitted its
+// title to the contract's limit, and an event sends only its ref.
 func checkCollection(c contracts.Collection) string {
-	if n := contractLimits().title; c.Title == "" || tooLong(c.Title, n) {
-		return fmt.Sprintf("its title is empty or longer than %d characters", n)
+	if c.Title == "" {
+		return "its title is empty"
 	}
 	if why := checkRef(c.Ref); why != "" {
 		return why
@@ -323,15 +356,17 @@ type Skipped struct {
 }
 
 // ToSend is what a webhook's event becomes: the requests to send, in order, items
-// before comments, and what was skipped, for the log.
+// before comments, and what was skipped and what was cut, for the log.
 type ToSend struct {
 	Items    []contracts.SourceItems
 	Comments []contracts.SourceItemComments
 	Skipped  []Skipped
+	Cut      []Cut
 }
 
-// addItem adds an item of collection c to t, unless it is to be skipped.
-func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string) {
+// addItem adds an item of collection c to t, and the texts cut to fit it, unless it is
+// to be skipped.
+func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, cuts []Cut) {
 	if cw := checkCollection(c); why == "" && cw != "" {
 		why = "its collection: " + cw
 	}
@@ -344,6 +379,7 @@ func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string) 
 		return
 	}
 	t.Items = append(t.Items, req)
+	t.Cut = append(t.Cut, cuts...)
 }
 
 // IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
@@ -376,8 +412,8 @@ func IssuesWebhook(payload []byte, system string, active func(Repository) bool) 
 	default:
 		return t, nil
 	}
-	it, why := itemOf(system, ev.Repository, ev.Issue)
-	t.addItem(collectionOf(ev.Repository), it, why)
+	it, why, cuts := itemOf(system, ev.Repository, ev.Issue)
+	t.addItem(collectionOf(ev.Repository), it, why, cuts)
 	if ev.Action != "transferred" || ev.Changes.NewIssue == nil || ev.Changes.NewRepository == nil {
 		return t, nil
 	}
@@ -385,8 +421,8 @@ func IssuesWebhook(payload []byte, system string, active func(Repository) bool) 
 	if !ok || active == nil || !active(Repository{Owner: owner, Name: name}) {
 		return t, nil
 	}
-	it, why = itemOf(system, *ev.Changes.NewRepository, *ev.Changes.NewIssue)
-	t.addItem(collectionOf(*ev.Changes.NewRepository), it, why)
+	it, why, cuts = itemOf(system, *ev.Changes.NewRepository, *ev.Changes.NewIssue)
+	t.addItem(collectionOf(*ev.Changes.NewRepository), it, why, cuts)
 	return t, nil
 }
 
@@ -418,7 +454,7 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	if ev.Action == "deleted" {
 		ev.Comment.Body = nil
 	}
-	c, why := commentOf(ev.Comment)
+	c, why, cuts := commentOf(ev.Comment)
 	c.Deleted = ev.Action == "deleted"
 	coll := collectionOf(ev.Repository)
 	req := contracts.SourceItemComments{
@@ -440,6 +476,7 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 		return t, nil
 	}
 	t.Comments = append(t.Comments, req)
+	t.Cut = append(t.Cut, cuts...)
 	return t, nil
 }
 
@@ -468,6 +505,9 @@ type Lister struct {
 	Sink Sink
 	// Logf logs what is skipped; nil is log.Printf.
 	Logf func(format string, args ...any)
+	// LogCut logs a text cut to the contract's limit, one call for each; nil logs it
+	// with Logf.
+	LogCut func(Cut)
 }
 
 func (l Lister) logf(format string, args ...any) {
@@ -476,6 +516,17 @@ func (l Lister) logf(format string, args ...any) {
 		return
 	}
 	log.Printf(format, args...)
+}
+
+// logCuts logs each of cuts.
+func (l Lister) logCuts(cuts []Cut) {
+	for _, c := range cuts {
+		if l.LogCut != nil {
+			l.LogCut(c)
+			continue
+		}
+		l.logf("cut the %s of %s, %d long, to the contract's limit", c.Field, c.Ref, c.Length)
+	}
 }
 
 // get reads one page with a fresh token and returns the next page's path.
@@ -577,7 +628,9 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 			return stop(err)
 		}
 		for _, r := range page.Repositories {
+			var cuts []Cut
 			c := collectionOf(r)
+			c.Title = fit(&cuts, c.Ref, "title", c.Title, contractLimits().title)
 			c.Target = &contracts.Target{System: system, Path: r.FullName}
 			n := size(c)
 			if why := checkCollection(c); why != "" || envelope+n > contracts.MaxRequest {
@@ -585,6 +638,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 				skipped = true
 				continue
 			}
+			l.logCuts(cuts)
 			if len(pending) == contractLimits().collections || used+n+1 > contracts.MaxRequest {
 				if err := send(ctx, false); err != nil {
 					return stop(err)
@@ -706,7 +760,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 			if is.PullRequest != nil || is.State != StateOpen {
 				continue
 			}
-			it, why := itemOf(system, r, is)
+			it, why, cuts := itemOf(system, r, is)
 			n := size(it)
 			if why == "" && envelope+n > contracts.MaxRequest {
 				why = "it is larger than a request may be"
@@ -715,6 +769,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 				l.logf("skipped the item %s: %s", it.Ref, why)
 				continue
 			}
+			l.logCuts(cuts)
 			if len(pending) == contractLimits().items || used+n+1 > contracts.MaxRequest {
 				sent, err := send(ctx, false)
 				if err != nil {
@@ -764,7 +819,7 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, ite
 				if workItemComment(c, l.Slug) {
 					continue
 				}
-				sc, why := commentOf(c)
+				sc, why, cuts := commentOf(c)
 				n := size(sc)
 				if why == "" && envelope+n > contracts.MaxRequest {
 					why = "it is larger than a request may be"
@@ -773,6 +828,7 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, ite
 					l.logf("skipped the comment %s on %s: %s", sc.Ref, x.item.Ref, why)
 					continue
 				}
+				l.logCuts(cuts)
 				if len(req.Comments) == contractLimits().comments || used+n+1 > contracts.MaxRequest {
 					if err := l.Sink.Comments(ctx, req); err != nil {
 						return err

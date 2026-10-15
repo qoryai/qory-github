@@ -302,7 +302,9 @@ func TestTheFeedLinksACollectionAndFillsIt(t *testing.T) {
 // API on a loopback host and port, and delivers an event, whose issue has a label of 101
 // characters and a filer of 300, and whose comment has an author of 300, and checks
 // every body reaches Qory Apiary as the contract takes it: the fake checks each against
-// the contract's schema, and the texts are cut and the system is the host alone.
+// the contract's schema, and the texts are cut and the system is the host alone. The
+// cuts are logged by ref, field and length, never by their text, throttled, and the
+// count held back is logged when the log stops.
 func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	if !strings.Contains(strings.TrimPrefix(w.gh.srv.URL, "http://"), ":") {
@@ -345,6 +347,14 @@ func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
 	json.Unmarshal(comments[0].raw, &req)
 	if len(req.Comments) != 1 || req.Comments[0].Author.Name != strings.Repeat("m", 100) {
 		t.Errorf("sent %s", comments[0].raw)
+	}
+	w.adapter.stopLog()
+	logged := w.log.String()
+	if !strings.Contains(logged, `"msg":"cut to the contract's limit","ref":"acme/widgets#1","field":"label","length":101`) || !strings.Contains(logged, `"msg":"cuts dropped","cuts_dropped":`) {
+		t.Errorf("the log: %s", logged)
+	}
+	if strings.Contains(logged, strings.Repeat("a", 100)) || strings.Contains(logged, strings.Repeat("n", 100)) || strings.Contains(logged, strings.Repeat("m", 100)) {
+		t.Errorf("a text is logged: %s", logged)
 	}
 }
 

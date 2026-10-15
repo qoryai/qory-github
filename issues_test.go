@@ -408,10 +408,12 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 // TestATextPastItsLimitIsCutToIt lists issues and a comment whose texts are longer than
 // the contract takes, and checks each is cut to its limit on a character's boundary,
 // labels left empty or the same as one before are dropped, the labels past 100 are
-// dropped, and nothing is skipped or logged.
+// dropped, nothing is skipped, and each cut is logged by ref, field and length, never
+// by its text.
 func TestATextPastItsLimitIsCutToIt(t *testing.T) {
+	secret := "SECRETTEXT"
 	longBody, longTitle, manyLabels, longName, atLimit := issue(2, 1), issue(3, 0), issue(4, 0), issue(5, 0), issue(6, 0)
-	longBody["body"] = strings.Repeat("ü", 70_000)
+	longBody["body"] = secret + strings.Repeat("ü", 70_000-len(secret))
 	longTitle["title"] = strings.Repeat("ü", 1030)
 	labels := []any{
 		map[string]any{"name": strings.Repeat("a", 100) + "1"},
@@ -435,15 +437,25 @@ func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	if err := f.lister(t, s, &logs).ListIssues(context.Background(), widgets); err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 0 {
-		t.Errorf("logged %v", logs)
+	wantLogs := []string{
+		"cut the body of acme/widgets#2, 70000 long, to the contract's limit",
+		"cut the title of acme/widgets#3, 1030 long, to the contract's limit",
+		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
+		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
+		"cut the labels of acme/widgets#4, 125 long, to the contract's limit",
+		"cut the filed_by.name of acme/widgets#5, 300 long, to the contract's limit",
+		"cut the author.name of 20, 300 long, to the contract's limit",
+		"cut the body of 20, 70000 long, to the contract's limit",
+	}
+	if !reflect.DeepEqual(logs, wantLogs) {
+		t.Errorf("logged\n%s", strings.Join(logs, "\n"))
 	}
 	items := s.items()
 	if len(items) != 1 || len(items[0].Items) != 5 {
 		t.Fatalf("items %+v", items)
 	}
 	got := items[0].Items
-	if got[0].Body != strings.Repeat("ü", 65_536) {
+	if got[0].Body != secret+strings.Repeat("ü", 65_536-len(secret)) {
 		t.Errorf("body of %d characters", utf8.RuneCountInString(got[0].Body))
 	}
 	if got[1].Title != strings.Repeat("ü", 1024) {
@@ -592,7 +604,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 		User: &ghUser{Login: "alice", Type: "User"}, Comments: 3,
 		CreatedAt: "2026-01-02T05:04:05+02:00", UpdatedAt: "2026-01-03T03:04:05Z",
 	}
-	it, why := itemOf("github.com", r, base)
+	it, why, _ := itemOf("github.com", r, base)
 	want := contracts.Item{
 		Ref: "acme/widgets#42", URL: "https://github.com/acme/widgets/issues/42", Title: "Widgets spin backwards", Body: "They should not.",
 		BodyFormat: "markdown", Type: "issue", State: "open", Labels: []string{"bug", "good first issue"},
@@ -621,18 +633,18 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	} {
 		is := base
 		is.State, is.StateReason = tc.state, tc.reason
-		it, _ := itemOf("github.com", r, is)
+		it, _, _ := itemOf("github.com", r, is)
 		if it.State != tc.state || !reflect.DeepEqual(it.StateReason, tc.want) {
 			t.Errorf("%s %v: state %s, reason %v", tc.state, tc.reason, it.State, it.StateReason)
 		}
 	}
 	is := base
 	is.Body, is.Labels, is.User = nil, nil, &ghUser{Login: "renovate[bot]", Type: "Bot"}
-	it, _ = itemOf("github.com", r, is)
+	it, _, _ = itemOf("github.com", r, is)
 	if it.Body != "" || it.Labels == nil || len(it.Labels) != 0 || it.FiledBy != (contracts.Person{Name: "renovate[bot]", Kind: "automation"}) {
 		t.Errorf("item %+v", it)
 	}
-	c, why := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"})
+	c, why, _ := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"})
 	if why != "" || c != (contracts.Comment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: contracts.Person{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
 		t.Errorf("comment %+v, %s", c, why)
 	}
@@ -641,7 +653,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 // TestTheWireIsTheContractsJSON checks the JSON an item and a comment of the adapter's
 // become: the names, the nulls the contract wants and the fields it leaves out.
 func TestTheWireIsTheContractsJSON(t *testing.T) {
-	it, _ := itemOf("github.com", ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
+	it, _, _ := itemOf("github.com", ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
 	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: "acme/widgets", Items: []contracts.Item{it}})
 	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"acme/widgets","items":[{"ref":"acme/widgets#1","url":"https://github.com/acme/widgets/issues/1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
 	if string(b) != want {
@@ -731,7 +743,7 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 	long := issue(1, 0)
 	long["body"] = strings.Repeat("a", 70_000)
 	got, _ := IssuesWebhook(event("edited", long, nil), "github.com", nil)
-	if len(got.Items) != 1 || len(got.Skipped) != 0 || got.Items[0].Items[0].Body != strings.Repeat("a", 65_536) {
+	if len(got.Items) != 1 || len(got.Skipped) != 0 || got.Items[0].Items[0].Body != strings.Repeat("a", 65_536) || !reflect.DeepEqual(got.Cut, []Cut{{Ref: "acme/widgets#1", Field: "body", Length: 70_000}}) {
 		t.Errorf("long body: %d requests, skipped %+v", len(got.Items), got.Skipped)
 	}
 	if _, err := IssuesWebhook([]byte("{"), "github.com", nil); err == nil {
@@ -897,7 +909,7 @@ func TestAWebhooksEventHasTheListingsChecks(t *testing.T) {
 	}
 	long := comment(5, "bob", "User", strings.Repeat("a", 70_000))
 	got, _ = IssueCommentWebhook(event("edited", issue(1, 1), map[string]any{"comment": long}), "qory-test")
-	if len(got.Comments) != 1 || len(got.Skipped) != 0 || got.Comments[0].Comments[0].Body != strings.Repeat("a", 65_536) {
+	if len(got.Comments) != 1 || len(got.Skipped) != 0 || got.Comments[0].Comments[0].Body != strings.Repeat("a", 65_536) || !reflect.DeepEqual(got.Cut, []Cut{{Ref: "5", Field: "body", Length: 70_000}}) {
 		t.Errorf("edited: %d requests, skipped %+v", len(got.Comments), got.Skipped)
 	}
 	got, _ = IssueCommentWebhook(event("deleted", issue(1, 1), map[string]any{"comment": long}), "qory-test")
