@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,12 +22,15 @@ import (
 // as a [Cut]: a title, a body, a person's name, a label and a collection's title. A cut
 // of an item's title, body or filed_by.name, or of a comment's body or author.name, is
 // named in its truncated too. A state_reason past its limit is dropped, never cut. An
-// empty label is dropped, a label the same as one before it is dropped, and the labels
-// past the most an item has are dropped, which is logged too. A field that cannot be
-// cut into the contract, a ref, a URL, a target's path, an empty title or a time that
-// is not RFC 3339, skips its item, comment or collection, which is logged by its ref,
-// never by its text, and the rest are sent. A request is at most contracts.MaxRequest
-// bytes, and lists at most the contract's most items, comments or collections.
+// empty label is dropped, a label the same as one before it, once cut, is dropped, and
+// the labels past the most an item has are left out, which is logged too; a label cut
+// and the labels left out are named labels in the item's truncated. A collection's
+// title, cut, is logged only, since the contract's collection has no truncated. A field
+// that cannot be cut into the contract, a ref, a URL, a target's path, an empty title
+// or a time that is not RFC 3339, skips its item, comment or collection, which is
+// logged by its ref, never by its text, and the rest are sent. A request is at most
+// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
+// collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -141,24 +145,37 @@ func fit(cuts *[]Cut, ref, field, s string, n int) string {
 	return cut(s, n)
 }
 
-// The fields the contract's truncated names, on an item and on a comment, as [fit] and
-// [Cut] call them.
+// truncatedField is a name the contract's truncated takes, and the fields of the
+// [Cut]s it names, as [fit] and [labelsOf] call them.
+type truncatedField struct {
+	name string
+	cuts []string
+}
+
+// The names the contract's truncated takes, on an item and on a comment, in the order
+// its schema lists them. An item's labels names a label cut to the limit of a label
+// and the labels past the most an item has, left out.
 var (
-	itemTruncated    = []string{"title", "body", "filed_by.name"}
-	commentTruncated = []string{"body", "author.name"}
+	itemTruncated = []truncatedField{
+		{"title", []string{"title"}},
+		{"body", []string{"body"}},
+		{"filed_by.name", []string{"filed_by.name"}},
+		{"labels", []string{"label", "labels"}},
+	}
+	commentTruncated = []truncatedField{
+		{"body", []string{"body"}},
+		{"author.name", []string{"author.name"}},
+	}
 )
 
-// truncatedOf is the fields among names that cuts cut, each once in the order of
-// names, for an item's or a comment's truncated; nil when cuts cut none of them, so
-// truncated is left out.
-func truncatedOf(cuts []Cut, names []string) []string {
+// truncatedOf is the names among fields whose cuts are among cuts, each once in the
+// order of fields, for an item's or a comment's truncated; nil when cuts holds none of
+// them, so truncated is left out.
+func truncatedOf(cuts []Cut, fields []truncatedField) []string {
 	var out []string
-	for _, n := range names {
-		for _, c := range cuts {
-			if c.Field == n {
-				out = append(out, n)
-				break
-			}
+	for _, f := range fields {
+		if slices.ContainsFunc(cuts, func(c Cut) bool { return slices.Contains(f.cuts, c.Field) }) {
+			out = append(out, f.name)
 		}
 	}
 	return out
@@ -188,8 +205,10 @@ func collectionOf(r ghRepo) contracts.Collection {
 }
 
 // labelsOf are the labels of the issue ref as the contract takes them: each fitted to
-// the limit of a label, an empty one dropped, one the same as a label before it
-// dropped, and none past the most labels an item has, which is a [Cut] of labels.
+// the limit of a label, an empty one dropped, one the same as a label before it, once
+// cut, dropped, so the first is kept and they are unique, and none past the most labels
+// an item has, which is a [Cut] of labels. A label cut and the labels left out are
+// named labels in the item's truncated, see [truncatedOf].
 func labelsOf(ls []ghLabel, cuts *[]Cut, ref string) []string {
 	lim := contractLimits()
 	labels := make([]string, 0, min(len(ls), lim.labels))

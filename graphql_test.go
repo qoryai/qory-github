@@ -828,7 +828,8 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 // labels left empty or the same as one before are dropped, the labels past 100 are
 // dropped, nothing is skipped, so the listing is complete, and each cut is logged by
 // ref, field and length, never by its text. Each item and comment names in truncated
-// the fields of it cut but its labels, and one with none of those cut has no truncated.
+// the fields of it cut, labels once for two labels cut, equal once cut and sent once,
+// and the labels past 100; one with nothing cut has no truncated.
 func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	secret := "SECRETTEXT"
 	longBody, longTitle, manyLabels, longName, atLimit := node(2, 1), node(3, 0), node(4, 0), node(5, 0), node(6, 0)
@@ -894,7 +895,7 @@ func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	if got[4].Body != strings.Repeat("ü", 65_536) {
 		t.Errorf("a body at the limit is changed")
 	}
-	for i, want := range [][]string{{"body"}, {"title"}, nil, {"filed_by.name"}, nil} {
+	for i, want := range [][]string{{"body"}, {"title"}, {"labels"}, {"filed_by.name"}, nil} {
 		names, ok := truncatedMember(t, got[i])
 		if !reflect.DeepEqual(names, want) || ok != (want != nil) {
 			t.Errorf("%s: truncated %q", got[i].Ref, names)
