@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -154,7 +155,7 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 		"enrolled as ak_0123456789abcdef in the work source na_0123456789abcdef\n" +
 		"wrote the access key's secret to " + file + "\n" +
 		"add these settings to serve's settings:\n" +
-		"compare the fingerprint " + fp + " with the one Qory Apiary shows on the integration's page: the key waits for approval there\n"
+		"compare the fingerprint " + fp + " with the one Qory Apiary shows on the integration's page; the key is active\n"
 	if errs != wantErrs {
 		t.Errorf("stderr:\n%s\nwant:\n%s", errs, wantErrs)
 	}
@@ -181,6 +182,9 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{"--secret-file", link, f.url, c}, "the secret file " + link + " exists; choose another or move it away"},
 		{[]string{"--secret-file", filepath.Join(dir, "none", "secret"), f.url, c}, "the secret file's directory: stat " + filepath.Join(dir, "none") + ": no such file or directory"},
 		{[]string{"--secret-file", filepath.Join(exists, "secret"), f.url, c}, "the secret file: lstat " + filepath.Join(exists, "secret") + ": not a directory"},
+		{[]string{"--secret-file", filepath.Join(dir, "sec\nret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\nret")) + " contains a control character; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "sec\u009bret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\u009bret")) + " contains a control character; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "sec\xffret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\xffret")) + " is not UTF-8; choose another with --secret-file"},
 		{[]string{"--secret-file", file, "http://apiary.example.com", c}, "the server is neither an https URL"},
 		{[]string{"--secret-file", file, "ftp://apiary.example.com", c}, "the server is neither an https URL"},
 		{[]string{"--secret-file", file, "https://apiary.example.com/enrol", c}, "the server is neither an https URL"},

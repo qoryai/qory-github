@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/qoryai/forager/accesskey"
 )
@@ -87,6 +89,9 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("the secret file: %w", err)
 	}
+	if err := checkSecretPath(file); err != nil {
+		return err
+	}
 	if err := checkSecretFile(file); err != nil {
 		return err
 	}
@@ -127,7 +132,7 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stderr, "add these settings to serve's settings:")
 	fmt.Fprint(stdout, fragment)
-	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the integration's page: the key waits for approval there\n", fingerprint)
+	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the integration's page; the key is active\n", fingerprint)
 	return nil
 }
 
@@ -219,6 +224,19 @@ func enrolledSettings(server, id, file string, pin accesskey.Pin) (string, error
 		fmt.Fprintf(&b, "  %q: %s%s\n", m.name, v, sep)
 	}
 	return b.String(), nil
+}
+
+// checkSecretPath refuses a secret file's absolute path that the settings enrol prints
+// cannot contain as it is written, as setup refuses its key file's: one that is not
+// UTF-8, or that contains a control character, C0, DEL or C1.
+func checkSecretPath(p string) error {
+	if !utf8.ValidString(p) {
+		return fmt.Errorf("the secret file's path %q is not UTF-8; choose another with --secret-file", p)
+	}
+	if strings.IndexFunc(p, unicode.IsControl) >= 0 {
+		return fmt.Errorf("the secret file's path %q contains a control character; choose another with --secret-file", p)
+	}
+	return nil
 }
 
 // checkSecretFile refuses a secret file that exists, or whose directory does not, before
