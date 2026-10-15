@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,25 +24,30 @@ import (
 	"unicode/utf8"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github/internal/cli"
 )
 
-// accessKeyHelp is the help of access-key enrol, which has no section on the program's
-// page: the command is switched on by QORY_FEATURES alone, see [factory].
-var accessKeyHelp = help{
-	short: "Enrol the integration's access key with a code from Qory Apiary",
-	use:   "qory-github access-key enrol --secret-file FILE [--] SERVER CODE",
-	long: `Enrol a new access key for this integration with an enrolment code an owner or
+// accessKeyHelp is the help of access-key enrol, which has no section on qory-github's
+// page: the command is switched on by QORY_FEATURES alone, see [cli.Factory].
+//
+// The enrol command's texts, this help and the lines and errors enrol prints, are
+// placeholders awaiting the user's wording: they stay as they were but for the program's
+// name until that wording replaces them.
+var accessKeyHelp = cli.Help{
+	Short: "Enrol the integration's access key with a code from Qory Apiary",
+	Use:   "qory-github-server access-key enrol --secret-file FILE [--] SERVER CODE",
+	Long: `Enrol a new access key for this integration with an enrolment code an owner or
 administrator in Qory Apiary created on the integration's Access key tab in
 Organisation settings. The code is valid for 15 minutes and used once.
 
-qory-github makes the key, prints its fingerprint and sends Qory Apiary, at SERVER, the
+qory-github-server makes the key, prints its fingerprint and sends Qory Apiary, at SERVER, the
 public key. Qory Apiary's signed answer gives the key its id and lists Qory Apiary's
 public key. Only then is the secret written, to --secret-file, which only you may
 read. enrol never writes over a file that exists, and never prints the secret.
 
 Then enrol prints the settings to add to serve's settings: apiary_url, access_key_id,
 access_key_secret_file, apiary_public_key and adapter_id.`,
-	example: `  qory-github access-key enrol --secret-file /etc/qory-github/access-key-secret https://apiary.example.com "$code"`,
+	Example: `  qory-github-server access-key enrol --secret-file /etc/qory-github/access-key-secret https://apiary.example.com "$code"`,
 }
 
 // enrol's test seams: the key it makes; the access key's name, from this machine's host
@@ -64,21 +68,22 @@ func enrolFlags() (fs *flag.FlagSet, secretFile *string) {
 // accessKey runs access-key's one verb, enrol. -h alone prints enrol's help, with its
 // flags.
 func accessKey(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	if len(args) == 1 && slices.Contains([]string{"-h", "-help", "--h", "--help"}, args[0]) {
+	if cli.HelpAlone(args) {
 		fs, _ := enrolFlags()
-		return accessKeyHelp.parse(fs, args, stderr)
+		return accessKeyHelp.Parse(fs, args, stderr)
 	}
 	if len(args) == 0 || args[0] != "enrol" {
-		return errors.New("access-key has one command, enrol: qory-github access-key enrol --secret-file FILE SERVER CODE")
+		return errors.New("access-key has one command, enrol: qory-github-server access-key enrol --secret-file FILE SERVER CODE")
 	}
 	return enrol(ctx, args[1:], stdout, stderr)
 }
 
 // enrol is access-key enrol. The lines for a person go to stderr, and the settings alone
-// to stdout. An error never contains the secret or the code.
+// to stdout. An error never contains the secret or the code. Its lines and errors are
+// placeholders awaiting the user's wording, see [accessKeyHelp].
 func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs, secretFile := enrolFlags()
-	if err := accessKeyHelp.parse(fs, args, stderr); err != nil {
+	if err := accessKeyHelp.Parse(fs, args, stderr); err != nil {
 		return err
 	}
 	if fs.NArg() != 2 {
@@ -283,7 +288,8 @@ func accessKeyName() string {
 // path, and so may a 401, which is never signed, so its text names Qory Apiary's
 // reasons beside a refusal by another server on the way. A verified refusal leaves the code as it was, so the same command can use it
 // again. Nothing was written, so an enrolment that may have succeeded behind an answer
-// that did not verify cannot be finished: its key is to be revoked.
+// that did not verify cannot be finished: its key is to be revoked. Its texts are
+// placeholders awaiting the user's wording, see [accessKeyHelp].
 func enrolFailed(err error, server, fingerprint string) error {
 	lost := "; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key " + fingerprint + " should it have been enrolled"
 	var ref *accesskey.Refusal
