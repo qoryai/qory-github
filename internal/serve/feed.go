@@ -43,6 +43,8 @@ type feed struct {
 	// entry's failures are timed by; nil is time.Now.
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
+	// declared, when set, is closed once the adapter is declared.
+	declared chan struct{}
 
 	// failing is what the feed keeps of the page read after the cursor after, by the
 	// entries' places in it: when each entry that failed, not for good, first failed,
@@ -119,6 +121,9 @@ func (f *feed) run(ctx context.Context) {
 	for ctx.Err() == nil {
 		err := f.apiary.Declare(ctx, f.publicURL)
 		if err == nil {
+			if f.declared != nil {
+				close(f.declared)
+			}
 			break
 		}
 		if ctx.Err() != nil || !fail("declaring the adapter to Qory Apiary", err) {

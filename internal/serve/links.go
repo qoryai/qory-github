@@ -23,11 +23,15 @@ import (
 //     case, with the ref as GitHub writes it, set by each listing of an installation's
 //     repositories.
 //   - adapter: the instance id, the change feed's cursor and the sync interval.
+//   - pulls: when the last pull of a collection that finished without error began, and
+//     when its last listing of open issues began, by its ref in lower case, see
+//     [pullMark].
 const (
 	nsInstallations = "installations"
 	nsCollections   = "collections"
 	nsRepositories  = "repositories"
 	nsAdapter       = "adapter"
+	nsPulls         = "pulls"
 
 	keyInstanceID   = "instance_id"
 	keyCursor       = "cursor"
