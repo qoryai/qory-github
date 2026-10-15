@@ -42,7 +42,8 @@ type ghRepoComment struct {
 // listing's. GitHub lists neither a deleted comment nor an issue deleted or transferred:
 // a deleted comment reaches Qory Apiary only by its webhook's event; such an issue
 // reaches it by its webhook's event, or Qory Apiary closes it after the next daily
-// listing of open issues, which says it is complete and leaves it out.
+// listing of open issues, which leaves it out and says it is complete, unless it
+// skipped an item.
 //
 // Both are read oldest change first, by time rather than by page number, see
 // [changedPages]: each page is asked for from the latest change the page before it
@@ -53,10 +54,11 @@ type ghRepoComment struct {
 // an edit to one of them while they are read can shift another onto a page already read,
 // which skips it. Such an entry stays as Qory Apiary has it until it changes again, or,
 // for an issue, until the next daily listing of open issues, which sends it when it is
-// open and, since that listing says it is complete, has Qory Apiary close it when it is
-// not. Each is read in at most 2,000 pages; a pull that would read more fails, and so
-// does one GitHub answers that the repository is gone or moved, with an error that wraps
-// [ErrRepositoryGone]. It stops at the first error, and sends nothing more.
+// open and, since that listing says it is complete unless it skipped an item, has
+// Qory Apiary close it when it is not. Each is read in at most 2,000 pages; a pull that
+// would read more fails, and so does one GitHub answers that the repository is gone or
+// moved, with an error that wraps [ErrRepositoryGone]. It stops at the first error, and
+// sends nothing more.
 func (l Lister) ListChanged(ctx context.Context, repo Repository, since time.Time) error {
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
 		return fmt.Errorf("%q is not owner/name", repo.String())

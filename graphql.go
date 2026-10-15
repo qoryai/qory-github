@@ -284,13 +284,15 @@ func rateLimited(errs []gqlError) bool {
 // A repository with no open issue, read without error, sends one part without items
 // that says the listing is complete, so Qory Apiary closes every item of the
 // collection it did not hear of since the listing started. A listing stopped early, by
-// an error or its context, sends the items it read and had not sent as its last part,
-// which never says it is complete, nor does any part before it; one that fails on its
-// first page sends nothing. A repository
-// GitHub answers it cannot resolve, or names otherwise, renamed or transferred, stops
-// the listing with an error that wraps [ErrRepositoryGone]; an issue whose comments
-// GitHub answers are gone has its comments skipped and logged by its ref, and the
-// listing goes on.
+// an error or its context, before every open issue is read and sent, sends the items it
+// read and had not sent as its last part, which never says it is complete, nor does any
+// part before it; one that fails on its first page sends nothing. A listing that fails
+// on the comments of its last part's items, once that part is sent, returns the error,
+// and that part, sent already, says it is complete, since every open issue was read and
+// sent and comments are no part of complete. A repository GitHub answers it cannot
+// resolve, or names otherwise, renamed or transferred, stops the listing with an error
+// that wraps [ErrRepositoryGone]; an issue whose comments GitHub answers are gone has
+// its comments skipped and logged by its ref, and the listing goes on.
 func (l Lister) ListOpenIssuesComplete(ctx context.Context, repo Repository) error {
 	return l.listOpenComplete(ctx, repo, openIssuesPerPage)
 }
@@ -329,6 +331,9 @@ func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int
 			o = l.openParts(p, repo, listing, coll)
 		}
 		for _, is := range page {
+			// An issue the listing returns as not open, one closed during the read say, is
+			// rightly left out of the open listing and is not a skip, so a complete listing
+			// may then close it.
 			if is.State != StateOpen {
 				continue
 			}

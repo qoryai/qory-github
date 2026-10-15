@@ -408,12 +408,14 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // by [github.Lister.ListOpenIssuesComplete]: its last part says the listing is complete
 // unless an item was skipped, so Qory Apiary closes every item of the collection the
 // listing left out and did not hear of since it started. A fill that fails or is
-// stopped sends no part that says it is complete, and a repository with no open issue
-// sends one part without items that does. A repository GitHub answers is gone or moved,
-// [github.ErrRepositoryGone], or for which GitHub refuses to mint a token for good,
-// [github.ErrMintRefused], fails for good, so the change feed passes it. It waits for a
-// pull of the collection that runs, and once it has sent everything, the next pull
-// reads what changed from when it began.
+// stopped before every open issue is read and sent sends no part that says it is
+// complete; one that fails on the comments of its last part's items has sent that part
+// already, complete, since comments are no part of complete. A repository with no open
+// issue sends one part without items that says it is complete. A repository GitHub
+// answers is gone or moved, [github.ErrRepositoryGone], or for which GitHub refuses to
+// mint a token for good, [github.ErrMintRefused], fails for good, so the change feed
+// passes it. It waits for a pull of the collection that runs, and once it has sent
+// everything, the next pull reads what changed from when it began.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	repo, err := repository(ref)
 	if err != nil {

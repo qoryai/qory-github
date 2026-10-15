@@ -718,8 +718,8 @@ func partsOf(w *wired) string {
 
 // TestTheFillAndTheDailyListingPassTheListingThrough lists 250 and 200 open issues by
 // the fill and by the daily listing, and checks each sends the listing's parts as it
-// makes them, the last alone complete, a full one for 200; and that with an issue Qory
-// Apiary would refuse, skipped, no part says complete.
+// makes them, the last alone complete, a full one for 200; and that with an issue
+// Qory Apiary would refuse, skipped, no part says complete.
 func TestTheFillAndTheDailyListingPassTheListingThrough(t *testing.T) {
 	for _, c := range listingCallers {
 		for _, tc := range []struct {
