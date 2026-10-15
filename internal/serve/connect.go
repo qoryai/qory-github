@@ -71,7 +71,7 @@ import (
 // sentence: a request that is not GET or whose query is not one serve reads; a pass
 // that is forged or malformed, one taken already, or one for another adapter; a request
 // without a session; a store that fails, or a connect return that fails to be made; and
-// a connection that holds another installation already, or a pass no newer than the
+// a connection that holds another installation already; and a pass no newer than the
 // newest a linked return was minted under for the connection, see [Connect.link]. So
 // does the request that tells the person to press Save.
 //
@@ -232,14 +232,18 @@ var (
 	refusePayload   = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's payload is not the contract's", name: refusePass.name}
 	refuseAdapter   = refusal{status: http.StatusForbidden, page: "This connect link is for another integration. Press Connect on this integration's page in Qory Apiary.", why: "the pass is for another adapter", name: "adapter"}
 	refuseUsed      = refusal{status: http.StatusBadRequest, page: `This link was used already. Press "Install the GitHub App" in Qory Apiary again.`, why: "the pass's nonce was used already", name: "used"}
-	// placeholder: wording waits for the user
 	refuseFailed    = refusal{status: http.StatusInternalServerError, page: `Something failed on this server. Press "Install the GitHub App" in Qory Apiary again.`, why: "the store, or the making of a connect return, failed", name: "failed"}
 	refuseNoSession = refusal{status: http.StatusBadRequest, page: `No installation is under way in this browser, or it took too long. Press "Install the GitHub App" in Qory Apiary again.`, why: "no session", dropCookie: true}
 	refuseHeld      = refusal{
-		status: http.StatusConflict,
-		page:   "This connection already holds another installation of the App, and it holds only one.",
-		// placeholder: wording waits for the user
-		why:        "the connection holds another installation, live, or the pass is no newer than one a linked return was made under",
+		status:     http.StatusConflict,
+		page:       "This connection already holds another installation of the App, and it holds only one.",
+		why:        "the connection holds another installation, live, or pending under a pass as new as this one",
+		endSession: true,
+	}
+	refuseOlder = refusal{
+		status:     http.StatusConflict,
+		page:       `A newer link for this connection was used already. Press "Install the GitHub App" in Qory Apiary again.`,
+		why:        "the pass is no newer than one a linked return was made under",
 		endSession: true,
 	}
 )
@@ -277,9 +281,7 @@ var (
 	verdictExpired   = verdict{outcomeRefused, reasonPassExpired, passExpired.why}
 	verdictCancelled = verdict{outcomeCancelled, "", "the person cancelled on GitHub"}
 	verdictState     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's state is not the session's"}
-	// placeholder: wording waits for the user
-	verdictReplay = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session's sign-in is taken already"}
-	// placeholder: wording waits for the user
+	verdictReplay    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session's sign-in is taken already"}
 	verdictSetup     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's state is not the session's"}
 	verdictDenied    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in sent back no code"}
 	verdictSignIn    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's code could not be exchanged"}
@@ -292,13 +294,10 @@ var (
 	verdictPermitted = verdict{outcomeRefused, reasonPermissionMissing, "the installation does not grant a permission the adapter needs"}
 	verdictNotAdmin  = verdict{outcomeRefused, reasonPersonNotPermitted, "the person does not administer the installation's account"}
 	verdictTaken     = verdict{outcomeRefused, reasonGrantTaken, "the installation is linked to another connection that is made"}
-	// placeholder: wording waits for the user
-	verdictBusy   = verdict{outcomeRefused, reasonSourceUnavailable, "another connect, or a listing, held the link past the deadline"}
-	verdictApiary = verdict{outcomeRefused, reasonSourceUnavailable, "the listing of the connection the installation is linked to failed"}
-	// placeholder: wording waits for the user
-	verdictDeleted = verdict{outcomeRefused, reasonGrantNotConfirmed, "GitHub deleted the installation meanwhile"}
-	// placeholder: wording waits for the user
-	verdictPaused = verdict{outcomeRefused, reasonSourceUnavailable, "Qory Apiary has suspended the connection the installation is linked to"}
+	verdictBusy      = verdict{outcomeRefused, reasonSourceUnavailable, "another connect, or a listing, held the link past the deadline"}
+	verdictApiary    = verdict{outcomeRefused, reasonSourceUnavailable, "the listing of the connection the installation is linked to failed"}
+	verdictDeleted   = verdict{outcomeRefused, reasonGrantNotConfirmed, "GitHub deleted the installation meanwhile"}
+	verdictPaused    = verdict{outcomeRefused, reasonSourceUnavailable, "Qory Apiary has suspended the connection the installation is linked to"}
 )
 
 // needs are the permissions an installation grants the App that the adapter needs,
@@ -849,8 +848,8 @@ func (c *Connect) administers(ctx context.Context, token string, account github.
 // connection, see [Connect.heldBy], the page [refuseHeld] answers, and nothing is
 // linked, unless that link is pending and gives way to a newer pass. Before all of
 // that, a pass that expires no later than the newest pass a linked return was minted
-// under for the connection, see [keepPass], gets [refuseHeld], whatever is linked to the
-// connection now: Qory Apiary takes a return only for the connection's newest pass,
+// under for the connection, see [keepPass], gets [refuseOlder], whatever is linked to
+// the connection now, so where both apply [refuseOlder] answers: Qory Apiary takes a return only for the connection's newest pass,
 // which may be that return, still unspent. Each linked return it allows keeps its pass
 // as that newest, with the link.
 //
@@ -869,7 +868,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		return false, nil, nil, err
 	}
 	if s.Pass <= newest {
-		return false, nil, &refuseHeld, nil
+		return false, nil, &refuseOlder, nil
 	}
 	wait := c.linkWait
 	if wait <= 0 {
@@ -960,7 +959,6 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		l, ok, err := linkOf(c.Store, other)
 		if err == nil && ok && l.Connection == s.Connection {
 			err = dropInstallation(c.Store, other)
-			// placeholder: wording waits for the user
 			c.log().Info("a newer pass for the connection replaces its pending link", slog.String("connection", s.Connection), slog.Int64("installation", other))
 		}
 		if err != nil {
@@ -971,7 +969,6 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		if err := keepReplaced(c.Store, installation, *old); err != nil {
 			return false, nil, nil, err
 		}
-		// placeholder: wording waits for the user
 		c.log().Info("a connect for another connection replaces the installation's pending link", slog.String("connection", old.Connection), slog.Int64("installation", installation))
 	}
 	if err := putLink(c.Store, installation, link{Connection: s.Connection, State: linkPending, Pass: s.Pass, Return: returnExpires}); err != nil {
@@ -1064,7 +1061,6 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 			if refusedAs(err, http.StatusForbidden, codeForbidden) {
 				// A 403 forbidden never drops a link: it is sent again, as a failure that passes.
 				passing = true
-				// placeholder: wording waits for the user
 				c.log().Warn("Qory Apiary answered a listing 403 forbidden, so it is sent again later", slog.String("connection", connection), slog.Int64("installation", installation))
 			}
 			if err != nil && !passing && (last || !refusedAs(err, http.StatusForbidden, codeConnectionUnknown)) {

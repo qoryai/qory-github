@@ -94,12 +94,10 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 	return func(connection string, status int, code string, at time.Time) {
 		end, err := noteAnswer(st, connection, status, code, at)
 		if err != nil {
-			// placeholder: wording waits for the user
-			log.Error("keeping when a connection's requests began to be refused", slog.String("connection", connection), slog.String("error", err.Error()))
+			log.Error("could not store when the connection's requests began to be refused", slog.String("connection", connection), slog.String("error", err.Error()))
 			return
 		}
 		if end {
-			// placeholder: wording waits for the user
 			log.Info("Qory Apiary answered connection_unknown for a day, so the connection is dropped", slog.String("connection", connection))
 			ended(connection)
 		}

@@ -367,7 +367,6 @@ func (a *Adapter) listFor(ctx context.Context, installation int64, connection st
 	if err := dropInstallation(a.Store, installation); err != nil {
 		return err
 	}
-	// placeholder: wording waits for the user
 	a.log().Info("the connection was not made in time, so its pending link is dropped", slog.String("connection", connection), slog.Int64("installation", installation))
 	return nil
 }
@@ -399,11 +398,9 @@ func (a *Adapter) listReplaced(ctx context.Context, installation int64, connecti
 		if err := a.endConnection(ctx, connection); err != nil {
 			return err
 		}
-		// placeholder: wording waits for the user
 		a.log().Info("the replaced connection was made meanwhile, so it is disconnected", slog.String("connection", connection), slog.Int64("installation", installation))
 	case refusedAs(err, http.StatusConflict, codeConnectionEnded):
 	case last && refusedAs(err, http.StatusForbidden, codeConnectionUnknown):
-		// placeholder: wording waits for the user
 		a.log().Info("the replaced connection was not made, so it is forgotten", slog.String("connection", connection), slog.Int64("installation", installation))
 	default:
 		return err

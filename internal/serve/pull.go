@@ -397,7 +397,6 @@ func (p *puller) listReplaced(ctx context.Context) {
 		go func() {
 			defer p.rounds.Done()
 			if err := p.adapter.listFor(ctx, r.Installation, connection, true); err != nil {
-				// placeholder: wording waits for the user
 				p.report(ctx, slog.String("connection", connection), "listing a replaced connection", err)
 			}
 		}()

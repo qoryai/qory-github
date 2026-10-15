@@ -1333,10 +1333,16 @@ func (rig *connectRig) held(t *testing.T, installation int64, connection, state 
 }
 
 // TestAConnectionHoldsOneInstallation connects the installation 7 to the connection
-// that the installation 42 is linked to already: live, the page refuses, and nothing
-// changes; pending, the link gives way at once, unlisted, to a newer pass, and to a pass
-// as old or older the page refuses. Qory Apiary failing, or answering unsigned, changes
-// none of that, since the link is not listed.
+// that the installation 42 is linked to already: live, the page refuseHeld refuses, and
+// nothing changes; pending, the link gives way at once, unlisted, to a newer pass, and
+// to a pass as old or older refuseHeld refuses. Where serve minted a linked return for
+// the connection under a pass as new as the one brought, refuseOlder refuses instead,
+// whatever the link. Qory Apiary failing, or answering unsigned, changes none of that,
+// since the link is not listed: the contract says "A newer pass on the same connection
+// (connect-pass.schema.json) drops the old link at once, since the control plane
+// accepts a return only for the nonce of the connection's latest pass", and the record
+// of the newest pass a linked return was minted under, see [keepPass], keeps an older
+// pass from ever replacing a link.
 func TestAConnectionHoldsOneInstallation(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	older, newer := now.Add(5*time.Minute), now.Add(10*time.Minute)
@@ -1346,20 +1352,29 @@ func TestAConnectionHoldsOneInstallation(t *testing.T) {
 		replaced bool
 		status   int
 		unsigned bool
+		minted   bool
 	}{
-		"live, a newer pass":    {linkLive, newer, false, 403, false},
-		"pending, a newer pass": {linkPending, newer, true, 403, false},
-		"pending, an older one": {linkPending, older.Add(-time.Minute), false, 403, false},
-		"pending, one as old":   {linkPending, older, false, 403, false},
+		"live, a newer pass":    {linkLive, newer, false, 403, false, false},
+		"pending, a newer pass": {linkPending, newer, true, 403, false, false},
+		"pending, an older one": {linkPending, older.Add(-time.Minute), false, 403, false, false},
+		"pending, one as old":   {linkPending, older, false, 403, false, false},
 		// Qory Apiary failing, or answering under a key the pin does not list, changes
 		// nothing: the link is not listed, and the passes alone decide.
-		"pending, a newer pass, Qory Apiary failing": {linkPending, newer, true, 500, false},
-		"pending, a newer pass, answers not signed":  {linkPending, newer, true, 403, true},
-		"pending, one as old, Qory Apiary failing":   {linkPending, older, false, 500, false},
-		"live, a newer pass, answers not signed":     {linkLive, newer, false, 403, true},
+		"pending, a newer pass, Qory Apiary failing": {linkPending, newer, true, 500, false, false},
+		"pending, a newer pass, answers not signed":  {linkPending, newer, true, 403, true, false},
+		"pending, one as old, Qory Apiary failing":   {linkPending, older, false, 500, false, false},
+		"live, a newer pass, answers not signed":     {linkLive, newer, false, 403, true, false},
+		// A linked return minted under the link's pass: refuseOlder answers where both
+		// apply.
+		"pending, one as old, its return minted":   {linkPending, older, false, 403, false, true},
+		"live, an older one, its return minted":    {linkLive, older.Add(-time.Minute), false, 403, false, true},
+		"pending, a newer pass, its return minted": {linkPending, newer, true, 403, false, true},
 	} {
 		rig := newConnectRig(t)
 		putLink(rig.st, 42, link{Connection: testConnection, State: tc.state, Pass: older.Unix(), Return: time.Now().Add(returnFor).Unix()})
+		if tc.minted {
+			keepPass(rig.st, testConnection, older.Unix(), time.Now())
+		}
 		setReach(rig.st, "acme/widgets", 42)
 		rig.apiary.refuse = func(string, int) (int, string) { return tc.status, `{"error":"connection_unknown"}` }
 		if tc.unsigned {
@@ -1389,7 +1404,11 @@ func TestAConnectionHoldsOneInstallation(t *testing.T) {
 				t.Errorf("%s: the connection is kept as replaced", name)
 			}
 		} else {
-			refused(t, rec, refuseHeld)
+			want := refuseHeld
+			if tc.minted {
+				want = refuseOlder
+			}
+			refused(t, rec, want)
 			if b.cookie != nil {
 				t.Errorf("%s: the cookie is kept", name)
 			}
@@ -1443,7 +1462,7 @@ func TestTwoPassesForOneConnectionLinkOneInstallation(t *testing.T) {
 				}
 				linked = s
 			} else {
-				refused(t, rec, refuseHeld)
+				refused(t, rec, refuseOlder)
 			}
 			held, err := linkedTo(rig.st, testConnection)
 			if err != nil || len(held) != 1 {
@@ -1703,6 +1722,7 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 		&refuseFailed:    `Something failed on this server. Press "Install the GitHub App" in Qory Apiary again.`,
 		&refuseNoSession: `No installation is under way in this browser, or it took too long. Press "Install the GitHub App" in Qory Apiary again.`,
 		&refuseHeld:      "This connection already holds another installation of the App, and it holds only one.",
+		&refuseOlder:     `A newer link for this connection was used already. Press "Install the GitHub App" in Qory Apiary again.`,
 		&refuseAdapter:   "This connect link is for another integration. Press Connect on this integration's page in Qory Apiary.",
 		&refuseMethod:    "This address answers GET requests alone.",
 	} {
@@ -1972,7 +1992,7 @@ func twoOrgs(rig *connectRig, made *atomic.Bool) {
 
 // TestAPassNoNewerThanTheConnectionsNewestIsRefused has the newest pass a linked return
 // was minted under for the connection outlive every link that pass made: a pass whose
-// expiry is no later than it, as late or earlier, gets the page refuseHeld, links
+// expiry is no later than it, as late or earlier, gets the page refuseOlder, links
 // nothing, and mints no return, whether the installation that pass linked has since
 // been re-linked elsewhere, deleted, or re-connected under it; so a return that newest
 // pass minted, delivered later, never makes another installation live.
@@ -1992,7 +2012,7 @@ func TestAPassNoNewerThanTheConnectionsNewestIsRefused(t *testing.T) {
 		}
 		rig.held(t, 9, testConnection, linkPending, p2.Unix())
 		b := rig.browser(t)
-		refused(t, b.connect(rig.passAt(testConnection, now.Add(pv)), "42"), refuseHeld)
+		refused(t, b.connect(rig.passAt(testConnection, now.Add(pv)), "42"), refuseOlder)
 		if b.cookie != nil {
 			t.Errorf("%v: the cookie is kept", pv)
 		}
@@ -2037,7 +2057,7 @@ func TestAPassNoNewerThanTheConnectionsNewestIsRefused(t *testing.T) {
 			} else {
 				rec = victim.connect(rig.passAt(testConnection, newer), "42")
 			}
-			refused(t, rec, refuseHeld)
+			refused(t, rec, refuseOlder)
 			if victim.cookie != nil {
 				t.Errorf("%s, %s: the cookie is kept", free, as)
 			}
@@ -2052,7 +2072,7 @@ func TestAPassNoNewerThanTheConnectionsNewestIsRefused(t *testing.T) {
 
 // TestAReConnectUnderANewerPassRaisesTheLinksPass re-connects acme's 42 under p2 after
 // p1: the link holds p2's expiry, and octo-org's 9 under p1.5, between them, gets the
-// page refuseHeld, and the connection holds 42 alone.
+// page refuseOlder, and the connection holds 42 alone.
 func TestAReConnectUnderANewerPassRaisesTheLinksPass(t *testing.T) {
 	rig := newConnectRig(t)
 	var made atomic.Bool
@@ -2065,7 +2085,7 @@ func TestAReConnectUnderANewerPassRaisesTheLinksPass(t *testing.T) {
 		}
 	}
 	rig.held(t, 42, testConnection, linkPending, p2.Unix())
-	refused(t, rig.browser(t).connect(rig.passAt(testConnection, p15), "9"), refuseHeld)
+	refused(t, rig.browser(t).connect(rig.passAt(testConnection, p15), "9"), refuseOlder)
 	if held, _ := linkedTo(rig.st, testConnection); len(held) != 1 || held[0] != 42 {
 		t.Errorf("the connection holds %v", held)
 	}
