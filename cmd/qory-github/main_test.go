@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net/http"
@@ -493,11 +494,22 @@ func fakeGitHub(t *testing.T) string {
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)})
+		answer := map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)}
+		if fakeClientSecret != "" {
+			answer["client_secret"] = fakeClientSecret
+		}
+		json.NewEncoder(w).Encode(answer)
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
+
+// testClientSecret is the client secret GitHub hands out with the App.
+const testClientSecret = "a-client-secret-of-the-app"
+
+// fakeClientSecret is the client secret fakeGitHub answers with; empty, it answers
+// without one.
+var fakeClientSecret = testClientSecret
 
 // approve is the browser and the person: it reads the local page's state and follows
 // GitHub's redirect with a code.
@@ -854,11 +866,14 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	server, _ := accesskey.Generate()
 	accessFile := filepath.Join(dir, "access-key")
 	os.WriteFile(accessFile, []byte(access.Secret()+"\n"), 0o600)
+	clientFile := filepath.Join(dir, "client-secret")
+	os.WriteFile(clientFile, []byte("c1ient-s3cr3t\n"), 0o600)
 	// Qory Apiary is a loopback port nothing listens on: serve serves all the same,
 	// and declares the adapter again after a wait.
 	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state"),
 		"app_slug": "qory-acme", "apiary_url": "http://127.0.0.1:1", "public_url": "https://qory-github.example.com", "access_key_id": "ak_0123456789abcdef",
-		"access_key_secret_file": accessFile, "apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": server.PublicKey().String()}}})
+		"access_key_secret_file": accessFile, "apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": server.PublicKey().String()}},
+		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.acme", "client_secret_file": clientFile})
 	file := filepath.Join(dir, "serve.json")
 	os.WriteFile(file, settings, 0o600)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -876,7 +891,7 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	cancel()
 	select {
 	case code := <-done:
-		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") || strings.Contains(errs.String(), access.Secret()) {
+		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") || strings.Contains(errs.String(), access.Secret()) || strings.Contains(errs.String(), "c1ient") {
 			t.Errorf("exit %d, stdout %q, stderr %s", code, out.String(), errs.String())
 		}
 	case <-time.After(10 * time.Second):
@@ -900,4 +915,192 @@ func (l *lockedBuffer) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.b.String()
+}
+
+// setupWhole runs setup whole, with the flags args after the fake API and the App's
+// name, as the command line does, approving in place of the browser and person. It
+// returns the exit status, what setup printed on stdout and stderr, and the manifest
+// the page posts.
+func setupWhole(t *testing.T, args ...string) (int, string, string, string) {
+	t.Helper()
+	var manifest string
+	saved := opener
+	t.Cleanup(func() { opener = saved })
+	opener = func(local string) error {
+		resp, err := http.Get(local)
+		if err != nil {
+			return err
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		m := regexp.MustCompile(`name="manifest" value="([^"]+)"`).FindSubmatch(b)
+		if m == nil {
+			return fmt.Errorf("the page contains no manifest:\n%s", b)
+		}
+		manifest = html.UnescapeString(string(m[1]))
+		return approve(local)
+	}
+	var out, errs bytes.Buffer
+	code := run(context.Background(), append([]string{"setup", "--api-url", fakeGitHub(t), "--name", "qory-github-test"}, args...), &out, &errs)
+	return code, out.String(), errs.String(), manifest
+}
+
+// setupPrinted is what setup printed at ce7d970, before Connect, for the App 123456
+// whose key is in file.
+func setupPrinted(t *testing.T, file string) string {
+	t.Helper()
+	integrations, policy, err := declaration(123456, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `The App 123456 (qory-github-test) is created, and its private key is in ` + file + `.
+
+Install it on the repositories your agents work on:
+  https://github.com/apps/qory-github-test/installations/new
+
+Then declare the integration in the machine's configuration, ~/.config/qory/forager.yaml:
+
+` + integrations + `
+qory expands the declaration into the gateway's credential github. A run's policy selects it
+with the repositories the run works on, and allows GitHub's hosts beside the others the
+run reaches:
+
+` + policy
+}
+
+// manifestBefore is the manifest setup posted at ce7d970, before Connect, with the
+// redirect URL redirect.
+func manifestBefore(redirect string) string {
+	return `{"default_events":[],"default_permissions":{"contents":"write","metadata":"read","pull_requests":"write"},"hook_attributes":{"active":false,"url":"https://github.com/qoryai/qory-github"},"name":"qory-github-test","public":false,"redirect_url":"` + redirect + `","url":"https://github.com/qoryai/qory-github"}`
+}
+
+// setupFlagsBefore are setup's flags as -h printed them at ce7d970.
+const setupFlagsBefore = `flags:
+  -api-url string
+    	GitHub's API: https://api.github.com, or for a test http or https on a loopback host (default "https://api.github.com")
+  -key-file string
+    	where the private key is written (default ~/.config/qory/github-app.pem)
+  -name string
+    	the App's name (default qory-github- and six random hex digits)
+  -org string
+    	create the App under this organisation
+  -web-url string
+    	GitHub's website: https://github.com, or for a test http or https on a loopback host (default "https://github.com")
+`
+
+// TestSetupWithoutFactoryIsAsItWas pins that, unless QORY_FEATURES names factory, setup
+// takes the flags it took, posts the manifest it posted and prints what it printed
+// before Connect, and keeps no client secret; and that with factory but no
+// --public-url it does the same.
+func TestSetupWithoutFactoryIsAsItWas(t *testing.T) {
+	for _, features := range []string{"", "all", "factory"} {
+		t.Setenv("QORY_FEATURES", features)
+		dir := t.TempDir()
+		file := filepath.Join(dir, "github-app.pem")
+		code, out, errs, manifest := setupWhole(t, "--key-file", file)
+		first, printed, _ := strings.Cut(out, "\n\n")
+		page := strings.TrimPrefix(first, "Approve the App in the browser. If none opened, open ")
+		if code != 0 || errs != "" || printed != setupPrinted(t, file) || page == first {
+			t.Errorf("QORY_FEATURES=%q: exit %d, stderr %q, setup prints\n%s", features, code, errs, out)
+		}
+		u, _ := url.Parse(page)
+		if manifest != manifestBefore(u.Scheme+"://"+u.Host+"/callback") {
+			t.Errorf("QORY_FEATURES=%q: the manifest %s", features, manifest)
+		}
+		entries, _ := os.ReadDir(dir)
+		if len(entries) != 1 || strings.Contains(out, testClientSecret) {
+			t.Errorf("QORY_FEATURES=%q: the directory holds %v", features, entries)
+		}
+		var help bytes.Buffer
+		run(context.Background(), []string{"setup", "-h"}, &bytes.Buffer{}, &help)
+		_, flags, _ := strings.Cut(help.String(), "\nflags:\n")
+		flags, _, _ = strings.Cut(flags, "\nexamples:")
+		if features != "factory" && "flags:\n"+flags != setupFlagsBefore {
+			t.Errorf("QORY_FEATURES=%q: setup -h prints the flags\n%s", features, flags)
+		}
+	}
+	t.Setenv("QORY_FEATURES", "")
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"setup", "--public-url", "https://qory-github.example.com"}, &out, &errs); code != 1 || !strings.Contains(errs.String(), "flag provided but not defined: -public-url") {
+		t.Errorf("--public-url without factory: exit %d, %q", code, errs.String())
+	}
+}
+
+// TestSetupWithFactoryKeepsTheClientSecretForConnect pins that with factory and
+// --public-url the App gets what Connect needs, its client secret is written beside the
+// key for its owner alone and never printed, and setup prints serve's settings for it.
+func TestSetupWithFactoryKeepsTheClientSecretForConnect(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "github-app.pem")
+	code, out, errs, manifest := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com/")
+	secretFile := filepath.Join(dir, "github-app.client-secret")
+	path, _ := json.Marshal(secretFile)
+	_, printed, _ := strings.Cut(out, "\n\n")
+	want := setupPrinted(t, file) + `
+The App's client secret is in ` + secretFile + `, which only you may read. Add these settings to
+serve's settings, for Connect:
+
+  "client_id": "Iv1.test",
+  "client_secret_file": ` + string(path) + `
+`
+	if code != 0 || errs != "" || printed != want || strings.Contains(out, testClientSecret) {
+		t.Errorf("exit %d, stderr %q, setup prints\n%s\nwant\n%s", code, errs, printed, want)
+	}
+	var m map[string]any
+	json.Unmarshal([]byte(manifest), &m)
+	urls, _ := json.Marshal(m["callback_urls"])
+	if len(m) != 11 || m["setup_url"] != "https://qory-github.example.com/v1/connect/return" || m["setup_on_update"] != true ||
+		string(urls) != `["https://qory-github.example.com/v1/connect/authorized"]` || m["request_oauth_on_install"] != false {
+		t.Errorf("the manifest %s", manifest)
+	}
+	info, err := os.Stat(secretFile)
+	b, _ := os.ReadFile(secretFile)
+	if err != nil || info.Mode().Perm() != 0o600 || string(b) != testClientSecret+"\n" {
+		t.Errorf("the client secret file: %v %v %q", info, err, b)
+	}
+	// A client secret file that exists, or a public URL that is not https of a host and
+	// an optional port, is refused before any App is created.
+	for _, args := range [][]string{
+		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "http://qory-github.example.com"},
+		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com/#a"},
+		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com:0"},
+		{"--key-file", file + ".2", "--public-url", "https://qory-github.example.com"},
+	} {
+		want := "--public-url is not an https URL of a host and an optional port, without a user, a query or a fragment"
+		if args[1] == file+".2" {
+			os.WriteFile(file+".2.client-secret", nil, 0o600)
+			want = "client-secret"
+		}
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), append([]string{"setup", "--api-url", "http://127.0.0.1:1"}, args...), &out, &errs); code != 1 || out.Len() != 0 || !strings.Contains(errs.String(), want) {
+			t.Errorf("%v: exit %d, %q %q", args, code, out.String(), errs.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "other.pem")); err == nil {
+		t.Error("a key is written")
+	}
+}
+
+// TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept pins that when GitHub answers
+// without a client secret, setup still prints the App, its install page and the
+// declaration, then fails saying where to generate the client secret.
+func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	fakeClientSecret = ""
+	t.Cleanup(func() { fakeClientSecret = testClientSecret })
+	dir := t.TempDir()
+	file := filepath.Join(dir, "github-app.pem")
+	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
+	_, printed, _ := strings.Cut(out, "\n\n")
+	if code != 1 || printed != setupPrinted(t, file) ||
+		!strings.Contains(errs, "the App's client secret was not kept: GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at ") {
+		t.Errorf("exit %d, stderr %q, setup prints\n%s", code, errs, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "github-app.client-secret")); err == nil {
+		t.Error("a client secret file is written")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("the key: %v", err)
+	}
 }

@@ -100,6 +100,28 @@ func readKey(path string) (*rsa.PrivateKey, error) {
 	return github.ParseKey(b)
 }
 
+// maxClientSecretFile is the most a client secret file may hold; one byte more is read
+// to tell a larger file apart. GitHub's client secret is 40 characters.
+const maxClientSecretFile = 4 << 10
+
+// ReadClientSecret reads the App's client secret from the file client_secret_file
+// names, which only its owner may have any permission on, as [ReadWebhookSecret] reads
+// a secret. One line break at the end of the file, \n or \r\n, is not part of it, and a
+// secret that is empty or holds white space or a control character is refused. An
+// error names the setting, never the path or the secret.
+func ReadClientSecret(path string) ([]byte, error) {
+	b, err := ownerfile.ReadNamed(path, maxClientSecretFile, "the file client_secret_file names", "a client secret")
+	if err != nil {
+		return nil, err
+	}
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	b = bytes.TrimSuffix(b, []byte("\r"))
+	if len(b) == 0 || bytes.ContainsFunc(b, func(r rune) bool { return r <= ' ' || r >= 0x7f }) {
+		return nil, errors.New("the file client_secret_file names holds no client secret, or one with white space or a control character in it")
+	}
+	return b, nil
+}
+
 // maxAccessKeyFile is the most an access key secret file may hold; one byte more is
 // read to tell a larger file apart. A secret is 47 characters.
 const maxAccessKeyFile = 4 << 10

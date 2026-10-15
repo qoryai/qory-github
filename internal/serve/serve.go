@@ -73,12 +73,13 @@ type Options struct {
 }
 
 // Run serves until ctx is done. Before it listens it reads the App's private key, the
-// webhook secret and the access key's secret, so a wrong file stops it at once, and
-// opens the store. Then it reads Qory Apiary's change feed, after it declares the
-// adapter, until it stops, and pulls from GitHub what the webhooks missed, see
-// [puller]. When ctx is done it stops taking deliveries, waits for the requests under
-// way and the handlers that run, each within a bound, stops the feed's reader and the
-// pull, and closes the store.
+// webhook secret, the access key's secret and the App's client secret, so a wrong file
+// stops it at once, and opens the store. It serves the webhook receiver and, beside it,
+// the connect page, see [Connect]. Then it reads Qory Apiary's change feed, after it
+// declares the adapter, until it stops, and pulls from GitHub what the webhooks missed,
+// see [puller]. When ctx is done it stops taking deliveries, waits for the requests
+// under way and the handlers that run, each within a bound, stops the fills a
+// re-connect started, the feed's reader and the pull, and closes the store.
 func Run(ctx context.Context, s Settings, opts Options) error {
 	log := opts.Log
 	if log == nil {
@@ -93,6 +94,10 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 		return err
 	}
 	accessKey, err := ReadAccessKeySecret(s.AccessKeySecretFile)
+	if err != nil {
+		return err
+	}
+	clientSecret, err := ReadClientSecret(s.ClientSecretFile)
 	if err != nil {
 		return err
 	}
@@ -128,8 +133,12 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	worker := &Worker{Store: st, Handlers: handlers, Log: log}
 	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, refusalEvery: opts.refusalEvery}
+	connect := &Connect{
+		Store: st, Adapter: adapter, Pin: s.ApiaryPublicKey, AdapterID: s.AdapterID, ClientID: s.ClientID, ClientSecret: clientSecret,
+		PublicURL: s.PublicURL, ApiaryURL: s.ApiaryURL, Log: log,
+	}
 	srv := &http.Server{
-		Handler:           rc.Mux(),
+		Handler:           connect.Route(rc.Mux()),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -184,6 +193,7 @@ loop:
 		srv.Close()
 	}
 	worker.Stop(handlerGrace)
+	connect.stop()
 	stopFeed()
 	<-fed
 	<-pulled

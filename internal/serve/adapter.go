@@ -78,6 +78,17 @@ func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(con
 		if err != nil {
 			return err
 		}
+		if !ok && d.Event == "installation" && d.Action == "created" && d.InstallationID > 0 {
+			// GitHub sends created for an installation Connect makes too, before its link,
+			// so the line says what serve knows: the installation is not linked yet.
+			a.log().Info("the installation is not linked to Qory Apiary, so nothing of it is listed until a person connects it", slog.Int64("installation", d.InstallationID))
+			return keepUnlinked(a.Store, d.InstallationID)
+		}
+		if d.Event == "installation" && d.Action == "deleted" && d.InstallationID > 0 {
+			if err := dropUnlinked(a.Store, d.InstallationID); err != nil {
+				return err
+			}
+		}
 		if !ok {
 			a.log().Info("the installation is not linked to Qory Apiary, so the delivery is not handled", deliveryArgs(d)...)
 			return nil

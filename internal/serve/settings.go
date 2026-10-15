@@ -58,13 +58,21 @@ type Settings struct {
 	AccessKeySecretFile string
 	// ApiaryPublicKey is the pin: Qory Apiary's public keys, a list of {"alg":
 	// "ed25519", "public_key": "<base64url>"}, which every answer of Qory Apiary is
-	// checked under before it is used.
+	// checked under before it is used, and every connect pass.
 	ApiaryPublicKey accesskey.Pin
+	// AdapterID is the id Qory Apiary enrolled the access key in, na_ and 16
+	// characters, which access-key enrol prints: a connect pass must name it.
+	AdapterID string
+	// ClientID is the App's client id, which setup prints, and ClientSecretFile a file
+	// that contains its client secret, read with [ReadClientSecret]: Connect signs a
+	// person in with GitHub with them.
+	ClientID         string
+	ClientSecretFile string
 }
 
 // fields are the settings' fields, in the order an error lists the missing ones. A
 // field that is added later is added here and in [ReadSettings]'s switch.
-var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key"}
+var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "client_id", "client_secret_file"}
 
 // optional are the fields that may be left out, each with its default.
 var optional = []string{"api_url"}
@@ -75,6 +83,10 @@ const maxSettingsFile = 1 << 20
 // appIDShape is an App's id as credential's settings take it: its numeric id or its
 // client id.
 var appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
+
+// adapterIDShape is the id of an adapter Qory Apiary enrolled, the contract's pattern
+// for a connect pass's adapter_id.
+var adapterIDShape = regexp.MustCompile(`^na_[0-9a-hjkmnp-tv-z]{16}$`)
 
 // ReadSettings reads the settings file at path, one JSON object with nothing after it
 // but white space. Every field is required but api_url, which is GitHub's API when it is
@@ -209,6 +221,16 @@ func parseSettings(b []byte) (Settings, error) {
 			s.AccessKeySecretFile, err = filePath(raw)
 		case "apiary_public_key":
 			s.ApiaryPublicKey, err = pin(raw)
+		case "adapter_id":
+			if s.AdapterID, err = text(raw); err == nil && !adapterIDShape.MatchString(s.AdapterID) {
+				err = errors.New("is not na_ and 16 lower-case Crockford base32 characters")
+			}
+		case "client_id":
+			if s.ClientID, err = text(raw); err == nil && !appIDShape.MatchString(s.ClientID) {
+				err = errors.New("is not an App's client id, 1 to 64 letters, digits or dots")
+			}
+		case "client_secret_file":
+			s.ClientSecretFile, err = filePath(raw)
 		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("the settings are invalid: /%s: %w", name, err)
@@ -282,14 +304,13 @@ func checkOrigin(s string) (string, error) {
 	return strings.TrimSuffix(s, "/"), nil
 }
 
-// checkPublicURL takes where serve is reached from outside: https, a host, and a path
-// or none, without a user, a query or a fragment. A trailing slash is dropped.
+// checkPublicURL takes where serve is reached from outside as [github.CheckPublicURL]
+// takes it, as setup does, and refuses one that holds what looks like a secret.
 func checkPublicURL(s string) (string, error) {
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || accesskey.ContainsSecret(s) {
-		return "", errors.New("is not an https URL without a user, a query or a fragment")
+	if accesskey.ContainsSecret(s) {
+		return "", errors.New("is not an https URL of a host and an optional port, without a user, a query or a fragment")
 	}
-	return strings.TrimSuffix(s, "/"), nil
+	return github.CheckPublicURL(s)
 }
 
 // pin is the apiary_public_key field: Qory Apiary's public keys, as

@@ -182,6 +182,54 @@ func TestAValueIsKeptUnderItsNamespaceUntilItExpires(t *testing.T) {
 	}
 }
 
+func TestPutNewKeepsAValueOnlyWhereNoneIs(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir, Options{Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := s.PutNew("nonces", "n1", []byte("a"), time.Minute); err != nil || !kept {
+		t.Fatalf("%v %v", kept, err)
+	}
+	if kept, err := s.PutNew("nonces", "n1", []byte("b"), time.Minute); err != nil || kept {
+		t.Fatalf("a second value is kept: %v %v", kept, err)
+	}
+	if v, _ := s.Get("nonces", "n1"); string(v) != "a" {
+		t.Errorf("the value is %q", v)
+	}
+	// What PutNew kept survives a reopen, and is taken again only once it expired.
+	s.Close()
+	s = open(t, dir, c)
+	if kept, _ := s.PutNew("nonces", "n1", []byte("b"), time.Minute); kept {
+		t.Error("a value kept before the reopen is replaced")
+	}
+	c.Add(time.Minute)
+	if kept, err := s.PutNew("nonces", "n1", []byte("b"), time.Minute); err != nil || !kept {
+		t.Errorf("an expired value is not replaced: %v %v", kept, err)
+	}
+	if _, err := s.PutNew("nonces", "n2", nil, 0); err == nil {
+		t.Error("a value without a time to live is taken")
+	}
+	// Of many calls for one key at once, one keeps its value.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	kept := 0
+	for range 20 {
+		wg.Go(func() {
+			if ok, err := s.PutNew("nonces", "n3", nil, time.Minute); err == nil && ok {
+				mu.Lock()
+				kept++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if kept != 1 {
+		t.Errorf("%d calls kept their value", kept)
+	}
+}
+
 func TestEachWalksANamespaceWithoutWhatExpired(t *testing.T) {
 	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
 	s := open(t, filepath.Join(t.TempDir(), "state"), c)

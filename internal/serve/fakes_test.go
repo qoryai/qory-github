@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -28,6 +29,14 @@ const (
 	testInstance = "i_AAAAAAAAAAAAAAAAAAAAAA"
 	testSlug     = "qory-test"
 	ghToken      = "ghs_a-token-that-must-not-leak"
+	// The adapter's id, and the App's client id and client secret.
+	testAdapterID = "na_0123456789abcdef"
+	testClientID  = "Iv1.0123456789abcdef"
+	clientSecret  = "a-client-secret-that-must-not-leak"
+	// signInCode is the code GitHub's sign-in sends back, and userToken the person's
+	// token GitHub exchanges it for.
+	signInCode = "a-code-that-must-not-leak"
+	userToken  = "ghu_a-user-token-that-must-not-leak"
 )
 
 // appKey is one RSA key for the App, made once, since making one is slow.
@@ -296,11 +305,18 @@ type fakeGitHub struct {
 	// reposDown answers every request under /repos/ 502.
 	unauthorized, issuesDown, reposDown bool
 	goneComments                        int
+	// userInstallations and userRepos are what the person signed in with Connect
+	// reaches: the installations, and the repositories of the installation 42, which
+	// GitHub lists one on each page. exchanges are the forms of the sign-in's codes'
+	// exchanges.
+	userInstallations []int64
+	userRepos         []string
+	exchanges         []url.Values
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	t.Helper()
-	f := &fakeGitHub{repos: []string{"acme/widgets", "acme/gadgets"}, comments: map[int][]map[string]any{}}
+	f := &fakeGitHub{repos: []string{"acme/widgets", "acme/gadgets"}, comments: map[int][]map[string]any{}, userInstallations: []int64{7, 42}, userRepos: []string{"acme/gadgets", "ACME/Widgets"}}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -377,6 +393,34 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		w.WriteHeader(201)
 		io.WriteString(w, `{"id":1}`)
+	case r.Method == "POST" && r.URL.Path == "/login/oauth/access_token":
+		form, _ := url.ParseQuery(string(b))
+		f.exchanges = append(f.exchanges, form)
+		if r.Header.Get("Accept") != "application/json" || form.Get("client_id") != testClientID || form.Get("client_secret") != clientSecret || form.Get("code") != signInCode {
+			io.WriteString(w, `{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired."}`)
+			return
+		}
+		io.WriteString(w, `{"access_token":"`+userToken+`","token_type":"bearer","scope":""}`)
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/user/") && r.Header.Get("Authorization") != "Bearer "+userToken:
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"Bad credentials"}`)
+	case r.Method == "GET" && r.URL.Path == "/user/installations":
+		var ins []map[string]any
+		for _, id := range f.userInstallations {
+			ins = append(ins, map[string]any{"id": id})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"total_count": len(ins), "installations": ins})
+	case r.Method == "GET" && r.URL.Path == "/user/installations/42/repositories":
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		page = max(page, 1)
+		var repos []map[string]any
+		if page <= len(f.userRepos) {
+			repos = append(repos, map[string]any{"full_name": f.userRepos[page-1]})
+		}
+		if page < len(f.userRepos) {
+			w.Header().Set("Link", "<"+f.srv.URL+"/user/installations/42/repositories?per_page=100&page="+strconv.Itoa(page+1)+`>; rel="next"`)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.userRepos), "repositories": repos})
 	case strings.HasPrefix(r.URL.Path, "/repos/acme/moved/") || r.URL.Path == "/repos/acme/moved":
 		// acme/moved was renamed: GitHub redirects every request for it.
 		w.Header().Set("Location", "https://api.github.com/repositories/1"+strings.TrimPrefix(r.URL.Path, "/repos/acme/moved"))
@@ -405,9 +449,12 @@ func settingsFiles(t *testing.T, dir string, access *accesskey.Key, apiaryURL st
 	writeFile(t, secretFile, secret, 0o600)
 	accessFile := filepath.Join(dir, "access-key")
 	writeFile(t, accessFile, access.Secret()+"\n", 0o600)
+	clientFile := filepath.Join(dir, "client-secret")
+	writeFile(t, clientFile, clientSecret+"\n", 0o600)
 	return Settings{
 		AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state"),
 		AppSlug: testSlug, APIURL: "https://api.github.com", ApiaryURL: apiaryURL, PublicURL: "https://qory-github.example.com",
 		AccessKeyID: testKeyID, AccessKeySecretFile: accessFile, ApiaryPublicKey: pin,
+		AdapterID: testAdapterID, ClientID: testClientID, ClientSecretFile: clientFile,
 	}
 }

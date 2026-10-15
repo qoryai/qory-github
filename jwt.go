@@ -86,12 +86,13 @@ func AppJWT(appID string, key *rsa.PrivateKey, now time.Time) (string, error) {
 	return signing + "." + enc.EncodeToString(sig), nil
 }
 
-// existsError is a key file that exists; it matches [fs.ErrExist].
-type existsError string
+// existsError is a file that exists, which what names, such as "the key file"; it
+// matches [fs.ErrExist].
+type existsError struct{ what, path string }
 
 // Error is the file that exists and what to do about it.
 func (e existsError) Error() string {
-	return "the key file " + string(e) + " exists; choose another or move it away"
+	return e.what + " " + e.path + " exists; choose another or move it away"
 }
 
 // Is matches [fs.ErrExist].
@@ -121,26 +122,32 @@ var createKeyFile = func(path string) (keyFile, error) {
 // file that could not be written whole, or whose sync failed, is removed; a file on a
 // filesystem that cannot sync one, see [syncUnsupported], is kept unsynced.
 func writeKeyFile(path string, pemBytes []byte) error {
+	return writeOwnerFile(path, "the key file", pemBytes)
+}
+
+// writeOwnerFile writes b to a new file at path as [writeKeyFile] writes a key, what
+// naming the file in an error, such as "the key file".
+func writeOwnerFile(path, what string, b []byte) error {
 	f, err := createKeyFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return existsError(path)
+			return existsError{what, path}
 		}
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
-	if _, err := f.Write(pemBytes); err != nil {
+	if _, err := f.Write(b); err != nil {
 		f.Close()
 		os.Remove(path)
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	if err := f.Sync(); err != nil && !syncUnsupported(err) {
 		f.Close()
 		os.Remove(path)
-		return fmt.Errorf("the key file could not be synced to disk: %w", err)
+		return fmt.Errorf("%s could not be synced to disk: %w", what, err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(path)
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	// The directory's entry for the file is synced too where the system can sync a
 	// directory; where it cannot, the file itself is on disk all the same, so an error
