@@ -282,7 +282,7 @@ func TestTheFeedLinksACollectionAndFillsIt(t *testing.T) {
 	}
 	var req contracts.SourceItems
 	json.Unmarshal(sent[0].raw, &req)
-	if req.CollectionRef != "acme/widgets" || len(req.Items) != 2 || req.Listing == nil || req.Listing.Complete {
+	if req.CollectionRef != "acme/widgets" || len(req.Items) != 2 || req.Listing == nil || !req.Listing.Complete {
 		t.Errorf("filled with %s", sent[0].raw)
 	}
 	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {

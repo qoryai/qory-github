@@ -84,10 +84,13 @@ func text(doc any, path ...string) string {
 	return s
 }
 
-// cut is s cut to at most n characters, on a character's boundary. The contract says
-// an adapter never cuts a text. GitHub's limits fit inside the contract's, so this cut
-// is only a guard against a request Qory Apiary would refuse, and every cut is logged,
-// as [fit] and [Cut] do.
+// cut is s cut to at most n characters, on a character's boundary. The contract never
+// lets an adapter cut a text to make a request fit: a text is cut only when it is past
+// its field's limit, which Qory Apiary would refuse, and every cut is logged, as [fit]
+// and [Cut] do. A cut title, body, filed_by.name, comment body or author.name is named
+// in the item's or the comment's truncated, see [truncatedOf]. The contract's truncated
+// has no name for a label or the list of labels, so those cuts are logged only. A
+// state_reason is never cut: one past its limit is dropped, see [stateReason].
 func cut(s string, n int) string {
 	i := 0
 	for j := range s {

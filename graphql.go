@@ -269,26 +269,30 @@ func rateLimited(errs []gqlError) bool {
 }
 
 // ListOpenIssuesComplete lists the repository's open issues by GraphQL's cursor, oldest
-// first, and their comments, and sends them to Qory Apiary as [Lister.ListIssues] does:
-// the same items, cut and skipped by the same rules, in parts of at most 100 items and
-// 1 MiB, each part's comments after it, read by REST as ListIssues reads them, the App's
-// work item comment left out. It reads at most 2,000 pages of 100 issues.
+// first, and their comments, and sends them to Qory Apiary; the fill and the daily
+// listing of open issues use it. Items go in parts of at most 100 items and 1 MiB, and
+// after each part the comments of its items, for an issue that has any, read by REST in
+// requests of at most 100 comments and 1 MiB, the App's work item comment left out. It
+// reads at most 2,000 pages of 100 issues, and 100 pages of an issue's comments.
 //
-// The last part says the listing is complete, since paging by cursor is meant not to
-// skip an issue, so Qory Apiary closes every item of the collection the listing left
-// out and did not hear of since it started. Neither the fill nor the daily listing uses
-// it yet. An item skipped, as Qory Apiary would refuse it,
+// The last part says the listing is complete, since paging by cursor does not skip an
+// issue, so Qory Apiary closes every item of the collection the listing left out and
+// did not hear of since it started. An item skipped, as Qory Apiary would refuse it,
 // leaves the listing not complete, so Qory Apiary never closes an open issue for that.
 // Comments are no part of complete: no request of comments says it is complete.
 //
-// A repository with no open issue sends no part, since the contract refuses a part
-// without items, so nothing is closed for it. A listing stopped early, by an error or
-// its context, sends the items it read and had not sent as its last part, which never
-// says it is complete; one that fails on its first page sends nothing. A repository
-// GitHub answers it cannot resolve, or names otherwise, renamed or transferred, stops
-// the listing with an error that wraps [ErrRepositoryGone]; an issue whose comments
-// GitHub answers are gone has its comments skipped and logged by its ref, and the
-// listing goes on.
+// A repository with no open issue, read without error, sends one part without items
+// that says the listing is complete, so Qory Apiary closes every item of the
+// collection it did not hear of since the listing started. A listing stopped early, by
+// an error or its context, before every open issue is read and sent, sends the items it
+// read and had not sent as its last part, which never says it is complete, nor does any
+// part before it; one that fails on its first page sends nothing. A listing that fails
+// on the comments of its last part's items, once that part is sent, returns the error,
+// and that part, sent already, says it is complete, since every open issue was read and
+// sent and comments are no part of complete. A repository GitHub answers it cannot
+// resolve, or names otherwise, renamed or transferred, stops the listing with an error
+// that wraps [ErrRepositoryGone]; an issue whose comments GitHub answers are gone has
+// its comments skipped and logged by its ref, and the listing goes on.
 func (l Lister) ListOpenIssuesComplete(ctx context.Context, repo Repository) error {
 	return l.listOpenComplete(ctx, repo, openIssuesPerPage)
 }
@@ -327,6 +331,9 @@ func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int
 			o = l.openParts(p, repo, listing, coll)
 		}
 		for _, is := range page {
+			// An issue the listing returns as not open, one closed during the read say, is
+			// rightly left out of the open listing and is not a skip, so a complete listing
+			// may then close it.
 			if is.State != StateOpen {
 				continue
 			}

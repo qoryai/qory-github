@@ -179,8 +179,11 @@ func (s linkedSink) send(send func() error) error {
 // one that is slow or fails holds no other, and its collections are pulled one after
 // another, each at a random moment in the first half of the interval, so many
 // collections do not reach GitHub and Qory Apiary at once. An installation whose last
-// round still runs passes the round. A pull that fails is logged and tried again at the
-// next round.
+// round still runs passes the round. A pull that fails is tried again at the next round;
+// see [puller.report] for its lines: the first failure since it last passed, throttled
+// with the rounds' other failures and those held back counted, unless GitHub answers
+// that the repository is gone or moved, or refuses to mint a token for good, which is
+// logged unthrottled; and one more once it has failed for a day.
 type puller struct {
 	adapter *Adapter
 	store   *store.Store
@@ -482,10 +485,15 @@ func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarge
 // failed, Qory Apiary's outage among the causes, is read again from the same time by
 // the next.
 //
-// The listing of open issues never says it is complete, as the fill's does not:
-// GitHub's REST API pages by number, which can skip an item, and a listing may say it is
-// complete only when its paging cannot skip one. GraphQL's cursors may not, but that is
-// not yet shown against GitHub itself, so no listing of issues says it is complete.
+// The listing of open issues is the fill's, [github.Lister.ListOpenIssuesComplete]: it
+// pages by GraphQL's cursor, which does not skip an item, so its last part says the
+// listing is complete unless an item was skipped, and Qory Apiary closes every item of
+// the collection it left out and did not hear of since it started. A listing that fails
+// or is stopped before every open issue is read and sent sends no part that says it is
+// complete; one that fails on the comments of its last part's items has sent that part
+// already, complete, since comments are no part of complete. Either way its start is
+// not kept, so the next pull lists again. A repository with no open issue sends one
+// part without items that says the listing is complete.
 func (p *puller) pull(ctx context.Context, ref string, installation int64) error {
 	a := p.adapter
 	repo, err := repository(ref)
@@ -522,7 +530,7 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 		}
 	}
 	if mark.Since.IsZero() || mark.Listed.IsZero() || start.Sub(mark.Listed) >= listEvery {
-		if err := a.forgetOn401(installation, l.ListIssues(ctx, repo)); err != nil {
+		if err := a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, repo)); err != nil {
 			return err
 		}
 		next.Listed = start

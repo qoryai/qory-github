@@ -398,3 +398,18 @@ func TestACommentsPageIsAPullRequestsOnlyByItsPath(t *testing.T) {
 		}
 	}
 }
+
+// TestAPullWhereNothingChangedSendsNothing checks a pull where no issue and no comment
+// changed sends no request: an event without items is refused by the contract.
+func TestAPullWhereNothingChangedSendsNothing(t *testing.T) {
+	f := &fakeChanged{issues: []map[string]any{changedIssue(1, -60)}}
+	s := &sink{}
+	var logs []string
+	l := f.lister(t, s, &logs)
+	if err := l.ListChanged(context.Background(), widgets, pullSince); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.reqs) != 0 {
+		t.Errorf("sent %+v", s.reqs)
+	}
+}
