@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/qoryai/integrations/contracts"
 )
 
 // fakeIssues is GitHub's API as a listing reads it: one repository, acme/widgets, its
@@ -155,25 +157,25 @@ func (s *sink) add(req any) error {
 	return nil
 }
 
-func (s *sink) Collections(_ context.Context, r SourceCollections) error { return s.add(r) }
-func (s *sink) Items(_ context.Context, r SourceItems) error             { return s.add(r) }
-func (s *sink) Comments(_ context.Context, r SourceComments) error       { return s.add(r) }
-func (s *sink) Disconnect(_ context.Context, r SourceDisconnect) error   { return s.add(r) }
+func (s *sink) Collections(_ context.Context, r contracts.SourceCollections) error { return s.add(r) }
+func (s *sink) Items(_ context.Context, r contracts.SourceItems) error             { return s.add(r) }
+func (s *sink) Comments(_ context.Context, r contracts.SourceItemComments) error   { return s.add(r) }
+func (s *sink) Disconnect(_ context.Context, r contracts.SourcesDisconnect) error  { return s.add(r) }
 
-func (s *sink) items() []SourceItems {
-	var out []SourceItems
+func (s *sink) items() []contracts.SourceItems {
+	var out []contracts.SourceItems
 	for _, r := range s.reqs {
-		if it, ok := r.(SourceItems); ok {
+		if it, ok := r.(contracts.SourceItems); ok {
 			out = append(out, it)
 		}
 	}
 	return out
 }
 
-func (s *sink) comments() []SourceComments {
-	var out []SourceComments
+func (s *sink) comments() []contracts.SourceItemComments {
+	var out []contracts.SourceItemComments
 	for _, r := range s.reqs {
-		if c, ok := r.(SourceComments); ok {
+		if c, ok := r.(contracts.SourceItemComments); ok {
 			out = append(out, c)
 		}
 	}
@@ -257,8 +259,8 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#2 acme/widgets#6" {
 		t.Errorf("items %v", refs)
 	}
-	if items[0].Collection != (SourceCollection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
-		t.Errorf("collection %+v", items[0].Collection)
+	if items[0].CollectionRef != "acme/widgets" {
+		t.Errorf("collection %s", items[0].CollectionRef)
 	}
 	// #6 has only the work item comment, so nothing is sent for it.
 	cs := s.comments()
@@ -269,11 +271,11 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 	for _, c := range cs[0].Comments {
 		got = append(got, c.Ref+" "+c.Author.Name+" "+c.Author.Kind)
 	}
-	if cs[0].CollectionRef != "acme/widgets" || cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
+	if cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
 		t.Errorf("comments on #1: %+v, %v", cs[0], got)
 	}
 	// The items come before their comments.
-	if _, ok := s.reqs[0].(SourceItems); !ok {
+	if _, ok := s.reqs[0].(contracts.SourceItems); !ok {
 		t.Errorf("first request %T", s.reqs[0])
 	}
 	if len(logs) != 0 {
@@ -314,8 +316,10 @@ func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 		var sizes []int
 		total := 0
 		for i, req := range items {
+			// The sink sets the time as it sends.
+			req.Time = "2026-01-02T03:04:05Z"
 			b, _ := json.Marshal(req)
-			if len(b) > 1<<20 {
+			if len(b) > contracts.MaxRequest {
 				t.Errorf("%s: part %d is %d bytes", tc.name, i+1, len(b))
 			}
 			if req.Listing.Part != i+1 || req.Listing.Complete {
@@ -349,8 +353,9 @@ func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
 	cs := s.comments()
 	total := 0
 	for i, c := range cs {
+		c.Time = "2026-01-02T03:04:05Z"
 		b, _ := json.Marshal(c)
-		if len(b) > 1<<20 || c.Complete != nil {
+		if len(b) > contracts.MaxRequest || c.Complete != nil {
 			t.Errorf("request %d: %d bytes, complete %v", i, len(b), c.Complete)
 		}
 		total += len(c.Comments)
@@ -490,10 +495,10 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	if len(s.reqs) != 1 {
 		t.Fatalf("requests %+v", s.reqs)
 	}
-	got := s.reqs[0].(SourceCollections)
-	want := []SourceCollection{
-		{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &Target{System: host, Path: "acme/widgets"}},
-		{Ref: "acme/gadgets", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &Target{System: host, Path: "acme/gadgets"}},
+	got := s.reqs[0].(contracts.SourceCollections)
+	want := []contracts.Collection{
+		{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &contracts.Target{System: host, Path: "acme/widgets"}},
+		{Ref: "acme/gadgets", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
 	}
 	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 {
 		t.Errorf("collections %+v", got)
@@ -526,16 +531,16 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 		CreatedAt: "2026-01-02T05:04:05+02:00", UpdatedAt: "2026-01-03T03:04:05Z",
 	}
 	it, why := itemOf("github.com", r, base)
-	want := SourceItem{
+	want := contracts.Item{
 		Ref: "acme/widgets#42", URL: "https://github.com/acme/widgets/issues/42", Title: "Widgets spin backwards", Body: "They should not.",
 		BodyFormat: "markdown", Type: "issue", State: "open", Labels: []string{"bug", "good first issue"},
-		FiledBy: Author{Name: "alice", Kind: "person"}, CommentCount: 3, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
-		Target: Target{System: "github.com", Path: "acme/widgets"},
+		FiledBy: contracts.Person{Name: "alice", Kind: "person"}, CommentCount: 3, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+		Target: &contracts.Target{System: "github.com", Path: "acme/widgets"},
 	}
 	if why != "" || !reflect.DeepEqual(it, want) {
 		t.Errorf("item %+v, %s\nwant %+v", it, why, want)
 	}
-	if c := collectionOf(r); c != (SourceCollection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
+	if c := collectionOf(r); c != (contracts.Collection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
 		t.Errorf("collection %+v", c)
 	}
 	for _, tc := range []struct {
@@ -562,35 +567,30 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	is := base
 	is.Body, is.Labels, is.User = nil, nil, &ghUser{Login: "renovate[bot]", Type: "Bot"}
 	it, _ = itemOf("github.com", r, is)
-	if it.Body != "" || it.Labels == nil || len(it.Labels) != 0 || it.FiledBy != (Author{Name: "renovate[bot]", Kind: "automation"}) {
+	if it.Body != "" || it.Labels == nil || len(it.Labels) != 0 || it.FiledBy != (contracts.Person{Name: "renovate[bot]", Kind: "automation"}) {
 		t.Errorf("item %+v", it)
 	}
 	c, why := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"})
-	if why != "" || c != (SourceComment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: Author{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
+	if why != "" || c != (contracts.Comment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: contracts.Person{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
 		t.Errorf("comment %+v, %s", c, why)
 	}
 }
 
-// TestTheWireIsTheContractsJSON checks the JSON names, the nulls the contract wants and
-// the fields it leaves out.
+// TestTheWireIsTheContractsJSON checks the JSON an item and a comment of the adapter's
+// become: the names, the nulls the contract wants and the fields it leaves out.
 func TestTheWireIsTheContractsJSON(t *testing.T) {
 	it, _ := itemOf("github.com", ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
-	b, _ := json.Marshal(SourceItems{Version: WireVersion, Collection: SourceCollection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}, Items: []SourceItem{it}})
-	want := `{"version":1,"collection":{"ref":"acme/widgets","url":"https://github.com/acme/widgets","title":"acme/widgets"},"items":[{"ref":"acme/widgets#1","url":"https://github.com/acme/widgets/issues/1","title":"t","body":"","body_format":"markdown","type":"issue","state":"open","state_reason":null,"labels":[],"filed_by":{"name":"ghost","kind":"person"},"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
+	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: "acme/widgets", Items: []contracts.Item{it}})
+	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"acme/widgets","items":[{"ref":"acme/widgets#1","url":"https://github.com/acme/widgets/issues/1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
 	if string(b) != want {
 		t.Errorf("items\n%s\nwant\n%s", b, want)
 	}
-	b, _ = json.Marshal(SourceComments{Version: 1, CollectionRef: "acme/widgets", ItemRef: "acme/widgets#1", Comments: []SourceComment{{Ref: "9", URL: "https://github.com/x", Author: Author{"bob", "person"}, Body: "b", BodyFormat: "markdown", CreatedAt: "c", UpdatedAt: "u", Deleted: true}}, Complete: &CommentsListing{Since: "s"}})
-	if string(b) != `{"version":1,"collection_ref":"acme/widgets","item_ref":"acme/widgets#1","comments":[{"ref":"9","url":"https://github.com/x","author":{"name":"bob","kind":"person"},"body":"b","body_format":"markdown","created_at":"c","updated_at":"u","deleted":true}],"complete":{"since":"s"}}` {
+	got, _ := IssueCommentWebhook(event("deleted", issue(1, 1), map[string]any{"comment": comment(9, "bob", "User", "b")}), "qory-test")
+	req := got.Comments[0]
+	req.Time = "2026-01-02T03:04:05Z"
+	b, _ = json.Marshal(req)
+	if string(b) != `{"version":1,"time":"2026-01-02T03:04:05Z","item_ref":"acme/widgets#1","comments":[{"ref":"9","url":"https://github.com/acme/widgets/issues/1#issuecomment-9","author":{"name":"bob","kind":"person"},"body":"","body_format":"markdown","created_at":"2026-01-04T00:00:00Z","updated_at":"2026-01-05T00:00:00Z","deleted":true}]}` {
 		t.Errorf("comments %s", b)
-	}
-	b, _ = json.Marshal(SourceCollections{Version: 1, Collections: []SourceCollection{{Ref: "r", URL: "u", Title: "t", Target: &Target{"github.com", "acme/widgets"}}}, Listing: Listing{ID: "l", Part: 1, StartedAt: "s", Complete: true}})
-	if string(b) != `{"version":1,"collections":[{"ref":"r","url":"u","title":"t","target":{"system":"github.com","path":"acme/widgets"}}],"listing":{"id":"l","part":1,"started_at":"s","complete":true}}` {
-		t.Errorf("collections %s", b)
-	}
-	b, _ = json.Marshal(SourceDisconnect{Version: 1, CollectionRef: "acme/widgets", Reason: ReasonRemoved})
-	if string(b) != `{"version":1,"collection_ref":"acme/widgets","reason":"removed"}` {
-		t.Errorf("disconnect %s", b)
 	}
 }
 
@@ -657,8 +657,8 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 			if it.StateReason != nil {
 				reason = *it.StateReason
 			}
-			lines = append(lines, req.Collection.Ref+" "+it.Ref+" "+it.State+" "+reason)
-			if it.Target.Path != req.Collection.Ref || it.Target.System != "github.com" {
+			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.State+" "+reason)
+			if it.Target.Path != req.CollectionRef || it.Target.System != "github.com" {
 				t.Errorf("%s: target %+v", tc.action, it.Target)
 			}
 		}
@@ -711,7 +711,7 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 			req := got.Comments[0]
 			c := req.Comments[0]
 			line = fmt.Sprintf("%s %s %s %v", c.Ref, c.Author.Name, c.Author.Kind, c.Deleted)
-			if req.CollectionRef != "acme/widgets" || req.ItemRef != "acme/widgets#1" || req.Complete != nil || req.Version != 1 || c.BodyFormat != "markdown" {
+			if req.ItemRef != "acme/widgets#1" || req.Complete != nil || req.Version != 1 || c.BodyFormat != "markdown" {
 				t.Errorf("%s: request %+v", tc.action, req)
 			}
 		}
@@ -880,7 +880,7 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 			continue
 		}
 		for i, req := range s.reqs {
-			c := req.(SourceCollections)
+			c := req.(contracts.SourceCollections)
 			total += len(c.Collections)
 			if c.Listing.Part != i+1 || c.Listing.Complete != (tc.complete && i == len(s.reqs)-1) {
 				t.Errorf("%s: part %d says %+v", tc.name, i+1, c.Listing)

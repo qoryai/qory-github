@@ -11,22 +11,29 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/qoryai/integrations/contracts"
 )
 
 // What Qory Apiary takes. It refuses a request that exceeds one of these and cuts
 // nothing, so the adapter never sends one that does: an item, a comment or a
 // collection that breaks one, in a listing or in a webhook's event, is skipped, and
 // logged by its ref, never by its text. Lengths are counted in characters, Unicode
-// code points.
+// code points. A request is at most contracts.MaxRequest bytes, and lists at most
+// maxPerBatch items, comments or collections.
 const (
 	maxTitle    = 1024
 	maxBody     = 65536
 	maxLabels   = 100
 	maxRef      = 200
 	maxURL      = 2048
-	maxRequest  = 1 << 20
 	maxPerBatch = 100
 )
+
+// timeWidth stands for a request's time while the request is sized: the sink sets the
+// time as it sends the request, and every time the wire carries, in
+// contracts.TimeLayout's form, is as long as the layout itself.
+const timeWidth = contracts.TimeLayout
 
 // The most pages a listing reads: a repository's issues, every state's, pull requests
 // among them, since GitHub lists both and the adapter drops pull requests after reading
@@ -39,23 +46,25 @@ const (
 )
 
 // workItemMarker begins the comment the App writes on an issue that is work in
-// Qory Apiary. Such a comment by the App's bot is the adapter's, not the issue's, so it
-// is never sent; the same words in a comment by anyone else are that person's comment.
+// Qory Apiary, see [Client.ApplyChange]. Such a comment by the App's bot is the
+// adapter's, not the issue's, so it is never sent; the same words in a comment by anyone
+// else are that person's comment.
 const workItemMarker = "<!-- qory:work-item "
 
 // Sink is where the wire's requests go: Qory Apiary's client, or a test's. Each method
-// sends one request and returns once Qory Apiary took it. A request is at most 1 MiB as
-// encoding/json's Marshal writes it, compact; a sink that encodes it otherwise, indented
-// for one, may exceed that.
+// sends one request and returns once Qory Apiary took it. A request comes without its
+// time, which the sink sets as it sends it. A request is at most 1 MiB as
+// encoding/json's Marshal writes it, compact, its time set; a sink that encodes it
+// otherwise, indented for one, may exceed that.
 type Sink interface {
 	// Collections sends POST /v1/source-collections.
-	Collections(ctx context.Context, req SourceCollections) error
+	Collections(ctx context.Context, req contracts.SourceCollections) error
 	// Items sends POST /v1/source-items.
-	Items(ctx context.Context, req SourceItems) error
+	Items(ctx context.Context, req contracts.SourceItems) error
 	// Comments sends POST /v1/source-items/comments.
-	Comments(ctx context.Context, req SourceComments) error
+	Comments(ctx context.Context, req contracts.SourceItemComments) error
 	// Disconnect sends POST /v1/sources/disconnect.
-	Disconnect(ctx context.Context, req SourceDisconnect) error
+	Disconnect(ctx context.Context, req contracts.SourcesDisconnect) error
 }
 
 // The fields of GitHub's answers and webhook payloads the adapter reads; the rest is
@@ -110,19 +119,19 @@ func (c Client) WebHost() string {
 
 // authorOf is who a user is on the wire: a bot is an automation, anyone else a person.
 // A user GitHub no longer has is its ghost.
-func authorOf(u *ghUser) Author {
+func authorOf(u *ghUser) contracts.Person {
 	if u == nil {
-		return Author{Name: "ghost", Kind: KindPerson}
+		return contracts.Person{Name: "ghost", Kind: KindPerson}
 	}
 	if u.Type == "Bot" {
-		return Author{Name: u.Login, Kind: KindAutomation}
+		return contracts.Person{Name: u.Login, Kind: KindAutomation}
 	}
-	return Author{Name: u.Login, Kind: KindPerson}
+	return contracts.Person{Name: u.Login, Kind: KindPerson}
 }
 
 // collectionOf is a repository's issues as a collection, without a target.
-func collectionOf(r ghRepo) SourceCollection {
-	return SourceCollection{Ref: r.FullName, URL: r.HTMLURL, Title: r.FullName}
+func collectionOf(r ghRepo) contracts.Collection {
+	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: r.FullName}
 }
 
 // stateReasons words GitHub's reasons an issue is closed for.
@@ -151,7 +160,7 @@ func utc(s string) (string, bool) {
 
 // itemOf is an issue of the repository r as an item whose target is on system, or why
 // it is skipped.
-func itemOf(system string, r ghRepo, is ghIssue) (SourceItem, string) {
+func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
 	labels := make([]string, 0, len(is.Labels))
 	for _, l := range is.Labels {
 		labels = append(labels, l.Name)
@@ -164,7 +173,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (SourceItem, string) {
 	if is.Body != nil {
 		body = *is.Body
 	}
-	it := SourceItem{
+	it := contracts.Item{
 		Ref:          r.FullName + "#" + strconv.FormatInt(is.Number, 10),
 		URL:          is.HTMLURL,
 		Title:        is.Title,
@@ -176,7 +185,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (SourceItem, string) {
 		Labels:       labels,
 		FiledBy:      authorOf(is.User),
 		CommentCount: is.Comments,
-		Target:       Target{System: system, Path: r.FullName},
+		Target:       &contracts.Target{System: system, Path: r.FullName},
 	}
 	var ok1, ok2 bool
 	it.CreatedAt, ok1 = utc(is.CreatedAt)
@@ -201,12 +210,12 @@ func itemOf(system string, r ghRepo, is ghIssue) (SourceItem, string) {
 }
 
 // commentOf is a comment as the wire says it, or why it is skipped.
-func commentOf(c ghComment) (SourceComment, string) {
+func commentOf(c ghComment) (contracts.Comment, string) {
 	body := ""
 	if c.Body != nil {
 		body = *c.Body
 	}
-	sc := SourceComment{
+	sc := contracts.Comment{
 		Ref:        strconv.FormatInt(c.ID, 10),
 		URL:        c.HTMLURL,
 		Author:     authorOf(c.User),
@@ -229,7 +238,7 @@ func commentOf(c ghComment) (SourceComment, string) {
 }
 
 // checkCollection is why a collection is skipped, or "".
-func checkCollection(c SourceCollection) string {
+func checkCollection(c contracts.Collection) string {
 	if n := utf8.RuneCountInString(c.Title); n < 1 || n > maxTitle {
 		return "its title is empty or longer than 1,024 characters"
 	}
@@ -260,6 +269,19 @@ func size(v any) int {
 	return len(b)
 }
 
+// sized is how many bytes a request is in JSON once the sink sets its time.
+func sized[R contracts.SourceCollections | contracts.SourceItems | contracts.SourceItemComments](req R) int {
+	switch r := any(&req).(type) {
+	case *contracts.SourceCollections:
+		r.Time = timeWidth
+	case *contracts.SourceItems:
+		r.Time = timeWidth
+	case *contracts.SourceItemComments:
+		r.Time = timeWidth
+	}
+	return size(req)
+}
+
 // Skipped is an item or a comment left out because Qory Apiary would refuse it: its ref,
 // and why, never its text.
 type Skipped struct {
@@ -269,24 +291,25 @@ type Skipped struct {
 // ToSend is what a webhook's event becomes: the requests to send, in order, items
 // before comments, and what was skipped, for the log.
 type ToSend struct {
-	Items    []SourceItems
-	Comments []SourceComments
+	Items    []contracts.SourceItems
+	Comments []contracts.SourceItemComments
 	Skipped  []Skipped
 }
 
 // addItem adds an item of collection c to t, unless it is to be skipped.
-func (t *ToSend) addItem(c SourceCollection, it SourceItem, why string) {
+func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string) {
 	if cw := checkCollection(c); why == "" && cw != "" {
 		why = "its collection: " + cw
 	}
-	if why == "" && size(SourceItems{Version: WireVersion, Collection: c, Items: []SourceItem{it}}) > maxRequest {
+	req := contracts.SourceItems{Version: contracts.Version, CollectionRef: c.Ref, Items: []contracts.Item{it}}
+	if why == "" && sized(req) > contracts.MaxRequest {
 		why = "it is larger than a request may be"
 	}
 	if why != "" {
 		t.Skipped = append(t.Skipped, Skipped{Ref: it.Ref, Why: why})
 		return
 	}
-	t.Items = append(t.Items, SourceItems{Version: WireVersion, Collection: c, Items: []SourceItem{it}})
+	t.Items = append(t.Items, req)
 }
 
 // IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
@@ -364,11 +387,10 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	c, why := commentOf(ev.Comment)
 	c.Deleted = ev.Action == "deleted"
 	coll := collectionOf(ev.Repository)
-	req := SourceComments{
-		Version:       WireVersion,
-		CollectionRef: ev.Repository.FullName,
-		ItemRef:       ev.Repository.FullName + "#" + strconv.FormatInt(ev.Issue.Number, 10),
-		Comments:      []SourceComment{c},
+	req := contracts.SourceItemComments{
+		Version:  contracts.Version,
+		ItemRef:  ev.Repository.FullName + "#" + strconv.FormatInt(ev.Issue.Number, 10),
+		Comments: []contracts.Comment{c},
 	}
 	if cw := checkCollection(coll); why == "" && cw != "" {
 		why = "its collection: " + cw
@@ -376,7 +398,7 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	if iw := checkRef(req.ItemRef); why == "" && iw != "" {
 		why = "its item: " + iw
 	}
-	if why == "" && size(req) > maxRequest {
+	if why == "" && sized(req) > contracts.MaxRequest {
 		why = "it is larger than a request may be"
 	}
 	if why != "" {
@@ -388,9 +410,10 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 }
 
 // workItemComment is whether c is the App's work item comment: written by the App's bot,
-// slug[bot], and beginning with the marker.
+// slug[bot] of type Bot, and beginning with the marker. Logins are ASCII, so EqualFold
+// folds ASCII's cases alone.
 func workItemComment(c ghComment, slug string) bool {
-	return slug != "" && c.User != nil && strings.EqualFold(c.User.Login, slug+"[bot]") && c.Body != nil && strings.HasPrefix(*c.Body, workItemMarker)
+	return slug != "" && c.User != nil && c.User.Type == "Bot" && strings.EqualFold(c.User.Login, slug+"[bot]") && c.Body != nil && strings.HasPrefix(*c.Body, workItemMarker)
 }
 
 // Lister lists what one installation of the App reaches on GitHub and sends it to
@@ -479,22 +502,27 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		return errors.New("the lister has no sink or no token")
 	}
 	p := l.pacerOr()
-	listing := Listing{ID: randomHex(), StartedAt: p.now().UTC().Format(time.RFC3339)}
+	// The listing starts before its first request to GitHub: Qory Apiary disconnects
+	// what a complete listing left out and did not hear of since it started, so a
+	// later start would drop a collection that changed meanwhile.
+	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
 	system := l.Client.WebHost()
-	var pending []SourceCollection
+	var pending []contracts.Collection
 	skipped := false
 	send := func(ctx context.Context, complete bool) error {
 		listing.Part++
 		listing.Complete = complete
-		req := SourceCollections{Version: WireVersion, Collections: pending, Listing: listing}
+		req := contracts.SourceCollections{Version: contracts.Version, Collections: pending, Listing: listing}
 		if req.Collections == nil {
-			req.Collections = []SourceCollection{}
+			req.Collections = []contracts.Collection{}
 		}
 		pending = nil
 		return l.Sink.Collections(ctx, req)
 	}
-	envelope := size(SourceCollections{Version: WireVersion, Collections: []SourceCollection{}, Listing: Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	envelope := sized(contracts.SourceCollections{Version: contracts.Version, Collections: []contracts.Collection{}, Listing: contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	used := envelope
+	// A part Qory Apiary did not take leaves the listing short, so the listing stops
+	// there, and the part that ends it says it is not complete.
 	stop := func(err error) error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
 		defer cancel()
@@ -516,14 +544,14 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		}
 		for _, r := range page.Repositories {
 			c := collectionOf(r)
-			c.Target = &Target{System: system, Path: r.FullName}
+			c.Target = &contracts.Target{System: system, Path: r.FullName}
 			n := size(c)
-			if why := checkCollection(c); why != "" || envelope+n > maxRequest {
+			if why := checkCollection(c); why != "" || envelope+n > contracts.MaxRequest {
 				l.logf("skipped the collection %s: %s", c.Ref, orTooLarge(why))
 				skipped = true
 				continue
 			}
-			if len(pending) == maxPerBatch || used+n+1 > maxRequest {
+			if len(pending) == maxPerBatch || used+n+1 > contracts.MaxRequest {
 				if err := send(ctx, false); err != nil {
 					return stop(err)
 				}
@@ -557,7 +585,7 @@ func (l Lister) pacerOr() *Pacer {
 
 // listed is an item of a listing and what its comments are read by.
 type listed struct {
-	item     SourceItem
+	item     contracts.Item
 	number   int64
 	comments int
 }
@@ -587,7 +615,10 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 		return errors.New("the lister has no sink, no token or no App slug")
 	}
 	p := l.pacerOr()
-	listing := Listing{ID: randomHex(), StartedAt: p.now().UTC().Format(time.RFC3339)}
+	// The listing starts before its first request to GitHub: Qory Apiary disconnects
+	// what a complete listing left out and did not hear of since it started, so a
+	// later start would drop a collection that changed meanwhile.
+	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
 	var r ghRepo
 	if _, err := l.get(ctx, p, "reading the repository "+repo.String(), "/repos/"+repo.String(), &r); err != nil {
 		return err
@@ -602,7 +633,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	send := func(ctx context.Context, last bool) ([]listed, error) {
 		listing.Part++
 		part := listing
-		req := SourceItems{Version: WireVersion, Collection: coll, Items: make([]SourceItem, 0, len(pending)), Listing: &part}
+		req := contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: make([]contracts.Item, 0, len(pending)), Listing: &part}
 		for _, x := range pending {
 			req.Items = append(req.Items, x.item)
 		}
@@ -614,7 +645,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 		ended = last
 		return sent, nil
 	}
-	envelope := size(SourceItems{Version: WireVersion, Collection: coll, Items: []SourceItem{}, Listing: &Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	envelope := sized(contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: []contracts.Item{}, Listing: &contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	used := envelope
 	stop := func(err error) error {
 		if ended {
@@ -643,20 +674,20 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 			}
 			it, why := itemOf(system, r, is)
 			n := size(it)
-			if why == "" && envelope+n > maxRequest {
+			if why == "" && envelope+n > contracts.MaxRequest {
 				why = "it is larger than a request may be"
 			}
 			if why != "" {
 				l.logf("skipped the item %s: %s", it.Ref, why)
 				continue
 			}
-			if len(pending) == maxPerBatch || used+n+1 > maxRequest {
+			if len(pending) == maxPerBatch || used+n+1 > contracts.MaxRequest {
 				sent, err := send(ctx, false)
 				if err != nil {
 					return stop(err)
 				}
 				used = envelope
-				if err := l.listComments(ctx, p, repo, coll.Ref, sent); err != nil {
+				if err := l.listComments(ctx, p, repo, sent); err != nil {
 					return stop(err)
 				}
 			}
@@ -669,19 +700,19 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if err != nil {
 		return stop(err)
 	}
-	return l.listComments(ctx, p, repo, coll.Ref, sent)
+	return l.listComments(ctx, p, repo, sent)
 }
 
 // listComments reads and sends the comments of the items that have any. An item's
 // comments are read by page number too, oldest first, and a comment deleted while they
 // are read shifts the pages after it, so no request says they are complete.
-func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, collRef string, items []listed) error {
+func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, items []listed) error {
 	for _, x := range items {
 		if x.comments <= 0 {
 			continue
 		}
-		req := SourceComments{Version: WireVersion, CollectionRef: collRef, ItemRef: x.item.Ref, Comments: []SourceComment{}}
-		envelope := size(req)
+		req := contracts.SourceItemComments{Version: contracts.Version, ItemRef: x.item.Ref, Comments: []contracts.Comment{}}
+		envelope := sized(req)
 		used := envelope
 		what := "listing the comments on " + x.item.Ref
 		read := pages{what: what, max: maxCommentPages}
@@ -701,18 +732,18 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, col
 				}
 				sc, why := commentOf(c)
 				n := size(sc)
-				if why == "" && envelope+n > maxRequest {
+				if why == "" && envelope+n > contracts.MaxRequest {
 					why = "it is larger than a request may be"
 				}
 				if why != "" {
 					l.logf("skipped the comment %s on %s: %s", sc.Ref, x.item.Ref, why)
 					continue
 				}
-				if len(req.Comments) == maxPerBatch || used+n+1 > maxRequest {
+				if len(req.Comments) == maxPerBatch || used+n+1 > contracts.MaxRequest {
 					if err := l.Sink.Comments(ctx, req); err != nil {
 						return err
 					}
-					req.Comments, used = []SourceComment{}, envelope
+					req.Comments, used = []contracts.Comment{}, envelope
 				}
 				req.Comments = append(req.Comments, sc)
 				used += n + 1
