@@ -91,10 +91,12 @@ func TestTheUserListingsReadEveryPageOnce(t *testing.T) {
 	}
 }
 
-func TestThePublicURLIsAnHTTPSURLOfAHostAndAnOptionalPort(t *testing.T) {
+func TestThePublicURLIsAnHTTPSURLOfAHostAnOptionalPortAndAnOptionalPath(t *testing.T) {
 	for in, want := range map[string]string{
 		"https://qory-github.example.com":              "https://qory-github.example.com",
 		"https://qory-github.example.com/":             "https://qory-github.example.com",
+		"https://qory-github.example.com//":            "https://qory-github.example.com",
+		"https://qory-github.example.com/github///":    "https://qory-github.example.com/github",
 		"HTTPS://Qory-GitHub.Example.com:8443/GitHub/": "https://qory-github.example.com:8443/GitHub",
 		"https://qory-github.example.com/a%20b":        "https://qory-github.example.com/a%20b",
 		"https://[2001:db8::1]:443":                    "https://[2001:db8::1]:443",
@@ -111,7 +113,7 @@ func TestThePublicURLIsAnHTTPSURLOfAHostAndAnOptionalPort(t *testing.T) {
 		"https://qory-github.example.com:01", "https://qory-github.example.com:x", "https://qory github.example.com",
 		"https://qory-github.example.com/a\nb", " https://qory-github.example.com",
 	} {
-		if got, err := CheckPublicURL(in); err == nil || err.Error() != "is not an https URL of a host and an optional port, without a user, a query or a fragment" {
+		if got, err := CheckPublicURL(in); err == nil || err.Error() != "is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment" {
 			t.Errorf("%q: %q %v", in, got, err)
 		}
 	}

@@ -1059,15 +1059,15 @@ serve's settings, for Connect:
 	if err != nil || info.Mode().Perm() != 0o600 || string(b) != testClientSecret+"\n" {
 		t.Errorf("the client secret file: %v %v %q", info, err, b)
 	}
-	// A client secret file that exists, or a public URL that is not https of a host and
-	// an optional port, is refused before any App is created.
+	// A client secret file that exists, or a public URL that is not https of a host, an
+	// optional port and an optional path, is refused before any App is created.
 	for _, args := range [][]string{
 		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "http://qory-github.example.com"},
 		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com/#a"},
 		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com:0"},
 		{"--key-file", file + ".2", "--public-url", "https://qory-github.example.com"},
 	} {
-		want := "--public-url is not an https URL of a host and an optional port, without a user, a query or a fragment"
+		want := "--public-url is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment"
 		if args[1] == file+".2" {
 			os.WriteFile(file+".2.client-secret", nil, 0o600)
 			want = "client-secret"

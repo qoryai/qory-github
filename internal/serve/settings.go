@@ -308,7 +308,7 @@ func checkOrigin(s string) (string, error) {
 // takes it, as setup does, and refuses one that holds what looks like a secret.
 func checkPublicURL(s string) (string, error) {
 	if accesskey.ContainsSecret(s) {
-		return "", errors.New("is not an https URL of a host and an optional port, without a user, a query or a fragment")
+		return "", github.ErrPublicURL
 	}
 	return github.CheckPublicURL(s)
 }

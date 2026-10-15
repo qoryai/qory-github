@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -348,7 +349,7 @@ func TestAPullAndAFillNeverOverlap(t *testing.T) {
 	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
 		t.Fatal(err)
 	}
-	if f.count() != n || !strings.Contains(w.log.String(), "a fill of the collection runs, so it is not pulled this round") {
+	if f.count() != n || !strings.Contains(w.log.String(), "a fill or another pull of the collection runs, so it is not pulled this round") {
 		t.Errorf("a pull ran during a fill: %d requests after %d; the log %s", f.count(), n, w.log.String())
 	}
 	release(c)
@@ -402,7 +403,7 @@ func TestAnUnlinkedCollectionSendsNothing(t *testing.T) {
 	if len(w.apiary.sent(routeItems)) != 1 || len(w.apiary.sent(routeComments)) != 0 {
 		t.Errorf("sent %d items and %d comments requests", len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)))
 	}
-	p.report(context.Background(), slog.String("collection", "acme/widgets"), "pulling the collection failed", err)
+	p.report(context.Background(), slog.String("collection", "acme/widgets"), "pulling the collection", err)
 	if !strings.Contains(w.log.String(), "the collection is not linked, so its pull stops") {
 		t.Errorf("err %v; the log %s", err, w.log.String())
 	}
@@ -574,5 +575,87 @@ func TestAStopStopsThePuller(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("run did not return")
+	}
+}
+
+// TestAPullThatKeepsFailingIsLoggedOnceAndOnceMoreAfterADay has GitHub answer 502 to a
+// collection's pulls round after round, and checks the failure is logged at the first
+// round and not at the rounds after it, once more when it has failed for a day, and not
+// after that; then that a pull that passes forgets it, so the next failure is logged
+// again.
+func TestAPullThatKeepsFailingIsLoggedOnceAndOnceMoreAfterADay(t *testing.T) {
+	w, _, p, clock := pulling(t)
+	keepPulled(w.st, "acme/widgets", pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
+	down := func(on bool) {
+		w.gh.mu.Lock()
+		w.gh.issuesDown = on
+		w.gh.mu.Unlock()
+	}
+	round := func(at time.Duration) {
+		clock.mu.Lock()
+		clock.t = pullStart.Add(at)
+		clock.mu.Unlock()
+		p.installationRound(context.Background(), 42, []pullTarget{{ref: "acme/widgets"}}, clock.now(), 0)
+	}
+	lines := func(want string) int { return strings.Count(w.log.String(), want) }
+	const failed = `"msg":"pulling the collection failed","collection":"acme/widgets"`
+	const day = `"msg":"pulling the collection has failed for a day, and the next round tries again","collection":"acme/widgets"`
+	down(true)
+	for _, at := range []time.Duration{0, time.Hour, 23 * time.Hour} {
+		round(at)
+	}
+	if lines(failed) != 1 || lines(day) != 0 {
+		t.Fatalf("the first day: the log %s", w.log.String())
+	}
+	for _, at := range []time.Duration{24 * time.Hour, 25 * time.Hour, 49 * time.Hour} {
+		round(at)
+	}
+	if lines(failed) != 1 || lines(day) != 1 {
+		t.Fatalf("after a day: the log %s", w.log.String())
+	}
+	down(false)
+	round(50 * time.Hour)
+	if m := markOf(t, w); !m.Since.Equal(pullStart.Add(50 * time.Hour)) {
+		t.Fatalf("kept %+v", m)
+	}
+	down(true)
+	round(51 * time.Hour)
+	if lines(failed) != 2 || lines(day) != 1 {
+		t.Errorf("after a pull that passed: the log %s", w.log.String())
+	}
+}
+
+// TestTheDroppedLinesAreCountedAsThePullRoundsFailures logs a failed read of the store
+// and a failed pull within pullFailEvery, and checks the second is held back and
+// counted as a failure of the pull rounds.
+func TestTheDroppedLinesAreCountedAsThePullRoundsFailures(t *testing.T) {
+	w, _, p, _ := pulling(t)
+	p.failed("reading the linked collections", errors.New("the store failed"))
+	p.failed("pulling the collection failed", errors.New("GitHub answered 502"), slog.String("collection", "acme/widgets"))
+	p.failLog().stop()
+	log := w.log.String()
+	if strings.Contains(log, "GitHub answered 502") || !strings.Contains(log, `"msg":"failures of the pull rounds dropped","failed_dropped":1`) {
+		t.Errorf("the log %s", log)
+	}
+}
+
+// TestTheSyncIntervalIsADayAtMost has the feed set an interval longer than a day, and
+// the store hold one, and checks each is taken as a day, the contract's maximum.
+func TestTheSyncIntervalIsADayAtMost(t *testing.T) {
+	w, _, p, _ := pulling(t)
+	if err := w.feed.apply(context.Background(), contracts.Change{Kind: contracts.ChangeSync, Interval: new(200000)}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := w.st.Get(nsAdapter, keySyncInterval); string(b) != "86400" {
+		t.Errorf("kept %q", b)
+	}
+	if d := p.interval(); d != 24*time.Hour {
+		t.Errorf("the interval %v", d)
+	}
+	if err := w.st.Put(nsAdapter, keySyncInterval, []byte("999999"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if d := p.interval(); d != 24*time.Hour {
+		t.Errorf("the interval kept as 999999 seconds is %v", d)
 	}
 }

@@ -972,8 +972,8 @@ func TestReadSettings(t *testing.T) {
 		"a user":               {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
 		"a public http URL":    {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
 		"a public query":       {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
-		"a public fragment":    {map[string]any{"public_url": "https://qory-github.example.com/#secret"}, "/public_url: is not an https URL of a host and an optional port, without a user, a query or a fragment"},
-		"a public bad port":    {map[string]any{"public_url": "https://qory-github.example.com:0"}, "/public_url: is not an https URL of a host and an optional port"},
+		"a public fragment":    {map[string]any{"public_url": "https://qory-github.example.com/#secret"}, "/public_url: is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment"},
+		"a public bad port":    {map[string]any{"public_url": "https://qory-github.example.com:0"}, "/public_url: is not an https URL of a host, an optional port and an optional path"},
 		"a bad key id":         {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
 		"a pin of no list":     {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
 		"a pin of a bad key":   {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
@@ -1393,5 +1393,19 @@ func TestAStaleTickDoesNothing(t *testing.T) {
 	th.stop()
 	if n := <-flushed; n != 1 {
 		t.Errorf("the stop flushed %d, want 1", n)
+	}
+}
+
+// TestServeTakesThePublicURLAsSetupDoes checks serve's public URL loses every slash at
+// its end, as setup's does, and is refused with setup's error, one that holds what looks
+// like a secret too.
+func TestServeTakesThePublicURLAsSetupDoes(t *testing.T) {
+	if got, err := checkPublicURL("https://qory-github.example.com/github//"); err != nil || got != "https://qory-github.example.com/github" {
+		t.Errorf("%q %v", got, err)
+	}
+	for _, in := range []string{"https://qory-github.example.com/#a", "https://qory-github.example.com/qak_a"} {
+		if _, err := checkPublicURL(in); !errors.Is(err, github.ErrPublicURL) {
+			t.Errorf("%q: %v", in, err)
+		}
 	}
 }

@@ -26,28 +26,32 @@ const (
 	ConnectAuthorizedPath = "/v1/connect/authorized"
 )
 
+// ErrPublicURL is the refusal of a public URL [CheckPublicURL] does not take.
+var ErrPublicURL = errors.New("is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment")
+
 // CheckPublicURL takes where serve is reached from outside: https, a host, a port from
 // 1 to 65535 or none, and a path or none, without a user, a query or a fragment, an
 // empty one among them, and without white space or a control character. It returns
-// the URL with its scheme and host in lower case and without a trailing slash. setup
-// and serve both check it so. The error names the rule, never the URL.
+// the URL with its scheme and host in lower case and with no slash at its end, however
+// many it had, so a path joined to it, as /v1/connect, follows one slash alone. setup
+// and serve both check it so.
+// The error, [ErrPublicURL], names the rule, never the URL.
 func CheckPublicURL(s string) (string, error) {
-	refused := errors.New("is not an https URL of a host and an optional port, without a user, a query or a fragment")
 	if strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }) || strings.ContainsAny(s, "#?") {
-		return "", refused
+		return "", ErrPublicURL
 	}
 	u, err := url.Parse(s)
 	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return "", refused
+		return "", ErrPublicURL
 	}
 	if p := u.Port(); p != "" {
 		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
-			return "", refused
+			return "", ErrPublicURL
 		}
 	} else if strings.HasSuffix(u.Host, ":") {
-		return "", refused
+		return "", ErrPublicURL
 	}
-	return strings.TrimSuffix("https://"+strings.ToLower(u.Host)+u.EscapedPath(), "/"), nil
+	return strings.TrimRight("https://"+strings.ToLower(u.Host)+u.EscapedPath(), "/"), nil
 }
 
 // ConnectManifest adds to the manifest m what Connect needs of the App, under serve's
