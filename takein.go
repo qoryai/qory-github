@@ -102,10 +102,10 @@ const maxChangeURL = 2048
 // Plane escaped as \uXXXX. A larger answer is refused, never read in part.
 const maxAnswer = 64 << 20
 
-// maxCommentPages is how many pages of an issue's comments, a hundred to a page, are read
+// maxMarkerPages is how many pages of an issue's comments, a hundred to a page, are read
 // looking for the work item's comment. An issue with more is refused, not commented on
 // a second time.
-const maxCommentPages = 100
+const maxMarkerPages = 100
 
 // issueRef is the issue a change refers to.
 type issueRef struct {
@@ -261,7 +261,7 @@ func (c Client) commented(ctx context.Context, tok, slug string, issue issueRef,
 	const reading = "reading the issue's comments"
 	bot := slug + "[bot]"
 	path := issue.path() + "/comments?per_page=100"
-	for range maxCommentPages {
+	for range maxMarkerPages {
 		a, err := c.send(ctx, reading, http.MethodGet, path, tok, nil)
 		if err != nil {
 			return false, err
@@ -294,7 +294,7 @@ func (c Client) commented(ctx context.Context, tok, slug string, issue issueRef,
 		}
 		path = next
 	}
-	return false, fmt.Errorf("%s: the issue has more than %d pages of comments; none is posted, since one may be there already", reading, maxCommentPages)
+	return false, fmt.Errorf("%s: the issue has more than %d pages of comments; none is posted, since one may be there already", reading, maxMarkerPages)
 }
 
 // undo removes the label from the issue. A 404, the label not on the issue, and a 410,
