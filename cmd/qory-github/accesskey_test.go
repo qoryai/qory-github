@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/qoryai/forager/accesskey"
@@ -196,6 +197,9 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 	noLeak(t, key.Secret(), c, out, errs)
 }
 
+// serverShape is the error of a server that is not Qory Apiary's origin.
+const serverShape = "the server is neither an https URL of a host and an optional port nor, for a test, an http one to localhost, 127.0.0.1 or [::1], with nothing after"
+
 // TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest pins that a secret file that exists,
 // or whose directory does not, and a server that is not Qory Apiary's origin over https
 // are refused before the code is sent.
@@ -222,19 +226,19 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{"--secret-file", filepath.Join(dir, "qec_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "QAK_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "x-qrk_"), "http://apiary.example.com", c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
-		{[]string{"--secret-file", file, "http://apiary.example.com", c}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, "ftp://apiary.example.com", c}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, "https://apiary.example.com/enrol", c}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, "https://user@apiary.example.com", c}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, "https://apiary.example.com?a=1", c}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, c, f.url}, "the server is neither an https URL"},
-		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + "U." + f.signer.Fingerprint()}, "the code is not an enrolment code"},
-		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + ".!" + f.signer.Fingerprint()}, "the code is not an enrolment code"},
+		{[]string{"--secret-file", file, "http://apiary.example.com", c}, serverShape},
+		{[]string{"--secret-file", file, "ftp://apiary.example.com", c}, serverShape},
+		{[]string{"--secret-file", file, "https://apiary.example.com/enrol", c}, serverShape},
+		{[]string{"--secret-file", file, "https://user@apiary.example.com", c}, serverShape},
+		{[]string{"--secret-file", file, "https://apiary.example.com?a=1", c}, serverShape},
+		{[]string{"--secret-file", file, c, f.url}, serverShape},
+		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + "U." + f.signer.Fingerprint()}, "the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"},
+		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + ".!" + f.signer.Fingerprint()}, "the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"},
 		{[]string{"--secret-file", file, f.url}, "want two arguments, the server and the code"},
 		{[]string{f.url, c}, "--secret-file is required"},
 	} {
 		status, out, errs := enrolRun(t, tc.args...)
-		if status != 1 || out != "" || !strings.HasPrefix(errs, "qory-github access-key: "+tc.want) || strings.Count(errs, "\n") != 1 {
+		if status != 1 || out != "" || errs != "qory-github access-key: "+tc.want+"\n" {
 			t.Errorf("%v: exit %d, stdout %q, stderr %q", tc.args, status, out, errs)
 		}
 		noLeak(t, "", c, out, errs)
@@ -303,11 +307,11 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 		"a fixture key pinned": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", signer: fixtureSigner(t)},
 			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}\n"},
 		"a used code": {reply: reply{status: http.StatusUnauthorized},
-			want: "access key fingerprint {fp}\nqory-github access-key: this code was used, has expired or was cancelled; if you did not use it, tell your administrator in Qory Apiary, who must revoke the key it enrolled. Enrolling needs a new code\n"},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary did not accept the code (HTTP 401): it was used, has expired or was cancelled; it is no code of the Qory Apiary at {server}; its maker can no longer make codes; its work source was deleted, or its workspace or organisation is marked for deletion or stopped; Qory Apiary has the feature factory off; its record fails Qory Apiary's integrity check; or this machine's clock is more than 5 minutes off. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled\n"},
 		"a key refused": {reply: reply{status: http.StatusConflict, refusal: "key_invalid"},
 			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the key; the code is not used: the same command, run within the code's 15 minutes, makes a new key\n"},
 		"two keys held": {reply: reply{status: http.StatusConflict, refusal: "key_limit"},
-			want: "access key fingerprint {fp}\nqory-github access-key: the work source already holds two keys: once an owner or administrator in Qory Apiary has revoked one, the same command, run within the code's 15 minutes, succeeds\n"},
+			want: "access key fingerprint {fp}\nqory-github access-key: the work source already holds two keys: have an owner or administrator in Qory Apiary revoke one, then run the same command again within the code's 15 minutes\n"},
 		"too many attempts": {reply: reply{status: http.StatusTooManyRequests, refusal: "rate_limited"},
 			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes\n"},
 	} {
@@ -326,7 +330,7 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 				return k, err
 			}
 			status, out, errs := enrolRun(t, "--secret-file", file, f.url, c)
-			if want := strings.ReplaceAll(tc.want, "{fp}", made.Fingerprint()); status != 1 || out != "" || errs != want {
+			if want := strings.NewReplacer("{fp}", made.Fingerprint(), "{server}", f.url).Replace(tc.want); status != 1 || out != "" || errs != want {
 				t.Errorf("exit %d, stdout %q, stderr:\n%s\nwant:\n%s", status, out, errs, want)
 			}
 			if n := f.requests.Load(); n != 1 {
@@ -375,6 +379,73 @@ func TestEnrolPrintsTheServerInLowerCase(t *testing.T) {
 	server := strings.Replace(f.url, "http://127.0.0.1", "HTTP://127.0.0.1", 1)
 	status, out, errs := enrolRun(t, "--secret-file", file, server, code(f.signer))
 	if status != 0 || !strings.HasPrefix(out, `  "apiary_url": "`+f.url+`",`) {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+}
+
+// TestCheckServerTakesAnASCIIHostAlone pins that a host that is not ASCII, once
+// decoded, is refused with a fixed error, before its letters are put in lower case, so
+// a dotted capital I or a Kelvin sign never becomes an i or a k, and that an IPv6
+// zone keeps its case.
+func TestCheckServerTakesAnASCIIHostAlone(t *testing.T) {
+	const notASCII = "the server's host holds a character that is not ASCII; give an international name in its ASCII form, xn--"
+	for in, want := range map[string]string{
+		"https://%C4%B0.example":        notASCII,
+		"https://qa%E2%84%AA_x":         notASCII,
+		"https://qa%E2%84%AA_x.example": notASCII,
+		"https://\u212aelvin.example":   notASCII,
+		"https://QAK_x.example":         serverShape,
+		"https://apiary.example%2ecom":  serverShape,
+	} {
+		got, err := checkServer(in)
+		if got != "" || err == nil || err.Error() != want {
+			t.Errorf("%s: %q, %v; want %q", in, got, err, want)
+		}
+	}
+	if got, err := checkServer("https://[FE80::1%25EN0]"); err != nil || got != "https://[fe80::1%25EN0]" {
+		t.Errorf("an IPv6 zone: %q, %v", got, err)
+	}
+	if got, err := checkServer("https://[FE80::1%25EN0]:8443"); err != nil || got != "https://[fe80::1%25EN0]:8443" {
+		t.Errorf("an IPv6 zone and a port: %q, %v", got, err)
+	}
+	f := newFakeApiary(t, adapterEnrolled)
+	file := filepath.Join(t.TempDir(), "secret")
+	status, out, errs := enrolRun(t, "--secret-file", file, "https://qa%E2%84%AA_x", code(f.signer))
+	if status != 1 || out != "" || errs != "qory-github access-key: "+notASCII+"\n" || f.requests.Load() != 0 {
+		t.Errorf("exit %d, stdout %q, stderr %q, %d requests", status, out, errs, f.requests.Load())
+	}
+}
+
+// TestEnrolRefusesARelativePathThatBecomesACodeOrSecret pins that the secret file's
+// path is checked as it is made absolute, too.
+func TestEnrolRefusesARelativePathThatBecomesACodeOrSecret(t *testing.T) {
+	f := newFakeApiary(t, adapterEnrolled)
+	dir := filepath.Join(t.TempDir(), "qak_dir")
+	os.Mkdir(dir, 0o700)
+	t.Chdir(dir)
+	status, out, errs := enrolRun(t, "--secret-file", "secret", f.url, code(f.signer))
+	if want := "qory-github access-key: the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file\n"; status != 1 || out != "" || errs != want || f.requests.Load() != 0 {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("the directory holds %v", entries)
+	}
+}
+
+// TestEnrolRefusesAProbeItCannotRemove pins that the probe file that checks the
+// directory can be written is named, and the code not sent, when it cannot be removed.
+func TestEnrolRefusesAProbeItCannotRemove(t *testing.T) {
+	f := newFakeApiary(t, adapterEnrolled)
+	dir := t.TempDir()
+	var probe string
+	defer func(r func(string) error) { removeProbe = r }(removeProbe)
+	removeProbe = func(p string) error {
+		probe = p
+		return &os.PathError{Op: "remove", Path: p, Err: syscall.EBUSY}
+	}
+	status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, code(f.signer))
+	want := "qory-github access-key: the secret file's directory " + dir + ": the file " + probe + " made to check it can be written could not be removed: " + syscall.EBUSY.Error() + "\n"
+	if status != 1 || out != "" || errs != want || f.requests.Load() != 0 || filepath.Dir(probe) != dir {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
 }
