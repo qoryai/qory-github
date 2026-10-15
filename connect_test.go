@@ -30,19 +30,25 @@ func TestUserTokenSaysNoCodeNoSecretAndFollowsNoRedirect(t *testing.T) {
 	}{
 		"a token":     {func(w http.ResponseWriter) { io.WriteString(w, `{"access_token":"`+token+`"}`) }, ""},
 		"a bad code":  {func(w http.ResponseWriter) { io.WriteString(w, `{"error":"bad_verification_code"}`) }, "GitHub answered bad_verification_code"},
-		"an odd code": {func(w http.ResponseWriter) { io.WriteString(w, `{"error":"`+secret+`"}`) }, "GitHub answered without a token"},
+		"an odd code": {func(w http.ResponseWriter) { io.WriteString(w, `{"error":"`+secret+`"}`) }, "exchanging the sign-in's code: GitHub answered an error"},
 		"a redirect": {func(w http.ResponseWriter) {
 			w.Header().Set("Location", "https://elsewhere.example.com/?code="+code)
 			w.WriteHeader(http.StatusFound)
 		}, "GitHub answered 302"},
 		"a token with a space": {func(w http.ResponseWriter) { io.WriteString(w, `{"access_token":"a b"}`) }, "GitHub answered without a token"},
+		"a token and an error": {func(w http.ResponseWriter) {
+			io.WriteString(w, `{"access_token":"`+token+`","error":"bad_verification_code"}`)
+		}, "GitHub answered bad_verification_code"},
+		"a token and an odd error": {func(w http.ResponseWriter) {
+			io.WriteString(w, `{"access_token":"`+token+`","error":"`+secret+`"}`)
+		}, "exchanging the sign-in's code: GitHub answered an error"},
 	} {
 		answer = tc.answer
 		got, err := c.UserToken(context.Background(), "Iv1.test", []byte(secret), code, "https://qory-github.example.com/v1/connect/authorized")
 		switch {
 		case tc.want == "" && (err != nil || got != token):
 			t.Errorf("%s: %q %v", name, got, err)
-		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+		case tc.want != "" && (err == nil || got != "" || !strings.Contains(err.Error(), tc.want)):
 			t.Errorf("%s: err %v, want %q", name, err, tc.want)
 		case err != nil && (strings.Contains(err.Error(), code) || strings.Contains(err.Error(), secret)):
 			t.Errorf("%s: the error says the code or the secret: %v", name, err)
@@ -82,5 +88,31 @@ func TestTheUserListingsReadEveryPageOnce(t *testing.T) {
 	}
 	if _, err := c.UserInstallations(context.Background(), "ghu_another"); err == nil || strings.Contains(err.Error(), "ghu_another") {
 		t.Errorf("err %v", err)
+	}
+}
+
+func TestThePublicURLIsAnHTTPSURLOfAHostAndAnOptionalPort(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://qory-github.example.com":              "https://qory-github.example.com",
+		"https://qory-github.example.com/":             "https://qory-github.example.com",
+		"HTTPS://Qory-GitHub.Example.com:8443/GitHub/": "https://qory-github.example.com:8443/GitHub",
+		"https://qory-github.example.com/a%20b":        "https://qory-github.example.com/a%20b",
+		"https://[2001:db8::1]:443":                    "https://[2001:db8::1]:443",
+	} {
+		if got, err := CheckPublicURL(in); err != nil || got != want {
+			t.Errorf("%q: %q %v, want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{
+		"", "http://qory-github.example.com", "https://", "https:///github", "https://:443",
+		"https://qory-github.example.com#", "https://qory-github.example.com/#a", "https://qory-github.example.com?",
+		"https://qory-github.example.com/?a", "https://user@qory-github.example.com", "https:qory-github.example.com",
+		"https://qory-github.example.com:", "https://qory-github.example.com:0", "https://qory-github.example.com:65536",
+		"https://qory-github.example.com:01", "https://qory-github.example.com:x", "https://qory github.example.com",
+		"https://qory-github.example.com/a\nb", " https://qory-github.example.com",
+	} {
+		if got, err := CheckPublicURL(in); err == nil || err.Error() != "is not an https URL of a host and an optional port, without a user, a query or a fragment" {
+			t.Errorf("%q: %q %v", in, got, err)
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +81,6 @@ type browser struct {
 	t      *testing.T
 	h      http.Handler
 	cookie *http.Cookie
-	addr   string
 }
 
 func (rig *connectRig) browser(t *testing.T) *browser { return &browser{t: t, h: rig.h} }
@@ -89,9 +88,6 @@ func (rig *connectRig) browser(t *testing.T) *browser { return &browser{t: t, h:
 // get requests target, a path and its query, with the cookie the browser holds.
 func (b *browser) get(target string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(http.MethodGet, target, nil)
-	if b.addr != "" {
-		r.RemoteAddr = b.addr
-	}
 	if b.cookie != nil {
 		r.AddCookie(&http.Cookie{Name: b.cookie.Name, Value: b.cookie.Value})
 	}
@@ -110,14 +106,24 @@ func (b *browser) get(target string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// start runs the first step with the pass and returns the state GitHub's install page
+// was handed, which it sends on to the Setup URL.
+func (b *browser) start(pass string) string {
+	b.t.Helper()
+	rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
+	if rec.Code != http.StatusSeeOther {
+		b.t.Fatalf("connect: %d %s", rec.Code, rec.Body)
+	}
+	u, _ := url.Parse(rec.Header().Get("Location"))
+	return u.Query().Get("state")
+}
+
 // signIn runs the first two steps with the pass and returns the state of the sign-in
 // GitHub was asked for.
 func (b *browser) signIn(pass string) string {
 	b.t.Helper()
-	if rec := b.get("/v1/connect?state=" + url.QueryEscape(pass)); rec.Code != http.StatusSeeOther {
-		b.t.Fatalf("connect: %d %s", rec.Code, rec.Body)
-	}
-	rec := b.get("/v1/connect/return?installation_id=42&setup_action=install")
+	install := b.start(pass)
+	rec := b.get("/v1/connect/return?installation_id=42&setup_action=install&state=" + install)
 	if rec.Code != http.StatusSeeOther {
 		b.t.Fatalf("return: %d %s", rec.Code, rec.Body)
 	}
@@ -208,6 +214,13 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 	if !strings.Contains(rig.log.String(), `"reason":"the pass's signature does not verify under the pin"`) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
+	// A line break in a pass, which Go's decoder would skip, is refused before decoding.
+	ok := signPass(rig.signer, good)
+	for _, bad := range []string{ok[:10] + "\n" + ok[10:], ok[:10] + "\r" + ok[10:], ok + " ", ok[:10] + "%" + ok[10:]} {
+		if _, _, rf := rig.c.checkPass(bad, now); rf != &refusePass {
+			t.Errorf("%q: refused as %v", bad, rf)
+		}
+	}
 	// A key after a rotation: either key of the pin verifies.
 	rig.c.Pin = append(pinOf(other), rig.c.Pin...)
 	if _, _, rf := rig.c.checkPass(signPass(rig.signer, good), now); rf != nil {
@@ -251,7 +264,10 @@ func TestTheSessionsCookie(t *testing.T) {
 	b := rig.browser(t)
 	pass := rig.pass()
 	rec := b.get("/v1/connect?state=" + url.QueryEscape(pass))
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != rig.gh.srv.URL+"/apps/"+testSlug+"/installations/new" || rec.Body.Len() != 0 {
+	// The install page is handed a random state, which the Setup URL brings back.
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || loc.Scheme+"://"+loc.Host+loc.Path != rig.gh.srv.URL+"/apps/"+testSlug+"/installations/new" ||
+		len(loc.Query()) != 1 || !idShape.MatchString(loc.Query().Get("state")) || strings.Contains(pass, loc.Query().Get("state")) || rec.Body.Len() != 0 {
 		t.Fatalf("%d %v %q", rec.Code, rec.Header(), rec.Body)
 	}
 	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
@@ -304,15 +320,18 @@ func TestAReturnWithoutACookieIsRefused(t *testing.T) {
 func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 	rig := newConnectRig(t)
 	for target, want := range map[string]refusal{
-		"/v1/connect/return?setup_action=request":                      refuseWaits,
-		"/v1/connect/return?installation_id=42":                        refuseAnswer,
-		"/v1/connect/return?installation_id=-1&setup_action=install":   refuseAnswer,
-		"/v1/connect/return?installation_id=<b>&setup_action=install":  refuseAnswer,
-		"/v1/connect/return?installation_id=42&setup_action=uninstall": refuseAnswer,
+		"/v1/connect/return?setup_action=request&state=S":                                             refuseWaits,
+		"/v1/connect/return?installation_id=42&state=S":                                               refuseAnswer,
+		"/v1/connect/return?installation_id=-1&setup_action=install&state=S":                          refuseAnswer,
+		"/v1/connect/return?installation_id=<b>&setup_action=install&state=S":                         refuseAnswer,
+		"/v1/connect/return?installation_id=42&setup_action=uninstall&state=S":                        refuseAnswer,
+		"/v1/connect/return?installation_id=42&setup_action=install":                                  refuseInstall,
+		"/v1/connect/return?installation_id=42&setup_action=install&state=" + strings.Repeat("A", 43): refuseInstall,
+		"/v1/connect/return?installation_id=42&setup_action=install&state=S&state=S":                  refuseInstall,
 	} {
 		b := rig.browser(t)
-		b.get("/v1/connect?state=" + url.QueryEscape(rig.pass()))
-		rec := b.get(target)
+		install := b.start(rig.pass())
+		rec := b.get(strings.ReplaceAll(target, "state=S", "state="+install))
 		refused(t, rec, want)
 		if b.cookie != nil || strings.Contains(rec.Body.String(), "<b>") {
 			t.Errorf("%s: the cookie %v, the page %q", target, b.cookie, rec.Body)
@@ -321,13 +340,22 @@ func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 	// The sign-in GitHub is asked for: the App's client id, a new state, and the
 	// callback URL under the public URL.
 	b := rig.browser(t)
-	b.get("/v1/connect?state=" + url.QueryEscape(rig.pass()))
-	rec := b.get("/v1/connect/return?installation_id=42&setup_action=update")
+	install := b.start(rig.pass())
+	rec := b.get("/v1/connect/return?installation_id=42&setup_action=update&state=" + install)
 	u, _ := url.Parse(rec.Header().Get("Location"))
 	q := u.Query()
 	if rec.Code != http.StatusSeeOther || u.Scheme+"://"+u.Host != rig.gh.srv.URL || u.Path != "/login/oauth/authorize" || q.Get("client_id") != testClientID ||
-		!idShape.MatchString(q.Get("state")) || q.Get("redirect_uri") != "https://qory-github.example.com/v1/connect/authorized" || len(q) != 3 {
+		!idShape.MatchString(q.Get("state")) || q.Get("state") == install || q.Get("redirect_uri") != "https://qory-github.example.com/v1/connect/authorized" || len(q) != 3 {
 		t.Errorf("%d %s", rec.Code, rec.Header().Get("Location"))
+	}
+	// The session's installation is set once: the same one again starts the sign-in
+	// again, another is refused and ends the session.
+	if rec := b.get("/v1/connect/return?installation_id=42&setup_action=update&state=" + install); rec.Code != http.StatusSeeOther {
+		t.Errorf("the same installation again: %d %s", rec.Code, rec.Body)
+	}
+	refused(t, b.get("/v1/connect/return?installation_id=43&setup_action=install&state="+install), refuseOnce)
+	if b.cookie != nil {
+		t.Error("the cookie is kept")
 	}
 }
 
@@ -399,7 +427,7 @@ func TestASecondInstallationIsRefused(t *testing.T) {
 
 func TestAConnectLinksTheInstallationAndSendsItsRepositories(t *testing.T) {
 	rig := newConnectRig(t)
-	// The installation was made on GitHub without Connect: it is kept unlinked, and
+	// GitHub announces the installation before its link: it is kept as not linked, and
 	// nothing of it is listed.
 	rig.deliver(t, "installation", guid1, map[string]any{"action": "created", "installation": map[string]any{"id": 42}})
 	if _, err := rig.st.Get(nsUnlinked, "42"); err != nil || len(rig.apiary.sent(routeCollections)) != 0 {
@@ -439,7 +467,7 @@ func TestAConnectLinksTheInstallationAndSendsItsRepositories(t *testing.T) {
 	if !strings.Contains(rig.log.String(), `"msg":"connected","installation":42,"again":false,"repositories":2`) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
-	if !strings.Contains(rig.log.String(), "made on GitHub without Connect") {
+	if !strings.Contains(rig.log.String(), `"msg":"the installation is not linked to Qory Apiary, so nothing of it is listed until a person connects it","installation":42`) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
 	rig.noLeak(t)
@@ -484,43 +512,30 @@ func TestTheConnectPagesBounds(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "script") {
 		t.Errorf("the page reflects the query: %q", rec.Body)
 	}
-	// One address is refused past its bound, another is not.
-	rig.c.limits.most = 3
-	b.addr = "192.0.2.7:1234"
-	for range 3 {
-		b.get("/v1/connect")
+	// A refusal of the method or the query keeps the session, on the last step too.
+	install := b.start(rig.pass())
+	r := httptest.NewRequest(http.MethodPost, "/v1/connect/authorized", nil)
+	r.AddCookie(&http.Cookie{Name: connectCookie, Value: b.cookie.Value})
+	rec = httptest.NewRecorder()
+	rig.h.ServeHTTP(rec, r)
+	refused(t, b.get("/v1/connect/authorized?state=%zz"), refuseQuery)
+	if len(rec.Result().Cookies()) != 0 || b.cookie == nil {
+		t.Error("a refused method or query drops the cookie")
 	}
-	refused(t, b.get("/v1/connect"), refuseRate)
-	b.addr = "192.0.2.8:1234"
-	refused(t, b.get("/v1/connect"), refusePass)
+	if rec := b.get("/v1/connect/return?installation_id=42&setup_action=install&state=" + install); rec.Code != http.StatusSeeOther {
+		t.Errorf("the session is gone: %d %s", rec.Code, rec.Body)
+	}
 	// The receiver beside it is as it was: a webhook delivery is taken, and another
 	// method or path there is answered as before.
 	body := `{"action":"opened","installation":{"id":42}}`
 	if rec := post(rig.h, "issues", guid2, body, sign(body)); rec.Code != http.StatusAccepted {
 		t.Errorf("the webhook: %d", rec.Code)
 	}
-	r := httptest.NewRequest(http.MethodGet, WebhookPath, nil)
+	r = httptest.NewRequest(http.MethodGet, WebhookPath, nil)
 	rec = httptest.NewRecorder()
 	rig.h.ServeHTTP(rec, r)
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Referrer-Policy") != "" {
 		t.Errorf("GET of the webhook: %d %v", rec.Code, rec.Header())
-	}
-}
-
-func TestAnAddressLimitCountsAddressesToItsBound(t *testing.T) {
-	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
-	l := &addressLimit{every: time.Minute, most: 1, now: func() time.Time { return now }, seen: map[string]addressWindow{}}
-	for i := range maxAddresses {
-		if !l.allow(strconv.Itoa(i)) {
-			t.Fatalf("the address %d is refused", i)
-		}
-	}
-	if l.allow("new") || l.allow("0") {
-		t.Error("an address past the bound, or one past its count, is taken")
-	}
-	now = now.Add(time.Minute)
-	if !l.allow("new") || !l.allow("0") || len(l.seen) != 2 {
-		t.Errorf("the counts that expired are kept: %d", len(l.seen))
 	}
 }
 
@@ -561,5 +576,86 @@ func TestAnInstallationMadeWithoutConnectIsKeptUnlinkedUntilItIsDeleted(t *testi
 	rig.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 43}})
 	if _, err := rig.st.Get(nsUnlinked, "43"); err == nil {
 		t.Error("kept after its deletion")
+	}
+}
+
+func TestAConnectThatWaitsPastItsDeadlineForTheLinkIsRefused(t *testing.T) {
+	rig := newConnectRig(t)
+	b := rig.browser(t)
+	state := b.signIn(rig.pass())
+	// Another connect holds the link.
+	rig.c.linking <- struct{}{}
+	r := httptest.NewRequest(http.MethodGet, "/v1/connect/authorized?code="+signInCode+"&state="+url.QueryEscape(state), nil)
+	r.AddCookie(&http.Cookie{Name: connectCookie, Value: b.cookie.Value})
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	rig.h.ServeHTTP(rec, r.WithContext(ctx))
+	refused(t, rec, refuseBusy)
+	<-rig.c.linking
+	if ok, _ := Linked(rig.st, 42); ok || len(rig.apiary.sent(routeCollections)) != 0 {
+		t.Error("linked or listed")
+	}
+	rig.noLeak(t)
+}
+
+func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
+	rig := newConnectRig(t)
+	Link(rig.st, 42)
+	setReach(rig.st, "acme/widgets", 42)
+	linkCollection(rig.st, "acme/widgets")
+	rig.gh.issues = []map[string]any{ghIssue(1, 0)}
+	// A fill under way for the collection holds its turn: a second refill leaves it to
+	// the first.
+	done, err := rig.adapter.waitTurn(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.c.refill(42)
+	rig.c.refill(42)
+	rig.c.fillMu.Lock()
+	n := len(rig.c.refilling)
+	rig.c.fillMu.Unlock()
+	done()
+	eventually(t, "filled", func() bool { return len(rig.apiary.sent(routeItems)) >= 1 })
+	eventually(t, "refilled", func() bool {
+		rig.c.fillMu.Lock()
+		defer rig.c.fillMu.Unlock()
+		return len(rig.c.refilling) == 0
+	})
+	if n != 1 || len(rig.apiary.sent(routeItems)) != 1 {
+		t.Errorf("%d refills under way, %d fills sent", n, len(rig.apiary.sent(routeItems)))
+	}
+	rig.c.stop()
+	rig.c.refill(42)
+	rig.c.fillMu.Lock()
+	n = len(rig.c.refilling)
+	rig.c.fillMu.Unlock()
+	if n != 0 || len(rig.apiary.sent(routeItems)) != 1 {
+		t.Errorf("a refill started after the stop")
+	}
+}
+
+func TestTheRecordOfAnInstallationNotLinkedExpiresAndGoesWithItsDeletion(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.deliver(t, "installation", guid1, map[string]any{"action": "created", "installation": map[string]any{"id": 42}})
+	Link(rig.st, 42)
+	// A linked installation's deletion drops the record too.
+	rig.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if _, err := rig.st.Get(nsUnlinked, "42"); err == nil {
+		t.Error("kept after the deletion of a linked installation")
+	}
+	// The record expires.
+	now := time.Now()
+	dir := filepath.Join(t.TempDir(), "state")
+	st, err := store.Open(dir, store.Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	keepUnlinked(st, 7)
+	now = now.Add(unlinkedFor)
+	if _, err := st.Get(nsUnlinked, "7"); err == nil {
+		t.Error("the record does not expire")
 	}
 }

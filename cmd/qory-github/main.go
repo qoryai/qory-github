@@ -422,6 +422,13 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err := github.CheckWebURL(*web); err != nil {
 		return err
 	}
+	public := ""
+	if publicURL != nil && *publicURL != "" {
+		var err error
+		if public, err = github.CheckPublicURL(*publicURL); err != nil {
+			return fmt.Errorf("--public-url %w", err)
+		}
+	}
 	if *keyFile == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -440,11 +447,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		*name = "qory-github-" + randomSuffix()
 	}
 	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
-	if publicURL != nil && *publicURL != "" {
-		public, err := github.CheckPublicURL(*publicURL)
-		if err != nil {
-			return err
-		}
+	if public != "" {
 		s.PublicURL, s.ClientSecretFile = public, clientSecretFile(*keyFile)
 	}
 	return runSetup(ctx, s, stdout)
@@ -486,6 +489,9 @@ with the repositories the run works on, and allows GitHub's hosts beside the oth
 run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
+	if app.ClientSecretErr != nil {
+		return app.ClientSecretErr
+	}
 	if app.ClientSecretFile != "" {
 		fragment, err := connectSettings(app.ClientID, app.ClientSecretFile)
 		if err != nil {

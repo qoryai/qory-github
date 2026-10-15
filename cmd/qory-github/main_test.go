@@ -494,7 +494,11 @@ func fakeGitHub(t *testing.T) string {
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes), "client_secret": testClientSecret})
+		answer := map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)}
+		if fakeClientSecret != "" {
+			answer["client_secret"] = fakeClientSecret
+		}
+		json.NewEncoder(w).Encode(answer)
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
@@ -502,6 +506,10 @@ func fakeGitHub(t *testing.T) string {
 
 // testClientSecret is the client secret GitHub hands out with the App.
 const testClientSecret = "a-client-secret-of-the-app"
+
+// fakeClientSecret is the client secret fakeGitHub answers with; empty, it answers
+// without one.
+var fakeClientSecret = testClientSecret
 
 // approve is the browser and the person: it reads the local page's state and follows
 // GitHub's redirect with a code.
@@ -1051,18 +1059,48 @@ serve's settings, for Connect:
 	if err != nil || info.Mode().Perm() != 0o600 || string(b) != testClientSecret+"\n" {
 		t.Errorf("the client secret file: %v %v %q", info, err, b)
 	}
-	// A client secret file that exists, or a public URL that is not https, is refused
-	// before any App is created.
+	// A client secret file that exists, or a public URL that is not https of a host and
+	// an optional port, is refused before any App is created.
 	for _, args := range [][]string{
 		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "http://qory-github.example.com"},
+		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com/#a"},
+		{"--key-file", filepath.Join(dir, "other.pem"), "--public-url", "https://qory-github.example.com:0"},
 		{"--key-file", file + ".2", "--public-url", "https://qory-github.example.com"},
 	} {
+		want := "--public-url is not an https URL of a host and an optional port, without a user, a query or a fragment"
 		if args[1] == file+".2" {
 			os.WriteFile(file+".2.client-secret", nil, 0o600)
+			want = "client-secret"
 		}
 		var out, errs bytes.Buffer
-		if code := run(context.Background(), append([]string{"setup", "--api-url", "http://127.0.0.1:1"}, args...), &out, &errs); code != 1 || out.Len() != 0 {
+		if code := run(context.Background(), append([]string{"setup", "--api-url", "http://127.0.0.1:1"}, args...), &out, &errs); code != 1 || out.Len() != 0 || !strings.Contains(errs.String(), want) {
 			t.Errorf("%v: exit %d, %q %q", args, code, out.String(), errs.String())
 		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "other.pem")); err == nil {
+		t.Error("a key is written")
+	}
+}
+
+// TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept pins that when GitHub answers
+// without a client secret, setup still prints the App, its install page and the
+// declaration, then fails saying where to generate the client secret.
+func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	fakeClientSecret = ""
+	t.Cleanup(func() { fakeClientSecret = testClientSecret })
+	dir := t.TempDir()
+	file := filepath.Join(dir, "github-app.pem")
+	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
+	_, printed, _ := strings.Cut(out, "\n\n")
+	if code != 1 || printed != setupPrinted(t, file) ||
+		!strings.Contains(errs, "the App's client secret was not kept: GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at ") {
+		t.Errorf("exit %d, stderr %q, setup prints\n%s", code, errs, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "github-app.client-secret")); err == nil {
+		t.Error("a client secret file is written")
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("the key: %v", err)
 	}
 }

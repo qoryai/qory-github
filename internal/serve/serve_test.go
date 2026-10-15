@@ -972,6 +972,8 @@ func TestReadSettings(t *testing.T) {
 		"a user":               {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
 		"a public http URL":    {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
 		"a public query":       {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
+		"a public fragment":    {map[string]any{"public_url": "https://qory-github.example.com/#secret"}, "/public_url: is not an https URL of a host and an optional port, without a user, a query or a fragment"},
+		"a public bad port":    {map[string]any{"public_url": "https://qory-github.example.com:0"}, "/public_url: is not an https URL of a host and an optional port"},
 		"a bad key id":         {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
 		"a pin of no list":     {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
 		"a pin of a bad key":   {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},

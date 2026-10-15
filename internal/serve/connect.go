@@ -12,7 +12,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,10 +34,10 @@ import (
 //  1. GET <public_url>/v1/connect?state=<pass> checks the pass, see [Connect.checkPass],
 //     keeps its nonce until the pass expires, so it is taken once, a restart
 //     notwithstanding, starts a connect session, and sends the browser to install the
-//     App on GitHub.
+//     App on GitHub, with a random state the session keeps.
 //  2. GET <public_url>/v1/connect/return, the App's Setup URL, where GitHub sends the
-//     browser after the installation, notes the installation in the session and starts
-//     GitHub's sign-in.
+//     browser after the installation with that state, notes the installation in the
+//     session, once, and starts GitHub's sign-in.
 //  3. GET <public_url>/v1/connect/authorized, the App's callback URL, takes the
 //     sign-in's code: the person's token, which is used for the checks alone and
 //     never kept or logged, must reach the installation and read every repository it
@@ -48,10 +47,18 @@ import (
 // One installation is linked for each adapter: the same one again is a re-connect,
 // which lists its repositories again and fills the linked collections again; another is
 // refused. A session lives in the store under the SHA-256 of a random id, which a
-// cookie for /v1/connect alone carries, for 15 minutes at most, and ends with each
-// answer of the last step, and with each refusal once it is found. Every redirect's
-// target is built from the settings, never from what the request carries, and a page
-// that refuses says one sentence and nothing the request carries.
+// cookie for /v1/connect alone carries, for 15 minutes at most. It ends with each
+// answer of the last step that reads it, and with each refusal once it is read; a
+// refusal of the method, of the query's size or of its form comes before the session
+// is read, so it keeps the session, on /v1/connect/authorized as on the other pages.
+// Every redirect's target is built from the settings, never from what the request
+// carries, and a page that refuses says one sentence and nothing the request carries.
+//
+// The pages count no requests by address: behind the operator's TLS proxy every request
+// comes from the proxy's address, so such a count would bound every person at once.
+// What a request costs is bounded otherwise: a pass's signature is checked before
+// anything is written to the store, and the Setup URL and the callback URL read a
+// session the store keeps, which only a pass makes, before they reach GitHub.
 type Connect struct {
 	// Store keeps the nonces, the sessions and the links.
 	Store *store.Store
@@ -71,32 +78,39 @@ type Connect struct {
 	// Log takes a line for each connect, and the refusals, once a second at most.
 	Log *slog.Logger
 
-	// now is the clock; nil is time.Now. perAddress replaces [connectPerAddress] in a
-	// test.
-	now        func() time.Time
-	perAddress int
+	// now is the clock; nil is time.Now.
+	now func() time.Time
 
 	once     sync.Once
 	base     string
-	limits   *addressLimit
 	refusals *throttle
-	// linking makes the check that no other installation is linked and the link one
-	// step, so two connects at once link one installation.
-	linking sync.Mutex
+	// linking holds one token: the connect that holds it makes the check that no other
+	// installation is linked and the link one step, so two connects at once link one
+	// installation. A connect waits for it until its request's deadline.
+	linking chan struct{}
 	// fills are the fills a re-connect started, which [Connect.stop] stops and waits
-	// for.
+	// for. fillMu guards stopped, after which no fill starts, and refilling, the
+	// collections a re-connect's fill is under way for, which another does not fill
+	// again meanwhile.
 	fillCtx   context.Context
 	stopFills context.CancelFunc
 	fills     sync.WaitGroup
+	fillMu    sync.Mutex
+	stopped   bool
+	refilling map[string]bool
 }
 
 // The store's namespaces Connect keeps its state in, each value with an expiry, and the
-// one an installation made on GitHub without Connect is kept in, unlinked.
+// one an installation GitHub announced is kept in while it is not linked, see
+// [keepUnlinked].
 const (
 	nsConnectNonces   = "connect_nonces"
 	nsConnectSessions = "connect_sessions"
 	nsUnlinked        = "installations_unlinked"
 )
+
+// unlinkedFor is how long the record of an installation not linked is kept.
+const unlinkedFor = 30 * 24 * time.Hour
 
 // Connect's bounds.
 const (
@@ -111,19 +125,19 @@ const (
 	// maxConnectQuery is the most bytes a request's query may hold: a pass is 1,024
 	// characters at most.
 	maxConnectQuery = 2 << 10
-	// connectBound is how long the last step may take, within [writeTimeout].
+	// connectBound is how long the last step may take, within [writeTimeout], its
+	// wait for another connect's link among it.
 	connectBound = 50 * time.Second
-	// connectEvery and connectPerAddress bound the requests from one address: at most
-	// connectPerAddress each connectEvery. maxAddresses is how many addresses are
-	// counted at once; a new one past it is refused until a count expires.
-	connectEvery      = time.Minute
-	connectPerAddress = 30
-	maxAddresses      = 4096
 )
 
 var (
-	// idShape is a session's id as the cookie carries it: 32 random bytes in base64url.
+	// idShape is a session's id as the cookie carries it, and a state the session
+	// keeps: 32 random bytes in base64url.
 	idShape = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	// passShape is the characters a pass may hold: base64url's and the dot. Go's
+	// base64 decoder skips a line break, so a pass is checked against it before it is
+	// decoded.
+	passShape = regexp.MustCompile(`^[A-Za-z0-9_.-]*$`)
 	// nonceShape is a pass's nonce, the contract's pattern: 128 bits in base64url.
 	nonceShape = regexp.MustCompile(`^[A-Za-z0-9_-]{21}[AQgw]$`)
 	// codeShape is the code GitHub's sign-in sends back.
@@ -146,7 +160,6 @@ type refusal struct {
 // request carries.
 var (
 	refuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers GET requests alone.", why: "the request is not GET"}
-	refuseRate      = refusal{status: http.StatusTooManyRequests, page: "Too many requests came from your address. Wait a minute, then try again.", why: "too many requests from one address"}
 	refuseQuery     = refusal{status: http.StatusBadRequest, page: "This link is not one this server reads. Press Connect in Qory Apiary again.", why: "the query is too long, or not one this server reads"}
 	refusePass      = refusal{status: http.StatusBadRequest, page: "This connect link is not valid. Press Connect in Qory Apiary again.", why: "the pass is not one: too long, or not two parts in base64url"}
 	refuseSignature = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's signature does not verify under the pin"}
@@ -155,8 +168,11 @@ var (
 	refuseExpired   = refusal{status: http.StatusBadRequest, page: "This connect link has expired. Press Connect in Qory Apiary again.", why: "the pass has expired, or expires too far ahead"}
 	refuseUsed      = refusal{status: http.StatusBadRequest, page: "This connect link was used already. Press Connect in Qory Apiary again.", why: "the pass's nonce was used already"}
 	refuseFailed    = refusal{status: http.StatusInternalServerError, page: "Something failed on this server. Press Connect in Qory Apiary again.", why: "the store failed"}
-	refuseNoSession = refusal{status: http.StatusBadRequest, page: "No connection is under way in this browser, or it took longer than 15 minutes. Press Connect in Qory Apiary again.", why: "no session", dropCookie: true}
+	refuseNoSession = refusal{status: http.StatusBadRequest, page: "No connection is under way in this browser, or it took too long. Press Connect in Qory Apiary again.", why: "no session", dropCookie: true}
 	refuseWaits     = refusal{status: http.StatusBadRequest, page: "The installation waits for an owner's approval on GitHub. Once it is approved, press Connect in Qory Apiary again.", why: "the installation waits for an owner's approval", endSession: true}
+	refuseInstall   = refusal{status: http.StatusBadRequest, page: "This installation does not belong to the connection under way in this browser. Press Connect in Qory Apiary again.", why: "the Setup URL's state is not the session's", endSession: true}
+	refuseOnce      = refusal{status: http.StatusBadRequest, page: "The connection under way in this browser is for another installation already. Press Connect in Qory Apiary again.", why: "the session holds another installation", endSession: true}
+	refuseBusy      = refusal{status: http.StatusServiceUnavailable, page: "Another connection is being made on this server. Press Connect in Qory Apiary again.", why: "another connect held the link past the deadline", endSession: true}
 	refuseAnswer    = refusal{status: http.StatusBadRequest, page: "GitHub's answer is not one this server reads. Press Connect in Qory Apiary again.", why: "the Setup URL's query is not GitHub's", endSession: true}
 	refuseState     = refusal{status: http.StatusBadRequest, page: "This sign-in does not belong to the connection under way in this browser. Press Connect in Qory Apiary again.", why: "the sign-in's state is not the session's", endSession: true}
 	refuseDenied    = refusal{status: http.StatusBadRequest, page: "GitHub did not complete the sign-in. Press Connect in Qory Apiary again.", why: "the sign-in sent back no code", endSession: true}
@@ -169,10 +185,11 @@ var (
 )
 
 // session is what the store keeps of a connect session: when it expires, in Unix
-// nanoseconds, and, once GitHub's Setup URL is reached, the installation and the state
-// GitHub's sign-in must send back.
+// nanoseconds; the state GitHub's Setup URL must send back; and, once that URL is
+// reached, the installation and the state GitHub's sign-in must send back.
 type session struct {
 	Expires      int64  `json:"expires"`
+	InstallState string `json:"install_state"`
 	Installation int64  `json:"installation,omitempty"`
 	State        string `json:"state,omitempty"`
 }
@@ -184,10 +201,8 @@ func (c *Connect) init() {
 			c.base = strings.TrimSuffix(u.Path, "/")
 		}
 		c.base += connectPath
-		c.limits = &addressLimit{every: connectEvery, most: connectPerAddress, now: c.clock, seen: map[string]addressWindow{}}
-		if c.perAddress > 0 {
-			c.limits.most = c.perAddress
-		}
+		c.linking = make(chan struct{}, 1)
+		c.refilling = map[string]bool{}
 		c.refusals = &throttle{every: refusalEvery, now: c.now, flush: func(dropped int) {
 			c.log().LogAttrs(context.Background(), slog.LevelInfo, "connect refusals dropped", slog.Int("refusals_dropped", dropped))
 		}}
@@ -213,6 +228,9 @@ func (c *Connect) log() *slog.Logger {
 // refusals held back, if any.
 func (c *Connect) stop() {
 	c.init()
+	c.fillMu.Lock()
+	c.stopped = true
+	c.fillMu.Unlock()
 	c.stopFills()
 	c.fills.Wait()
 	c.refusals.stop()
@@ -244,14 +262,6 @@ func (c *Connect) Route(next http.Handler) http.Handler {
 		if r.Method != http.MethodGet {
 			h.Set("Allow", http.MethodGet)
 			c.refuse(w, r, refuseMethod, "")
-			return
-		}
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			host = r.RemoteAddr
-		}
-		if !c.limits.allow(host) {
-			c.refuse(w, r, refuseRate, "")
 			return
 		}
 		q, err := url.ParseQuery(r.URL.RawQuery)
@@ -298,8 +308,8 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		return
 	}
 	ttl := max(min(sessionFor, expires.Sub(now)), time.Second)
-	id := randomID()
-	if err := c.save(id, session{Expires: now.Add(ttl).UnixNano()}); err != nil {
+	id, installState := randomID(), randomID()
+	if err := c.save(id, session{Expires: now.Add(ttl).UnixNano(), InstallState: installState}); err != nil {
 		c.failed(w, r, "", "keeping the session", err)
 		return
 	}
@@ -307,14 +317,19 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		Name: connectCookie, Value: id, Path: c.base, MaxAge: int(ttl / time.Second), Expires: now.Add(ttl),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 	})
-	redirect(w, github.App{Slug: c.Adapter.Slug}.InstallURL(c.Adapter.GitHub.Web()))
+	// GitHub sends the state on to the Setup URL, which requires it. Whether GitHub
+	// sends it when the person changes an installation that exists, on its settings
+	// page, rather than installing anew, is not known here; the Setup URL requires it
+	// all the same, so such a return is refused, and the person connects again.
+	redirect(w, github.App{Slug: c.Adapter.Slug}.InstallURL(c.Adapter.GitHub.Web())+"?"+url.Values{"state": {installState}}.Encode())
 }
 
 // checkPass checks a connect pass, in this order, and returns its payload and when it
 // expires, or the refusal:
 //
-//  1. at most [contracts.ConnectPassMaxLength] characters, split on its last dot into
-//     the payload and the signature, each base64url without padding, decoded strictly;
+//  1. at most [contracts.ConnectPassMaxLength] characters, each base64url's or a dot,
+//     split on its last dot into the payload and the signature, each base64url
+//     without padding, decoded strictly;
 //  2. the signature verifies under a key of the pin over [contracts.ConnectDomain], a
 //     line feed and the payload's bytes, before the payload is parsed;
 //  3. the payload is one JSON object with the contract's four members and no other,
@@ -325,7 +340,7 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 // The nonce is checked by the caller, which keeps it.
 func (c *Connect) checkPass(pass string, now time.Time) (contracts.ConnectPass, time.Time, *refusal) {
 	invalid := &refusePass
-	if len(pass) > contracts.ConnectPassMaxLength {
+	if len(pass) > contracts.ConnectPassMaxLength || !passShape.MatchString(pass) {
 		return contracts.ConnectPass{}, time.Time{}, invalid
 	}
 	i := strings.LastIndexByte(pass, '.')
@@ -385,6 +400,11 @@ func (c *Connect) returned(w http.ResponseWriter, r *http.Request, q url.Values)
 		c.refuse(w, r, refuseNoSession, "")
 		return
 	}
+	state, ok := one(q, "state")
+	if !ok || s.InstallState == "" || subtle.ConstantTimeCompare([]byte(state), []byte(s.InstallState)) != 1 {
+		c.refuse(w, r, refuseInstall, id)
+		return
+	}
 	action, _ := one(q, "setup_action")
 	if action == "request" {
 		c.refuse(w, r, refuseWaits, id)
@@ -395,7 +415,14 @@ func (c *Connect) returned(w http.ResponseWriter, r *http.Request, q url.Values)
 		c.refuse(w, r, refuseAnswer, id)
 		return
 	}
-	s.Installation, _ = strconv.ParseInt(raw, 10, 64)
+	installation, _ := strconv.ParseInt(raw, 10, 64)
+	// The session's installation is set once: a second return names the same one, or
+	// is refused.
+	if s.Installation != 0 && s.Installation != installation {
+		c.refuse(w, r, refuseOnce, id)
+		return
+	}
+	s.Installation = installation
 	s.State = randomID()
 	if err := c.save(id, s); err != nil {
 		c.failed(w, r, id, "keeping the session", err)
@@ -452,8 +479,13 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 		c.refuse(w, r, refuseNoAccess, id, attrs...)
 		return
 	}
-	c.linking.Lock()
-	defer c.linking.Unlock()
+	select {
+	case c.linking <- struct{}{}:
+		defer func() { <-c.linking }()
+	case <-ctx.Done():
+		c.refuse(w, r, refuseBusy, id, attrs...)
+		return
+	}
 	other, err := linkedOther(c.Store, installation)
 	if err != nil {
 		c.failed(w, r, id, "reading the links", err)
@@ -567,23 +599,43 @@ func (k *keptCollections) Disconnect(context.Context, contracts.SourcesDisconnec
 
 // refill fills again, after the answer, each collection Qory Apiary linked that the
 // installation reaches, as the change feed's linked entry fills it, so a re-connect
-// brings what changed meanwhile. A fill that fails is logged.
+// brings what changed meanwhile. Each fill goes through [Adapter.fill], so it takes
+// the collection's turn. A collection a re-connect's fill is under way for already is
+// left to that fill, and once [Connect.stop] has run no fill starts. A fill that fails
+// is logged.
 func (c *Connect) refill(installation int64) {
 	refs, err := reachedBy(c.Store, installation)
 	if err != nil {
 		c.log().Error("filling the collections again after a re-connect", slog.String("error", err.Error()))
 		return
 	}
+	c.fillMu.Lock()
+	defer c.fillMu.Unlock()
+	if c.stopped {
+		return
+	}
+	var mine []string
+	for _, ref := range refs {
+		if key := collectionKey(ref); !c.refilling[key] {
+			c.refilling[key] = true
+			mine = append(mine, ref)
+		}
+	}
+	if len(mine) == 0 {
+		return
+	}
 	c.fills.Add(1)
 	go func() {
 		defer c.fills.Done()
-		for _, ref := range refs {
-			if ok, err := collectionLinked(c.Store, ref); err != nil || !ok {
-				continue
+		for _, ref := range mine {
+			if ok, err := collectionLinked(c.Store, ref); err == nil && ok {
+				if err := c.Adapter.fill(c.fillCtx, ref); err != nil && c.fillCtx.Err() == nil {
+					c.log().Error("filling a collection again after a re-connect", slog.String("collection", ref), slog.String("error", err.Error()))
+				}
 			}
-			if err := c.Adapter.fill(c.fillCtx, ref); err != nil && c.fillCtx.Err() == nil {
-				c.log().Error("filling a collection again after a re-connect", slog.String("collection", ref), slog.String("error", err.Error()))
-			}
+			c.fillMu.Lock()
+			delete(c.refilling, collectionKey(ref))
+			c.fillMu.Unlock()
 		}
 	}()
 }
@@ -599,14 +651,17 @@ func linkedOther(st *store.Store, installation int64) (bool, error) {
 	return other, err
 }
 
-// keepUnlinked keeps that the installation was made on GitHub without Connect: it is
-// not linked, and nothing of it is listed or sent until a person connects it.
+// keepUnlinked keeps, for [unlinkedFor], that GitHub announced the installation, by
+// its installation created event, while it is not linked: Connect's installations
+// bring that event too, before their link. The record says what serve has seen of the
+// App's installations; nothing reads it to decide what is handled, which the link
+// alone decides, and it expires, so it never grows unread.
 func keepUnlinked(st *store.Store, installation int64) error {
-	return st.Put(nsUnlinked, strconv.FormatInt(installation, 10), []byte("unlinked"), 0)
+	return st.Put(nsUnlinked, strconv.FormatInt(installation, 10), []byte("unlinked"), unlinkedFor)
 }
 
-// dropUnlinked forgets that the installation is kept unlinked, once it is linked or
-// deleted.
+// dropUnlinked forgets the installation's record of [keepUnlinked], once it is linked
+// or deleted.
 func dropUnlinked(st *store.Store, installation int64) error {
 	return st.Delete(nsUnlinked, strconv.FormatInt(installation, 10))
 }
@@ -719,52 +774,4 @@ func randomID() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// addressLimit bounds the requests from each address: most in each window of every,
-// counted from the first. It counts maxAddresses addresses at most: a new one past
-// that is refused until a window expires. Behind a proxy every request has the proxy's
-// address, so the bound is then the connect page's whole.
-type addressLimit struct {
-	every time.Duration
-	most  int
-	now   func() time.Time
-
-	mu   sync.Mutex
-	seen map[string]addressWindow
-}
-
-// addressWindow is an address's window: when it began and how many requests it has
-// counted.
-type addressWindow struct {
-	start time.Time
-	n     int
-}
-
-// allow is whether a request from addr is taken, which it counts.
-func (l *addressLimit) allow(addr string) bool {
-	now := l.now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	w, ok := l.seen[addr]
-	if ok && now.Sub(w.start) < l.every {
-		if w.n >= l.most {
-			return false
-		}
-		w.n++
-		l.seen[addr] = w
-		return true
-	}
-	if !ok && len(l.seen) >= maxAddresses {
-		for a, w := range l.seen {
-			if now.Sub(w.start) >= l.every {
-				delete(l.seen, a)
-			}
-		}
-		if len(l.seen) >= maxAddresses {
-			return false
-		}
-	}
-	l.seen[addr] = addressWindow{start: now, n: 1}
-	return true
 }

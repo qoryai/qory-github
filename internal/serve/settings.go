@@ -304,14 +304,13 @@ func checkOrigin(s string) (string, error) {
 	return strings.TrimSuffix(s, "/"), nil
 }
 
-// checkPublicURL takes where serve is reached from outside: https, a host, and a path
-// or none, without a user, a query or a fragment. A trailing slash is dropped.
+// checkPublicURL takes where serve is reached from outside as [github.CheckPublicURL]
+// takes it, as setup does, and refuses one that holds what looks like a secret.
 func checkPublicURL(s string) (string, error) {
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || accesskey.ContainsSecret(s) {
-		return "", errors.New("is not an https URL without a user, a query or a fragment")
+	if accesskey.ContainsSecret(s) {
+		return "", errors.New("is not an https URL of a host and an optional port, without a user, a query or a fragment")
 	}
-	return strings.TrimSuffix(s, "/"), nil
+	return github.CheckPublicURL(s)
 }
 
 // pin is the apiary_public_key field: Qory Apiary's public keys, as

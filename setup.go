@@ -91,8 +91,10 @@ type App struct {
 	KeyFile string
 	// Moved, when set, is why the key is not in [Setup.KeyFile].
 	Moved error
-	// ClientSecretFile is where its client secret is, when [Setup.PublicURL] is set.
+	// ClientSecretFile is where its client secret is, when [Setup.PublicURL] is set,
+	// and ClientSecretErr, when set, is why it is not kept.
 	ClientSecretFile string
+	ClientSecretErr  error
 }
 
 // InstallURL is where a person installs the App on the repositories runs work on.
@@ -271,6 +273,9 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	app.KeyFile = s.KeyFile + "." + hex.EncodeToString(b)
 	app.Moved = err
 	if err2 := writeKeyFile(app.KeyFile, []byte(got.PEM)); err2 != nil {
+		if s.PublicURL != "" {
+			return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v, so its client secret was not kept either; generate a private key and a client secret at %s", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
+		}
 		return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v; generate a private key at %s", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
 	}
 	return s.keepClientSecret(app, got.ClientSecret)
@@ -280,7 +285,7 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 // refuses, no client secret file, or one that exists.
 func (s Setup) checkConnect() error {
 	if _, err := CheckPublicURL(s.PublicURL); err != nil {
-		return err
+		return fmt.Errorf("the public URL %w", err)
 	}
 	if s.ClientSecretFile == "" {
 		return errors.New("no client secret file")
@@ -295,17 +300,20 @@ func (s Setup) checkConnect() error {
 
 // keepClientSecret writes the App's client secret to [Setup.ClientSecretFile], 0600,
 // when [Setup.PublicURL] is set, and returns app with where it is. GitHub shows a client
-// secret once, but a new one can be generated on the App's settings page, which the
-// error names when the file cannot be written; it never contains the secret.
+// secret once, but a new one can be generated on the App's settings page: when the
+// secret cannot be kept, [App.ClientSecretErr] says why and names that page, and the
+// App is returned all the same, its key kept. The error never contains the secret.
 func (s Setup) keepClientSecret(app *App, secret string) (*App, error) {
 	if s.PublicURL == "" {
 		return app, nil
 	}
 	if app.ClientID == "" || secret == "" || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }) {
-		return nil, fmt.Errorf("the App %d (%s) is created and its private key is in %s, but GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at %s", app.ID, app.Slug, app.KeyFile, s.keysURL(app.Slug))
+		app.ClientSecretErr = fmt.Errorf("the App's client secret was not kept: GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at %s", s.keysURL(app.Slug))
+		return app, nil
 	}
 	if err := writeOwnerFile(s.ClientSecretFile, "the client secret file", []byte(secret+"\n")); err != nil {
-		return nil, fmt.Errorf("the App %d (%s) is created and its private key is in %s, but %v; generate a client secret at %s", app.ID, app.Slug, app.KeyFile, err, s.keysURL(app.Slug))
+		app.ClientSecretErr = fmt.Errorf("the App's client secret was not kept: %v; generate a client secret at %s", err, s.keysURL(app.Slug))
+		return app, nil
 	}
 	app.ClientSecretFile = s.ClientSecretFile
 	return app, nil

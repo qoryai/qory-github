@@ -26,15 +26,28 @@ const (
 	ConnectAuthorizedPath = "/v1/connect/authorized"
 )
 
-// CheckPublicURL takes where serve is reached from outside: https, a host, and a path
-// or none, without a user, a query or a fragment. It returns the URL without a
-// trailing slash. The error names the rule, never the URL.
+// CheckPublicURL takes where serve is reached from outside: https, a host, a port from
+// 1 to 65535 or none, and a path or none, without a user, a query or a fragment, an
+// empty one among them, and without white space or a control character. It returns
+// the URL with its scheme and host in lower case and without a trailing slash. setup
+// and serve both check it so. The error names the rule, never the URL.
 func CheckPublicURL(s string) (string, error) {
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
-		return "", errors.New("the public URL is not an https URL without a user, a query or a fragment")
+	refused := errors.New("is not an https URL of a host and an optional port, without a user, a query or a fragment")
+	if strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }) || strings.ContainsAny(s, "#?") {
+		return "", refused
 	}
-	return strings.TrimSuffix(s, "/"), nil
+	u, err := url.Parse(s)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", refused
+	}
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
+			return "", refused
+		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		return "", refused
+	}
+	return strings.TrimSuffix("https://"+strings.ToLower(u.Host)+u.EscapedPath(), "/"), nil
 }
 
 // ConnectManifest adds to the manifest m what Connect needs of the App, under serve's
@@ -75,7 +88,8 @@ var oauthErrorShape = regexp.MustCompile(`^[a-z_]{1,64}$`)
 
 // UserToken exchanges the code GitHub's sign-in sent back for the person's token, with
 // the App's client id and secret: POST /login/oauth/access_token on GitHub's website,
-// [Client.Web]. redirectURI is the callback URL the sign-in was started with. The token
+// [Client.Web]. redirectURI is the callback URL the sign-in was started with. An answer
+// that names an error is one, even with a token. The token
 // is the person's: the caller uses it for the checks it makes and drops it. It follows
 // no redirect. An error says GitHub's error code or the status, never the code, the
 // secret or a token.
@@ -116,6 +130,8 @@ func (c Client) UserToken(ctx context.Context, clientID string, clientSecret []b
 		return "", fmt.Errorf("%s: GitHub answered %d", what, resp.StatusCode)
 	case got.Error != "" && oauthErrorShape.MatchString(got.Error):
 		return "", fmt.Errorf("%s: GitHub answered %s", what, got.Error)
+	case got.Error != "":
+		return "", fmt.Errorf("%s: GitHub answered an error", what)
 	case got.AccessToken == "" || strings.ContainsFunc(got.AccessToken, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
 		return "", fmt.Errorf("%s: GitHub answered without a token", what)
 	}
