@@ -47,7 +47,8 @@ var (
 	kvBucket         = []byte("kv")
 )
 
-// errReplaced is the store's file when it is not the one [Open] checked.
+// errReplaced is the store's file when bbolt opens a link there, or a file on another
+// device or inode than the one [Open] checked.
 var errReplaced = errors.New("the store's file is not the one checked")
 
 // betweenOpens runs between the check of the store's file and bbolt's open of it; a
@@ -85,8 +86,13 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the store: %w", err)
 	}
-	// bbolt opens the path again. The file it opens, never through a link, must be the
-	// one checked above, so a file put in its place between the two opens is refused.
+	// bbolt opens the path again, never through a link. The file it opens must be the one
+	// checked above, the same device and inode, so a file renamed into its place between
+	// the two opens is refused. A file removed and created again there can be given the
+	// freed inode, as Linux file systems such as ext4 do at once, and then passes as the
+	// same; so what bbolt opened is checked again as above: a regular file, the user's,
+	// that grants group and others no permission.
+	var refused error
 	open := func(name string, flag int, perm os.FileMode) (*os.File, error) {
 		f, err := os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		if errors.Is(err, syscall.ELOOP) {
@@ -100,10 +106,18 @@ func Open(dir string, opts Options) (*Store, error) {
 			f.Close()
 			return nil, errReplaced
 		}
+		if err := ownerfile.Check(info, "the store "+name); err != nil {
+			f.Close()
+			refused = err
+			return nil, err
+		}
 		return f, nil
 	}
 	betweenOpens(path)
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second, OpenFile: open})
+	if refused != nil {
+		return nil, refused
+	}
 	if errors.Is(err, errReplaced) {
 		return nil, fmt.Errorf("the store %s was replaced while it was opened", path)
 	}

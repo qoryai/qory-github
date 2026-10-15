@@ -45,15 +45,23 @@ func open(path string, flag int, perm fs.FileMode, what string, shown bool) (*os
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", what, cause(err))
 	}
-	if !info.Mode().IsRegular() {
-		f.Close()
-		return nil, fmt.Errorf("%s is not a regular file", subject)
-	}
-	if err := owned(info, subject, "0600"); err != nil {
+	if err := Check(info, subject); err != nil {
 		f.Close()
 		return nil, err
 	}
 	return f, nil
+}
+
+// Check refuses the file info describes as [Open] refuses what it opened: a file that is
+// not a regular one, that grants group or others any permission, or that belongs to
+// another user than the one the program runs as. info is the Stat of an open file, so
+// what is checked is the file open, whatever its path names now. subject names it in an
+// error, such as "the store /var/lib/qory-github/qory-github.db".
+func Check(info fs.FileInfo, subject string) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", subject)
+	}
+	return owned(info, subject, "0600")
 }
 
 // pathless is err without the path, the [fs.PathError]'s cause when it is one.
