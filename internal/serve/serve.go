@@ -21,11 +21,14 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// The server's bounds. A delivery is read within a minute, 25 MiB at most, and answered
-// within a minute of its headers; a connection is idle two minutes at most.
+// The server's bounds. A delivery is read within 15 seconds, 25 MiB at most, and
+// answered within a minute of its headers; a connection is idle two minutes at most.
+// GitHub counts a delivery not answered within ten seconds as failed, so a body that
+// takes longer to arrive is lost already, and the shorter bound frees a read slot
+// sooner from a sender that sends slowly.
 const (
 	readHeaderTimeout = 10 * time.Second
-	readTimeout       = time.Minute
+	readTimeout       = 15 * time.Second
 	writeTimeout      = time.Minute
 	idleTimeout       = 2 * time.Minute
 	maxHeaderBytes    = 64 << 10
