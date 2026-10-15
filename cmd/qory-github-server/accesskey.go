@@ -109,10 +109,25 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// NormaliseCode's error can quote a part of the code, which no error contains.
+	notACode := errors.New("the code is not an enrolment code: " + accesskey.CodePrefixAdapter + ", 26 characters, then a dot and a fingerprint, as Qory Apiary shows it")
 	code, err := accesskey.NormaliseCode(fs.Arg(1))
 	if err != nil {
-		// NormaliseCode's error can quote a part of the code, which no error contains.
-		return errors.New("the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it")
+		return notACode
+	}
+	// Only an integration's code, an adapter's, is taken. The code's prefix names its
+	// kind, and a code of another kind is refused here, before the secret file's
+	// directory is probed, a key is made or anything is sent.
+	kind, err := accesskey.CodeKind(code)
+	if err != nil {
+		return notACode
+	}
+	if kind != "adapter" {
+		what, ok := codeKindNames[kind]
+		if !ok {
+			return notACode
+		}
+		return fmt.Errorf("this code is for %s: use a code from the integration's Access key tab", what)
 	}
 	// The secret file is checked before the code is sent: its path, that no file is
 	// there, and that its directory exists and can be written. Qory Apiary's 201 spends
@@ -142,13 +157,19 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	ans, err := req.Post(ctx, enrolClient, server, "qory-github/"+version)
+	// accesskey refuses a verified 201 whose node_kind is not the code's kind, adapter,
+	// with a KindError: the key is enrolled, as the check below says.
+	var kindErr *accesskey.KindError
+	if errors.As(err, &kindErr) {
+		return notAnIntegration(kindErr.AccessKeyID, kindErr.Kind, kindErr.NodeID, fingerprint)
+	}
 	if err != nil {
 		return enrolFailed(err, server, fingerprint)
 	}
 	// Only an adapter's key is an integration's: a code for a node, a node pool or a
 	// gateway enrolled a key no integration uses, and its secret is not kept.
 	if ans.NodeKind != "adapter" {
-		return fmt.Errorf("Qory Apiary enrolled the key as %s in the %s %s, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key %s, and enrol with a code made on the integration's Access key tab in Organisation settings", ans.AccessKeyID, ans.NodeKind, ans.NodeID, fingerprint)
+		return notAnIntegration(ans.AccessKeyID, ans.NodeKind, ans.NodeID, fingerprint)
 	}
 	if ans.Pin.Fixture() {
 		return fmt.Errorf("Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key %s", fingerprint)
@@ -166,6 +187,21 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fmt.Fprint(stdout, fragment)
 	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the integration's Access key tab in Organisation settings; the key is active\n", fingerprint)
 	return nil
+}
+
+// codeKindNames words the kinds of key a code enrols that enrol refuses, by the
+// node_kind [accesskey.CodeKind] returns.
+var codeKindNames = map[string]string{
+	"node":    "a node",
+	"pool":    "a node pool",
+	"gateway": "a gateway",
+}
+
+// notAnIntegration is the error of a key Qory Apiary enrolled as the access key id in
+// the node of kind and id node, which is not an integration's, so its secret is not
+// kept. Its text is a placeholder awaiting the user's wording, see [accessKeyHelp].
+func notAnIntegration(id, kind, node, fingerprint string) error {
+	return fmt.Errorf("Qory Apiary enrolled the key as %s in the %s %s, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key %s, and enrol with a code made on the integration's Access key tab in Organisation settings", id, kind, node, fingerprint)
 }
 
 // checkServer takes Qory Apiary's origin, as accesskey's enrolment posts to it: an https
@@ -266,10 +302,24 @@ func lowerHost(host string) string {
 	return string(b)
 }
 
-// hasCodeOrSecret reports whether a value holds what starts an enrolment code, qec_, an
-// access key secret, qak_, or a run key, qrk_, in any case.
+// codePrefixes are the prefixes of an enrolment code, one for each kind of key it
+// enrols.
+var codePrefixes = []string{accesskey.CodePrefixNode, accesskey.CodePrefixPool, accesskey.CodePrefixGateway, accesskey.CodePrefixAdapter}
+
+// hasCodeOrSecret reports whether a value holds what starts an enrolment code of any
+// kind, qecn_, qecp_, qecg_ or qeci_, an access key secret, qak_, or a run key, qrk_,
+// in any case.
 func hasCodeOrSecret(v string) bool {
-	return accesskey.ContainsSecret(v) || strings.Contains(strings.ToLower(v), strings.ToLower(accesskey.CodePrefix))
+	if accesskey.ContainsSecret(v) {
+		return true
+	}
+	lower := strings.ToLower(v)
+	for _, p := range codePrefixes {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // accessKeyName is the access key's name in Qory Apiary: this machine's host name, or its

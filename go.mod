@@ -3,7 +3,7 @@ module github.com/qoryai/qory-github
 go 1.27.1
 
 require (
-	github.com/qoryai/forager v0.7.1-0.20261015090139-b790e4136c8c
+	github.com/qoryai/forager v0.7.1-0.20261015133646-ef5d0a5fde79
 	github.com/qoryai/integrations v0.3.1-0.20261015131746-94ee2d0876a0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	go.etcd.io/bbolt v1.5.0
