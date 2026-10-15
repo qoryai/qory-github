@@ -9,7 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -18,20 +18,21 @@ import (
 // file that is not a regular one, that grants group or others any permission, or that
 // belongs to another user than the one the program runs as is refused and closed. what
 // names the file in an error, such as "the private key file"; an error never says what
-// the file contains. The cleaned path is the one opened, so a trailing slash cannot make
-// the open follow a link; an error names path as it is given.
+// the file contains. path is opened as it is given, so the system resolves each .. in
+// it through the links before it, and a trailing slash opens no file; a final link is
+// refused.
 func Open(path string, flag int, perm fs.FileMode, what string) (*os.File, error) {
-	f, err := os.OpenFile(filepath.Clean(path), flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
+	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
 	if errors.Is(err, syscall.ELOOP) {
 		return nil, fmt.Errorf("%s %s is a symbolic link; use the path of the file itself", what, path)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", what, given(err, path))
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("%s: %w", what, given(err, path))
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	if !info.Mode().IsRegular() {
 		f.Close()
@@ -55,7 +56,7 @@ func ReadFile(path string, max int, what, holds string) ([]byte, error) {
 	defer f.Close()
 	b, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", what, given(err, path))
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	if len(b) > max {
 		return nil, fmt.Errorf("%s %s is larger than %s", what, path, holds)
@@ -67,10 +68,15 @@ func ReadFile(path string, max int, what, holds string) ([]byte, error) {
 // and checks it: one that is a symbolic link, that is not a directory, that grants group
 // or others any permission, or that belongs to another user than the one the program
 // runs as is refused. what names it in an error, such as "the state directory". The
-// cleaned path is the one checked, since Lstat of link/ would read the directory the
-// link points to; an error names path as it is given.
+// path checked is path without its trailing slashes, / itself kept, since Lstat of
+// link/ would read the directory the link points to; nothing else in it is changed, so
+// the system still resolves each .. through the links before it. An error names path
+// as it is given.
 func Dir(path, what string) error {
-	clean := filepath.Clean(path)
+	clean := strings.TrimRight(path, "/")
+	if clean == "" && path != "" {
+		clean = "/"
+	}
 	if err := os.Mkdir(clean, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("%s: %w", what, given(err, path))
 	}
@@ -88,7 +94,8 @@ func Dir(path, what string) error {
 }
 
 // given is err with the path of the [fs.PathError] it is, if it is one, set back to path
-// as the operator gave it, since the call it failed was handed the cleaned path.
+// as the operator gave it, since the call it failed was handed path without its
+// trailing slashes.
 func given(err error, path string) error {
 	var pe *fs.PathError
 	if errors.As(err, &pe) {

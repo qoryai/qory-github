@@ -193,8 +193,9 @@ func held(rc *Receiver) (int64, int64) {
 
 func TestASenderThatSendsNothingHoldsNothing(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	// The budget is one body: a sender that held it by what it claims would leave none.
-	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: int64(len(body1))}
+	// The budget is one body, its chunk and its joined bytes: a sender that held it by
+	// what it claims would leave none.
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: progressBytes + int64(len(body1))}
 	srv := httptest.NewServer(rc.Mux())
 	defer srv.Close()
 	for i := range 5 {
@@ -225,7 +226,7 @@ func TestASenderThatSendsNothingHoldsNothing(t *testing.T) {
 
 func TestTheBudgetIsNeverExceededNorTakenFromTheLengthClaimed(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: int64(len(body1))}
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: progressBytes + int64(len(body1))}
 	larger := body1 + strings.Repeat(" ", 10)
 	if w := post(rc.Mux(), "issues", guid1, larger, sign(larger)); w.Code != http.StatusServiceUnavailable {
 		t.Errorf("a body beyond the budget: status %d", w.Code)
@@ -246,7 +247,7 @@ func TestTheBudgetIsNeverExceededNorTakenFromTheLengthClaimed(t *testing.T) {
 		t.Errorf("a body within the budget, its length claimed larger: status %d", w.Code)
 	}
 	h, peak := held(rc)
-	if h != 0 || peak > rc.maxBudget || peak != int64(len(body1)) {
+	if h != 0 || peak > rc.maxBudget || peak != progressBytes+int64(len(body1)) {
 		t.Errorf("held %d, peak %d, budget %d", h, peak, rc.maxBudget)
 	}
 }
@@ -337,6 +338,9 @@ func TestRefusalsAreLoggedOnceASecond(t *testing.T) {
 	var log syncBuffer
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	rc := &Receiver{Secret: []byte(secret), Store: st, Log: slog.New(slog.NewJSONHandler(&log, nil)), now: func() time.Time { return now }}
+	// The clock is a test's, so no timer flushes the count: the next line says it.
+	rc.init()
+	rc.refusals.flush = nil
 	for range 5 {
 		if w := post(rc.Mux(), "issues", guid1, body1, ""); w.Code != http.StatusUnauthorized {
 			t.Fatalf("status %d", w.Code)
@@ -350,6 +354,41 @@ func TestRefusalsAreLoggedOnceASecond(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(log.String()), "\n")
 	if len(lines) != 2 || !strings.Contains(lines[1], `"refusals_dropped":4`) {
 		t.Errorf("the log:\n%s", log.String())
+	}
+}
+
+func TestACountOfRefusalsIsLoggedWhenNoRefusalFollows(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	var log syncBuffer
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: slog.New(slog.NewJSONHandler(&log, nil))}
+	rc.init()
+	rc.refusals.every = 50 * time.Millisecond
+	for range 3 {
+		post(rc.Mux(), "issues", guid1, body1, "")
+	}
+	eventually(t, "the count", func() bool {
+		return strings.Contains(log.String(), `"msg":"refusals dropped","refusals_dropped":2`)
+	})
+}
+
+func TestACountOfRefusalsIsLoggedAtTheStop(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	var log syncBuffer
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: slog.New(slog.NewJSONHandler(&log, nil))}
+	for range 3 {
+		post(rc.Mux(), "issues", guid1, body1, "")
+	}
+	rc.stopLog()
+	if !strings.Contains(log.String(), `"msg":"refusals dropped","refusals_dropped":2`) {
+		t.Errorf("the log:\n%s", log.String())
+	}
+	// A refusal after the stop sets no timer, and is never flushed.
+	post(rc.Mux(), "issues", guid1, body1, "")
+	rc.refusals.mu.Lock()
+	timer := rc.refusals.timer
+	rc.refusals.mu.Unlock()
+	if timer != nil {
+		t.Error("a timer is set after the stop")
 	}
 }
 
@@ -902,9 +941,9 @@ func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
 	}
 }
 
-// running runs serve with opts on a loopback port, and returns its address and its log.
-// It stops when the test ends.
-func running(t *testing.T, opts Options) (string, *syncBuffer) {
+// running runs serve with opts on a loopback port, and returns its address, its log and
+// a function that stops it and waits for it. It stops when the test ends.
+func running(t *testing.T, opts Options) (string, *syncBuffer, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	k, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -923,14 +962,16 @@ func running(t *testing.T, opts Options) (string, *syncBuffer) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, s, opts) }()
-	t.Cleanup(func() { cancel(); <-done })
+	var once sync.Once
+	stop := func() { once.Do(func() { cancel(); <-done }) }
+	t.Cleanup(stop)
 	select {
 	case a := <-addr:
-		return a.String(), log
+		return a.String(), log, stop
 	case err := <-done:
 		t.Fatalf("Run: %v", err)
 	}
-	return "", nil
+	return "", nil, nil
 }
 
 // idle opens a connection to addr and makes one request on it, which it keeps open.
@@ -958,7 +999,7 @@ func TestAnIdleConnectionIsClosedAfterTheIdleTimeout(t *testing.T) {
 	if idleTimeout != 5*time.Second {
 		t.Errorf("the idle timeout is %s", idleTimeout)
 	}
-	addr, _ := running(t, Options{idleTimeout: 200 * time.Millisecond})
+	addr, _, _ := running(t, Options{idleTimeout: 200 * time.Millisecond})
 	c := idle(t, addr)
 	begun := time.Now()
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -968,7 +1009,7 @@ func TestAnIdleConnectionIsClosedAfterTheIdleTimeout(t *testing.T) {
 }
 
 func TestAFullConnectionBoundIsLogged(t *testing.T) {
-	addr, log := running(t, Options{maxConns: 1})
+	addr, log, _ := running(t, Options{maxConns: 1})
 	first := idle(t, addr)
 	second, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -985,4 +1026,63 @@ func TestAFullConnectionBoundIsLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+}
+
+func TestRunLogsTheCountsHeldBackBeforeItStops(t *testing.T) {
+	addr, log, stop := running(t, Options{maxConns: 1})
+	for range 3 {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+WebhookPath, strings.NewReader(body1))
+		req.Header.Set("X-GitHub-Event", "issues")
+		req.Header.Set("X-GitHub-Delivery", guid1)
+		req.Header.Set("Connection", "close")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	stop()
+	out := log.String()
+	dropped := strings.Index(out, `"refusals_dropped":2`)
+	stopped := strings.Index(out, `"msg":"stopped"`)
+	if dropped < 0 || stopped < dropped {
+		t.Errorf("the log:\n%s", out)
+	}
+}
+
+func TestAStaleTickDoesNothing(t *testing.T) {
+	flushed := make(chan int, 4)
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	th := &throttle{every: time.Hour, now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now }, flush: func(n int) { flushed <- n }}
+	th.allow()
+	th.allow()
+	th.mu.Lock()
+	stale := th.gen
+	th.mu.Unlock()
+	// A line is allowed in the next period, which cancels that timer, and one is held
+	// back after it, which sets another.
+	mu.Lock()
+	now = now.Add(time.Hour)
+	mu.Unlock()
+	if ok, dropped := th.allow(); !ok || dropped != 1 {
+		t.Fatalf("%v %d", ok, dropped)
+	}
+	th.allow()
+	th.tick(stale)
+	th.mu.Lock()
+	timer := th.timer
+	th.mu.Unlock()
+	if timer == nil {
+		t.Error("a stale tick orphaned the timer that is set")
+	}
+	select {
+	case n := <-flushed:
+		t.Errorf("a stale tick flushed %d", n)
+	default:
+	}
+	th.stop()
+	if n := <-flushed; n != 1 {
+		t.Errorf("the stop flushed %d, want 1", n)
+	}
 }

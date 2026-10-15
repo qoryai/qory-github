@@ -10,7 +10,7 @@ import (
 // maxConns is how many connections serve keeps open at once. A connection beyond it
 // waits to be accepted until one closes. A connection pins no body's memory, see
 // [readBudget], and an idle one is closed after [idleTimeout], so the bound is high.
-const maxConns = 1024
+const maxConns = 8192
 
 // limitListener accepts a connection only while fewer than its bound are open, as
 // golang.org/x/net/netutil's LimitListener does, without that module. When the bound is
@@ -27,7 +27,7 @@ type limitListener struct {
 
 // limit is ln accepting n connections at once at most, logging to log, when it is not
 // nil, each time it is full, once a second at most.
-func limit(ln net.Listener, n int, log *slog.Logger) net.Listener {
+func limit(ln net.Listener, n int, log *slog.Logger) *limitListener {
 	l := &limitListener{Listener: ln, slots: make(chan struct{}, n), done: make(chan struct{}), log: log}
 	l.full = &throttle{every: time.Second, flush: l.logFull}
 	return l

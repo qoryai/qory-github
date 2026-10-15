@@ -10,9 +10,10 @@
 //
 // Put serve behind a proxy that holds the whole request body before it passes the
 // request on, as nginx does by default (proxy_request_buffering on). Then a sender that
-// sends a body slowly holds the proxy's buffer, not serve's: serve reads each body at
-// the proxy's speed, and its byte budget and progress deadline, see [Receiver.ServeHTTP],
-// cut only senders that reach it directly.
+// sends a body slowly holds the proxy's buffer, not serve's, and serve reads each body
+// at the proxy's speed: the progress deadline, see [Receiver.ServeHTTP], cuts only
+// senders that reach serve directly. The byte budget, see [readBudget], bounds the
+// bodies serve holds at once whichever way they come, through the proxy or not.
 package serve
 
 import (
@@ -28,13 +29,14 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// The server's bounds. A delivery is read within 15 seconds, 25 MiB at most, and
-// answered within a minute of its headers; GitHub counts a delivery not answered within
-// ten seconds as failed, so a body that takes longer to arrive is lost already. A
-// connection is idle five seconds at most, so idle connections do not hold the
-// [maxConns] slots.
+// The server's bounds. A delivery's headers are read within three seconds, and the
+// whole delivery within 15 seconds, 25 MiB at most, and answered within a minute of its
+// headers; GitHub counts a delivery not answered within ten seconds as failed, so a
+// delivery that takes longer to arrive is lost already. A connection is idle five
+// seconds at most. Both keep a sender that reaches serve directly, sending headers
+// slowly or nothing at all, from holding the [maxConns] slots.
 const (
-	readHeaderTimeout = 10 * time.Second
+	readHeaderTimeout = 3 * time.Second
 	readTimeout       = 15 * time.Second
 	writeTimeout      = time.Minute
 	idleTimeout       = 5 * time.Second
@@ -105,7 +107,8 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	worker.Start()
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(limit(ln, cmp.Or(opts.maxConns, maxConns), log)) }()
+	limited := limit(ln, cmp.Or(opts.maxConns, maxConns), log)
+	go func() { served <- srv.Serve(limited) }()
 	log.Info("serving", slog.String("address", ln.Addr().String()), slog.String("path", WebhookPath))
 	if opts.Listening != nil {
 		opts.Listening(ln.Addr())
@@ -134,6 +137,9 @@ loop:
 		srv.Close()
 	}
 	worker.Stop(handlerGrace)
+	// A count of lines held back is logged before serve stops.
+	rc.stopLog()
+	limited.full.stop()
 	log.Info("stopped")
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
