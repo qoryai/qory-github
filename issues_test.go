@@ -231,14 +231,18 @@ func (f *fakeIssues) lister(t *testing.T, s Sink, logs *[]string) Lister {
 	}
 	clock := &fakeClock{}
 	return Lister{
-		Client: Client{API: f.srv.URL},
-		Pacer:  clock.pacer(),
-		Token:  func(context.Context) (string, error) { return fakeToken, nil },
-		Slug:   "qory-test",
-		Sink:   s,
-		Logf:   func(format string, args ...any) { *logs = append(*logs, fmt.Sprintf(format, args...)) },
+		Client:       Client{API: f.srv.URL},
+		Pacer:        clock.pacer(),
+		Token:        func(context.Context) (string, error) { return fakeToken, nil },
+		Slug:         "qory-test",
+		ConnectionID: testConnection,
+		Sink:         s,
+		Logf:         func(format string, args ...any) { *logs = append(*logs, fmt.Sprintf(format, args...)) },
 	}
 }
+
+// testConnection is the connection a test's listings name.
+const testConnection = "ac_0123456789abcdef"
 
 var widgets = Repository{Owner: "acme", Name: "widgets"}
 
@@ -263,7 +267,7 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 		{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &contracts.Target{System: host, Path: "acme/widgets"}},
 		{Ref: "acme/gadgets", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
 	}
-	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 {
+	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 || got.ConnectionID != testConnection {
 		t.Errorf("collections %+v", got)
 	}
 	if !reflect.DeepEqual(logs, []string{"skipped the collection acme/broken: its URL is not https or is longer than 2048 characters"}) {

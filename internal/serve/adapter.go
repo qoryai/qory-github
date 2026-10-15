@@ -24,7 +24,8 @@ const tokenMargin = 5 * time.Minute
 // Adapter is what serve does with GitHub's deliveries and Qory Apiary's change feed: it
 // sends an installation's repositories, issues and comments to Qory Apiary, and writes
 // on GitHub what the feed says. It serves only an installation the store holds as
-// linked, see [Link], and sends only the items of a collection Qory Apiary linked.
+// linked to a connection, see [Link], and sends only the items of a collection Qory
+// Apiary linked.
 type Adapter struct {
 	// Store keeps the links, the repositories' installations and the feed's cursor.
 	Store *store.Store
@@ -219,12 +220,15 @@ func (a *Adapter) stopLog() {
 	a.cutLog().stop()
 }
 
-// reachSink is the adapter's sink for a listing of an installation's repositories: it
-// keeps which installation reaches each repository it lists before it sends them.
+// reachSink is the adapter's sink for a listing of an installation's repositories,
+// which names the installation's connection: it keeps which installation reaches each
+// repository it lists before it sends them, and once Qory Apiary takes a part, which it
+// does once the connection is made, it marks the installation's link live.
 type reachSink struct {
 	github.Sink
 	st           *store.Store
 	installation int64
+	connection   string
 }
 
 // Collections keeps each collection's installation and sends them.
@@ -234,52 +238,89 @@ func (s reachSink) Collections(ctx context.Context, req contracts.SourceCollecti
 			return err
 		}
 	}
-	return s.Sink.Collections(ctx, req)
+	if err := s.Sink.Collections(ctx, req); err != nil {
+		return err
+	}
+	return goLive(s.st, s.installation, s.connection)
 }
 
-// listRepositories sends Qory Apiary the repositories the installation reaches.
+// listRepositories sends Qory Apiary the repositories the installation reaches, as
+// collections of the connection it is linked to; an installation not linked sends
+// nothing.
 func (a *Adapter) listRepositories(ctx context.Context, installation int64) error {
+	l, ok, err := linkOf(a.Store, installation)
+	if err != nil || !ok {
+		return err
+	}
+	return a.listConnection(ctx, installation, l.Connection)
+}
+
+// listConnection sends Qory Apiary the repositories the installation reaches, as
+// collections of connection, see [reachSink].
+func (a *Adapter) listConnection(ctx context.Context, installation int64, connection string) error {
 	l := github.Lister{
-		Client: a.GitHub,
-		Pacer:  a.pacer(installation),
-		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
-		Slug:   a.Slug,
-		Sink:   reachSink{Sink: a.Sink, st: a.Store, installation: installation},
-		Logf:   a.logf,
-		LogCut: a.logCut,
+		Client:       a.GitHub,
+		Pacer:        a.pacer(installation),
+		Token:        func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
+		Slug:         a.Slug,
+		ConnectionID: connection,
+		Sink:         reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: connection},
+		Logf:         a.logf,
+		LogCut:       a.logCut,
 	}
 	return a.forgetOn401(installation, l.ListRepositories(ctx))
 }
 
-// installation handles the installation event: deleted disconnects each repository
-// of the installation the store knows, ended, then forgets them and unlinks it;
-// suspend disconnects each, paused; unsuspend lists the repositories again.
+// connectionSink is a sink that ends a connection, as [Apiary.DisconnectConnection]
+// does.
+type connectionSink interface {
+	DisconnectConnection(ctx context.Context, req contracts.ConnectionsDisconnect) error
+}
+
+// installation handles the installation event: deleted ends the installation's
+// connection, see [Adapter.endConnection], then drops what the store keeps of the
+// installation; suspend is logged and changes nothing, since a suspended installation
+// is no disconnect, and the next round lists it again; unsuspend lists the
+// repositories again.
 func (a *Adapter) installation(ctx context.Context, d Delivery) error {
 	switch d.Action {
 	case "deleted":
-		refs, err := reachedBy(a.Store, d.InstallationID)
+		l, ok, err := linkOf(a.Store, d.InstallationID)
 		if err != nil {
 			return err
 		}
-		if err := a.disconnect(ctx, refs, github.ReasonEnded); err != nil {
-			return err
-		}
-		for _, ref := range refs {
-			if err := a.Store.Delete(nsRepositories, collectionKey(ref)); err != nil {
+		if ok {
+			if err := a.endConnection(ctx, l.Connection); err != nil {
 				return err
 			}
 		}
-		return Unlink(a.Store, d.InstallationID)
+		installMu.Lock()
+		defer installMu.Unlock()
+		return dropInstallation(a.Store, d.InstallationID)
 	case "suspend":
-		refs, err := reachedBy(a.Store, d.InstallationID)
-		if err != nil {
-			return err
-		}
-		return a.disconnect(ctx, refs, github.ReasonPaused)
+		// placeholder: wording waits for the user
+		a.log().Info("GitHub suspended the installation, so its link stays and it is read again later", slog.Int64("installation", d.InstallationID))
 	case "unsuspend":
 		return a.listRepositories(ctx, d.InstallationID)
 	}
 	return nil
+}
+
+// endConnection tells Qory Apiary the source no longer grants the connection access,
+// POST /v1/connections/disconnect, which [Apiary.DisconnectConnection] sends again while
+// Qory Apiary answers 403. A 403 that lasts, or another refusal for good, is logged and
+// passed; any other error stops it, to be tried again.
+func (a *Adapter) endConnection(ctx context.Context, connection string) error {
+	cs, ok := a.Sink.(connectionSink)
+	if !ok {
+		return Permanent(errors.New("the sink cannot disconnect a connection"))
+	}
+	err := cs.DisconnectConnection(ctx, contracts.ConnectionsDisconnect{Version: contracts.Version, ConnectionID: connection})
+	if IsPermanent(err) {
+		a.log().Error("the disconnect is refused", slog.String("connection", connection), slog.String("error", err.Error()))
+		return nil
+	}
+	return err
 }
 
 // installationRepositories handles the installation_repositories event: each
@@ -304,7 +345,7 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 			refs = append(refs, r.FullName)
 		}
 	}
-	if err := a.disconnect(ctx, refs, github.ReasonRemoved); err != nil {
+	if err := a.disconnect(ctx, refs); err != nil {
 		return err
 	}
 	for _, ref := range refs {
@@ -315,11 +356,11 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	return a.listRepositories(ctx, d.InstallationID)
 }
 
-// disconnect sends a disconnect for each collection, for reason. One Qory Apiary refuses
-// for good is logged and passed; any other error stops it, to be tried again.
-func (a *Adapter) disconnect(ctx context.Context, refs []string, reason string) error {
+// disconnect sends a disconnect for each collection. One Qory Apiary refuses for good is
+// logged and passed; any other error stops it, to be tried again.
+func (a *Adapter) disconnect(ctx context.Context, refs []string) error {
 	for _, ref := range refs {
-		err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref, Reason: reason})
+		err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref})
 		if IsPermanent(err) {
 			a.log().Error("the disconnect is refused", slog.String("collection", ref), slog.String("error", err.Error()))
 			continue

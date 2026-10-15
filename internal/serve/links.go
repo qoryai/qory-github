@@ -3,6 +3,7 @@ package serve
 import (
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +16,15 @@ import (
 // The store's namespaces serve keeps the adapter's state in.
 //
 //   - installations: an installation of the App that is linked to Qory Apiary, by its
-//     id. Only a linked installation's deliveries are handled.
+//     id, with the connection it is linked to and whether that connection is made, see
+//     [link]. Only a linked installation's deliveries are handled.
 //   - collections: a collection, a repository, that Qory Apiary linked to a workspace,
 //     by its ref in lower case, set from the change feed. Only a linked collection's
 //     items and comments are sent.
 //   - repositories: the installation that reaches a repository, by its ref in lower
 //     case, with the ref as GitHub writes it, set by each listing of an installation's
-//     repositories.
+//     repositories. The installation's link names the connection the repository's
+//     collection belongs to.
 //   - adapter: the instance id, the change feed's cursor and the sync interval.
 //   - pulls: when the last pull of a collection that finished without error began, and
 //     when its last listing of open issues began, by its ref in lower case, see
@@ -38,12 +41,42 @@ const (
 	keySyncInterval = "sync_interval"
 )
 
-// Link marks the installation linked to Qory Apiary, so its deliveries are handled.
-func Link(st *store.Store, installation int64) error {
+// The states of an installation's link: pending from the linked connect return, and live
+// once Qory Apiary answers a listing that names the connection with a signed 204, which
+// it does once the connection is made.
+const (
+	linkPending = "pending"
+	linkLive    = "live"
+)
+
+// link is what the store keeps of a linked installation: the connection in Qory Apiary,
+// ac_ and 16 characters, and the link's state, [linkPending] or [linkLive].
+type link struct {
+	Connection string `json:"connection_id"`
+	State      string `json:"state"`
+}
+
+// connectionShape is a connection's id, the contract's pattern.
+var connectionShape = regexp.MustCompile(`^ac_[0-9a-hjkmnp-tv-z]{16}$`)
+
+// installMu orders the changes of the installations' links, each of which reads a link
+// before it writes it.
+var installMu sync.Mutex
+
+// Link links the installation to the connection, in state, so its deliveries are
+// handled.
+func Link(st *store.Store, installation int64, connection, state string) error {
 	if installation <= 0 {
 		return errors.New("an installation's id is positive")
 	}
-	return st.Put(nsInstallations, strconv.FormatInt(installation, 10), []byte("linked"), 0)
+	if !connectionShape.MatchString(connection) || (state != linkPending && state != linkLive) {
+		return errors.New("a link names a connection and is pending or live")
+	}
+	b, err := json.Marshal(link{Connection: connection, State: state})
+	if err != nil {
+		return err
+	}
+	return st.Put(nsInstallations, strconv.FormatInt(installation, 10), b, 0)
 }
 
 // Unlink marks the installation not linked, so its deliveries are done unhandled.
@@ -51,12 +84,111 @@ func Unlink(st *store.Store, installation int64) error {
 	return st.Delete(nsInstallations, strconv.FormatInt(installation, 10))
 }
 
-// Linked is whether the installation is linked to Qory Apiary.
+// Linked is whether the installation is linked to Qory Apiary, pending or live.
 func Linked(st *store.Store, installation int64) (bool, error) {
+	_, ok, err := linkOf(st, installation)
+	return ok, err
+}
+
+// linkOf is the installation's link, or false when it has none.
+func linkOf(st *store.Store, installation int64) (link, bool, error) {
 	if installation <= 0 {
-		return false, nil
+		return link{}, false, nil
 	}
-	return present(st.Get(nsInstallations, strconv.FormatInt(installation, 10)))
+	b, err := st.Get(nsInstallations, strconv.FormatInt(installation, 10))
+	if errors.Is(err, store.ErrNotFound) {
+		return link{}, false, nil
+	}
+	if err != nil {
+		return link{}, false, err
+	}
+	var l link
+	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) {
+		return link{}, false, errors.New("the store's entry for an installation is not one")
+	}
+	return l, true, nil
+}
+
+// goLive marks the installation's link live when it is pending and names connection, as
+// Qory Apiary's signed 204 to a listing that names connection says.
+func goLive(st *store.Store, installation int64, connection string) error {
+	installMu.Lock()
+	defer installMu.Unlock()
+	l, ok, err := linkOf(st, installation)
+	if err != nil || !ok || l.Connection != connection || l.State == linkLive {
+		return err
+	}
+	return Link(st, installation, connection, linkLive)
+}
+
+// connectionOf is the connection of the collection ref: that of the link of the
+// installation that reaches it, or "" when the store knows none.
+func connectionOf(st *store.Store, ref string) (string, error) {
+	installation, ok, err := reachOf(st, ref)
+	if err != nil || !ok {
+		return "", err
+	}
+	l, ok, err := linkOf(st, installation)
+	if err != nil || !ok {
+		return "", err
+	}
+	return l.Connection, nil
+}
+
+// dropConnection drops what the store keeps of the connection, which ended: the link of
+// each installation linked to it, and the records of the collections that installation
+// reaches, see [dropInstallation]. A link to another connection stays, so an answer
+// about a connection that a new connect has replaced since drops nothing. It says
+// whether it dropped a link.
+func dropConnection(st *store.Store, connection string) (bool, error) {
+	var installations []int64
+	err := st.Each(nsInstallations, func(key string, v []byte) error {
+		var l link
+		if json.Unmarshal(v, &l) == nil && l.Connection == connection {
+			if id, err := strconv.ParseInt(key, 10, 64); err == nil && id > 0 {
+				installations = append(installations, id)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	dropped := false
+	for _, id := range installations {
+		installMu.Lock()
+		l, ok, err := linkOf(st, id)
+		if err == nil && ok && l.Connection == connection {
+			err = dropInstallation(st, id)
+			dropped = true
+		}
+		installMu.Unlock()
+		if err != nil {
+			return dropped, err
+		}
+	}
+	return dropped, nil
+}
+
+// dropInstallation drops what the store keeps of the installation: the records of the
+// collections it reaches, which are its repositories, whether they are linked and their
+// pulls, and then its link.
+func dropInstallation(st *store.Store, installation int64) error {
+	refs, err := reachedBy(st, installation)
+	if err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		for _, ns := range []string{nsRepositories, nsPulls} {
+			if err := st.Delete(ns, collectionKey(ref)); err != nil {
+				return err
+			}
+		}
+		if err := unlinkCollection(st, ref); err != nil {
+			return err
+		}
+	}
+	return Unlink(st, installation)
 }
 
 // present is whether a value was found, or the store's error.

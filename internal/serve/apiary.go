@@ -31,6 +31,8 @@ const (
 	routeDisconnect  = "/v1/sources/disconnect"
 	routeChanges     = "/v1/work-items/changes"
 	changesAfter     = "after"
+	// routeConnectionsDisconnect ends a connection the source no longer grants access.
+	routeConnectionsDisconnect = "/v1/connections/disconnect"
 	// headerContractVersion carries contracts.Revision on every request. It is not
 	// part of what the request's signature covers.
 	headerContractVersion = "X-Qory-Contract-Version"
@@ -79,6 +81,20 @@ const unauthorizedEvery = time.Minute
 // The refusal codes serve reads, contracts' refusal.schema.json.
 const (
 	codeCollectionNotLinked = "collection_not_linked"
+	// codeConnectionEnded is final for the connection: serve drops what it keeps of it.
+	// codeConnectionSuspended is not: serve changes nothing, and sends the request again
+	// on its periodic check.
+	codeConnectionEnded     = "connection_ended"
+	codeConnectionSuspended = "connection_suspended"
+)
+
+// The tries of POST /v1/connections/disconnect that Qory Apiary answers 403, as it
+// answers one sent while the connection's linked connect return is being saved:
+// disconnectTries in all, the waits between them doubling from disconnectWait, so the
+// last is sent about two minutes after the first.
+const (
+	disconnectTries = 5
+	disconnectWait  = 8 * time.Second
 )
 
 // refusalShape is a refusal code's form, refusal.schema.json's error.
@@ -116,6 +132,13 @@ type Apiary struct {
 	// that the collection is not linked, so serve stops sending its items, and with the
 	// [linkMoment] the request began at, so a link the change feed stored since is kept.
 	Unlinked func(collectionRef string, began uint64)
+	// Ended, when set, is called with a connection's id when Qory Apiary answers a
+	// request of that connection, or of a collection of it, 409 connection_ended, so
+	// serve drops what it keeps of the connection. ConnectionOf, when set, is the
+	// connection of a collection, read as a request for the collection begins, so the
+	// answer speaks of the connection the request was sent for.
+	Ended        func(connection string)
+	ConnectionOf func(collectionRef string) string
 	// Log takes the throttled line for a 401; nil logs nothing.
 	Log *slog.Logger
 
@@ -164,13 +187,13 @@ func (a *Apiary) sleep(ctx context.Context, d time.Duration) error {
 
 // Collections sends POST /v1/source-collections.
 func (a *Apiary) Collections(ctx context.Context, req contracts.SourceCollections) error {
-	return a.post(ctx, "sending the collections", routeCollections, "", func(t string) any { req.Time = t; return req })
+	return a.post(ctx, "sending the collections", routeCollections, "", req.ConnectionID, func(t string) any { req.Time = t; return req })
 }
 
 // Items sends POST /v1/source-items. When Qory Apiary answers that the collection is not
 // linked, [Apiary.Unlinked] is called with its ref, and the error is [Permanent].
 func (a *Apiary) Items(ctx context.Context, req contracts.SourceItems) error {
-	return a.post(ctx, "sending the items of "+req.CollectionRef, routeItems, req.CollectionRef, func(t string) any { req.Time = t; return req })
+	return a.post(ctx, "sending the items of "+req.CollectionRef, routeItems, req.CollectionRef, "", func(t string) any { req.Time = t; return req })
 }
 
 // Comments sends POST /v1/source-items/comments. An item's ref is owner/name#number, so
@@ -178,12 +201,35 @@ func (a *Apiary) Items(ctx context.Context, req contracts.SourceItems) error {
 // [Apiary.Items] calls it.
 func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments) error {
 	collection, _, _ := strings.Cut(req.ItemRef, "#")
-	return a.post(ctx, "sending the comments on "+req.ItemRef, routeComments, collection, func(t string) any { req.Time = t; return req })
+	return a.post(ctx, "sending the comments on "+req.ItemRef, routeComments, collection, "", func(t string) any { req.Time = t; return req })
 }
 
 // Disconnect sends POST /v1/sources/disconnect.
 func (a *Apiary) Disconnect(ctx context.Context, req contracts.SourcesDisconnect) error {
-	return a.post(ctx, "disconnecting "+req.CollectionRef, routeDisconnect, "", func(t string) any { req.Time = t; return req })
+	return a.post(ctx, "disconnecting "+req.CollectionRef, routeDisconnect, req.CollectionRef, "", func(t string) any { req.Time = t; return req })
+}
+
+// DisconnectConnection sends POST /v1/connections/disconnect: the source no longer
+// grants the connection access. Qory Apiary answers 403 for a connection not made yet,
+// and for one whose linked connect return is being saved, so a 403 is sent again, built
+// anew, up to [disconnectTries] in all, see [disconnectWait]; a 403 that lasts is the
+// error. A 409 connection_ended is the connection ended, as the signed 204 is, so it is
+// no error.
+func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.ConnectionsDisconnect) error {
+	wait := disconnectWait
+	for try := 1; ; try++ {
+		err := a.post(ctx, "disconnecting the connection "+req.ConnectionID, routeConnectionsDisconnect, "", req.ConnectionID, func(t string) any { req.Time = t; return req })
+		if refusedAs(err, http.StatusConflict, codeConnectionEnded) {
+			return nil
+		}
+		if !refusedAs(err, http.StatusForbidden, "") || try == disconnectTries {
+			return err
+		}
+		if err := a.sleep(ctx, wait); err != nil {
+			return err
+		}
+		wait *= 2
+	}
 }
 
 // Declare sends POST /v1/adapter, which serve sends each time it starts: where a person
@@ -194,7 +240,7 @@ func (a *Apiary) Declare(ctx context.Context, publicURL string) error {
 		ConnectURL: publicURL + connectPath,
 		Sync:       contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: true},
 	}
-	return a.post(ctx, "declaring the adapter", routeAdapter, "", func(t string) any { req.Time = t; return req })
+	return a.post(ctx, "declaring the adapter", routeAdapter, "", "", func(t string) any { req.Time = t; return req })
 }
 
 // Changes reads the change feed after cursor, GET /v1/work-items/changes, from the
@@ -213,7 +259,7 @@ func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes,
 		a.mu.Unlock()
 		ans, err := a.send(ctx, what, http.MethodGet, target, nil, maxChangesAnswer, changesTimeout)
 		if err == nil {
-			err = a.judge(what, ans, "", 0)
+			err = a.judge(what, ans, "", "", 0)
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
@@ -258,9 +304,14 @@ func checkChanges(body []byte) (contracts.Changes, error) {
 
 // post sends one POST, its body body with the time set, and judges the answer. A 429 is
 // waited out and the request built again, with a later time and so a new signature.
-// collection is the collection the request is for, when it is one collection's.
-func (a *Apiary) post(ctx context.Context, what, route, collection string, body func(time string) any) error {
+// collection is the collection the request is for, when it is one collection's, and
+// connection the connection, when it is one connection's; a collection's connection is
+// read with [Apiary.ConnectionOf] as the request begins.
+func (a *Apiary) post(ctx context.Context, what, route, collection, connection string, body func(time string) any) error {
 	began := linkMoment()
+	if connection == "" && collection != "" && a.ConnectionOf != nil {
+		connection = a.ConnectionOf(collection)
+	}
 	for try := 1; ; try++ {
 		b, err := json.Marshal(body(contracts.FormatTime(a.now())))
 		if err != nil {
@@ -271,7 +322,7 @@ func (a *Apiary) post(ctx context.Context, what, route, collection string, body 
 		}
 		ans, err := a.send(ctx, what, http.MethodPost, route, b, maxPostAnswer, postTimeout)
 		if err == nil {
-			err = a.judge(what, ans, collection, began)
+			err = a.judge(what, ans, collection, connection, began)
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
@@ -387,13 +438,16 @@ func retryWait(err error) (time.Duration, bool) {
 //   - an answer whose signature does not verify under the pin is an [Outage], and its
 //     body is never parsed;
 //   - 409 collection_not_linked calls [Apiary.Unlinked] with collection and began,
-//     and is [Permanent], and so are 400, 403, 409 and 413;
+//     and 409 connection_ended calls [Apiary.Ended] with connection; 409
+//     connection_suspended changes nothing, and the periodic check sends the request
+//     again. Each is [Permanent], and so are 400, 403, 409 and 413, each a
+//     [*refusedError];
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.
 //
 // An error names the status and the refusal's code, never the body.
-func (a *Apiary) judge(what string, ans *answer, collection string, began uint64) error {
+func (a *Apiary) judge(what string, ans *answer, collection, connection string, began uint64) error {
 	if ans.status == http.StatusUnauthorized {
 		a.init()
 		if ok, dropped := a.unauthorized.allow(); ok {
@@ -411,14 +465,14 @@ func (a *Apiary) judge(what string, ans *answer, collection string, began uint64
 	if json.Unmarshal(ans.body, &refusal) != nil || !refusalShape.MatchString(refusal.Error) {
 		refusal.Error = ""
 	}
-	err := fmt.Errorf("%s: Qory Apiary answered %d", what, ans.status)
-	if refusal.Error != "" {
-		err = fmt.Errorf("%s: Qory Apiary answered %d %s", what, ans.status, refusal.Error)
-	}
+	var err error = &refusedError{what: what, status: ans.status, code: refusal.Error}
 	switch ans.status {
 	case http.StatusConflict:
-		if refusal.Error == codeCollectionNotLinked && collection != "" && a.Unlinked != nil {
+		switch {
+		case refusal.Error == codeCollectionNotLinked && collection != "" && a.Unlinked != nil:
 			a.Unlinked(collection, began)
+		case refusal.Error == codeConnectionEnded && connection != "" && a.Ended != nil:
+			a.Ended(connection)
 		}
 		return Permanent(err)
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge:
@@ -430,6 +484,29 @@ func (a *Apiary) judge(what string, ans *answer, collection string, began uint64
 		return Outage(err)
 	}
 	return err
+}
+
+// refusedError is Qory Apiary's signed answer that is not a 2xx: the request it answers,
+// as post names it, the status, and the refusal's code, or "" when the answer names
+// none.
+type refusedError struct {
+	what   string
+	status int
+	code   string
+}
+
+func (e *refusedError) Error() string {
+	if e.code == "" {
+		return fmt.Sprintf("%s: Qory Apiary answered %d", e.what, e.status)
+	}
+	return fmt.Sprintf("%s: Qory Apiary answered %d %s", e.what, e.status, e.code)
+}
+
+// refusedAs is whether err, or an error it wraps or joins, is Qory Apiary's signed
+// answer status, with the refusal code code unless code is "".
+func refusedAs(err error, status int, code string) bool {
+	var e *refusedError
+	return errors.As(err, &e) && e.status == status && (code == "" || e.code == code)
 }
 
 // retryAfter reads Retry-After, seconds or an HTTP date, from one second to an hour; a

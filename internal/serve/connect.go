@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,40 +27,50 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// Connect is how a person links the App's installation to Qory Apiary. An owner or
-// administrator presses Connect on the integration's page in Qory Apiary, which sends
-// the browser to serve's connect page with a connect pass, which Qory Apiary signed.
-// Then:
+// Connect is how a person links an installation of the App to a connection in Qory
+// Apiary. An owner or administrator presses Connect in Qory Apiary, which makes a
+// connection, pending until the person comes back, and sends the browser to serve's
+// connect page with a connect pass, which Qory Apiary signed and which names the
+// connection. Then:
 //
 //  1. GET <public_url>/v1/connect?state=<pass> checks the pass, see [Connect.checkPass],
 //     keeps its nonce until the pass expires, so it is taken once, a restart
-//     notwithstanding, starts a connect session, and sends the browser to install the
-//     App on GitHub, with a random state the session keeps.
-//  2. GET <public_url>/v1/connect/return, the App's Setup URL, where GitHub sends the
-//     browser after the installation with that state, notes the installation in the
-//     session, once, and starts GitHub's sign-in.
-//  3. GET <public_url>/v1/connect/authorized, the App's callback URL, takes the
-//     sign-in's code: the person's token, which is used for the checks alone and
-//     never kept or logged, must reach the installation and read every repository it
-//     reaches. Then the installation is linked, its repositories are sent to Qory
-//     Apiary, and the browser goes back to Qory Apiary, to
-//     <apiary_url>/integrations/<adapter_id>, a route Qory Apiary keeps, which sends
-//     it on to the integration's page.
+//     notwithstanding, starts a connect session for the pass's connection, and sends
+//     the browser to GitHub's sign-in with a random state the session keeps.
+//  2. GET <public_url>/v1/connect/authorized, the App's callback URL, takes the
+//     sign-in's code, which needs the session's state, and exchanges it for the person's
+//     token, which the session holds in memory alone, never in the store or a log. Then
+//     it sends the browser to install the App on GitHub; when the person reaches an
+//     installation of the App already, it first shows a page that says to press Save on
+//     GitHub's page, since only then does GitHub send the browser back.
+//  3. GET <public_url>/v1/connect/return, the App's Setup URL, where GitHub sends the
+//     browser after the installation, or after its change once Save is pressed. The
+//     installation it names is linked only once GitHub, under the person's token,
+//     lists it among the person's installations, and says the person administers the
+//     account it is installed on: an organisation's active administrator, or the user
+//     the account is. A state on this URL is not relied on: the session is.
 //
-// One installation is linked for each adapter: the same one again is a re-connect,
-// which lists its repositories again and fills the linked collections again; another is
-// refused. A session lives in the store under the SHA-256 of a random id, which a
-// cookie for /v1/connect alone carries, for 15 minutes at most. It ends with each
-// answer of the last step that reads it, and with each refusal once it is read; a
-// refusal of the method, of the query's size or of its form comes before the session
-// is read, so it keeps the session, on /v1/connect/authorized as on the other pages.
-// Every redirect's target is built from the settings, never from what the request
-// carries, and a page that refuses says one sentence and nothing the request carries.
+// Every step past the pass's checks ends with a connect return, see
+// [Connect.connectReturn]: the browser goes back to Qory Apiary, to
+// <apiary_url>/integrations/<connection_id>?return=<the connect return>, with the
+// outcome, linked, refused with a reason, or cancelled, which Qory Apiary shows. Only a
+// pass that is forged or malformed, or a request without a session, gets serve's page
+// instead, one sentence, and so does the request that tells the person to press Save.
+//
+// An installation is linked to one connection at a time, pending from the linked
+// connect return, live once Qory Apiary takes a listing that names the connection, see
+// [Connect.link]. A session lives in the store under the SHA-256 of a random id, which a
+// cookie for /v1/connect alone carries, for 30 minutes at most. It ends with each
+// connect return, and with each refusal that ends it once it is read; a refusal of the
+// method, of the query's size or of its form comes before the session is read, so it
+// keeps the session. Every redirect's target is built from the settings and the pass
+// the session keeps, never from what the request carries, and a page says nothing the
+// request carries.
 //
 // The pages count no requests by address: behind the operator's TLS proxy every request
 // comes from the proxy's address, so such a count would bound every person at once.
 // What a request costs is bounded otherwise: a pass's signature is checked before
-// anything is written to the store, and the Setup URL and the callback URL read a
+// anything is written to the store, and the callback URL and the Setup URL read a
 // session the store keeps, which only a pass makes, before they reach GitHub.
 type Connect struct {
 	// Store keeps the nonces, the sessions and the links.
@@ -70,37 +81,52 @@ type Connect struct {
 	Pin accesskey.Pin
 	// AdapterID is the adapter's id, na_ and 16 characters, which a pass must name.
 	AdapterID string
+	// Key is the adapter's access key, which signs each connect return.
+	Key *accesskey.Key
 	// ClientID and ClientSecret are the App's, which GitHub's sign-in takes.
 	ClientID     string
 	ClientSecret []byte
 	// PublicURL is where serve is reached from outside, without a trailing slash.
 	PublicURL string
-	// ApiaryURL is Qory Apiary's origin, without a trailing slash. Once connected, the
-	// browser goes to ApiaryURL/integrations/AdapterID there.
+	// ApiaryURL is Qory Apiary's origin the adapter enrolled with, without a trailing
+	// slash: every connect return goes to ApiaryURL/integrations/<connection_id> there.
 	ApiaryURL string
 	// Log takes a line for each connect, and the refusals, once a second at most.
 	Log *slog.Logger
 
-	// now is the clock; nil is time.Now.
-	now func() time.Time
+	// now is the clock; nil is time.Now. sleep waits d or until ctx is done between
+	// the tries of a connection's first listing; nil waits on a timer.
+	now   func() time.Time
+	sleep func(ctx context.Context, d time.Duration) error
 
 	once     sync.Once
 	base     string
 	refusals *throttle
-	// linking holds one token: the connect that holds it makes the check that no other
-	// installation is linked and the link one step, so two connects at once link one
-	// installation. A connect waits for it until its request's deadline.
+	// linking holds one token: the connect that holds it makes the checks of the
+	// installation's link and the link one step, so two connects at once link an
+	// installation to one connection. A connect waits for it until its request's
+	// deadline.
 	linking chan struct{}
-	// fills are the fills a re-connect started, which [Connect.stop] stops and waits
-	// for. fillMu guards stopped, after which no fill starts, and refilling, the
-	// collections a re-connect's fill is under way for, which another does not fill
-	// again meanwhile.
+	// fills are the first listings and the fills a connect started, which
+	// [Connect.stop] stops and waits for. fillMu guards stopped, after which none
+	// starts, and refilling, the collections a re-connect's fill is under way for,
+	// which another does not fill again meanwhile.
 	fillCtx   context.Context
 	stopFills context.CancelFunc
 	fills     sync.WaitGroup
 	fillMu    sync.Mutex
 	stopped   bool
 	refilling map[string]bool
+	// tokens are the persons' tokens, by their sessions' keys, held in memory alone
+	// until the session ends or expires; tokenMu guards them.
+	tokenMu sync.Mutex
+	tokens  map[string]heldToken
+}
+
+// heldToken is a person's token a session holds, and when the session expires.
+type heldToken struct {
+	token   string
+	expires time.Time
 }
 
 // The store's namespaces Connect keeps its state in, each value with an expiry, and the
@@ -119,17 +145,20 @@ const unlinkedFor = 30 * 24 * time.Hour
 const (
 	// connectCookie is the session's cookie, for the connect page's path alone.
 	connectCookie = "qory_github_connect"
-	// sessionFor is how long a session lives at most; a pass that expires sooner ends
-	// it then.
-	sessionFor = 15 * time.Minute
+	// sessionFor is how long a session lives: the pass's expiry bounds only its arrival.
+	sessionFor = 30 * time.Minute
 	// passAhead is how far ahead of serve's clock a pass's expiry may be: Qory Apiary
 	// makes a pass that expires 15 minutes after it is made.
 	passAhead = 15 * time.Minute
+	// returnFor is how long a connect return lives at most.
+	returnFor = 300 * time.Second
+	// maxConnectReturn is the most characters a connect return has, as a pass.
+	maxConnectReturn = contracts.ConnectPassMaxLength
 	// maxConnectQuery is the most bytes a request's query may hold: a pass is 1,024
 	// characters at most.
 	maxConnectQuery = 2 << 10
-	// connectBound is how long the last step may take, within [writeTimeout], its
-	// wait for another connect's link among it.
+	// connectBound is how long a step that reaches GitHub may take, within
+	// [writeTimeout], its wait for another connect's link among it.
 	connectBound = 50 * time.Second
 )
 
@@ -159,8 +188,9 @@ type refusal struct {
 	endSession, dropCookie bool
 }
 
-// The pages that refuse, by what went wrong. Each says one sentence, and nothing the
-// request carries.
+// The pages that refuse, by what went wrong: a request that is not one, a pass that is
+// forged or malformed, or no session. Each says one sentence, and nothing the request
+// carries.
 var (
 	refuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers GET requests alone.", why: "the request is not GET"}
 	refuseQuery     = refusal{status: http.StatusBadRequest, page: "This link is not one this server reads. Press Connect in Qory Apiary again.", why: "the query is too long, or not one this server reads"}
@@ -168,33 +198,76 @@ var (
 	refuseSignature = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's signature does not verify under the pin"}
 	refusePayload   = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's payload is not the contract's"}
 	refuseAdapter   = refusal{status: http.StatusForbidden, page: "This connect link is for another integration. Press Connect on this integration's page in Qory Apiary.", why: "the pass is for another adapter"}
-	refuseExpired   = refusal{status: http.StatusBadRequest, page: "This connect link has expired. Press Connect in Qory Apiary again.", why: "the pass has expired, or expires too far ahead"}
 	refuseUsed      = refusal{status: http.StatusBadRequest, page: "This connect link was used already. Press Connect in Qory Apiary again.", why: "the pass's nonce was used already"}
 	refuseFailed    = refusal{status: http.StatusInternalServerError, page: "Something failed on this server. Press Connect in Qory Apiary again.", why: "the store failed"}
 	refuseNoSession = refusal{status: http.StatusBadRequest, page: "No connection is under way in this browser, or it took too long. Press Connect in Qory Apiary again.", why: "no session", dropCookie: true}
-	refuseWaits     = refusal{status: http.StatusBadRequest, page: "The installation waits for an owner's approval on GitHub. Once it is approved, press Connect in Qory Apiary again.", why: "the installation waits for an owner's approval", endSession: true}
-	refuseInstall   = refusal{status: http.StatusBadRequest, page: "This installation does not belong to the connection under way in this browser. Press Connect in Qory Apiary again.", why: "the Setup URL's state is not the session's", endSession: true}
-	refuseOnce      = refusal{status: http.StatusBadRequest, page: "The connection under way in this browser is for another installation already. Press Connect in Qory Apiary again.", why: "the session holds another installation", endSession: true}
-	refuseBusy      = refusal{status: http.StatusServiceUnavailable, page: "Another connection is being made on this server. Press Connect in Qory Apiary again.", why: "another connect held the link past the deadline", endSession: true}
-	refuseAnswer    = refusal{status: http.StatusBadRequest, page: "GitHub's answer is not one this server reads. Press Connect in Qory Apiary again.", why: "the Setup URL's query is not GitHub's", endSession: true}
-	refuseState     = refusal{status: http.StatusBadRequest, page: "This sign-in does not belong to the connection under way in this browser. Press Connect in Qory Apiary again.", why: "the sign-in's state is not the session's", endSession: true}
-	refuseDenied    = refusal{status: http.StatusBadRequest, page: "GitHub did not complete the sign-in. Press Connect in Qory Apiary again.", why: "the sign-in sent back no code", endSession: true}
-	refuseSignIn    = refusal{status: http.StatusBadGateway, page: "GitHub could not confirm the sign-in. Press Connect in Qory Apiary again.", why: "the sign-in's code could not be exchanged", endSession: true}
-	refuseGitHub    = refusal{status: http.StatusBadGateway, page: "GitHub could not be reached, or did not answer as expected. Press Connect in Qory Apiary again.", why: "GitHub failed", endSession: true}
-	refuseNoAccess  = refusal{status: http.StatusForbidden, page: "Your GitHub account cannot reach this installation of the App. Sign in to GitHub with an account that can, then press Connect in Qory Apiary again.", why: "the person does not reach the installation", endSession: true}
-	refuseCannot    = refusal{status: http.StatusForbidden, page: "Your GitHub account cannot read every repository this installation reaches, so it cannot connect it.", why: "the person cannot read every repository the installation reaches", endSession: true}
-	refuseAnother   = refusal{status: http.StatusConflict, page: "Another installation of this GitHub App is connected already, and only one can be.", why: "another installation is linked", endSession: true}
-	refuseApiary    = refusal{status: http.StatusBadGateway, page: "The repositories could not be sent to Qory Apiary. Press Connect in Qory Apiary again.", why: "Qory Apiary did not take the repositories", endSession: true}
 )
 
+// passExpired is a pass that verifies but has expired, or expires too far ahead: no
+// page, but a connect return, refused, pass_expired.
+var passExpired = refusal{why: "the pass has expired, or expires too far ahead"}
+
+// The outcomes of a connect return, and the reasons of one refused, the contract's.
+const (
+	outcomeLinked    = "linked"
+	outcomeRefused   = "refused"
+	outcomeCancelled = "cancelled"
+
+	reasonPersonNotPermitted = "person_not_permitted"
+	reasonGrantTaken         = "grant_taken"
+	reasonGrantNotConfirmed  = "grant_not_confirmed"
+	reasonGrantSuspended     = "grant_suspended"
+	reasonPermissionMissing  = "permission_missing"
+	reasonPassExpired        = "pass_expired"
+	reasonSourceUnavailable  = "source_unavailable"
+)
+
+// verdict is how a connect ends that sends the browser back to Qory Apiary without a
+// link: the connect return's outcome and reason, and why, for the log.
+type verdict struct {
+	outcome, reason, why string
+}
+
+// The verdicts, by what went wrong.
+var (
+	verdictExpired   = verdict{outcomeRefused, reasonPassExpired, passExpired.why}
+	verdictCancelled = verdict{outcomeCancelled, "", "the person cancelled on GitHub"}
+	verdictState     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's state is not the session's"}
+	verdictDenied    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in sent back no code"}
+	verdictSignIn    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's code could not be exchanged"}
+	verdictGitHub    = verdict{outcomeRefused, reasonSourceUnavailable, "GitHub failed"}
+	verdictNoSignIn  = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session holds no sign-in"}
+	verdictAnswer    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's query is not GitHub's"}
+	verdictWaits     = verdict{outcomeRefused, reasonPersonNotPermitted, "the installation waits for an owner's approval"}
+	verdictNoAccess  = verdict{outcomeRefused, reasonGrantNotConfirmed, "the person does not reach the installation"}
+	verdictSuspended = verdict{outcomeRefused, reasonGrantSuspended, "GitHub has suspended the installation"}
+	verdictPermitted = verdict{outcomeRefused, reasonPermissionMissing, "the installation does not grant a permission the adapter needs"}
+	verdictNotAdmin  = verdict{outcomeRefused, reasonPersonNotPermitted, "the person does not administer the installation's account"}
+	verdictTaken     = verdict{outcomeRefused, reasonGrantTaken, "the installation is linked to another connection that is made"}
+	verdictBusy      = verdict{outcomeRefused, reasonSourceUnavailable, "another connect held the link past the deadline"}
+	verdictApiary    = verdict{outcomeRefused, reasonSourceUnavailable, "Qory Apiary did not answer the listing of the connection the installation is linked to"}
+)
+
+// needs are the permissions an installation grants the App that the adapter needs,
+// each at least at the level named: it lists the repositories, reads and writes their
+// issues, and, for an organisation, reads whether the person administers it.
+var (
+	needs             = map[string]string{"metadata": "read", "issues": "write"}
+	organisationNeeds = map[string]string{"members": "read"}
+)
+
+// levels orders a permission's levels.
+var levels = map[string]int{"read": 1, "write": 2, "admin": 3}
+
 // session is what the store keeps of a connect session: when it expires, in Unix
-// nanoseconds; the state GitHub's Setup URL must send back; and, once that URL is
-// reached, the installation and the state GitHub's sign-in must send back.
+// nanoseconds; the connection and the nonce of the pass that started it; the state
+// GitHub's sign-in must send back, until it has; and whether it has.
 type session struct {
-	Expires      int64  `json:"expires"`
-	InstallState string `json:"install_state"`
-	Installation int64  `json:"installation,omitempty"`
-	State        string `json:"state,omitempty"`
+	Expires    int64  `json:"expires"`
+	Connection string `json:"connection_id"`
+	Nonce      string `json:"nonce"`
+	State      string `json:"state,omitempty"`
+	SignedIn   bool   `json:"signed_in,omitempty"`
 }
 
 func (c *Connect) init() {
@@ -206,6 +279,7 @@ func (c *Connect) init() {
 		c.base += connectPath
 		c.linking = make(chan struct{}, 1)
 		c.refilling = map[string]bool{}
+		c.tokens = map[string]heldToken{}
 		c.refusals = &throttle{every: refusalEvery, now: c.now, flush: func(dropped int) {
 			c.log().LogAttrs(context.Background(), slog.LevelInfo, "connect refusals dropped", slog.Int("refusals_dropped", dropped))
 		}}
@@ -220,6 +294,20 @@ func (c *Connect) clock() time.Time {
 	return time.Now()
 }
 
+func (c *Connect) wait(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (c *Connect) log() *slog.Logger {
 	if c.Log == nil {
 		return slog.New(slog.DiscardHandler)
@@ -227,8 +315,8 @@ func (c *Connect) log() *slog.Logger {
 	return c.Log
 }
 
-// stop stops the fills a re-connect started and waits for them, and logs the count of
-// refusals held back, if any.
+// stop stops the first listings and the fills a connect started and waits for them, and
+// logs the count of refusals held back, if any.
 func (c *Connect) stop() {
 	c.init()
 	c.fillMu.Lock()
@@ -249,10 +337,10 @@ func (c *Connect) Route(next http.Handler) http.Handler {
 		switch r.URL.Path {
 		case c.base:
 			step = c.start
-		case c.base + "/return":
-			step = c.returned
 		case c.base + "/authorized":
 			step = c.authorized
+		case c.base + "/return":
+			step = c.installed
 		default:
 			next.ServeHTTP(w, r)
 			return
@@ -294,6 +382,12 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 	}
 	now := c.clock()
 	p, expires, rf := c.checkPass(pass, now)
+	if rf == &passExpired {
+		// The pass verifies, so it goes back as a connect return; its nonce, past its
+		// expiry, is not kept, and no session starts.
+		c.giveBack(w, r, "", p.ConnectionID, p.Nonce, verdictExpired)
+		return
+	}
 	if rf != nil {
 		c.refuse(w, r, *rf, "")
 		return
@@ -310,21 +404,19 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		c.refuse(w, r, refuseUsed, "")
 		return
 	}
-	ttl := max(min(sessionFor, expires.Sub(now)), time.Second)
-	id, installState := randomID(), randomID()
-	if err := c.save(id, session{Expires: now.Add(ttl).UnixNano(), InstallState: installState}); err != nil {
+	id := randomID()
+	s := session{Expires: now.Add(sessionFor).UnixNano(), Connection: p.ConnectionID, Nonce: p.Nonce, State: randomID()}
+	if err := c.save(id, s); err != nil {
 		c.failed(w, r, "", "keeping the session", err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: connectCookie, Value: id, Path: c.base, MaxAge: int(ttl / time.Second), Expires: now.Add(ttl),
+		Name: connectCookie, Value: id, Path: c.base, MaxAge: int(sessionFor / time.Second), Expires: now.Add(sessionFor),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 	})
-	// GitHub sends the state on to the Setup URL, which requires it. Whether GitHub
-	// sends it when the person changes an installation that exists, on its settings
-	// page, rather than installing anew, is not known here; the Setup URL requires it
-	// all the same, so such a return is refused, and the person connects again.
-	redirect(w, github.App{Slug: c.Adapter.Slug}.InstallURL(c.Adapter.GitHub.Web())+"?"+url.Values{"state": {installState}}.Encode())
+	redirect(w, c.Adapter.GitHub.Web()+"/login/oauth/authorize?"+url.Values{
+		"client_id": {c.ClientID}, "state": {s.State}, "redirect_uri": {c.PublicURL + github.ConnectAuthorizedPath},
+	}.Encode())
 }
 
 // checkPass checks a connect pass, in this order, and returns its payload and when it
@@ -335,10 +427,11 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 //     without padding, decoded strictly;
 //  2. the signature verifies under a key of the pin over [contracts.ConnectDomain], a
 //     line feed and the payload's bytes, before the payload is parsed;
-//  3. the payload is one JSON object with the contract's four members and no other,
+//  3. the payload is one JSON object with the contract's five members and no other,
 //     each of the contract's shape, and version 1;
 //  4. adapter_id is the adapter's;
-//  5. expires_at has not passed on serve's clock, and is at most 15 minutes ahead.
+//  5. expires_at has not passed on serve's clock, and is at most 15 minutes ahead,
+//     or the refusal is [passExpired], returned with the payload, which verified.
 //
 // The nonce is checked by the caller, which keeps it.
 func (c *Connect) checkPass(pass string, now time.Time) (contracts.ConnectPass, time.Time, *refusal) {
@@ -363,10 +456,11 @@ func (c *Connect) checkPass(pass string, now time.Time) (contracts.ConnectPass, 
 	}
 	invalid = &refusePayload
 	var doc struct {
-		Version   *int    `json:"version"`
-		AdapterID *string `json:"adapter_id"`
-		Nonce     *string `json:"nonce"`
-		ExpiresAt *string `json:"expires_at"`
+		Version      *int    `json:"version"`
+		AdapterID    *string `json:"adapter_id"`
+		ConnectionID *string `json:"connection_id"`
+		Nonce        *string `json:"nonce"`
+		ExpiresAt    *string `json:"expires_at"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
@@ -374,6 +468,7 @@ func (c *Connect) checkPass(pass string, now time.Time) (contracts.ConnectPass, 
 		return contracts.ConnectPass{}, time.Time{}, invalid
 	}
 	if doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
+		doc.ConnectionID == nil || !connectionShape.MatchString(*doc.ConnectionID) ||
 		doc.Nonce == nil || !nonceShape.MatchString(*doc.Nonce) || doc.ExpiresAt == nil {
 		return contracts.ConnectPass{}, time.Time{}, invalid
 	}
@@ -381,64 +476,18 @@ func (c *Connect) checkPass(pass string, now time.Time) (contracts.ConnectPass, 
 	if err != nil || contracts.FormatTime(expires) != *doc.ExpiresAt {
 		return contracts.ConnectPass{}, time.Time{}, invalid
 	}
-	p := contracts.ConnectPass{Version: *doc.Version, AdapterID: *doc.AdapterID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt}
+	p := contracts.ConnectPass{Version: *doc.Version, AdapterID: *doc.AdapterID, ConnectionID: *doc.ConnectionID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt}
 	if p.AdapterID != c.AdapterID {
 		return contracts.ConnectPass{}, time.Time{}, &refuseAdapter
 	}
 	if now.After(expires) || expires.Sub(now) > passAhead {
-		return contracts.ConnectPass{}, time.Time{}, &refuseExpired
+		return p, expires, &passExpired
 	}
 	return p, expires, nil
 }
 
-// returned is the second step, GitHub's Setup URL, GET
-// /v1/connect/return?installation_id=…&setup_action=…, which needs the session.
-func (c *Connect) returned(w http.ResponseWriter, r *http.Request, q url.Values) {
-	id, s, ok, err := c.session(r)
-	if err != nil {
-		c.failed(w, r, id, "reading the session", err)
-		return
-	}
-	if !ok {
-		c.refuse(w, r, refuseNoSession, "")
-		return
-	}
-	state, ok := one(q, "state")
-	if !ok || s.InstallState == "" || subtle.ConstantTimeCompare([]byte(state), []byte(s.InstallState)) != 1 {
-		c.refuse(w, r, refuseInstall, id)
-		return
-	}
-	action, _ := one(q, "setup_action")
-	if action == "request" {
-		c.refuse(w, r, refuseWaits, id)
-		return
-	}
-	raw, ok := one(q, "installation_id")
-	if !ok || !installationShape.MatchString(raw) || (action != "install" && action != "update") {
-		c.refuse(w, r, refuseAnswer, id)
-		return
-	}
-	installation, _ := strconv.ParseInt(raw, 10, 64)
-	// The session's installation is set once: a second return names the same one, or
-	// is refused.
-	if s.Installation != 0 && s.Installation != installation {
-		c.refuse(w, r, refuseOnce, id)
-		return
-	}
-	s.Installation = installation
-	s.State = randomID()
-	if err := c.save(id, s); err != nil {
-		c.failed(w, r, id, "keeping the session", err)
-		return
-	}
-	redirect(w, c.Adapter.GitHub.Web()+"/login/oauth/authorize?"+url.Values{
-		"client_id": {c.ClientID}, "state": {s.State}, "redirect_uri": {c.PublicURL + github.ConnectAuthorizedPath},
-	}.Encode())
-}
-
-// authorized is the last step, GitHub's sign-in sending the browser back, GET
-// /v1/connect/authorized?code=…&state=…, which needs the session and its state. The
-// session ends whatever the answer.
+// authorized is the second step, GitHub's sign-in sending the browser back, GET
+// /v1/connect/authorized?code=…&state=…, which needs the session and its state.
 func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Values) {
 	id, s, ok, err := c.session(r)
 	if err != nil {
@@ -450,152 +499,304 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 		return
 	}
 	state, ok := one(q, "state")
-	if s.State == "" || s.Installation <= 0 || !ok || subtle.ConstantTimeCompare([]byte(state), []byte(s.State)) != 1 {
-		c.refuse(w, r, refuseState, id)
+	if s.State == "" || !ok || subtle.ConstantTimeCompare([]byte(state), []byte(s.State)) != 1 {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictState)
+		return
+	}
+	if e, _ := one(q, "error"); e == "access_denied" {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictCancelled)
 		return
 	}
 	code, ok := one(q, "code")
 	if q.Has("error") || !ok || !codeShape.MatchString(code) {
-		c.refuse(w, r, refuseDenied, id)
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictDenied)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), connectBound)
 	defer cancel()
-	installation := s.Installation
-	attrs := []slog.Attr{slog.Int64("installation", installation)}
 	gh := c.Adapter.GitHub
 	token, err := gh.UserToken(ctx, c.ClientID, c.ClientSecret, code, c.PublicURL+github.ConnectAuthorizedPath)
 	if err != nil {
-		c.refuse(w, r, refuseSignIn, id, append(attrs, slog.String("error", err.Error()))...)
+		v := verdictGitHub
+		if github.CodeRefused(err) {
+			v = verdictSignIn
+		}
+		c.giveBack(w, r, id, s.Connection, s.Nonce, v, slog.String("error", err.Error()))
 		return
 	}
 	reached, err := gh.UserInstallations(ctx, token)
 	if err != nil {
-		c.refuse(w, r, refuseGitHub, id, append(attrs, slog.String("error", err.Error()))...)
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictGitHub, slog.String("error", err.Error()))
 		return
 	}
-	found := false
-	for _, in := range reached {
-		found = found || in == installation
+	// The sign-in is taken once: its state is dropped, and the token is held in memory
+	// alone, for the Setup URL.
+	s.State, s.SignedIn = "", true
+	if err := c.save(id, s); err != nil {
+		c.failed(w, r, id, "keeping the session", err)
+		return
 	}
-	if !found {
-		c.refuse(w, r, refuseNoAccess, id, attrs...)
+	c.holdToken(id, token, time.Unix(0, s.Expires))
+	install := github.App{Slug: c.Adapter.Slug}.InstallURL(gh.Web())
+	if len(reached) > 0 {
+		c.savePage(w, install)
+		return
+	}
+	redirect(w, install)
+}
+
+// installed is the last step, GitHub's Setup URL, GET
+// /v1/connect/return?installation_id=…&setup_action=…, which needs the session and the
+// person's token it holds. It checks, under the person's token, that GitHub lists the
+// installation among the person's, that GitHub has not suspended it, that it grants
+// the permissions the adapter needs, and that the person administers its account, see
+// [Connect.administers]; then it links the installation to the session's connection,
+// see [Connect.link]. The session ends whatever the answer.
+func (c *Connect) installed(w http.ResponseWriter, r *http.Request, q url.Values) {
+	id, s, ok, err := c.session(r)
+	if err != nil {
+		c.failed(w, r, id, "reading the session", err)
+		return
+	}
+	if !ok {
+		c.refuse(w, r, refuseNoSession, "")
+		return
+	}
+	token, ok := c.tokenOf(id)
+	if !s.SignedIn || !ok {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNoSignIn)
+		return
+	}
+	if e, _ := one(q, "error"); e == "access_denied" {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictCancelled)
+		return
+	}
+	action, _ := one(q, "setup_action")
+	if action == "request" {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictWaits)
+		return
+	}
+	raw, ok := one(q, "installation_id")
+	if !ok || !installationShape.MatchString(raw) || (action != "install" && action != "update") {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictAnswer)
+		return
+	}
+	// The installation's id the URL carries is only what to look for: GitHub must list
+	// it among the person's.
+	installation, _ := strconv.ParseInt(raw, 10, 64)
+	attrs := []slog.Attr{slog.Int64("installation", installation), slog.String("connection", s.Connection)}
+	ctx, cancel := context.WithTimeout(r.Context(), connectBound)
+	defer cancel()
+	gh := c.Adapter.GitHub
+	reached, err := gh.UserInstallations(ctx, token)
+	if err != nil {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictGitHub, append(attrs, slog.String("error", err.Error()))...)
+		return
+	}
+	var in *github.UserInstallation
+	for i := range reached {
+		if reached[i].ID == installation {
+			in = &reached[i]
+		}
+	}
+	if in == nil {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNoAccess, attrs...)
+		return
+	}
+	if in.Suspended {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictSuspended, attrs...)
+		return
+	}
+	if !permitted(*in) {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictPermitted, attrs...)
+		return
+	}
+	// This is the person's token's last use.
+	admin, err := c.administers(ctx, token, in.Account)
+	if err != nil {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictGitHub, append(attrs, slog.String("error", err.Error()))...)
+		return
+	}
+	if !admin {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNotAdmin, attrs...)
 		return
 	}
 	if !c.takeLink(ctx) {
-		c.refuse(w, r, refuseBusy, id, attrs...)
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictBusy, attrs...)
 		return
 	}
-	defer func() { <-c.linking }()
-	other, err := linkedOther(c.Store, installation)
-	if err != nil {
-		c.failed(w, r, id, "reading the links", err)
-		return
-	}
-	if other {
-		c.refuse(w, r, refuseAnother, id, attrs...)
-		return
-	}
-	listing, err := c.listInstallation(ctx, installation)
-	if err != nil {
-		c.refuse(w, r, refuseGitHub, id, append(attrs, slog.String("error", err.Error()))...)
-		return
-	}
-	// This is the person's token's last use: it is never kept or logged.
-	readable, err := gh.UserRepositories(ctx, token, installation)
-	if err != nil {
-		c.refuse(w, r, refuseGitHub, id, append(attrs, slog.String("error", err.Error()))...)
-		return
-	}
-	reads := map[string]bool{}
-	for _, name := range readable {
-		reads[collectionKey(name)] = true
-	}
-	unread, total := 0, 0
-	for _, req := range listing {
-		for _, col := range req.Collections {
-			total++
-			if !reads[collectionKey(col.Ref)] {
-				unread++
-			}
-		}
-	}
-	if unread > 0 {
-		c.refuse(w, r, refuseCannot, id, append(attrs, slog.Int("unread", unread))...)
-		return
-	}
-	again, err := Linked(c.Store, installation)
-	if err == nil {
-		err = Link(c.Store, installation)
-	}
-	if err == nil {
-		err = dropUnlinked(c.Store, installation)
-	}
+	again, v, err := c.link(ctx, installation, s.Connection)
+	<-c.linking
 	if err != nil {
 		c.failed(w, r, id, "linking the installation", err)
 		return
 	}
-	// Should Qory Apiary not take the listing, the installation stays linked, and a
-	// re-connect sends it again.
-	sink := reachSink{Sink: c.Adapter.Sink, st: c.Store, installation: installation}
-	for _, req := range listing {
-		if err := sink.Collections(ctx, req); err != nil {
-			c.refuse(w, r, refuseApiary, id, append(attrs, slog.String("error", err.Error()))...)
-			return
+	if v != nil {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, *v, attrs...)
+		return
+	}
+	ret, err := c.connectReturn(s.Connection, s.Nonce, outcomeLinked, "")
+	if err != nil {
+		c.failed(w, r, id, "making the connect return", err)
+		return
+	}
+	c.listSoon(installation, s.Connection, again)
+	c.end(w, id)
+	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again))...)
+	c.toApiary(w, s.Connection, ret)
+}
+
+// permitted is whether the installation grants the App each permission it needs, see
+// [needs], at least at the level named.
+func permitted(in github.UserInstallation) bool {
+	check := func(want map[string]string) bool {
+		for name, level := range want {
+			if levels[in.Permissions[name]] < levels[level] {
+				return false
+			}
+		}
+		return true
+	}
+	return check(needs) && (in.Account.Type != "Organization" || check(organisationNeeds))
+}
+
+// administers is whether the person whose token token is administers account, as
+// GitHub says under that token: for an organisation, the person's membership of it is
+// active, its role admin, and it names the organisation's id and the person's; for a
+// user, the account is the person's, by id and by login. GitHub's 404 or 403 to the
+// membership, a person not a member or a membership the token may not read, is no.
+// Any other account is no.
+func (c *Connect) administers(ctx context.Context, token string, account github.Account) (bool, error) {
+	gh := c.Adapter.GitHub
+	person, err := gh.User(ctx, token)
+	if err != nil {
+		return false, err
+	}
+	if person.ID <= 0 || account.ID <= 0 {
+		return false, nil
+	}
+	switch account.Type {
+	case "Organization":
+		m, err := gh.OrgMembership(ctx, token, account.Login)
+		if github.Gone(err) || github.Refused(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return m.State == "active" && m.Role == "admin" && m.Organization == account.ID && m.Person == person.ID, nil
+	case "User":
+		return person.ID == account.ID && strings.EqualFold(person.Login, account.Login), nil
+	}
+	return false, nil
+}
+
+// link links the installation to connection, pending, which the caller does holding
+// the linking token, and says whether the installation was linked to connection and
+// live already, a re-connect; or the verdict that refuses it. An installation is linked
+// to one connection at a time:
+//
+//   - one linked to connection already stays as it is;
+//   - one linked to another connection that is live is refused, grant_taken;
+//   - one linked to another connection that is pending is first listed for that
+//     connection, so the link learns whether the connection was made meanwhile: a
+//     signed 204, the link is live, refused, grant_taken; a 403, the connection is
+//     not made yet, and the link is replaced; a 409 connection_ended, the connection
+//     ended, and the link is replaced; a 409 connection_suspended, the connection is
+//     made, refused, grant_taken; any other answer, refused, source_unavailable.
+//
+// The person administers the installation's account, which the caller checked, for each
+// connect anew.
+func (c *Connect) link(ctx context.Context, installation int64, connection string) (bool, *verdict, error) {
+	installMu.Lock()
+	l, ok, err := linkOf(c.Store, installation)
+	installMu.Unlock()
+	if err != nil {
+		return false, nil, err
+	}
+	switch {
+	case ok && l.Connection == connection:
+		return l.State == linkLive, nil, nil
+	case ok && l.State == linkLive:
+		return false, &verdictTaken, nil
+	case ok:
+		listed := c.Adapter.listConnection(ctx, installation, l.Connection)
+		installMu.Lock()
+		now, still, err := linkOf(c.Store, installation)
+		installMu.Unlock()
+		if err != nil {
+			return false, nil, err
+		}
+		pending := still && now.Connection == l.Connection
+		switch {
+		case pending && now.State == linkLive:
+			return false, &verdictTaken, nil
+		case !pending || refusedAs(listed, http.StatusConflict, codeConnectionEnded):
+		case refusedAs(listed, http.StatusConflict, codeConnectionSuspended):
+			return false, &verdictTaken, nil
+		case !refusedAs(listed, http.StatusForbidden, ""):
+			if listed != nil {
+				c.log().Error("listing the installation's repositories failed", slog.Int64("installation", installation), slog.String("connection", l.Connection), slog.String("error", listed.Error()))
+			}
+			return false, &verdictApiary, nil
 		}
 	}
-	if again {
-		c.refill(installation)
+	installMu.Lock()
+	err = Link(c.Store, installation, connection, linkPending)
+	installMu.Unlock()
+	if err == nil {
+		err = dropUnlinked(c.Store, installation)
 	}
-	c.end(w, id)
-	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again), slog.Int("repositories", total))...)
-	redirect(w, c.ApiaryURL+"/integrations/"+c.AdapterID)
+	return false, nil, err
 }
 
-// listInstallation lists the repositories the installation reaches, as
-// [github.Lister.ListRepositories] lists them with an installation token, and keeps
-// the requests it would send, so they are checked before any is sent.
-func (c *Connect) listInstallation(ctx context.Context, installation int64) ([]contracts.SourceCollections, error) {
-	a := c.Adapter
-	kept := &keptCollections{}
-	l := github.Lister{
-		Client: a.GitHub,
-		Pacer:  a.pacer(installation),
-		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
-		Slug:   a.Slug,
-		Sink:   kept,
-		Logf:   a.logf,
-		LogCut: a.logCut,
+// listSoon sends, after the answer, the first listing of the installation's
+// repositories for connection, while the browser carries the linked connect return to
+// Qory Apiary, which answers the listing 403 until it has taken the return: a 403 is
+// sent again, as [Apiary.DisconnectConnection] sends a disconnect again,
+// [disconnectTries] in all, the waits doubling from [disconnectWait], and the next
+// round lists the installation again after that. A signed
+// 204 makes the link live. It stops once the installation is linked to another
+// connection, or not at all, and once [Connect.stop] has run. again, a re-connect,
+// fills the linked collections again once the listing is taken, see [Connect.refill].
+// A listing that fails is logged.
+func (c *Connect) listSoon(installation int64, connection string, again bool) {
+	c.fillMu.Lock()
+	defer c.fillMu.Unlock()
+	if c.stopped {
+		return
 	}
-	if err := a.forgetOn401(installation, l.ListRepositories(ctx)); err != nil {
-		return nil, err
-	}
-	return kept.reqs, nil
-}
-
-// keptCollections is a [github.Sink] that keeps the listing's requests and sends
-// nothing.
-type keptCollections struct{ reqs []contracts.SourceCollections }
-
-// Collections keeps the request.
-func (k *keptCollections) Collections(_ context.Context, req contracts.SourceCollections) error {
-	k.reqs = append(k.reqs, req)
-	return nil
-}
-
-// Items refuses: a listing of repositories sends none.
-func (k *keptCollections) Items(context.Context, contracts.SourceItems) error {
-	return errors.New("a listing of repositories sends no items")
-}
-
-// Comments refuses: a listing of repositories sends none.
-func (k *keptCollections) Comments(context.Context, contracts.SourceItemComments) error {
-	return errors.New("a listing of repositories sends no comments")
-}
-
-// Disconnect refuses: a listing of repositories disconnects nothing.
-func (k *keptCollections) Disconnect(context.Context, contracts.SourcesDisconnect) error {
-	return errors.New("a listing of repositories disconnects nothing")
+	c.fills.Add(1)
+	go func() {
+		defer c.fills.Done()
+		wait := disconnectWait
+		for try := 1; ; try++ {
+			l, ok, err := linkOf(c.Store, installation)
+			if err != nil || !ok || l.Connection != connection {
+				return
+			}
+			err = c.Adapter.listConnection(c.fillCtx, installation, connection)
+			if c.fillCtx.Err() != nil {
+				return
+			}
+			if l, ok, _ := linkOf(c.Store, installation); ok && l.Connection == connection && l.State == linkLive && err == nil {
+				if again {
+					c.refill(installation)
+				}
+				return
+			}
+			if !refusedAs(err, http.StatusForbidden, "") || try == disconnectTries {
+				if err != nil {
+					c.log().Error("listing the installation's repositories failed", slog.Int64("installation", installation), slog.String("connection", connection), slog.String("error", err.Error()))
+				}
+				return
+			}
+			if c.wait(c.fillCtx, wait) != nil {
+				return
+			}
+			wait *= 2
+		}
+	}()
 }
 
 // refill fills again, after the answer, each collection Qory Apiary linked that the
@@ -641,17 +842,6 @@ func (c *Connect) refill(installation int64) {
 	}()
 }
 
-// linkedOther is whether an installation other than installation is linked.
-func linkedOther(st *store.Store, installation int64) (bool, error) {
-	other := false
-	self := strconv.FormatInt(installation, 10)
-	err := st.Each(nsInstallations, func(key string, _ []byte) error {
-		other = other || key != self
-		return nil
-	})
-	return other, err
-}
-
 // keepUnlinked keeps, for [unlinkedFor], that GitHub announced the installation, by
 // its installation created event, while it is not linked: Connect's installations
 // bring that event too, before their link. The record says what serve has seen of the
@@ -665,6 +855,94 @@ func keepUnlinked(st *store.Store, installation int64) error {
 // or deleted.
 func dropUnlinked(st *store.Store, installation int64) error {
 	return st.Delete(nsUnlinked, strconv.FormatInt(installation, 10))
+}
+
+// connectReturn is the connect return for the pass whose connection and nonce are
+// connection and nonce: the payload, contracts.ConnectReturn, version 1, with outcome,
+// reason when it is refused, and an expiry [returnFor] from now, in whole seconds;
+// signed with the adapter's access key over [contracts.ConnectReturnDomain], a line feed
+// and the payload's bytes; written as the payload in base64url without padding, a dot,
+// and the signature in base64url without padding, at most [maxConnectReturn]
+// characters. It is made only for a pass that verified.
+func (c *Connect) connectReturn(connection, nonce, outcome, reason string) (string, error) {
+	if outcome != outcomeRefused {
+		reason = ""
+	}
+	payload, err := json.Marshal(contracts.ConnectReturn{
+		Version: contracts.Version, ConnectionID: connection, Nonce: nonce, Outcome: outcome, Reason: reason,
+		ExpiresAt: contracts.FormatTime(c.clock().Add(returnFor)),
+	})
+	if err != nil {
+		return "", err
+	}
+	if c.Key == nil {
+		return "", errors.New("no access key signs the connect return")
+	}
+	enc := base64.RawURLEncoding.EncodeToString
+	ret := enc(payload) + "." + enc(c.Key.Sign(append([]byte(contracts.ConnectReturnDomain+"\n"), payload...)))
+	if len(ret) > maxConnectReturn {
+		return "", errors.New("the connect return is longer than 1024 characters")
+	}
+	return ret, nil
+}
+
+// giveBack ends the connect without a link: it makes the connect return of the verdict
+// for the pass whose connection and nonce are connection and nonce, ends the session id
+// names, when it is set, logs the verdict once each [refusalEvery] at most, with attrs,
+// which never hold a pass, a code, a token or a cookie, and sends the browser back to
+// Qory Apiary.
+func (c *Connect) giveBack(w http.ResponseWriter, r *http.Request, id, connection, nonce string, v verdict, attrs ...slog.Attr) {
+	ret, err := c.connectReturn(connection, nonce, v.outcome, v.reason)
+	if err != nil {
+		c.failed(w, r, id, "making the connect return", err)
+		return
+	}
+	if id != "" {
+		c.end(w, id)
+	}
+	if ok, dropped := c.refusals.allow(); ok {
+		line := append([]slog.Attr{slog.String("step", c.step(r)), slog.Int("status", http.StatusSeeOther), slog.String("reason", v.why), slog.String("outcome", v.outcome)}, attrs...)
+		if v.reason != "" {
+			line = append(line, slog.String("return_reason", v.reason))
+		}
+		if dropped > 0 {
+			line = append(line, slog.Int("refusals_dropped", dropped))
+		}
+		c.log().LogAttrs(r.Context(), slog.LevelInfo, "connect refused", line...)
+	}
+	c.toApiary(w, connection, ret)
+}
+
+// toApiary sends the browser to Qory Apiary with the connect return ret, 303, to
+// <apiary_url>/integrations/<connection_id>?return=<ret>: the origin is the settings'
+// alone, the one the adapter enrolled with, and connection one a pass named that
+// verified, of the contract's shape.
+func (c *Connect) toApiary(w http.ResponseWriter, connection, ret string) {
+	redirect(w, c.ApiaryURL+"/integrations/"+url.PathEscape(connection)+"?"+url.Values{"return": {ret}}.Encode())
+}
+
+// savePageHTML is the page that tells the person to press Save on GitHub's page, which
+// links to GitHub's page to install the App.
+var savePageHTML = template.Must(template.New("save").Parse(`<!doctype html>
+<meta charset="utf-8"><title>qory-github</title>
+<p>{{.Line}}</p>
+<p><a href="{{.Target}}">{{.Link}}</a></p>
+`))
+
+// savePage answers the page that tells the person, who reaches an installation of the
+// App already, to press Save on GitHub's page: GitHub sends the browser back to the
+// Setup URL for an installation that exists only once Save is pressed. target is
+// GitHub's page to install the App, built from the settings.
+func (c *Connect) savePage(w http.ResponseWriter, target string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	savePageHTML.Execute(w, map[string]string{
+		// placeholder: wording waits for the user
+		"Line": "The App is already installed. On GitHub's page, choose the account, then press Save to finish.",
+		// placeholder: wording waits for the user
+		"Link":   "Continue on GitHub",
+		"Target": target,
+	})
 }
 
 // sessionKey is the store's key for the session id: its SHA-256, so the store's
@@ -702,16 +980,45 @@ func (c *Connect) session(r *http.Request) (string, session, bool, error) {
 		return ck.Value, session{}, false, err
 	}
 	var s session
-	if json.Unmarshal(b, &s) != nil || !c.clock().Before(time.Unix(0, s.Expires)) {
+	if json.Unmarshal(b, &s) != nil || !c.clock().Before(time.Unix(0, s.Expires)) || !connectionShape.MatchString(s.Connection) || !nonceShape.MatchString(s.Nonce) {
 		return "", session{}, false, nil
 	}
 	return ck.Value, s, true, nil
 }
 
-// end ends the session: it drops it from the store, when id is set, and has the
-// browser drop the cookie.
+// holdToken holds the person's token for the session id until expires, in memory
+// alone, and forgets the tokens of the sessions that have expired.
+func (c *Connect) holdToken(id, token string, expires time.Time) {
+	now := c.clock()
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	for k, t := range c.tokens {
+		if !now.Before(t.expires) {
+			delete(c.tokens, k)
+		}
+	}
+	c.tokens[sessionKey(id)] = heldToken{token: token, expires: expires}
+}
+
+// tokenOf is the person's token the session id holds, or false when it holds none, or
+// its session has expired.
+func (c *Connect) tokenOf(id string) (string, bool) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	t, ok := c.tokens[sessionKey(id)]
+	if !ok || !c.clock().Before(t.expires) {
+		return "", false
+	}
+	return t.token, true
+}
+
+// end ends the session: it drops it from the store, and the token it holds, when id is
+// set, and has the browser drop the cookie.
 func (c *Connect) end(w http.ResponseWriter, id string) {
 	if id != "" {
+		c.tokenMu.Lock()
+		delete(c.tokens, sessionKey(id))
+		c.tokenMu.Unlock()
 		if err := c.Store.Delete(nsConnectSessions, sessionKey(id)); err != nil {
 			c.log().Error("dropping a connect session", slog.String("error", err.Error()))
 		}
@@ -775,7 +1082,7 @@ func (c *Connect) failed(w http.ResponseWriter, r *http.Request, id, what string
 	c.refuse(w, r, rf, id)
 }
 
-// step names the request's step for the log: connect, return or authorized.
+// step names the request's step for the log: connect, authorized or return.
 func (c *Connect) step(r *http.Request) string {
 	switch r.URL.Path {
 	case c.base + "/return":
