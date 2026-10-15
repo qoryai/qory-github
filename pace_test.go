@@ -101,6 +101,10 @@ func TestPacerWaitsOutGitHubsRateLimits(t *testing.T) {
 		{"a 429 with retry-after", []reply{{status: 429, headers: map[string]string{"Retry-After": "7"}}, ok}, false, 2, []time.Duration{7 * time.Second}, ""},
 		{"a 403 with retry-after", []reply{{status: 403, headers: map[string]string{"Retry-After": "3"}, body: `{"message":"You have exceeded a secondary rate limit"}`}, ok}, false, 2, []time.Duration{3 * time.Second}, ""},
 		{"a secondary rate limit without either header waits a minute", []reply{{status: 403, body: `{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`}, ok}, false, 2, []time.Duration{time.Minute}, ""},
+		{"a huge retry-after is an hour", []reply{{status: 429, headers: map[string]string{"Retry-After": "99999999999999999"}}, ok}, false, 2, []time.Duration{time.Hour}, ""},
+		{"a reset days away is an hour", []reply{
+			{headers: map[string]string{"X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": unix(72 * time.Hour)}}, ok,
+		}, false, 2, []time.Duration{time.Hour}, ""},
 		{"a 429 without either header waits a minute", []reply{{status: 429}, ok}, false, 2, []time.Duration{time.Minute}, ""},
 		{"a 403 that is no rate limit is the answer", []reply{{status: 403, body: `{"message":"Resource not accessible by integration"}`}}, false, 1, nil, "reading: GitHub answered 403: Resource not accessible by integration"},
 		{"five refusals are the answer", []reply{{status: 429, headers: map[string]string{"Retry-After": "1"}, body: `{"message":"slow down"}`}}, false, 5, []time.Duration{time.Second, time.Second, time.Second, time.Second}, "reading: GitHub answered 429: slow down"},
@@ -230,5 +234,63 @@ func TestAPageNeverSaysTheToken(t *testing.T) {
 	_, err = Client{API: unreachable(t)}.get(context.Background(), &Pacer{}, true, "listing", "/repos/acme/widgets/issues", fakeToken, &out)
 	if err == nil || strings.Contains(err.Error(), fakeToken) || strings.Contains(err.Error(), "/repos/") {
 		t.Errorf("err %v", err)
+	}
+}
+
+// TestAPausedListingLetsOtherRequestsGo pauses a listing below a fifth of the limit and
+// checks another request for the installation goes while the listing waits, and the
+// listing goes after it.
+func TestAPausedListingLetsOtherRequestsGo(t *testing.T) {
+	s := &scripted{replies: []reply{
+		{headers: map[string]string{"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": "10", "X-Ratelimit-Reset": unix(600 * time.Second)}},
+		{headers: map[string]string{"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": "9", "X-Ratelimit-Reset": unix(600 * time.Second)}},
+	}}
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	var mu sync.Mutex
+	now := t0
+	paused, resume := make(chan time.Duration, 1), make(chan struct{})
+	p := &Pacer{
+		Now: func() time.Time { mu.Lock(); defer mu.Unlock(); return now },
+		Sleep: func(_ context.Context, d time.Duration) error {
+			paused <- d
+			<-resume
+			mu.Lock()
+			now = now.Add(d)
+			mu.Unlock()
+			return nil
+		},
+	}
+	c := Client{API: srv.URL}
+	var out any
+	if _, err := c.get(context.Background(), p, false, "reading", "/a", fakeToken, &out); err != nil {
+		t.Fatal(err)
+	}
+	listed := make(chan error, 1)
+	go func() {
+		var out any
+		_, err := c.get(context.Background(), p, true, "listing", "/l", fakeToken, &out)
+		listed <- err
+	}()
+	if d := <-paused; d != 600*time.Second {
+		t.Errorf("the listing pauses %v", d)
+	}
+	other := make(chan error, 1)
+	go func() {
+		var out any
+		_, err := c.get(context.Background(), p, false, "writing", "/w", fakeToken, &out)
+		other <- err
+	}()
+	select {
+	case err := <-other:
+		if err != nil || s.count() != 2 {
+			t.Errorf("err %v, %d requests", err, s.count())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the paused listing holds the turn")
+	}
+	close(resume)
+	if err := <-listed; err != nil || s.count() != 3 {
+		t.Errorf("the listing: %v, %d requests", err, s.count())
 	}
 }

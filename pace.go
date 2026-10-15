@@ -41,7 +41,10 @@ const (
 //     it; else after the reset, when no request remains; else, a secondary rate limit,
 //     after 60 seconds. After five refusals the refusal is the answer.
 //   - A listing's request waits while fewer than a fifth of x-ratelimit-limit remain,
-//     until the limit resets.
+//     until the limit resets. It waits without the turn, so the installation's other
+//     requests, events and writes, go on meanwhile; only the waits for a request that
+//     GitHub refused or that has none remaining hold the turn.
+//   - A reset or a retry-after further away than an hour is taken as an hour.
 //
 // The zero value is ready to use.
 type Pacer struct {
@@ -53,7 +56,8 @@ type Pacer struct {
 
 	once sync.Once
 	turn chan struct{}
-	// What GitHub last said, read and written only while a request has the turn.
+	// mu guards what GitHub last said, which a paused listing reads without the turn.
+	mu               sync.Mutex
 	limit, remaining int
 	reset            time.Time
 	until            time.Time
@@ -85,14 +89,31 @@ func (p *Pacer) sleep(ctx context.Context, d time.Duration) error {
 // gives way to others when few requests remain.
 func (p *Pacer) do(ctx context.Context, listing bool, send func(context.Context) (*http.Response, error)) (*http.Response, error) {
 	p.once.Do(func() { p.turn = make(chan struct{}, 1) })
-	select {
-	case p.turn <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	for {
+		// A listing pauses before it takes the turn, and looks again once it has it,
+		// since a request that went meanwhile may have spent what remained.
+		if listing {
+			if d := p.paused().Sub(p.now()); d > 0 {
+				if err := p.sleep(ctx, min(d, maxWait)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+		select {
+		case p.turn <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if listing && p.paused().After(p.now()) {
+			<-p.turn
+			continue
+		}
+		break
 	}
 	defer func() { <-p.turn }()
 	for try := 1; ; try++ {
-		if err := p.wait(ctx, listing); err != nil {
+		if err := p.wait(ctx); err != nil {
 			return nil, err
 		}
 		resp, err := send(ctx)
@@ -106,12 +127,23 @@ func (p *Pacer) do(ctx context.Context, listing bool, send func(context.Context)
 	}
 }
 
-// wait waits until the next request may go.
-func (p *Pacer) wait(ctx context.Context, listing bool) error {
-	until := p.until
-	if listing && p.limit > 0 && p.remaining*pauseBelow < p.limit && p.reset.After(until) {
-		until = p.reset
+// paused is until when a listing pauses: the reset while fewer than a fifth of the
+// limit remain, else the zero time.
+func (p *Pacer) paused() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.limit > 0 && p.remaining*pauseBelow < p.limit {
+		return p.reset
 	}
+	return time.Time{}
+}
+
+// wait waits, with the turn, until the next request may go: after the reset when none
+// remains, or after GitHub's retry-after.
+func (p *Pacer) wait(ctx context.Context) error {
+	p.mu.Lock()
+	until := p.until
+	p.mu.Unlock()
 	d := until.Sub(p.now())
 	if d <= 0 {
 		return nil
@@ -122,6 +154,8 @@ func (p *Pacer) wait(ctx context.Context, listing bool) error {
 // observe reads GitHub's rate limit headers from a response and says whether GitHub
 // refused the request for a rate limit, so it is to be sent again.
 func (p *Pacer) observe(resp *http.Response) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	h := resp.Header
 	now := p.now()
 	exhausted := false
@@ -130,6 +164,9 @@ func (p *Pacer) observe(resp *http.Response) bool {
 	}
 	if n, err := strconv.ParseInt(h.Get("X-Ratelimit-Reset"), 10, 64); err == nil {
 		p.reset = time.Unix(n, 0)
+		if p.reset.After(now.Add(maxWait)) {
+			p.reset = now.Add(maxWait)
+		}
 	}
 	if n, err := strconv.Atoi(h.Get("X-Ratelimit-Remaining")); err == nil {
 		p.remaining = n
@@ -155,16 +192,17 @@ func (p *Pacer) observe(resp *http.Response) bool {
 	return true
 }
 
-// retryAfter reads retry-after, seconds or an HTTP date.
+// retryAfter reads retry-after, seconds or an HTTP date, and takes more than an hour
+// as an hour; the seconds are cut before they are multiplied, so they never overflow.
 func retryAfter(v string, now time.Time) (time.Duration, bool) {
 	if v == "" {
 		return 0, false
 	}
-	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-		return time.Duration(n) * time.Second, true
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+		return time.Duration(min(n, int64(maxWait/time.Second))) * time.Second, true
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return max(t.Sub(now), 0), true
+		return min(max(t.Sub(now), 0), maxWait), true
 	}
 	return 0, false
 }

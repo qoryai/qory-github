@@ -15,8 +15,9 @@ import (
 
 // What Qory Apiary takes. It refuses a request that exceeds one of these and cuts
 // nothing, so the adapter never sends one that does: an item, a comment or a
-// collection that breaks one is skipped, and logged by its ref, never by its text.
-// Lengths are counted in characters, Unicode code points.
+// collection that breaks one, in a listing or in a webhook's event, is skipped, and
+// logged by its ref, never by its text. Lengths are counted in characters, Unicode
+// code points.
 const (
 	maxTitle    = 1024
 	maxBody     = 65536
@@ -27,13 +28,24 @@ const (
 	maxPerBatch = 100
 )
 
+// The most pages a listing reads: a repository's issues, every state's, and one
+// issue's comments, and the installation's repositories. A listing that would read
+// more stops, as does one whose next page repeats a page it read.
+const (
+	maxIssuePages      = 2000
+	maxCommentPages    = 100
+	maxRepositoryPages = 1000
+)
+
 // workItemMarker begins the comment the App writes on an issue that is work in
 // Qory Apiary. Such a comment by the App's bot is the adapter's, not the issue's, so it
 // is never sent; the same words in a comment by anyone else are that person's comment.
 const workItemMarker = "<!-- qory:work-item "
 
 // Sink is where the wire's requests go: Qory Apiary's client, or a test's. Each method
-// sends one request and returns once Qory Apiary took it.
+// sends one request and returns once Qory Apiary took it. A request is at most 1 MiB as
+// encoding/json's Marshal writes it, compact; a sink that encodes it otherwise, indented
+// for one, may exceed that.
 type Sink interface {
 	// Collections sends POST /v1/source-collections.
 	Collections(ctx context.Context, req SourceCollections) error
@@ -263,6 +275,9 @@ type ToSend struct {
 
 // addItem adds an item of collection c to t, unless it is to be skipped.
 func (t *ToSend) addItem(c SourceCollection, it SourceItem, why string) {
+	if cw := checkCollection(c); why == "" && cw != "" {
+		why = "its collection: " + cw
+	}
 	if why == "" && size(SourceItems{Version: WireVersion, Collection: c, Items: []SourceItem{it}}) > maxRequest {
 		why = "it is larger than a request may be"
 	}
@@ -340,13 +355,25 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	default:
 		return t, nil
 	}
+	// A deleted comment is sent without its body, so the size limits never lose a
+	// deletion.
+	if ev.Action == "deleted" {
+		ev.Comment.Body = nil
+	}
 	c, why := commentOf(ev.Comment)
 	c.Deleted = ev.Action == "deleted"
+	coll := collectionOf(ev.Repository)
 	req := SourceComments{
 		Version:       WireVersion,
 		CollectionRef: ev.Repository.FullName,
 		ItemRef:       ev.Repository.FullName + "#" + strconv.FormatInt(ev.Issue.Number, 10),
 		Comments:      []SourceComment{c},
+	}
+	if cw := checkCollection(coll); why == "" && cw != "" {
+		why = "its collection: " + cw
+	}
+	if iw := checkRef(req.ItemRef); why == "" && iw != "" {
+		why = "its item: " + iw
 	}
 	if why == "" && size(req) > maxRequest {
 		why = "it is larger than a request may be"
@@ -402,14 +429,42 @@ func (l Lister) get(ctx context.Context, p *Pacer, what, path string, out any) (
 	return l.Client.get(ctx, p, true, what, path, token, out)
 }
 
+// pages keeps a listing to at most max pages, none read twice.
+type pages struct {
+	what string
+	max  int
+	seen map[string]bool
+}
+
+// read is whether the page at path may be read.
+func (p *pages) read(path string) error {
+	if p.seen[path] {
+		return fmt.Errorf("%s: GitHub's next page repeats one already read", p.what)
+	}
+	if len(p.seen) == p.max {
+		return fmt.Errorf("%s: GitHub has more than %d pages, which a listing never reads", p.what, p.max)
+	}
+	if p.seen == nil {
+		p.seen = map[string]bool{}
+	}
+	p.seen[path] = true
+	return nil
+}
+
+// A listing reads GitHub's pages by number, and a page's contents shift when an
+// earlier one loses an entry, so a listing can miss one. No listing ever says it is
+// complete, then: it adds and updates what it sees, never closes or drops what it does
+// not, and closing and deleting come from webhooks' events alone.
+
 // listingEnd is how long the request that ends a listing stopped early may take,
 // even when the listing stopped because its context is done.
 const listingEnd = 10 * time.Second
 
 // ListRepositories lists the repositories the installation reaches, as collections, in
-// parts of at most 100 collections and 1 MiB. The last part says the listing is complete;
-// a listing stopped early, by an error or its context, ends with a part that says it is
-// not, so Qory Apiary closes nothing.
+// parts of at most 100 collections and 1 MiB, and reads at most 1,000 pages. No part
+// says the listing is complete, since a repository removed from the installation while
+// it is listed shifts the pages after it; a listing stopped early, by an error or its
+// context, still ends with a part.
 func (l Lister) ListRepositories(ctx context.Context) error {
 	if l.Sink == nil || l.Token == nil {
 		return errors.New("the lister has no sink or no token")
@@ -418,9 +473,8 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	listing := Listing{ID: randomHex(), StartedAt: p.now().UTC().Format(time.RFC3339)}
 	system := l.Client.WebHost()
 	var pending []SourceCollection
-	send := func(ctx context.Context, complete bool) error {
+	send := func(ctx context.Context) error {
 		listing.Part++
-		listing.Complete = complete
 		req := SourceCollections{Version: WireVersion, Collections: pending, Listing: listing}
 		if req.Collections == nil {
 			req.Collections = []SourceCollection{}
@@ -433,14 +487,19 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	stop := func(err error) error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
 		defer cancel()
-		return errors.Join(err, send(ctx, false))
+		return errors.Join(err, send(ctx))
 	}
+	const what = "listing the installation's repositories"
+	read := pages{what: what, max: maxRepositoryPages}
 	path := "/installation/repositories?per_page=100"
 	for path != "" {
+		if err := read.read(path); err != nil {
+			return stop(err)
+		}
 		var page struct {
 			Repositories []ghRepo `json:"repositories"`
 		}
-		next, err := l.get(ctx, p, "listing the installation's repositories", path, &page)
+		next, err := l.get(ctx, p, what, path, &page)
 		if err != nil {
 			return stop(err)
 		}
@@ -453,7 +512,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 				continue
 			}
 			if len(pending) == maxPerBatch || used+n+1 > maxRequest {
-				if err := send(ctx, false); err != nil {
+				if err := send(ctx); err != nil {
 					return stop(err)
 				}
 				used = envelope
@@ -463,7 +522,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		}
 		path = next
 	}
-	if err := send(ctx, true); err != nil {
+	if err := send(ctx); err != nil {
 		return stop(err)
 	}
 	return nil
@@ -494,11 +553,20 @@ type listed struct {
 // ListIssues lists the repository's open issues, pull requests left out, and their
 // comments, and sends them to Qory Apiary: items in parts of at most 100 items and
 // 1 MiB, and after each part the comments of its items, for an issue that has any, in
-// requests of at most 1 MiB. The App's work item comment is left out. An item's last
-// comments request says the item's comments are complete when every page of them was
-// read. The last part of items says the listing is complete; a listing stopped early, by
-// an error or its context, ends with a part that says it is not, so Qory Apiary closes
-// nothing; one that cannot read the repository sends nothing.
+// requests of at most 100 comments and 1 MiB. The App's work item comment is left out.
+//
+// It reads every issue, in every state, oldest first, and sends the open ones alone:
+// closing an issue then moves none of the others from one page to another, as it
+// would in a list of open issues, which deleting or transferring one still does. It
+// reads at most 2,000 pages of issues and 100 of an issue's comments.
+//
+// No part says the listing is complete, nor do an item's comments, so Qory Apiary closes
+// and drops nothing a listing does not see. What that leaves is a limit: an issue a
+// listing missed, as one deleted or transferred while it was listed makes it miss one,
+// and an issue closed while its repository was not mirrored, stay as Qory Apiary has
+// them until that issue next changes on GitHub, and its webhook event brings it. A
+// listing stopped early, by an error or its context, still ends with a part; one that
+// cannot read the repository sends nothing.
 func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
 		return fmt.Errorf("%q is not owner/name", repo.String())
@@ -518,10 +586,9 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	}
 	system := l.Client.WebHost()
 	var pending []listed
-	completed := false
-	send := func(ctx context.Context, complete bool) ([]listed, error) {
+	ended := false
+	send := func(ctx context.Context, last bool) ([]listed, error) {
 		listing.Part++
-		listing.Complete = complete
 		part := listing
 		req := SourceItems{Version: WireVersion, Collection: coll, Items: make([]SourceItem, 0, len(pending)), Listing: &part}
 		for _, x := range pending {
@@ -532,13 +599,13 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 		if err := l.Sink.Items(ctx, req); err != nil {
 			return nil, err
 		}
-		completed = complete
+		ended = last
 		return sent, nil
 	}
 	envelope := size(SourceItems{Version: WireVersion, Collection: coll, Items: []SourceItem{}, Listing: &Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	used := envelope
 	stop := func(err error) error {
-		if completed {
+		if ended {
 			return err
 		}
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
@@ -546,15 +613,20 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 		_, end := send(ctx, false)
 		return errors.Join(err, end)
 	}
-	path := "/repos/" + repo.String() + "/issues?state=open&per_page=100"
+	what := "listing the issues of " + repo.String()
+	read := pages{what: what, max: maxIssuePages}
+	path := "/repos/" + repo.String() + "/issues?state=all&sort=created&direction=asc&per_page=100"
 	for path != "" {
+		if err := read.read(path); err != nil {
+			return stop(err)
+		}
 		var page []ghIssue
-		next, err := l.get(ctx, p, "listing the open issues of "+repo.String(), path, &page)
+		next, err := l.get(ctx, p, what, path, &page)
 		if err != nil {
 			return stop(err)
 		}
 		for _, is := range page {
-			if is.PullRequest != nil {
+			if is.PullRequest != nil || is.State != StateOpen {
 				continue
 			}
 			it, why := itemOf(system, r, is)
@@ -572,7 +644,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 					return stop(err)
 				}
 				used = envelope
-				if err := l.listComments(ctx, p, repo, coll.Ref, sent, listing.StartedAt); err != nil {
+				if err := l.listComments(ctx, p, repo, coll.Ref, sent); err != nil {
 					return stop(err)
 				}
 			}
@@ -585,21 +657,27 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if err != nil {
 		return stop(err)
 	}
-	return l.listComments(ctx, p, repo, coll.Ref, sent, listing.StartedAt)
+	return l.listComments(ctx, p, repo, coll.Ref, sent)
 }
 
-// listComments reads and sends the comments of the items that have any.
-func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, collRef string, items []listed, since string) error {
+// listComments reads and sends the comments of the items that have any. An item's
+// comments are read by page number too, oldest first, and a comment deleted while they
+// are read shifts the pages after it, so no request says they are complete.
+func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, collRef string, items []listed) error {
 	for _, x := range items {
 		if x.comments <= 0 {
 			continue
 		}
 		req := SourceComments{Version: WireVersion, CollectionRef: collRef, ItemRef: x.item.Ref, Comments: []SourceComment{}}
-		envelope := size(SourceComments{Version: WireVersion, CollectionRef: collRef, ItemRef: x.item.Ref, Comments: []SourceComment{}, Complete: &CommentsListing{Since: since}})
+		envelope := size(req)
 		used := envelope
 		what := "listing the comments on " + x.item.Ref
+		read := pages{what: what, max: maxCommentPages}
 		path := "/repos/" + repo.String() + "/issues/" + strconv.FormatInt(x.number, 10) + "/comments?per_page=100"
 		for path != "" {
+			if err := read.read(path); err != nil {
+				return err
+			}
 			var page []ghComment
 			next, err := l.get(ctx, p, what, path, &page)
 			if err != nil {
@@ -618,7 +696,7 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, col
 					l.logf("skipped the comment %s on %s: %s", sc.Ref, x.item.Ref, why)
 					continue
 				}
-				if used+n+1 > maxRequest {
+				if len(req.Comments) == maxPerBatch || used+n+1 > maxRequest {
 					if err := l.Sink.Comments(ctx, req); err != nil {
 						return err
 					}
@@ -629,7 +707,9 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, col
 			}
 			path = next
 		}
-		req.Complete = &CommentsListing{Since: since}
+		if len(req.Comments) == 0 {
+			continue
+		}
 		if err := l.Sink.Comments(ctx, req); err != nil {
 			return err
 		}

@@ -34,10 +34,14 @@ func TestMintInstallationTokenAsksForTheRepositoriesAndPermissionsAlone(t *testi
 	if tok.Token != fakeToken || !tok.ExpiresAt.Equal(time.Date(2026, 9, 25, 21, 0, 0, 0, time.UTC)) {
 		t.Errorf("token %+v", tok)
 	}
-	for _, s := range []string{tok.String(), fmt.Sprint(tok), fmt.Sprintf("%v", tok)} {
+	for _, s := range []string{tok.String(), fmt.Sprint(tok), fmt.Sprintf("%v", tok), fmt.Sprintf("%+v", tok), fmt.Sprintf("%#v", tok), fmt.Sprintf("%#v", &tok)} {
 		if strings.Contains(s, fakeToken) || s != "an installation token that expires at 2026-09-25T21:00:00Z" {
 			t.Errorf("printed: %s", s)
 		}
+	}
+	b, err := json.Marshal(tok)
+	if err != nil || strings.Contains(string(b), fakeToken) || string(b) != `{"ExpiresAt":"2026-09-25T21:00:00Z"}` {
+		t.Errorf("JSON %s, %v", b, err)
 	}
 }
 

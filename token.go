@@ -12,9 +12,9 @@ import (
 )
 
 // InstallationToken is a token GitHub minted for one installation of the App, and when
-// it expires. It is a secret: String and an error never say it.
+// it expires. It is a secret: String, GoString, JSON and an error never say it.
 type InstallationToken struct {
-	Token     string
+	Token     string `json:"-"`
 	ExpiresAt time.Time
 }
 
@@ -23,6 +23,9 @@ type InstallationToken struct {
 func (t InstallationToken) String() string {
 	return "an installation token that expires at " + t.ExpiresAt.UTC().Format(time.RFC3339)
 }
+
+// GoString is String, so %#v does not give the token away either.
+func (t InstallationToken) GoString() string { return t.String() }
 
 // MintInstallationToken requests from GitHub a token for the installation the request
 // names, req.InstallationID, which must be set, limited to the request's repositories

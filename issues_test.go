@@ -29,11 +29,15 @@ type fakeIssues struct {
 	// failIssues and failComments answer that page of issues, or of any issue's
 	// comments, with a 500; zero never does.
 	failIssues, failComments int
-	// elsewhere is set to make the first page of issues link its next on another host.
-	elsewhere bool
-	mu        sync.Mutex
-	paths     []string
-	auth      []string
+	// elsewhere is set to make the first page of issues link its next on another host,
+	// and again to make every page link its next to the first.
+	elsewhere, again bool
+	// afterIssues, when set, is called after a page of issues is answered, with its
+	// number, as GitHub changes between two pages.
+	afterIssues func(page int)
+	mu          sync.Mutex
+	paths       []string
+	auth        []string
 }
 
 var commentsPath = regexp.MustCompile(`^/repos/acme/widgets/issues/(\d+)/comments$`)
@@ -52,9 +56,12 @@ func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		lo, hi := min((page-1)*f.pageSize, len(all)), min(page*f.pageSize, len(all))
-		if hi < len(all) {
+		if hi < len(all) || f.again {
 			q := r.URL.Query()
 			q.Set("page", strconv.Itoa(page+1))
+			if f.again {
+				q.Del("page")
+			}
 			host := f.srv.URL
 			if f.elsewhere {
 				host = "https://elsewhere.example"
@@ -68,7 +75,22 @@ func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/repos/acme/widgets":
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets","private":true}`)
 	case r.URL.Path == "/repos/acme/widgets/issues":
-		serve(f.issues, f.failIssues, list)
+		// GitHub lists issues in the state asked for, all of them for all; the
+		// fixtures are in the order they were created.
+		f.mu.Lock()
+		var in []map[string]any
+		for _, is := range f.issues {
+			if st := r.URL.Query().Get("state"); st == "all" || st == is["state"] {
+				in = append(in, is)
+			}
+		}
+		f.mu.Unlock()
+		serve(in, f.failIssues, list)
+		if f.afterIssues != nil {
+			f.mu.Lock()
+			f.afterIssues(page)
+			f.mu.Unlock()
+		}
 	case m != nil:
 		n, _ := strconv.Atoi(m[1])
 		serve(f.comments[n], f.failComments, list)
@@ -209,9 +231,9 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 	}
 	want := []string{
 		"/repos/acme/widgets",
-		"/repos/acme/widgets/issues?state=open&per_page=100",
-		"/repos/acme/widgets/issues?page=2&per_page=100&state=open",
-		"/repos/acme/widgets/issues?page=3&per_page=100&state=open",
+		"/repos/acme/widgets/issues?state=all&sort=created&direction=asc&per_page=100",
+		"/repos/acme/widgets/issues?direction=asc&page=2&per_page=100&sort=created&state=all",
+		"/repos/acme/widgets/issues?direction=asc&page=3&per_page=100&sort=created&state=all",
 		"/repos/acme/widgets/issues/1/comments?per_page=100",
 		"/repos/acme/widgets/issues/1/comments?page=2&per_page=100",
 		"/repos/acme/widgets/issues/6/comments?per_page=100",
@@ -225,7 +247,7 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 		}
 	}
 	items := s.items()
-	if len(items) != 1 || items[0].Listing == nil || items[0].Listing.Part != 1 || !items[0].Listing.Complete || items[0].Listing.StartedAt != "2026-09-21T14:13:20Z" {
+	if len(items) != 1 || items[0].Listing == nil || items[0].Listing.Part != 1 || items[0].Listing.Complete || items[0].Listing.StartedAt != "2026-09-21T14:13:20Z" {
 		t.Fatalf("items requests %+v", items)
 	}
 	var refs []string
@@ -238,19 +260,17 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 	if items[0].Collection != (SourceCollection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
 		t.Errorf("collection %+v", items[0].Collection)
 	}
+	// #6 has only the work item comment, so nothing is sent for it.
 	cs := s.comments()
-	if len(cs) != 2 {
+	if len(cs) != 1 {
 		t.Fatalf("comments requests %+v", cs)
 	}
 	var got []string
 	for _, c := range cs[0].Comments {
 		got = append(got, c.Ref+" "+c.Author.Name+" "+c.Author.Kind)
 	}
-	if cs[0].CollectionRef != "acme/widgets" || cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete == nil || cs[0].Complete.Since != "2026-09-21T14:13:20Z" {
+	if cs[0].CollectionRef != "acme/widgets" || cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
 		t.Errorf("comments on #1: %+v, %v", cs[0], got)
-	}
-	if cs[1].ItemRef != "acme/widgets#6" || len(cs[1].Comments) != 0 || cs[1].Complete == nil {
-		t.Errorf("comments on #6: %+v", cs[1])
 	}
 	// The items come before their comments.
 	if _, ok := s.reqs[0].(SourceItems); !ok {
@@ -298,7 +318,7 @@ func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 			if len(b) > 1<<20 {
 				t.Errorf("%s: part %d is %d bytes", tc.name, i+1, len(b))
 			}
-			if req.Listing.Part != i+1 || req.Listing.Complete != (i == len(items)-1) {
+			if req.Listing.Part != i+1 || req.Listing.Complete {
 				t.Errorf("%s: part %d says %+v", tc.name, i+1, req.Listing)
 			}
 			sizes = append(sizes, len(req.Items))
@@ -330,7 +350,7 @@ func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
 	total := 0
 	for i, c := range cs {
 		b, _ := json.Marshal(c)
-		if len(b) > 1<<20 || (c.Complete != nil) != (i == len(cs)-1) {
+		if len(b) > 1<<20 || c.Complete != nil {
 			t.Errorf("request %d: %d bytes, complete %v", i, len(b), c.Complete)
 		}
 		total += len(c.Comments)
@@ -365,7 +385,7 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	items := s.items()
-	if len(items) != 1 || len(items[0].Items) != 2 || items[0].Items[0].Ref != "acme/widgets#1" || items[0].Items[1].Ref != "acme/widgets#6" || !items[0].Listing.Complete {
+	if len(items) != 1 || len(items[0].Items) != 2 || items[0].Items[0].Ref != "acme/widgets#1" || items[0].Items[1].Ref != "acme/widgets#6" || items[0].Listing.Complete {
 		t.Errorf("items %+v", items)
 	}
 	cs := s.comments()
@@ -384,10 +404,9 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 	}
 }
 
-// TestAListingStoppedEarlyEndsIncomplete stops listings in several places and checks
-// that each returns its error and ends with a part that says it is not complete, and
-// that an item whose comments were not all read is never said complete.
-func TestAListingStoppedEarlyEndsIncomplete(t *testing.T) {
+// TestAListingStoppedEarlyEndsWithAPart stops listings in several places and checks
+// that each returns its error and ends with a part, none of which says it is complete.
+func TestAListingStoppedEarlyEndsWithAPart(t *testing.T) {
 	many := func(n, comments int) []map[string]any {
 		var out []map[string]any
 		for i := 1; i <= n; i++ {
@@ -402,9 +421,9 @@ func TestAListingStoppedEarlyEndsIncomplete(t *testing.T) {
 		err   string
 		parts int // items requests, the last of which is incomplete
 	}{
-		{"a page of issues fails", &fakeIssues{pageSize: 2, issues: many(5, 0), failIssues: 2}, &sink{}, "listing the open issues of acme/widgets: GitHub answered 500: Server Error", 1},
-		{"a page of issues fails after a part", &fakeIssues{pageSize: 100, issues: many(250, 0), failIssues: 3}, &sink{}, "listing the open issues of acme/widgets: GitHub answered 500: Server Error", 2},
-		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the open issues of acme/widgets: GitHub's next page is not on its API, so it is not read", 1},
+		{"a page of issues fails", &fakeIssues{pageSize: 2, issues: many(5, 0), failIssues: 2}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 1},
+		{"a page of issues fails after a part", &fakeIssues{pageSize: 100, issues: many(250, 0), failIssues: 3}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 2},
+		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the issues of acme/widgets: GitHub's next page is not on its API, so it is not read", 1},
 		{"Qory Apiary fails a part", &fakeIssues{pageSize: 100, issues: many(150, 0)}, &sink{failAt: 1}, "Qory Apiary is not reachable", 2},
 		{"comments fail before the last part", &fakeIssues{pageSize: 1, issues: many(150, 1), comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}, failComments: 2}, &sink{}, "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", 2},
 	} {
@@ -446,12 +465,11 @@ func TestAListingStoppedEarlyEndsIncomplete(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || len(items) != 1 || items[0].Listing.Complete || len(items[0].Items) != 2 {
 		t.Errorf("err %v, items %+v", err, items)
 	}
-	// Comments that fail after the last part leave the listing complete, and the
-	// item's comments not.
+	// Comments that fail after the last part send no part after it.
 	f = &fakeIssues{issues: many(1, 2), comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}, pageSize: 1, failComments: 2}
 	s = &sink{}
 	err = f.lister(t, s, &logs).ListIssues(context.Background(), widgets)
-	if items := s.items(); err == nil || len(items) != 1 || !items[0].Listing.Complete || len(s.comments()) != 0 {
+	if items := s.items(); err == nil || len(items) != 1 || items[0].Listing.Complete || len(s.comments()) != 0 {
 		t.Errorf("err %v, items %+v, comments %+v", err, items, s.comments())
 	}
 }
@@ -477,7 +495,7 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 		{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &Target{System: host, Path: "acme/widgets"}},
 		{Ref: "acme/gadgets", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &Target{System: host, Path: "acme/gadgets"}},
 	}
-	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || !got.Listing.Complete || got.Version != 1 {
+	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 {
 		t.Errorf("collections %+v", got)
 	}
 	if !reflect.DeepEqual(logs, []string{"skipped the collection acme/broken: its URL is not https or is longer than 2,048 characters"}) {
@@ -707,5 +725,117 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 func TestTheStartTimeIsTheClocks(t *testing.T) {
 	if got := t0.UTC().Format(time.RFC3339); got != "2026-09-21T14:13:20Z" {
 		t.Errorf("t0 is %s", got)
+	}
+}
+
+// TestAnIssueClosedDuringAListingSkipsNoOpenIssue closes the first issue once the first
+// page is read, which in a list of open issues would move the third onto the first
+// page, already read, and checks every open issue is sent all the same, and a closed
+// issue is neither sent nor has its comments read.
+func TestAnIssueClosedDuringAListingSkipsNoOpenIssue(t *testing.T) {
+	closed := issue(6, 2)
+	closed["state"], closed["state_reason"] = "closed", "completed"
+	f := &fakeIssues{pageSize: 2, issues: []map[string]any{issue(1, 0), issue(2, 0), issue(3, 0), issue(4, 0), issue(5, 0), closed}}
+	f.afterIssues = func(page int) {
+		if page == 1 {
+			f.issues[0]["state"] = "closed"
+		}
+	}
+	s := &sink{}
+	var logs []string
+	if err := f.lister(t, s, &logs).ListIssues(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	var refs []string
+	for _, req := range s.items() {
+		for _, it := range req.Items {
+			refs = append(refs, it.Ref+" "+it.State)
+		}
+	}
+	if strings.Join(refs, ", ") != "acme/widgets#1 open, acme/widgets#2 open, acme/widgets#3 open, acme/widgets#4 open, acme/widgets#5 open" {
+		t.Errorf("sent %v", refs)
+	}
+	for _, p := range f.requested() {
+		if strings.Contains(p, "/comments") {
+			t.Errorf("read %s", p)
+		}
+	}
+}
+
+// TestAListingReadsABoundedNumberOfPages checks a listing stops, with its error and a
+// last part, at 2,000 pages of issues, at 100 pages of an issue's comments, and when a
+// next page repeats one it read.
+func TestAListingReadsABoundedNumberOfPages(t *testing.T) {
+	var manyIssues []map[string]any
+	for i := 1; i <= 2001; i++ {
+		manyIssues = append(manyIssues, issue(i, 0))
+	}
+	manyComments := map[int][]map[string]any{1: {}}
+	for i := range 101 {
+		manyComments[1] = append(manyComments[1], comment(i+1, "bob", "User", "c"))
+	}
+	for _, tc := range []struct {
+		name     string
+		f        *fakeIssues
+		err      string
+		requests int
+	}{
+		{"issues", &fakeIssues{pageSize: 1, issues: manyIssues}, "listing the issues of acme/widgets: GitHub has more than 2000 pages, which a listing never reads", 1 + 2000},
+		{"comments", &fakeIssues{pageSize: 1, issues: []map[string]any{issue(1, 101)}, comments: manyComments}, "listing the comments on acme/widgets#1: GitHub has more than 100 pages, which a listing never reads", 1 + 1 + 100},
+		{"a repeated page", &fakeIssues{pageSize: 1, issues: []map[string]any{issue(1, 0), issue(2, 0)}, again: true}, "listing the issues of acme/widgets: GitHub's next page repeats one already read", 1 + 2},
+	} {
+		s := &sink{}
+		var logs []string
+		err := tc.f.lister(t, s, &logs).ListIssues(context.Background(), widgets)
+		if err == nil || err.Error() != tc.err || len(tc.f.requested()) != tc.requests {
+			t.Errorf("%s: err %v, %d requests", tc.name, err, len(tc.f.requested()))
+		}
+		items := s.items()
+		if len(items) == 0 || items[len(items)-1].Listing.Complete {
+			t.Errorf("%s: parts %d", tc.name, len(items))
+		}
+	}
+}
+
+func TestCommentsGoInRequestsOfAHundred(t *testing.T) {
+	f := &fakeIssues{issues: []map[string]any{issue(1, 250)}, comments: map[int][]map[string]any{}}
+	for i := range 250 {
+		f.comments[1] = append(f.comments[1], comment(i+1, "bob", "User", "c"))
+	}
+	s := &sink{}
+	var logs []string
+	if err := f.lister(t, s, &logs).ListIssues(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	var sizes []int
+	for _, c := range s.comments() {
+		sizes = append(sizes, len(c.Comments))
+	}
+	if !reflect.DeepEqual(sizes, []int{100, 100, 50}) {
+		t.Errorf("requests of %v", sizes)
+	}
+}
+
+// TestAWebhooksEventHasTheListingsChecks sends events from a repository Qory Apiary
+// would refuse as a collection, and a deleted comment whose body was too long.
+func TestAWebhooksEventHasTheListingsChecks(t *testing.T) {
+	bad := map[string]any{"repository": map[string]any{"full_name": "acme/widgets", "html_url": "http://github.com/acme/widgets"}}
+	got, _ := IssuesWebhook(event("opened", issue(1, 0), bad), "github.com", nil)
+	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "acme/widgets#1", Why: "its collection: its URL is not https or is longer than 2,048 characters"}}) {
+		t.Errorf("issues: %+v", got)
+	}
+	bad["comment"] = comment(5, "bob", "User", "c")
+	got, _ = IssueCommentWebhook(event("created", issue(1, 1), bad), "qory-test")
+	if len(got.Comments) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "5", Why: "its collection: its URL is not https or is longer than 2,048 characters"}}) {
+		t.Errorf("issue_comment: %+v", got)
+	}
+	long := comment(5, "bob", "User", strings.Repeat("a", 70_000))
+	got, _ = IssueCommentWebhook(event("edited", issue(1, 1), map[string]any{"comment": long}), "qory-test")
+	if len(got.Comments) != 0 || len(got.Skipped) != 1 {
+		t.Errorf("edited: %+v", got.Skipped)
+	}
+	got, _ = IssueCommentWebhook(event("deleted", issue(1, 1), map[string]any{"comment": long}), "qory-test")
+	if len(got.Comments) != 1 || len(got.Skipped) != 0 || got.Comments[0].Comments[0].Body != "" || !got.Comments[0].Comments[0].Deleted {
+		t.Errorf("deleted: %+v", got)
 	}
 }
