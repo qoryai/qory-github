@@ -427,6 +427,38 @@ func TestAFeedEntryThatFailsForGoodIsPassed(t *testing.T) {
 	}
 }
 
+// TestAnEntryForAnIssueOrARepositoryGoneIsPassed reads a work item whose issue GitHub
+// answers 404, one in a repository GitHub answers 301, and a linked collection whose
+// repository GitHub answers 404 or 301, each before an entry serve can apply, and checks
+// each is passed, the entry after it applied and the cursor moved.
+func TestAnEntryForAnIssueOrARepositoryGoneIsPassed(t *testing.T) {
+	for name, gone := range map[string]contracts.Change{
+		"a work item whose issue is gone":       {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_8", Ref: "acme/widgets#8", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_8"},
+		"a work item whose repository moved":    {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_9", Ref: "acme/moved#9", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_9"},
+		"a collection whose repository is gone": {Kind: contracts.ChangeCollection, CollectionRef: "acme/old", Status: "linked"},
+		"a collection whose repository moved":   {Kind: contracts.ChangeCollection, CollectionRef: "acme/moved", Status: "linked"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		for _, repo := range []string{"acme/widgets", "acme/moved", "acme/old"} {
+			setReach(w.st, repo, 42)
+		}
+		w.apiary.add(gone, contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+			t.Errorf("%s: the cursor %q", name, c)
+		}
+		if posted := w.gh.postedComments(); len(posted) != 1 || !strings.HasPrefix(posted[0], "<!-- qory:work-item wi_42 -->") {
+			t.Errorf("%s: posted %q", name, posted)
+		}
+		if !strings.Contains(w.log.String(), "a change of the feed failed, and is passed") {
+			t.Errorf("%s: the log %s", name, w.log.String())
+		}
+	}
+}
+
 // TestAFeedEntryThatMayPassKeepsTheCursor links a collection whose fill Qory Apiary
 // answers 500, and checks the step fails and the cursor stays, so the entry is read
 // again.
@@ -519,6 +551,17 @@ func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
 		if len(gets) < 3 || gets[1].target != routeChanges+"?after=c_1" || gets[2].target != routeChanges+"?after=c_1" {
 			t.Errorf("%s %s: read %v", bad.Kind, bad.Status, gets)
 		}
+	}
+}
+
+// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose kind and status are long,
+// and checks the refusal keeps 64 characters of each.
+func TestAnUnknownEntrysKindAndStatusAreCut(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100), Status: strings.Repeat("s", 100)})
+	var u *unknownChange
+	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != strings.Repeat("ü", 64) || u.status != strings.Repeat("s", 64) {
+		t.Errorf("err %v", err)
 	}
 }
 

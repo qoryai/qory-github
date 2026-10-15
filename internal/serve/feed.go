@@ -126,9 +126,23 @@ func (f *feed) run(ctx context.Context) {
 	}
 }
 
+// maxLogged is the most characters of an entry's kind or status a line says.
+const maxLogged = 64
+
+// first is s cut to at most n characters, on a character's boundary.
+func first(s string, n int) string {
+	for i := range s {
+		if n == 0 {
+			return s[:i]
+		}
+		n--
+	}
+	return s
+}
+
 // unknownChange is an answer of the feed that holds an entry of a kind, or a status of
 // a known kind, that serve does not know: the cursor the answer was read after, and the
-// entry's kind and status as Qory Apiary sent them.
+// entry's kind and status as Qory Apiary sent them, maxLogged characters of each.
 type unknownChange struct {
 	after, kind, status string
 }
@@ -168,7 +182,7 @@ func (f *feed) step(ctx context.Context) error {
 	}
 	for _, ch := range page.Changes {
 		if !known(ch) {
-			return &unknownChange{after: string(cursor), kind: ch.Kind, status: ch.Status}
+			return &unknownChange{after: string(cursor), kind: first(ch.Kind, maxLogged), status: first(ch.Status, maxLogged)}
 		}
 	}
 	for _, ch := range page.Changes {

@@ -79,9 +79,10 @@ var appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 // but white space. Every field is required but api_url, which is GitHub's API when it is
 // left out, and a field it does not know is refused. An error says where the settings
 // are wrong and what is wrong there, never a value: a field's name is quoted as Go
-// quotes a string. Settings that hold a secret anywhere, in a value or a member's name,
-// are refused before anything else, with an error that quotes nothing, and so is a
-// file's setting whose value holds a control character or a PEM block.
+// quotes a string. Settings that hold what looks like a secret anywhere, qak_ or qrk_ in
+// any case, in a value or a member's name, are refused before anything else, with an
+// error that quotes nothing, and so is a file's setting whose value holds a control
+// character or a PEM block.
 func ReadSettings(path string) (Settings, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -98,15 +99,16 @@ func ReadSettings(path string) (Settings, error) {
 	return parseSettings(b)
 }
 
-// errSecretInSettings and errRunKeyInSettings refuse settings that hold a secret, as
-// [accesskey.SecretInDocument] finds one, and quote nothing.
+// errSecretInSettings and errRunKeyInSettings refuse settings that hold what looks like
+// a secret, as [accesskey.SecretInDocument] finds one, its prefix in any case, and quote
+// nothing.
 var (
-	errSecretInSettings = errors.New("the settings contain an access key secret, which belongs in the file access_key_secret_file names and nowhere else")
-	errRunKeyInSettings = errors.New("the settings contain a run key, which belongs nowhere in them")
+	errSecretInSettings = errors.New("the settings contain what looks like an access key secret, qak_, which belongs in the file access_key_secret_file names and nowhere else")
+	errRunKeyInSettings = errors.New("the settings contain what looks like a run key, qrk_, which belongs nowhere in them")
 )
 
-// secretIn is the error of settings b that hold a secret, as their bytes and, when they
-// decode, their member names and values hold one, or nil.
+// secretIn is the error of settings b that hold what looks like a secret, as their
+// bytes and, when they decode, their member names and values hold one, or nil.
 func secretIn(b []byte) error {
 	err := accesskey.SecretInDocument(string(b))
 	var doc any
@@ -224,8 +226,10 @@ func text(raw json.RawMessage) (string, error) {
 }
 
 // filePath is a field that names a file: a string that is not empty, with no control
-// character and no PEM block, so a secret pasted in place of its file is refused and
-// never quoted.
+// character and no PEM block, so a key pasted in place of its file is refused. An error
+// here names the setting alone, and serve reads the file as ownerfile.ReadNamed reads
+// it, with errors that name the setting and never the path, so a secret pasted on one
+// line in place of the path is not quoted either.
 func filePath(raw json.RawMessage) (string, error) {
 	s, err := text(raw)
 	switch {

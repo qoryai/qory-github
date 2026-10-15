@@ -79,6 +79,9 @@ const (
 	// to maxBackoff.
 	firstBackoff = 2 * time.Second
 	maxBackoff   = time.Minute
+	// outageEvery is how often the first outage of a delivery is logged at most; those
+	// in between are counted.
+	outageEvery = time.Minute
 	// outageFor is how long a delivery whose handler meets Qory Apiary's [Outage] is
 	// tried again, from its first attempt, after a wait that doubles from two seconds
 	// to outageMaxBackoff, so a deploy of Qory Apiary loses no delivery.
@@ -102,7 +105,9 @@ const (
 // and counts as no attempt, so the installation's later deliveries wait behind it. An
 // [Outage] error, Qory Apiary's, counts as no attempt either: it is tried again after a
 // wait that doubles to five minutes, until a day has passed since the delivery's first
-// attempt, and the delivery is then marked failed and logged. A delivery stays pending
+// attempt, and the delivery is then marked failed and logged. The first outage a
+// delivery meets is logged at the warning level, one line a minute at most, the lines
+// held back counted. A delivery stays pending
 // until one of these, so one that a stop interrupted is handled after the next start,
 // and its day counted again from then.
 type Worker struct {
@@ -125,6 +130,7 @@ type Worker struct {
 	now func() time.Time
 
 	once     sync.Once
+	outages  *throttle
 	wake     chan struct{}
 	stopping chan struct{}
 	// ctx is the handlers' context, cancelled when a stop's bound has passed.
@@ -157,6 +163,9 @@ func (w *Worker) init() {
 		if w.Log == nil {
 			w.Log = slog.New(slog.DiscardHandler)
 		}
+		w.outages = &throttle{every: outageEvery, flush: func(dropped int) {
+			w.Log.LogAttrs(context.Background(), slog.LevelWarn, "outages of Qory Apiary dropped", slog.Int("outages_dropped", dropped))
+		}}
 	})
 }
 
@@ -214,6 +223,7 @@ func (w *Worker) Stop(grace time.Duration) {
 		}
 	}
 	w.cancel()
+	w.outages.stop()
 }
 
 // scan queues each pending delivery that is not queued yet in its installation's lane,
@@ -341,6 +351,9 @@ func (w *Worker) handle(meta Delivery) bool {
 			if w.clock().Sub(first) >= outageFor {
 				return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt+outage), slog.Bool("outage", true), slog.String("error", err.Error()))
 			}
+			if outage == 0 {
+				w.logOutage(d, err)
+			}
 			outage++
 			wait = w.backoffTo(outage, outageMaxBackoff)
 		case attempt >= attempts:
@@ -356,6 +369,20 @@ func (w *Worker) handle(meta Delivery) bool {
 			return true
 		}
 	}
+}
+
+// logOutage logs, at most once each outageEvery, that a delivery met Qory Apiary's
+// outage and is tried again for a day, with how many such lines were held back.
+func (w *Worker) logOutage(d Delivery, err error) {
+	ok, dropped := w.outages.allow()
+	if !ok {
+		return
+	}
+	attrs := append(deliveryAttrs(d.Event, d.Action, d.GUID, "retrying"), slog.Bool("outage", true), slog.String("error", err.Error()))
+	if dropped > 0 {
+		attrs = append(attrs, slog.Int("outages_dropped", dropped))
+	}
+	w.Log.LogAttrs(context.Background(), slog.LevelWarn, "delivery", attrs...)
 }
 
 // call calls h, and turns a panic into an error, so one handler's panic fails its

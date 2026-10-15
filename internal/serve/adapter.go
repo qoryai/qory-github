@@ -390,6 +390,8 @@ func (a *Adapter) sendLinked(ctx context.Context, collection, what string, send 
 var errNoInstallation = errors.New("no installation is known to reach the repository")
 
 // fill sends Qory Apiary the open issues of a collection it linked, and their comments.
+// A repository GitHub answers is gone or moved, as [github.Gone] says, fails for good,
+// so the change feed passes it.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	repo, err := repository(ref)
 	if err != nil {
@@ -411,7 +413,11 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		Logf:   a.logf,
 		LogCut: a.logCut,
 	}
-	return a.forgetOn401(installation, l.ListIssues(ctx, repo))
+	err = a.forgetOn401(installation, l.ListIssues(ctx, repo))
+	if github.Gone(err) {
+		return Permanent(err)
+	}
+	return err
 }
 
 // applyChange writes on GitHub what a work_item entry of the feed says, with a token

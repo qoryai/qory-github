@@ -725,6 +725,9 @@ func TestAnOutageIsTriedForADay(t *testing.T) {
 	if n := calls.Load(); n != 24 {
 		t.Errorf("called %d times, want 24", n)
 	}
+	if logged := log.String(); strings.Count(logged, `"level":"WARN","msg":"delivery","event":"issues","action":"opened","guid":"`+guid1+`","outcome":"retrying","outage":true,"error":"sending the items: Qory Apiary answered 502"`) != 1 {
+		t.Errorf("the log %s", logged)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(waits) != 23 || waits[0] != 2*time.Second || waits[1] != 4*time.Second || waits[8] != outageMaxBackoff || waits[22] != outageMaxBackoff {
@@ -744,6 +747,8 @@ func TestAJoinedErrorIsPermanentOnlyWhenEveryPartIs(t *testing.T) {
 		fmt.Errorf("filling: %w", errors.Join(transient, refused)):           false,
 		fmt.Errorf("filling: %w", errors.Join(refused, github.ErrIssueGone)): true,
 		fmt.Errorf("%w and %w", transient, refused):                          false,
+		fmt.Errorf("%w: %w", github.ErrIssueGone, transient):                 true,
+		fmt.Errorf("%w: %w", github.ErrUnreachable, transient):               true,
 		fmt.Errorf("filling: %w", refused):                                   true,
 		transient:                                                            false,
 	} {
@@ -969,10 +974,10 @@ func TestReadSettings(t *testing.T) {
 		"a pin of no list":     {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
 		"a pin of a bad key":   {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
 		"a fixture pin":        {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "rcFAEfgtHFbZVqpPnXPYhYNhpgYEhSXg0Ixjjcdd2Mc"}}}, "/apiary_public_key: lists a published fixture key"},
-		"a secret in the pin":  {map[string]any{"apiary_public_key": "qak_secret value"}, "the settings contain an access key secret, which belongs in the file access_key_secret_file names"},
-		"a secret as the path": {map[string]any{"access_key_secret_file": "qak_secret value"}, "the settings contain an access key secret"},
-		"a secret as a name":   {map[string]any{"qak_secret value": "/a"}, "the settings contain an access key secret"},
-		"a run key":            {map[string]any{"state_dir": "QRK_secret value"}, "the settings contain a run key, which belongs nowhere in them"},
+		"a secret in the pin":  {map[string]any{"apiary_public_key": "qak_secret value"}, "the settings contain what looks like an access key secret, qak_, which belongs in the file access_key_secret_file names"},
+		"a secret as the path": {map[string]any{"access_key_secret_file": "qak_secret value"}, "the settings contain what looks like an access key secret"},
+		"a secret as a name":   {map[string]any{"qak_secret value": "/a"}, "the settings contain what looks like an access key secret"},
+		"a run key":            {map[string]any{"state_dir": "QRK_secret value"}, "the settings contain what looks like a run key, qrk_, which belongs nowhere in them"},
 		"a PEM as the path":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY-----\nsecret value\n-----END RSA PRIVATE KEY-----"}, "/private_key_file: holds a control character, so it is not a file's path"},
 		"a PEM on one line":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY----- secret value"}, "/private_key_file: holds a PEM block, which belongs in the file it names"},
 		"a control character":  {map[string]any{"webhook_secret_file": "/s\tsecret value"}, "/webhook_secret_file: holds a control character"},
@@ -1028,6 +1033,33 @@ func TestReadSettings(t *testing.T) {
 	}
 }
 
+// TestAFileASettingNamesIsNeverQuoted names, in each file's setting, a file that does
+// not exist by a path that is a pasted secret, and checks Run's error names the setting
+// and the cause, never the path.
+func TestAFileASettingNamesIsNeverQuoted(t *testing.T) {
+	const pasted = "a-pasted-one-line-secret-0123456789"
+	for _, setting := range []string{"private_key_file", "webhook_secret_file", "access_key_secret_file"} {
+		dir := t.TempDir()
+		s := settingsFiles(t, dir, newKey(t), "https://apiary.example.com", pinOf(newKey(t)))
+		s.StateDir = filepath.Join(dir, "state")
+		switch setting {
+		case "private_key_file":
+			s.PrivateKeyFile = pasted
+		case "webhook_secret_file":
+			s.WebhookSecretFile = pasted
+		case "access_key_secret_file":
+			s.AccessKeySecretFile = pasted
+		}
+		err := Run(context.Background(), s, Options{})
+		if err == nil || err.Error() != "the file "+setting+" names: no such file or directory" {
+			t.Errorf("%s: err %v", setting, err)
+		}
+		if err != nil && strings.Contains(err.Error(), pasted) {
+			t.Errorf("%s: the error quotes the path: %v", setting, err)
+		}
+	}
+}
+
 func TestAWebhookSecretFileOthersMayReadIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610, 0o620, 0o601} {
@@ -1035,7 +1067,7 @@ func TestAWebhookSecretFileOthersMayReadIsRefused(t *testing.T) {
 		os.Remove(open)
 		writeFile(t, open, secret, mode)
 		_, err := ReadWebhookSecret(open)
-		if err == nil || !strings.Contains(err.Error(), "the webhook secret file") || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0600") {
+		if err == nil || !strings.HasPrefix(err.Error(), "the file webhook_secret_file names is ") || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0600") || strings.Contains(err.Error(), dir) {
 			t.Errorf("%s: err %v", mode, err)
 		}
 		if err != nil && strings.Contains(err.Error(), secret) {

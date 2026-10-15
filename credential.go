@@ -423,6 +423,21 @@ func Unauthorized(err error) bool {
 	return errors.As(err, &e) && e.status == http.StatusUnauthorized
 }
 
+// Gone is whether err, or an error it wraps, is GitHub's answer that what was asked
+// for is not where it was: 404 or 410, gone or out of the token's reach, or 301 or
+// 308, moved by a rename or a transfer, which no request to the same place changes.
+func Gone(err error) bool {
+	var e *answerError
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch e.status {
+	case http.StatusNotFound, http.StatusGone, http.StatusMovedPermanently, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
 // redirect is whether the answer is a redirect, a 3xx.
 func (e *answerError) redirect() bool { return e.status >= 300 && e.status < 400 }
 

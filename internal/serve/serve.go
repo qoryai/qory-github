@@ -83,7 +83,7 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	key, err := github.ReadKeyFile(s.PrivateKeyFile)
+	key, err := readKey(s.PrivateKeyFile)
 	if err != nil {
 		return err
 	}

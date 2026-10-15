@@ -24,25 +24,29 @@ func (e *permanentError) Error() string { return e.err.Error() }
 func (e *permanentError) Unwrap() error { return e.err }
 
 // IsPermanent is whether err, or an error it wraps, is one asking again would not
-// change: one [Permanent] marked, or a take in's that wraps [github.ErrIssueGone],
-// [github.ErrUnreachable] or [github.ErrInvalidChange]. An error that joins several,
-// as [errors.Join] does, is one only when every error it joins is, so a joined error
-// whose cause may pass is tried again.
+// change: a take in's that wraps [github.ErrIssueGone], [github.ErrUnreachable] or
+// [github.ErrInvalidChange] anywhere, as a take in's error joins one with GitHub's
+// answer; or one [Permanent] marked. An error that joins several, as [errors.Join]
+// does, is [Permanent] only when every error it joins is, so a listing's error joined
+// with its last part's refusal is tried again when the listing's may pass.
 func IsPermanent(err error) bool {
+	if errors.Is(err, github.ErrIssueGone) || errors.Is(err, github.ErrUnreachable) || errors.Is(err, github.ErrInvalidChange) {
+		return true
+	}
+	return marked(err)
+}
+
+// marked is whether err is one [Permanent] marked, every part of a joined one.
+func marked(err error) bool {
 	for err != nil {
 		if _, ok := err.(*permanentError); ok {
 			return true
-		}
-		for _, target := range []error{github.ErrIssueGone, github.ErrUnreachable, github.ErrInvalidChange} {
-			if is, ok := err.(interface{ Is(error) bool }); err == target || ok && is.Is(target) {
-				return true
-			}
 		}
 		switch u := err.(type) {
 		case interface{ Unwrap() []error }:
 			joined := u.Unwrap()
 			for _, e := range joined {
-				if !IsPermanent(e) {
+				if !marked(e) {
 					return false
 				}
 			}

@@ -361,6 +361,11 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		w.WriteHeader(201)
 		io.WriteString(w, `{"id":1}`)
+	case strings.HasPrefix(r.URL.Path, "/repos/acme/moved/") || r.URL.Path == "/repos/acme/moved":
+		// acme/moved was renamed: GitHub redirects every request for it.
+		w.Header().Set("Location", "https://api.github.com/repositories/1"+strings.TrimPrefix(r.URL.Path, "/repos/acme/moved"))
+		w.WriteHeader(301)
+		io.WriteString(w, `{"message":"Moved Permanently"}`)
 	default:
 		w.WriteHeader(404)
 		io.WriteString(w, `{"message":"Not Found"}`)
