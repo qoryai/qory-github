@@ -42,7 +42,9 @@ import (
 //     sign-in's code: the person's token, which is used for the checks alone and
 //     never kept or logged, must reach the installation and read every repository it
 //     reaches. Then the installation is linked, its repositories are sent to Qory
-//     Apiary, and the browser goes back to Qory Apiary.
+//     Apiary, and the browser goes back to Qory Apiary, to
+//     <apiary_url>/integrations/<adapter_id>, a route Qory Apiary keeps, which sends
+//     it on to the integration's page.
 //
 // One installation is linked for each adapter: the same one again is a re-connect,
 // which lists its repositories again and fills the linked collections again; another is
@@ -73,7 +75,8 @@ type Connect struct {
 	ClientSecret []byte
 	// PublicURL is where serve is reached from outside, without a trailing slash.
 	PublicURL string
-	// ApiaryURL is Qory Apiary's origin, where the browser goes once it is connected.
+	// ApiaryURL is Qory Apiary's origin, without a trailing slash. Once connected, the
+	// browser goes to ApiaryURL/integrations/AdapterID there.
 	ApiaryURL string
 	// Log takes a line for each connect, and the refusals, once a second at most.
 	Log *slog.Logger
@@ -548,7 +551,7 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 	}
 	c.end(w, id)
 	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again), slog.Int("repositories", total))...)
-	redirect(w, c.ApiaryURL+"/")
+	redirect(w, c.ApiaryURL+"/integrations/"+c.AdapterID)
 }
 
 // listInstallation lists the repositories the installation reaches, as

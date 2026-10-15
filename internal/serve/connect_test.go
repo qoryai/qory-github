@@ -435,7 +435,7 @@ func TestAConnectLinksTheInstallationAndSendsItsRepositories(t *testing.T) {
 	}
 	b := rig.browser(t)
 	rec := b.connect(rig.pass())
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != rig.apiary.srv.URL+"/" || rec.Body.Len() != 0 {
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != rig.apiary.srv.URL+"/integrations/na_0123456789abcdef" || rec.Body.Len() != 0 {
 		t.Fatalf("%d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
 	if b.cookie != nil {
