@@ -88,9 +88,10 @@ func text(doc any, path ...string) string {
 // lets an adapter cut a text to make a request fit: a text is cut only when it is past
 // its field's limit, which Qory Apiary would refuse, and every cut is logged, as [fit]
 // and [Cut] do. A cut title, body, filed_by.name, comment body or author.name is named
-// in the item's or the comment's truncated, see [truncatedOf]. The contract's truncated
-// has no name for a label or the list of labels, so those cuts are logged only. A
-// state_reason is never cut: one past its limit is dropped, see [stateReason].
+// in the item's or the comment's truncated, see [truncatedOf], and so is a label cut,
+// or a label left out past the most an item has, as labels. A collection's title, cut,
+// is logged only, since the contract's collection has no truncated. A state_reason is
+// never cut: one past its limit is dropped, see [stateReason].
 func cut(s string, n int) string {
 	i := 0
 	for j := range s {

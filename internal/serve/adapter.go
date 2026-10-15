@@ -200,8 +200,7 @@ func (a *Adapter) cutLog() *throttle {
 }
 
 // logCut logs a text GitHub sent past the contract's limit, cut to it: the ref, the
-// field and its length before the cut, never the text. It is not expected, since
-// GitHub's limits fit inside the contract's, and the lines are throttled as the
+// field and its length before the cut, never the text. The lines are throttled as the
 // receiver's refusals are, a burst's count logged on the next line or after it.
 func (a *Adapter) logCut(c github.Cut) {
 	ok, dropped := a.cutLog().allow()

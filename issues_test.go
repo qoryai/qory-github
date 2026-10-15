@@ -606,29 +606,40 @@ func truncatedMember(t *testing.T, v any) ([]string, bool) {
 
 // TestACutFieldIsNamedInTruncated cuts each field of an item and of a comment that the
 // contract's truncated names, and several at once, and checks truncated names exactly
-// the fields cut, in the request the contract's schema takes; and that an uncut item or
-// comment, or an item whose labels alone are cut, has no truncated member.
+// the fields cut, in the order of the schema's enum, in the request the contract's
+// schema takes: labels once, for a label cut, the labels past 100 left out, or both,
+// and two labels equal once cut are sent once. An uncut item or comment has no
+// truncated member.
 func TestACutFieldIsNamedInTruncated(t *testing.T) {
 	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
 	long := func(n int) string { return strings.Repeat("ü", n) }
+	past := func(is *ghIssue) {
+		for i := range 101 {
+			is.Labels = append(is.Labels, ghLabel{"l" + strconv.Itoa(i)})
+		}
+	}
 	for _, tc := range []struct {
-		name string
-		edit func(is *ghIssue)
-		want []string
+		name   string
+		edit   func(is *ghIssue)
+		want   []string
+		labels int
 	}{
-		{"nothing cut", func(*ghIssue) {}, nil},
-		{"the title", func(is *ghIssue) { is.Title = long(1025) }, []string{"title"}},
-		{"the body", func(is *ghIssue) { is.Body = str(long(65_537)) }, []string{"body"}},
-		{"the filer's name", func(is *ghIssue) { is.User = &ghUser{Login: long(101), Type: "User"} }, []string{"filed_by.name"}},
-		{"a label alone", func(is *ghIssue) { is.Labels = []ghLabel{{long(101)}} }, nil},
-		{"the labels past the most alone", func(is *ghIssue) {
-			for i := range 101 {
-				is.Labels = append(is.Labels, ghLabel{"l" + strconv.Itoa(i)})
-			}
-		}, nil},
-		{"all three and a label", func(is *ghIssue) {
+		{"nothing cut", func(*ghIssue) {}, nil, 0},
+		{"the title", func(is *ghIssue) { is.Title = long(1025) }, []string{"title"}, 0},
+		{"the body", func(is *ghIssue) { is.Body = str(long(65_537)) }, []string{"body"}, 0},
+		{"the filer's name", func(is *ghIssue) { is.User = &ghUser{Login: long(101), Type: "User"} }, []string{"filed_by.name"}, 0},
+		{"a label alone", func(is *ghIssue) { is.Labels = []ghLabel{{long(101)}} }, []string{"labels"}, 1},
+		{"the labels past the most alone", past, []string{"labels"}, 100},
+		{"a label and the labels past the most", func(is *ghIssue) {
+			is.Labels = []ghLabel{{long(101)}}
+			past(is)
+		}, []string{"labels"}, 100},
+		{"two labels equal once cut", func(is *ghIssue) {
+			is.Labels = []ghLabel{{long(100) + "1"}, {"bug"}, {long(100) + "2"}}
+		}, []string{"labels"}, 2},
+		{"all four", func(is *ghIssue) {
 			is.Title, is.Body, is.User, is.Labels = long(1025), str(long(65_537)), &ghUser{Login: long(101), Type: "Bot"}, []ghLabel{{long(101)}}
-		}, []string{"title", "body", "filed_by.name"}},
+		}, []string{"title", "body", "filed_by.name", "labels"}, 1},
 	} {
 		is := ghIssue{
 			Number: 42, Title: "Widgets spin backwards", Body: str("They should not."), State: "open",
@@ -643,6 +654,9 @@ func TestACutFieldIsNamedInTruncated(t *testing.T) {
 		}
 		if tc.name != "nothing cut" && len(cuts) == 0 {
 			t.Errorf("item, %s: no cut logged", tc.name)
+		}
+		if len(it.Labels) != tc.labels {
+			t.Errorf("item, %s: %d labels %q", tc.name, len(it.Labels), it.Labels)
 		}
 		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{it}}); bad != "" {
 			t.Errorf("item, %s: %s", tc.name, bad)
@@ -671,16 +685,31 @@ func TestACutFieldIsNamedInTruncated(t *testing.T) {
 	}
 }
 
-// TestAWebhooksCutIsNamedInTruncated sends an issues event whose title and filer's name
-// are past their limits, and an issue_comment event whose body is, and checks each
-// request names the fields cut, while an event with nothing cut names none.
+// TestAWebhooksCutIsNamedInTruncated sends an issues event whose title, filer's name
+// and two labels, equal once cut, are past their limits, one whose labels alone are, and
+// an issue_comment event whose body is, and checks each request names the fields cut,
+// the labels once, sent once, while an event with nothing cut names none.
 func TestAWebhooksCutIsNamedInTruncated(t *testing.T) {
 	is := issue(1, 1)
 	is["title"] = strings.Repeat("t", 1025)
 	is["user"] = map[string]any{"login": strings.Repeat("n", 101), "type": "User"}
+	is["labels"] = []any{map[string]any{"name": strings.Repeat("a", 101)}, map[string]any{"name": strings.Repeat("a", 102)}}
 	got, err := IssuesWebhook(event("edited", is, nil), "github.com", nil)
-	if err != nil || len(got.Items) != 1 || !reflect.DeepEqual(got.Items[0].Items[0].Truncated, []string{"title", "filed_by.name"}) {
+	if err != nil || len(got.Items) != 1 || !reflect.DeepEqual(got.Items[0].Items[0].Truncated, []string{"title", "filed_by.name", "labels"}) || !reflect.DeepEqual(got.Items[0].Items[0].Labels, []string{strings.Repeat("a", 100)}) {
 		t.Fatalf("issues: %+v, %v", got, err)
+	}
+	if bad := check(got.Items[0]); bad != "" {
+		t.Error(bad)
+	}
+	labelled := issue(1, 1)
+	var labels []any
+	for i := range 101 {
+		labels = append(labels, map[string]any{"name": "l" + strconv.Itoa(i)})
+	}
+	labelled["labels"] = labels
+	got, _ = IssuesWebhook(event("labeled", labelled, nil), "github.com", nil)
+	if len(got.Items) != 1 || !reflect.DeepEqual(got.Items[0].Items[0].Truncated, []string{"labels"}) || len(got.Items[0].Items[0].Labels) != 100 {
+		t.Fatalf("labeled: %+v", got)
 	}
 	if bad := check(got.Items[0]); bad != "" {
 		t.Error(bad)
