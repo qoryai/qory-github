@@ -307,7 +307,7 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 		"a fixture key pinned": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", signer: fixtureSigner(t)},
 			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}\n"},
 		"a used code": {reply: reply{status: http.StatusUnauthorized},
-			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary did not accept the code (HTTP 401): it was used, has expired or was cancelled; it is no code of the Qory Apiary at {server}; its maker can no longer make codes; its work source was deleted, or its workspace or organisation is marked for deletion or stopped; Qory Apiary has the feature factory off; its record fails Qory Apiary's integrity check; or this machine's clock is more than 5 minutes off. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled\n"},
+			want: "access key fingerprint {fp}\nqory-github access-key: the server at {server} answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at {server}, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled\n"},
 		"a key refused": {reply: reply{status: http.StatusConflict, refusal: "key_invalid"},
 			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the key; the code is not used: the same command, run within the code's 15 minutes, makes a new key\n"},
 		"two keys held": {reply: reply{status: http.StatusConflict, refusal: "key_limit"},
@@ -416,12 +416,59 @@ func TestCheckServerTakesAnASCIIHostAlone(t *testing.T) {
 	}
 }
 
+// TestCheckServerTakesAHostAndAPortAlone pins that a host outside letters, digits, dots
+// and dashes, or a bracketed IPv6 address, an empty host, and a port that is empty or
+// outside 1 to 65535 are refused, and that a host and port of the right shape are taken.
+func TestCheckServerTakesAHostAndAPortAlone(t *testing.T) {
+	for _, in := range []string{
+		"https://apiary.example.com:", "https://:", "https://:443", "https://apiary.example.com:0",
+		"https://apiary.example.com:65536", "https://apiary.example.com:0443", "https://apiary.example.com:+443",
+		"https://a]b", "https://%25", "https://a_b.example", "https://a b.example", "https://a!b.example",
+		"https://[fe80::1", "https://[apiary.example.com]", "https://[127.0.0.1]", "https://[fe80::1%25]",
+		"https://[fe80::1%25a!b]", "https://[::1]:", "https://[::1]:70000",
+	} {
+		if got, err := checkServer(in); got != "" || err == nil || err.Error() != serverShape {
+			t.Errorf("%s: %q, %v", in, got, err)
+		}
+	}
+	for in, want := range map[string]string{
+		"https://apiary.example.com:1":     "https://apiary.example.com:1",
+		"https://apiary.example.com:65535": "https://apiary.example.com:65535",
+		"https://xn--bcher-kva.example":    "https://xn--bcher-kva.example",
+		"https://192.0.2.1:8443":           "https://192.0.2.1:8443",
+		"https://[2001:DB8::1]:8443":       "https://[2001:db8::1]:8443",
+		"https://[fe80::1%25en0.1_a-b]":    "https://[fe80::1%25en0.1_a-b]",
+		"http://[::1]:8080":                "http://[::1]:8080",
+	} {
+		if got, err := checkServer(in); err != nil || got != want {
+			t.Errorf("%s: %q, %v; want %q", in, got, err, want)
+		}
+	}
+}
+
+// TestEnrolRefusesAServerOnlyItsOriginShowsACodeIn pins the case that only the check of
+// the origin as it is printed catches: a zone that spells qak_ only once decoded.
+func TestEnrolRefusesAServerOnlyItsOriginShowsACodeIn(t *testing.T) {
+	const server = "https://[fe80::1%25q%61k_x]"
+	if hasCodeOrSecret(server) {
+		t.Fatal("the server as given already shows qak_")
+	}
+	f := newFakeApiary(t, adapterEnrolled)
+	file := filepath.Join(t.TempDir(), "secret")
+	status, out, errs := enrolRun(t, "--secret-file", file, server, code(f.signer))
+	if status != 1 || out != "" || errs != "qory-github access-key: "+serverShape+"\n" || f.requests.Load() != 0 {
+		t.Errorf("exit %d, stdout %q, stderr %q, %d requests", status, out, errs, f.requests.Load())
+	}
+}
+
 // TestEnrolRefusesARelativePathThatBecomesACodeOrSecret pins that the secret file's
 // path is checked as it is made absolute, too.
 func TestEnrolRefusesARelativePathThatBecomesACodeOrSecret(t *testing.T) {
 	f := newFakeApiary(t, adapterEnrolled)
 	dir := filepath.Join(t.TempDir(), "qak_dir")
-	os.Mkdir(dir, 0o700)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(dir)
 	status, out, errs := enrolRun(t, "--secret-file", "secret", f.url, code(f.signer))
 	if want := "qory-github access-key: the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file\n"; status != 1 || out != "" || errs != want || f.requests.Load() != 0 {

@@ -10,11 +10,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -187,6 +190,9 @@ func checkServer(server string) (string, error) {
 	if hasCodeOrSecret(origin) {
 		return "", shape
 	}
+	if !hostShape(u.Host) {
+		return "", shape
+	}
 	switch h := strings.ToLower(u.Hostname()); {
 	case u.Scheme == "https":
 		return origin, nil
@@ -194,6 +200,47 @@ func checkServer(server string) (string, error) {
 		return origin, nil
 	}
 	return "", shape
+}
+
+// zoneShape is an IPv6 zone, the name of an interface.
+var zoneShape = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// hostShape reports whether host, as url.Parse decodes it, is a host and an optional
+// port: a name or an IPv4 address of letters, digits, dots and dashes, or an IPv6
+// address in brackets with an optional zone of the same and underscores; and, after a
+// colon, a port from 1 to 65535 written as Go writes the number.
+func hostShape(host string) bool {
+	name, port := host, ""
+	if i := strings.LastIndexByte(host, ':'); i >= 0 && !strings.HasSuffix(host, "]") {
+		name, port = host[:i], host[i+1:]
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+			return false
+		}
+	}
+	if strings.HasPrefix(name, "[") {
+		addr, ok := strings.CutSuffix(name[1:], "]")
+		if !ok {
+			return false
+		}
+		if a, zone, found := strings.Cut(addr, "%"); found {
+			if !zoneShape.MatchString(zone) {
+				return false
+			}
+			addr = a
+		}
+		ip := net.ParseIP(addr)
+		return ip != nil && strings.Contains(addr, ":")
+	}
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // lowerHost is an ASCII host with its letters in lower case, but for the zone of an
@@ -233,7 +280,8 @@ func accessKeyName() string {
 
 // enrolFailed words an enrolment that got no verified 201, on the refusal's code alone,
 // never on an HTTP status: an answer that does not verify may come from anyone on the
-// path. A verified refusal leaves the code as it was, so the same command can use it
+// path, and so may a 401, which is never signed, so its text names Qory Apiary's
+// reasons beside a refusal by another server on the way. A verified refusal leaves the code as it was, so the same command can use it
 // again. Nothing was written, so an enrolment that may have succeeded behind an answer
 // that did not verify cannot be finished: its key is to be revoked.
 func enrolFailed(err error, server, fingerprint string) error {
@@ -245,8 +293,9 @@ func enrolFailed(err error, server, fingerprint string) error {
 	switch ref.Code {
 	case accesskey.CodeUnauthorized:
 		// Qory Apiary answers every code it does not accept with one 401, whatever the
-		// reason; only a used code has enrolled a key.
-		return fmt.Errorf("Qory Apiary did not accept the code (HTTP 401): it was used, has expired or was cancelled; it is no code of the Qory Apiary at %s; its maker can no longer make codes; its work source was deleted, or its workspace or organisation is marked for deletion or stopped; Qory Apiary has the feature factory off; its record fails Qory Apiary's integrity check; or this machine's clock is more than 5 minutes off. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled", server)
+		// reason, and anything on the path can answer one too; only a used code has
+		// enrolled a key.
+		return fmt.Errorf("the server at %s answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at %s, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled", server, server)
 	case accesskey.CodeKeyInvalid:
 		names := ""
 		if len(ref.Names) > 0 {
