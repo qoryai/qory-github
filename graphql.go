@@ -13,13 +13,16 @@ import (
 
 // A listing that says it is complete makes Qory Apiary close every item of the
 // collection it left out, so it may say so only when its paging cannot skip an item.
-// REST's page numbers can: an issue deleted from a page already read moves the first
-// issue of the next page onto it. GraphQL's cursors are meant not to: the next page
-// starts after the last issue the page before it held, by its place in the order,
-// whatever came or went before it. [Lister.ListOpenIssuesComplete] lists the open
-// issues by cursor, oldest first, so that an issue open for the whole listing is in it
-// once, whatever is closed, reopened, edited, created or deleted meanwhile. Nothing
-// relies on it until a test against GitHub itself shows it.
+// Paging by page number can: an issue deleted from a page already read moves the first
+// issue of the next page onto it. GraphQL's cursors do not: a cursor names a place in
+// the order, the creation time and the id of the last issue a page held, and the next
+// page starts after that place, whatever came or went before it. graphql_live_test.go
+// shows it against GitHub itself, with issues closed, created, edited, reopened and
+// deleted between the pages. [Lister.ListOpenIssuesComplete] lists the open issues by
+// cursor, oldest first, so an issue open for the whole listing is in it once. GitHub's
+// REST listing of issues, as GitHub answers it today, names its next page by a cursor
+// as well as by number, but GitHub documents that listing by page number, so the
+// adapter does not rely on it.
 
 // openIssuesPerPage is how many issues a page of [Lister.ListOpenIssuesComplete] holds,
 // the most GraphQL gives. A page of issues each with 100 labels is about 10,000 nodes,
