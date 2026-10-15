@@ -192,9 +192,11 @@ func known(ch contracts.Change) bool {
 // of the same page again skips, so every entry of a page is timed and passed alone,
 // and the page's cursor is kept once none is left; it forgets them when the cursor
 // moves. A time the feed cannot be read, its read failing or its answer refused, does
-// not count: the first failures are moved later by as long, so an outage of Qory
-// Apiary passes no entry. All this is kept in memory alone, so a restart times the
-// entries from their next failures again.
+// not count: the first failures are moved later by as long, so an outage that stops the
+// feed's reads does not count toward the day. One that fails an entry's requests to
+// Qory Apiary while the feed's reads are answered does count, as any failure of the
+// entry does. All this is kept in memory alone, so a restart times the entries from
+// their next failures again.
 //
 // A page that holds an entry serve does not know is refused whole, an
 // [*unknownChange], before any of its entries is applied, and its cursor is not kept:
