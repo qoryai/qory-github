@@ -154,6 +154,8 @@ func (p *Pacer) wait(ctx context.Context) error {
 // observe reads GitHub's rate limit headers from a response and says whether GitHub
 // refused the request for a rate limit, so it is to be sent again.
 func (p *Pacer) observe(resp *http.Response) bool {
+	// A 403's body is read before the lock, so a paused listing never waits on it.
+	secondary := resp.StatusCode == http.StatusForbidden && secondaryLimit(resp)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	h := resp.Header
@@ -185,7 +187,7 @@ func (p *Pacer) observe(resp *http.Response) bool {
 	if exhausted || h.Get("X-Ratelimit-Remaining") == "0" {
 		return true
 	}
-	if resp.StatusCode == http.StatusForbidden && !secondaryLimit(resp) {
+	if resp.StatusCode == http.StatusForbidden && !secondary {
 		return false
 	}
 	p.until = now.Add(secondaryWait)

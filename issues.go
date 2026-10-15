@@ -28,9 +28,10 @@ const (
 	maxPerBatch = 100
 )
 
-// The most pages a listing reads: a repository's issues, every state's, and one
-// issue's comments, and the installation's repositories. A listing that would read
-// more stops, as does one whose next page repeats a page it read.
+// The most pages a listing reads: a repository's issues, every state's, pull requests
+// among them, since GitHub lists both and the adapter drops pull requests after reading
+// them; one issue's comments; and the installation's repositories. A listing that would
+// read more stops, as does one whose next page repeats a page it read.
 const (
 	maxIssuePages      = 2000
 	maxCommentPages    = 100
@@ -452,9 +453,12 @@ func (p *pages) read(path string) error {
 }
 
 // A listing reads GitHub's pages by number, and a page's contents shift when an
-// earlier one loses an entry, so a listing can miss one. No listing ever says it is
-// complete, then: it adds and updates what it sees, never closes or drops what it does
-// not, and closing and deleting come from webhooks' events alone.
+// earlier one loses an entry, so a listing can miss one. A listing of issues or of an
+// issue's comments never says it is complete, then: it adds and updates what it sees,
+// never closes or drops what it does not, and closing and deleting come from webhooks'
+// events alone. The one exception is a listing of the installation's repositories that
+// GitHub answers with one page and that skips none, which nothing can shift; see
+// [Lister.ListRepositories].
 
 // listingEnd is how long the request that ends a listing stopped early may take,
 // even when the listing stopped because its context is done.
@@ -464,7 +468,8 @@ const listingEnd = 10 * time.Second
 // parts of at most 100 collections and 1 MiB, and reads at most 1,000 pages. When GitHub
 // answers with one page, up to 100 repositories, nothing can shift, so the last part
 // says the listing is complete, and Qory Apiary disconnects a repository the
-// installation no longer reaches. A listing of more than one page never says it is
+// installation no longer reaches; unless a repository was skipped, which then must not
+// be disconnected, so that listing is not complete. A listing of more than one page never says it is
 // complete, since a repository removed from the installation while it is listed shifts
 // the pages after it: that is a limit, and such a removal reaches Qory Apiary only by
 // the installation_repositories event that says it was removed. A listing stopped
@@ -477,6 +482,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	listing := Listing{ID: randomHex(), StartedAt: p.now().UTC().Format(time.RFC3339)}
 	system := l.Client.WebHost()
 	var pending []SourceCollection
+	skipped := false
 	send := func(ctx context.Context, complete bool) error {
 		listing.Part++
 		listing.Complete = complete
@@ -514,6 +520,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 			n := size(c)
 			if why := checkCollection(c); why != "" || envelope+n > maxRequest {
 				l.logf("skipped the collection %s: %s", c.Ref, orTooLarge(why))
+				skipped = true
 				continue
 			}
 			if len(pending) == maxPerBatch || used+n+1 > maxRequest {
@@ -527,7 +534,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		}
 		path = next
 	}
-	if err := send(ctx, len(read.seen) == 1); err != nil {
+	if err := send(ctx, len(read.seen) == 1 && !skipped); err != nil {
 		return stop(err)
 	}
 	return nil

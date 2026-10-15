@@ -856,11 +856,17 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 		{"none", 0, 100, false, true, 1},
 		{"two pages", 101, 100, false, false, 2},
 		{"one page GitHub fails", 3, 100, true, false, 1},
+		{"one page with a skip", 3, 100, false, false, 1},
 	} {
 		f := &fakeIssues{pageSize: tc.pageSize}
 		for i := range tc.n {
 			n := "repo" + strconv.Itoa(i)
 			f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
+		}
+		total := 0
+		if tc.name == "one page with a skip" {
+			f.repos[1]["html_url"] = "http://github.com/acme/repo1"
+			total = 1
 		}
 		s := &sink{}
 		var logs []string
@@ -873,7 +879,6 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 			t.Errorf("%s: err %v, %d parts", tc.name, err, len(s.reqs))
 			continue
 		}
-		total := 0
 		for i, req := range s.reqs {
 			c := req.(SourceCollections)
 			total += len(c.Collections)
