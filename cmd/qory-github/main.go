@@ -122,6 +122,18 @@ policy that selects it.`,
 	Section: "setup",
 }
 
+// setupPublicHelp is the paragraph setup's help adds after the App's description where
+// QORY_FEATURES names factory, see [cli.Factory], for the App --public-url makes.
+const setupPublicHelp = `With --public-url, the App instead gets a webhook at the public URL and
+` + github.WebhookPath + `, the events issues, issue_comment and workflow_run, and actions and
+issues write, contents and metadata read.`
+
+// setupLong is setup's help where QORY_FEATURES names factory: [setupHelp]'s, with
+// [setupPublicHelp] after its paragraph on the App.
+func setupLong() string {
+	return strings.Replace(setupHelp.Long, "setup waits ten minutes at most.\n\n", "setup waits ten minutes at most.\n\n"+setupPublicHelp+"\n\n", 1)
+}
+
 // run is the command, with its streams, so a test runs it whole. It returns the exit
 // status; an error is one line on stderr describing what failed, never a secret.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -219,10 +231,12 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// --public-url exists only where QORY_FEATURES names factory, see [cli.Factory]:
 	// without it setup's flags, its App and what it prints are as they were.
 	var publicURL *string
+	help := setupHelp
 	if cli.Factory() {
+		help.Long = setupLong()
 		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, webhook, events and permissions, and its client secret and webhook secret are written beside the key")
 	}
-	if err := setupHelp.Parse(fs, args, stderr); err != nil {
+	if err := help.Parse(fs, args, stderr); err != nil {
 		return err
 	}
 	// The URLs are checked before anything is created, listened on or opened.

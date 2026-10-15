@@ -1173,3 +1173,43 @@ func TestSetupSaysOnOneLineThatNeitherSecretIsKept(t *testing.T) {
 		t.Errorf("the directory holds %v", entries)
 	}
 }
+
+// setupLongBefore is setup's help above its usage, as -h printed it before --public-url.
+const setupLongBefore = `Create the GitHub App that qory-github mints access tokens with, and write its private
+key.
+
+setup opens GitHub in the browser with the App filled in: private, no webhook, contents
+and pull requests write, metadata read. You approve it there; nothing is created
+without you. setup waits ten minutes at most.
+
+The private key goes to --key-file, which only you may read. setup never writes over a
+file that exists, and never prints the key. GitHub hands the key out once: when the
+file cannot be written, the key goes beside it, and setup prints where.
+
+Then setup prints where to install the App, the declaration for forager.yaml, and a
+policy that selects it.
+
+`
+
+// TestSetupHelpSaysWhatAppPublicURLMakes pins setup's help above its usage: unless
+// QORY_FEATURES names factory, as it was; with factory, the same with a paragraph on the
+// App --public-url makes.
+func TestSetupHelpSaysWhatAppPublicURLMakes(t *testing.T) {
+	withFactory := strings.Replace(setupLongBefore, "setup waits ten minutes at most.\n\n", `setup waits ten minutes at most.
+
+With --public-url, the App instead gets a webhook at the public URL and
+/github/webhook, the events issues, issue_comment and workflow_run, and actions and
+issues write, contents and metadata read.
+
+`, 1)
+	for features, want := range map[string]string{"": setupLongBefore, "all": setupLongBefore, "factory": withFactory} {
+		t.Setenv("QORY_FEATURES", features)
+		var help bytes.Buffer
+		if code := run(context.Background(), []string{"setup", "-h"}, &bytes.Buffer{}, &help); code != 2 {
+			t.Errorf("QORY_FEATURES=%q: exit %d", features, code)
+		}
+		if long, _, _ := strings.Cut(help.String(), "usage:\n"); long != want {
+			t.Errorf("QORY_FEATURES=%q: setup -h prints\n%s\nwant\n%s", features, long, want)
+		}
+	}
+}
