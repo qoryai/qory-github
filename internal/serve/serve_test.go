@@ -195,7 +195,7 @@ func TestASenderThatSendsNothingHoldsNothing(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
 	// The budget is one body, its chunk and its joined bytes: a sender that held it by
 	// what it claims would leave none.
-	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: progressBytes + int64(len(body1))}
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: firstChunk + int64(len(body1))}
 	srv := httptest.NewServer(rc.Mux())
 	defer srv.Close()
 	for i := range 5 {
@@ -226,7 +226,7 @@ func TestASenderThatSendsNothingHoldsNothing(t *testing.T) {
 
 func TestTheBudgetIsNeverExceededNorTakenFromTheLengthClaimed(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: progressBytes + int64(len(body1))}
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: firstChunk + int64(len(body1))}
 	larger := body1 + strings.Repeat(" ", 10)
 	if w := post(rc.Mux(), "issues", guid1, larger, sign(larger)); w.Code != http.StatusServiceUnavailable {
 		t.Errorf("a body beyond the budget: status %d", w.Code)
@@ -247,8 +247,74 @@ func TestTheBudgetIsNeverExceededNorTakenFromTheLengthClaimed(t *testing.T) {
 		t.Errorf("a body within the budget, its length claimed larger: status %d", w.Code)
 	}
 	h, peak := held(rc)
-	if h != 0 || peak > rc.maxBudget || peak != progressBytes+int64(len(body1)) {
+	if h != 0 || peak > rc.maxBudget || peak != firstChunk+int64(len(body1)) {
 		t.Errorf("held %d, peak %d, budget %d", h, peak, rc.maxBudget)
+	}
+}
+
+// oneByte is a body that sends one byte, then waits until release is closed.
+type oneByte struct {
+	sent    bool
+	release chan struct{}
+}
+
+func (o *oneByte) Read(p []byte) (int, error) {
+	if !o.sent {
+		o.sent = true
+		p[0] = '{'
+		return 1, nil
+	}
+	<-o.release
+	return 0, io.EOF
+}
+
+func TestSendersOfOneByteEachHoldOneSmallChunk(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st}
+	const senders = 8192
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range senders {
+		r := httptest.NewRequest(http.MethodPost, WebhookPath, &oneByte{release: release})
+		r.ContentLength = 1000
+		r.Header.Set("X-GitHub-Event", "issues")
+		r.Header.Set("X-GitHub-Delivery", fmt.Sprintf("72d3162e-cc78-11e3-81ab-%012x", i))
+		r.Header.Set("X-Hub-Signature-256", sign(body1))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rc.Mux().ServeHTTP(httptest.NewRecorder(), r)
+		}()
+	}
+	eventually(t, "every sender's byte", func() bool { h, _ := held(rc); return h == senders*firstChunk })
+	time.Sleep(50 * time.Millisecond)
+	if h, _ := held(rc); h > senders*firstChunk {
+		t.Errorf("%d senders of one byte hold %d bytes, more than %d", senders, h, senders*firstChunk)
+	}
+	close(release)
+	wg.Wait()
+	if h, _ := held(rc); h != 0 {
+		t.Errorf("held %d after", h)
+	}
+}
+
+func TestChunksGrowToTheirBound(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st}
+	body := `{"x":"` + strings.Repeat("a", 200<<10) + `"}`
+	if w := post(rc.Mux(), "issues", guid1, body, sign(body)); w.Code != http.StatusAccepted {
+		t.Fatalf("status %d", w.Code)
+	}
+	// 1, 2, 4, 8 and 16 KiB, then 32 KiB chunks: the chunks never hold more than the
+	// body and one chunk of 32 KiB, and the joined body is held beside them.
+	_, peak := held(rc)
+	if limit := int64(2*len(body) + progressBytes); peak > limit || peak < int64(2*len(body)) {
+		t.Errorf("peak %d, body %d", peak, len(body))
+	}
+	if d, err := st.Lookup(guid1); err != nil {
+		t.Errorf("%+v %v", d, err)
+	} else if full, _ := st.Load(d.Seq); string(full.Body) != body {
+		t.Error("the body kept is not the body sent")
 	}
 }
 
@@ -544,7 +610,9 @@ func TestTheAnswerDoesNotWaitForTheHandler(t *testing.T) {
 	req.Header.Set("X-GitHub-Event", "issues")
 	req.Header.Set("X-GitHub-Delivery", guid1)
 	req.Header.Set("X-Hub-Signature-256", sign(body1))
-	client := http.Client{Timeout: 2 * time.Second}
+	// The handler is released only after the answer, so the timeout only bounds a
+	// test that would otherwise hang; it is long, so a loaded machine does not fail it.
+	client := http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("the answer waits for the handler: %v", err)
@@ -1029,7 +1097,9 @@ func TestAFullConnectionBoundIsLogged(t *testing.T) {
 }
 
 func TestRunLogsTheCountsHeldBackBeforeItStops(t *testing.T) {
-	addr, log, stop := running(t, Options{maxConns: 1})
+	// The period is long, so the count of the refusals after the first is logged by
+	// the stop alone, however long the requests take.
+	addr, log, stop := running(t, Options{refusalEvery: time.Hour})
 	for range 3 {
 		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+WebhookPath, strings.NewReader(body1))
 		req.Header.Set("X-GitHub-Event", "issues")

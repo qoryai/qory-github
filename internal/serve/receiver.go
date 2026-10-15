@@ -2,6 +2,7 @@ package serve
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -41,8 +42,10 @@ const minSecret = 16
 // [MaxBody]. A body is read before its signature can be checked, so a sender with no
 // secret can send bodies for the receiver to hold. A request takes from the budget the
 // memory it holds for its body as the body arrives, never by what Content-Length
-// claims: each chunk of [progressBytes] once its first byte has arrived, and the body's
-// exact length when the chunks are joined, which are then given back. It gives back
+// claims: each chunk once its first byte has arrived, the first of [firstChunk] and each
+// next one twice as large up to [progressBytes], so a sender that sends one byte holds
+// one small chunk, and the body's exact length when the chunks are joined, which are
+// then given back. It gives back
 // the rest when its handling is over, after the store has its copy and the answer is
 // sent. A sender that sends nothing holds nothing, and a request whose next chunk or
 // joined body would take the budget past the bound is answered 503. So the bodies'
@@ -53,10 +56,12 @@ const readBudget = 8 * MaxBody
 // The body's progress: progressBytes, or the rest of the body, must arrive within
 // progressWithin, the window starting again each time they have, so a sender that
 // sends slowly is cut within about progressWithin, and the whole body within
-// [readTimeout] of the handler's start.
+// [readTimeout] of when the receiver starts on the request, just after its headers.
+// firstChunk is the size of the first chunk a body is read into.
 const (
 	progressBytes  = 32 << 10
 	progressWithin = 2 * time.Second
+	firstChunk     = 1 << 10
 )
 
 // refusalEvery is how often a refusal is logged at most; those in between are counted,
@@ -117,9 +122,12 @@ type Receiver struct {
 	// [readTimeout].
 	progress  time.Duration
 	readBound time.Duration
-	// now is the clock refusals are logged by; nil is time.Now.
-	now      func() time.Time
-	refusals *throttle
+	// now is the clock refusals are logged by; nil is time.Now. refusalEvery is the
+	// period they are logged once in at most, which a test lengthens; zero is
+	// [refusalEvery].
+	now          func() time.Time
+	refusalEvery time.Duration
+	refusals     *throttle
 }
 
 func (rc *Receiver) init() {
@@ -133,7 +141,7 @@ func (rc *Receiver) init() {
 		if rc.readBound <= 0 {
 			rc.readBound = readTimeout
 		}
-		rc.refusals = &throttle{every: refusalEvery, now: rc.now, flush: func(dropped int) {
+		rc.refusals = &throttle{every: cmp.Or(rc.refusalEvery, refusalEvery), now: rc.now, flush: func(dropped int) {
 			if rc.Log != nil {
 				rc.Log.LogAttrs(context.Background(), slog.LevelInfo, "refusals dropped", slog.Int("refusals_dropped", dropped))
 			}
@@ -184,7 +192,8 @@ func (rc *Receiver) Mux() *http.ServeMux {
 //   - 401 when X-Hub-Signature-256 is missing, malformed or not the HMAC-SHA256 of the
 //     body with the secret, which is checked before the body is parsed;
 //   - 408 when the body arrives too slowly: 32 KiB, or the rest of it, not within two
-//     seconds, or the whole of it not within 15 seconds;
+//     seconds, or the whole of it not within 15 seconds of the receiver's start on the
+//     request, just after its headers;
 //   - 503 when the body's bytes would take the bodies held past their budget, eight
 //     times [MaxBody];
 //   - 202 when the delivery is kept, 200 when the store has its GUID already, which
@@ -256,14 +265,16 @@ func (rc *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// readBody reads r's body as it arrives, into chunks of [progressBytes], and joins them
-// once at the end into a body of its exact length. Each chunk is taken from the budget
-// when its first byte has arrived, and the body when it is joined; the chunks are given
-// back once it is, and the body when the caller gives back held, to which readBody adds
-// what it holds. It moves the connection's read deadline forward as the body makes
-// progress: [progressBytes], or the rest of the body, within rc.progress, and the whole
-// body within rc.readBound of the start. A response writer that has no connection, as
-// in a test, has no deadline. It returns the body, or the status and why it is refused.
+// readBody reads r's body as it arrives, into chunks, and joins them once at the end
+// into a body of its exact length. The first chunk holds [firstChunk] bytes and each
+// next one twice as many as the last, up to [progressBytes]. Each chunk is taken from
+// the budget, its whole size, when its first byte has arrived, and the body when it is
+// joined; the chunks are given back once it is, and the body when the caller gives
+// back held, to which readBody adds what it holds. It moves the connection's read
+// deadline forward as the body makes progress: [progressBytes], or the rest of the
+// body, within rc.progress, and the whole body within rc.readBound of the start. A
+// response writer that has no connection, as in a test, has no deadline. It returns
+// the body, or the status and why it is refused.
 func (rc *Receiver) readBody(w http.ResponseWriter, r *http.Request, held *int64) ([]byte, int, string) {
 	ctl := http.NewResponseController(w)
 	end := time.Now().Add(rc.readBound)
@@ -278,6 +289,7 @@ func (rc *Receiver) readBody(w http.ResponseWriter, r *http.Request, held *int64
 	const busy = "too many bodies are being read; try again"
 	lr := http.MaxBytesReader(w, r.Body, MaxBody)
 	var chunks [][]byte
+	var chunked int64
 	total := 0
 	for {
 		var n int
@@ -291,11 +303,16 @@ func (rc *Receiver) readBody(w http.ResponseWriter, r *http.Request, held *int64
 			// arrived for it: a sender that sends nothing holds nothing.
 			var first [1]byte
 			if n, err = lr.Read(first[:]); n == 1 {
-				if !rc.take(progressBytes) {
+				size := firstChunk
+				if len(chunks) > 0 {
+					size = min(2*cap(chunks[len(chunks)-1]), progressBytes)
+				}
+				if !rc.take(int64(size)) {
 					return nil, http.StatusServiceUnavailable, busy
 				}
-				*held += progressBytes
-				chunks = append(chunks, append(make([]byte, 0, progressBytes), first[0]))
+				*held += int64(size)
+				chunked += int64(size)
+				chunks = append(chunks, append(make([]byte, 0, size), first[0]))
 			}
 		}
 		if n > 0 {
@@ -316,8 +333,8 @@ func (rc *Receiver) readBody(w http.ResponseWriter, r *http.Request, held *int64
 			for _, c := range chunks {
 				body = append(body, c...)
 			}
-			rc.give(int64(len(chunks)) * progressBytes)
-			*held -= int64(len(chunks)) * progressBytes
+			rc.give(chunked)
+			*held -= chunked
 			// The deadline left once the body is read is the whole body's, as
 			// net/http's ReadTimeout would have it. A body that is refused keeps the
 			// deadline it has, so net/http does not wait on the rest of it before it

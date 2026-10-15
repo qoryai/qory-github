@@ -29,10 +29,11 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// The server's bounds. A delivery's headers are read within three seconds, and the
-// whole delivery within 15 seconds, 25 MiB at most, and answered within a minute of its
-// headers; GitHub counts a delivery not answered within ten seconds as failed, so a
-// delivery that takes longer to arrive is lost already. A connection is idle five
+// The server's bounds. A delivery's headers are read within three seconds, and its body,
+// 25 MiB at most, within 15 seconds after them, as the [Receiver] counts from when it
+// starts on the request; it is answered within a minute of its headers. GitHub counts a
+// delivery not answered within ten seconds as failed, so a delivery that takes longer
+// to arrive is lost already. A connection is idle five
 // seconds at most. Both keep a sender that reaches serve directly, sending headers
 // slowly or nothing at all, from holding the [maxConns] slots.
 const (
@@ -59,9 +60,11 @@ type Options struct {
 	// Listening, when set, is called with the address serve listens on, once it does.
 	Listening func(net.Addr)
 
-	// idleTimeout and maxConns replace [idleTimeout] and [maxConns] in a test.
-	idleTimeout time.Duration
-	maxConns    int
+	// idleTimeout, maxConns and refusalEvery replace [idleTimeout], [maxConns] and
+	// [refusalEvery] in a test.
+	idleTimeout  time.Duration
+	maxConns     int
+	refusalEvery time.Duration
 }
 
 // Run serves until ctx is done. Before it listens it reads the App's private key and
@@ -95,7 +98,7 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 		return err
 	}
 	worker := &Worker{Store: st, Handlers: opts.Handlers, Log: log}
-	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify}
+	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, refusalEvery: opts.refusalEvery}
 	srv := &http.Server{
 		Handler:           rc.Mux(),
 		ReadHeaderTimeout: readHeaderTimeout,

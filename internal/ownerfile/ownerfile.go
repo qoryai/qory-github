@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -67,15 +68,20 @@ func ReadFile(path string, max int, what, holds string) ([]byte, error) {
 // Dir makes the directory at path, 0700, when it does not exist, its parent existing,
 // and checks it: one that is a symbolic link, that is not a directory, that grants group
 // or others any permission, or that belongs to another user than the one the program
-// runs as is refused. what names it in an error, such as "the state directory". The
-// path checked is path without its trailing slashes, / itself kept, since Lstat of
-// link/ would read the directory the link points to; nothing else in it is changed, so
-// the system still resolves each .. through the links before it. An error names path
-// as it is given.
+// runs as is refused, and so is a path whose last part is . or .. . what names it in an
+// error, such as "the state directory". The path checked is path without its trailing
+// slashes, / itself kept, since Lstat of link/ would read the directory the link
+// points to; nothing else in it is changed, so the system still resolves each .. before
+// the last part through the links before it. An error names path as it is given.
 func Dir(path, what string) error {
 	clean := strings.TrimRight(path, "/")
 	if clean == "" && path != "" {
 		clean = "/"
+	}
+	// A last part . or .. names the directory through another, a link's target
+	// among them, so link/. would be checked as what link points to.
+	if base := filepath.Base(clean); base == "." || base == ".." {
+		return fmt.Errorf("%s %s ends in . or ..; name the directory itself", what, path)
 	}
 	if err := os.Mkdir(clean, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("%s: %w", what, given(err, path))

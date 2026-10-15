@@ -30,9 +30,10 @@ func TestAnErrorNamesThePathAsItIsGiven(t *testing.T) {
 		{dir + "//loose.pem", dir + "//loose.pem is -rw-r--r--", true},
 		{dir + "//./none.pem", "open " + dir + "//./none.pem: no such file", true},
 		{dirLink + "/", dirLink + "/ is a symbolic link", false},
-		// A path that does not end in a slash is checked as the system resolves it:
-		// here the directory the link points to.
-		{dirLink + "//.", dirLink + "//. is -rwxr-xr-x", false},
+		{dirLink + "//.", dirLink + "//. ends in . or ..; name the directory itself", false},
+		{dirLink + "/./", dirLink + "/./ ends in . or ..", false},
+		{sub + "/..", sub + "/.. ends in . or ..", false},
+		{".", ". ends in . or ..", false},
 		{sub + "//", sub + "// is -rwxr-xr-x", false},
 		{dir + "//none/sub", "mkdir " + dir + "//none/sub: no such file", false},
 	} {

@@ -210,6 +210,12 @@ func TestTheStoreIsOnlyItsOwners(t *testing.T) {
 			t.Errorf("the link %s: %v", path, err)
 		}
 	}
+	// link/. is refused as link/ is, though by its last part.
+	for _, path := range []string{link + "/.", link + "/./", dir + "/.", dir + "/sub/.."} {
+		if _, err := Open(path, Options{}); err == nil || !strings.Contains(err.Error(), path+" ends in . or ..") {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
 	file := filepath.Join(parent, "file")
 	os.WriteFile(file, nil, 0o600)
 	if _, err := Open(file, Options{}); err == nil || !strings.Contains(err.Error(), "not a directory") {
