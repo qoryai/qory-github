@@ -461,10 +461,14 @@ func (p *pages) read(path string) error {
 const listingEnd = 10 * time.Second
 
 // ListRepositories lists the repositories the installation reaches, as collections, in
-// parts of at most 100 collections and 1 MiB, and reads at most 1,000 pages. No part
-// says the listing is complete, since a repository removed from the installation while
-// it is listed shifts the pages after it; a listing stopped early, by an error or its
-// context, still ends with a part.
+// parts of at most 100 collections and 1 MiB, and reads at most 1,000 pages. When GitHub
+// answers with one page, up to 100 repositories, nothing can shift, so the last part
+// says the listing is complete, and Qory Apiary disconnects a repository the
+// installation no longer reaches. A listing of more than one page never says it is
+// complete, since a repository removed from the installation while it is listed shifts
+// the pages after it: that is a limit, and such a removal reaches Qory Apiary only by
+// the installation_repositories event that says it was removed. A listing stopped
+// early, by an error or its context, still ends with a part, never complete.
 func (l Lister) ListRepositories(ctx context.Context) error {
 	if l.Sink == nil || l.Token == nil {
 		return errors.New("the lister has no sink or no token")
@@ -473,8 +477,9 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	listing := Listing{ID: randomHex(), StartedAt: p.now().UTC().Format(time.RFC3339)}
 	system := l.Client.WebHost()
 	var pending []SourceCollection
-	send := func(ctx context.Context) error {
+	send := func(ctx context.Context, complete bool) error {
 		listing.Part++
+		listing.Complete = complete
 		req := SourceCollections{Version: WireVersion, Collections: pending, Listing: listing}
 		if req.Collections == nil {
 			req.Collections = []SourceCollection{}
@@ -487,7 +492,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	stop := func(err error) error {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
 		defer cancel()
-		return errors.Join(err, send(ctx))
+		return errors.Join(err, send(ctx, false))
 	}
 	const what = "listing the installation's repositories"
 	read := pages{what: what, max: maxRepositoryPages}
@@ -512,7 +517,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 				continue
 			}
 			if len(pending) == maxPerBatch || used+n+1 > maxRequest {
-				if err := send(ctx); err != nil {
+				if err := send(ctx, false); err != nil {
 					return stop(err)
 				}
 				used = envelope
@@ -522,7 +527,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		}
 		path = next
 	}
-	if err := send(ctx); err != nil {
+	if err := send(ctx, len(read.seen) == 1); err != nil {
 		return stop(err)
 	}
 	return nil

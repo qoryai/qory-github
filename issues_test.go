@@ -839,3 +839,50 @@ func TestAWebhooksEventHasTheListingsChecks(t *testing.T) {
 		t.Errorf("deleted: %+v", got)
 	}
 }
+
+// TestARepositoriesListingOfOnePageIsComplete lists the installation's repositories
+// from one page, which says the listing is complete, from one page GitHub fails, and
+// from two pages, neither of which does.
+func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		n        int
+		pageSize int
+		fail     bool
+		complete bool
+		parts    int
+	}{
+		{"one page", 100, 100, false, true, 1},
+		{"none", 0, 100, false, true, 1},
+		{"two pages", 101, 100, false, false, 2},
+		{"one page GitHub fails", 3, 100, true, false, 1},
+	} {
+		f := &fakeIssues{pageSize: tc.pageSize}
+		for i := range tc.n {
+			n := "repo" + strconv.Itoa(i)
+			f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
+		}
+		s := &sink{}
+		var logs []string
+		l := f.lister(t, s, &logs)
+		if tc.fail {
+			l.Token = func(context.Context) (string, error) { return "", errors.New("no token") }
+		}
+		err := l.ListRepositories(context.Background())
+		if (err != nil) != tc.fail || len(s.reqs) != tc.parts {
+			t.Errorf("%s: err %v, %d parts", tc.name, err, len(s.reqs))
+			continue
+		}
+		total := 0
+		for i, req := range s.reqs {
+			c := req.(SourceCollections)
+			total += len(c.Collections)
+			if c.Listing.Part != i+1 || c.Listing.Complete != (tc.complete && i == len(s.reqs)-1) {
+				t.Errorf("%s: part %d says %+v", tc.name, i+1, c.Listing)
+			}
+		}
+		if !tc.fail && total != tc.n {
+			t.Errorf("%s: %d collections", tc.name, total)
+		}
+	}
+}
