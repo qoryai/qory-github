@@ -152,7 +152,7 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 		return err
 	}
 	worker := &Worker{Store: st, Handlers: handlers, Log: log}
-	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, Linked: linked, refusalEvery: opts.refusalEvery}
+	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, Handlers: handlers, Linked: linked, refusalEvery: opts.refusalEvery}
 	connect := &Connect{
 		Store: st, Adapter: adapter, Pin: s.ApiaryPublicKey, AdapterID: s.AdapterID, Key: accessKey, ClientID: s.ClientID, ClientSecret: clientSecret,
 		PublicURL: s.PublicURL, ApiaryURL: s.ApiaryURL, Log: log,

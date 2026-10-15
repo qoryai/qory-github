@@ -64,7 +64,7 @@ func newWired(t *testing.T, dir string) *wired {
 	hs := &Handlers{}
 	w.adapter.Register(hs)
 	worker := &Worker{Store: st, Handlers: hs, Log: logger, Attempts: 3, Backoff: func(int) time.Duration { return time.Millisecond }}
-	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify, Linked: func(id int64) (bool, error) { return Linked(st, id) }}
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify, Handlers: hs, Linked: func(id int64) (bool, error) { return Linked(st, id) }}
 	worker.Start()
 	t.Cleanup(func() { worker.Stop(5 * time.Second) })
 	w.mux = rc.Mux()
@@ -186,6 +186,378 @@ func TestRepositoriesRemovedAreDisconnected(t *testing.T) {
 	}
 	if len(w.apiary.sent(routeCollections)) != 1 {
 		t.Error("the repositories are not listed again")
+	}
+}
+
+// lastListed are the refs of the collections the last listing sent Qory Apiary, one
+// part.
+func (w *wired) lastListed(t *testing.T) []string {
+	t.Helper()
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) == 0 {
+		t.Fatal("no listing is sent")
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[len(sent)-1].raw, &req)
+	if !req.Listing.Complete || req.Listing.Part != 1 {
+		t.Errorf("the listing is not complete in one part: %s", sent[len(sent)-1].raw)
+	}
+	var refs []string
+	for _, c := range req.Collections {
+		refs = append(refs, c.Ref)
+	}
+	return refs
+}
+
+// installed sets the repositories the fake GitHub lists for the installation 42.
+func (f *fakeGitHub) installed(repos ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos = repos
+}
+
+// repositoriesEvent is an installation_repositories event of the installation 42: action
+// with the repository selection selection, the repositories added and those removed.
+func repositoriesEvent(action, selection string, added, removed []string) map[string]any {
+	list := func(names []string) []any {
+		out := []any{}
+		for _, n := range names {
+			out = append(out, map[string]any{"full_name": n, "name": n[strings.Index(n, "/")+1:], "private": false})
+		}
+		return out
+	}
+	return map[string]any{
+		"action": action, "installation": map[string]any{"id": 42}, "repository_selection": selection,
+		"repositories_added": list(added), "repositories_removed": list(removed),
+	}
+}
+
+// disconnected are the collections of the disconnects Qory Apiary was sent, from the one
+// numbered from on, counted from 0; a disconnect that names a reason, which none does,
+// shows it.
+func (w *wired) disconnected(from int) []string {
+	var got []string
+	for _, r := range w.apiary.sent(routeDisconnect)[from:] {
+		ref := r.body["collection_ref"].(string)
+		if reason, ok := r.body["reason"]; ok {
+			ref += fmt.Sprintf(" reason %v", reason)
+		}
+		got = append(got, ref)
+	}
+	return got
+}
+
+// TestASelectionSwitchedToAllRepositoriesIsListed switches an installation that GitHub
+// gave a selection of repositories to all of the account's, which GitHub delivers as
+// installation_repositories added, repository_selection all, with each repository the
+// installation now reaches beside the selection: the installation is listed again, the
+// new repositories in it, each kept as reached by the installation, and nothing is
+// disconnected.
+func TestASelectionSwitchedToAllRepositoriesIsListed(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.gh.installed("acme/widgets")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "selected", []string{"acme/widgets"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets"}) {
+		t.Fatalf("listed %v", got)
+	}
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("added", "all", []string{"acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}) {
+		t.Errorf("listed %v", got)
+	}
+	for _, ref := range []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"} {
+		if inst, ok, err := reachOf(w.st, ref); inst != 42 || !ok || err != nil {
+			t.Errorf("%s: %d %v %v", ref, inst, ok, err)
+		}
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if s := state(w.st, guid2); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+}
+
+// TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers switches an installation
+// on all of the account's repositories to a selection, which GitHub delivers as
+// installation_repositories removed, repository_selection selected, with each
+// repository left out: each is disconnected, removed, and forgotten, and the
+// installation is listed again with the selection alone.
+func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	w.gh.installed("acme/gadgets")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/widgets", "acme/tools", "acme/docs"}))
+	if got := w.disconnected(0); !slices.Equal(got, []string{"acme/widgets", "acme/tools", "acme/docs"}) {
+		t.Errorf("disconnected %v", got)
+	}
+	for _, ref := range []string{"acme/widgets", "acme/tools", "acme/docs"} {
+		if _, ok, _ := reachOf(w.st, ref); ok {
+			t.Errorf("%s: the removed repository's installation is kept", ref)
+		}
+	}
+	if inst, ok, _ := reachOf(w.st, "acme/gadgets"); inst != 42 || !ok {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/gadgets"}) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestRemovingARepositoryNeverKnownIsHarmless removes from the installation a
+// repository serve never listed, and one the store holds as another installation's:
+// no disconnect is sent for either, the delivery is done, the repositories serve knows
+// stay as they were, and the installation is listed again.
+func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, "acme/widgets", 42)
+	setReach(w.st, "acme/gadgets", 42)
+	setReach(w.st, "octo-org/tools", 43)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/never", "octo-org/tools"}))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	for ref, want := range map[string]int64{"acme/widgets": 42, "acme/gadgets": 42, "octo-org/tools": 43} {
+		if inst, ok, _ := reachOf(w.st, ref); inst != want || !ok {
+			t.Errorf("%s: %d %v", ref, inst, ok)
+		}
+	}
+	if _, ok, _ := reachOf(w.st, "acme/never"); ok {
+		t.Error("acme/never is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets", "acme/gadgets"}) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestAChangeOfRepositoriesListsWithANewToken lists the installation, which keeps its
+// listing token, then delivers installation_repositories added and removed in turn:
+// each drops the installation's tokens, so each listing after a change reads with a
+// token minted after it, and another installation's token is kept.
+func TestAChangeOfRepositoriesListsWithANewToken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.adapter.mu.Lock()
+	w.adapter.tokens["43 octo-org/tools read"] = github.InstallationToken{Token: "another", ExpiresAt: time.Now().Add(time.Hour)}
+	w.adapter.mu.Unlock()
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/gadgets"}, nil))
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/gadgets"}))
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	if len(mints) != 3 {
+		t.Errorf("%d listing tokens minted, want 3: %v", len(mints), mints)
+	}
+	w.adapter.mu.Lock()
+	_, kept := w.adapter.tokens["43 octo-org/tools read"]
+	w.adapter.mu.Unlock()
+	if !kept {
+		t.Error("another installation's token is dropped")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 3 {
+		t.Errorf("%d listings", n)
+	}
+}
+
+// TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas adds and removes
+// repositories in turn, a selection grown, switched to all and back to a selection, and
+// checks after each that the listing and the repositories kept are the installation's
+// and that each repository removed is disconnected once.
+func TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	guids := []string{guid1, guid2, guid3, "a4c5d6e7-1b2c-11ef-8f4b-0242ac120004", "b5d6e7f8-1c2d-11ef-8f4b-0242ac120005"}
+	for i, step := range []struct {
+		action, selection string
+		added, removed    []string
+		repos             []string
+		disconnected      []string
+	}{
+		{"added", "selected", []string{"acme/widgets"}, nil, []string{"acme/widgets"}, nil},
+		{"added", "selected", []string{"acme/gadgets"}, nil, []string{"acme/widgets", "acme/gadgets"}, nil},
+		{"removed", "selected", nil, []string{"acme/widgets"}, []string{"acme/gadgets"}, []string{"acme/widgets"}},
+		{"added", "all", []string{"acme/widgets", "acme/tools"}, nil, []string{"acme/widgets", "acme/gadgets", "acme/tools"}, nil},
+		{"removed", "selected", nil, []string{"acme/gadgets", "acme/tools"}, []string{"acme/widgets"}, []string{"acme/gadgets", "acme/tools"}},
+	} {
+		before := len(w.apiary.sent(routeDisconnect))
+		w.gh.installed(step.repos...)
+		w.deliver(t, "installation_repositories", guids[i], repositoriesEvent(step.action, step.selection, step.added, step.removed))
+		if got := w.lastListed(t); !slices.Equal(got, step.repos) {
+			t.Errorf("step %d: listed %v, want %v", i+1, got, step.repos)
+		}
+		if got := w.disconnected(before); !slices.Equal(got, step.disconnected) {
+			t.Errorf("step %d: disconnected %v, want %v", i+1, got, step.disconnected)
+		}
+		refs, _ := reachedBy(w.st, 42)
+		for i := range refs {
+			refs[i] = strings.ToLower(refs[i])
+		}
+		slices.Sort(refs)
+		want := slices.Sorted(slices.Values(step.repos))
+		if !slices.Equal(refs, want) {
+			t.Errorf("step %d: kept %v, want %v", i+1, refs, want)
+		}
+	}
+}
+
+// TestEveryTokenServeMintsIsNarrowedToItsStep lists an installation's repositories,
+// fills a collection and applies a work item's change, each step serve mints a token
+// for, and pins every mint: each names its permissions, since a mint that names none
+// is granted every permission the installation has, and none asks for one the App
+// holds for steps serve does not take with an installation token, so an App with more
+// permissions does not widen serve's tokens. The listing reads metadata alone, on every
+// repository; the fill reads issues and the change writes them, on one repository.
+func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets"}, nil))
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, "acme/widgets")
+	if err := w.adapter.fill(context.Background(), "acme/widgets"); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	want := []string{
+		`{"permissions":{"metadata":"read"}}`,
+		`{"permissions":{"issues":"read"},"repositories":["widgets"]}`,
+		`{"permissions":{"issues":"write"},"repositories":["widgets"]}`,
+	}
+	if !slices.Equal(mints, want) {
+		t.Errorf("mints\n%s\nwant\n%s", strings.Join(mints, "\n"), strings.Join(want, "\n"))
+	}
+	for _, m := range mints {
+		var body struct {
+			Permissions map[string]string `json:"permissions"`
+		}
+		if err := json.Unmarshal([]byte(m), &body); err != nil || len(body.Permissions) == 0 {
+			t.Errorf("a mint names no permission: %s", m)
+		}
+		for _, wider := range []string{"contents", "pull_requests", "actions", "checks", "administration", "members"} {
+			if _, ok := body.Permissions[wider]; ok {
+				t.Errorf("a mint asks for %s: %s", wider, m)
+			}
+		}
+	}
+}
+
+// holdMint is a transport that holds the first mint of an installation token until
+// release is closed, once it has closed minting, and passes every other request on.
+type holdMint struct {
+	once             *sync.Once
+	minting, release chan struct{}
+}
+
+func (h holdMint) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access_tokens") {
+		held := false
+		h.once.Do(func() { held = true })
+		if held {
+			close(h.minting)
+			<-h.release
+		}
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestATokenMintedAcrossAForgetIsNotKept holds a mint of the installation's listing
+// token in flight while its tokens are dropped: the token is handed to the request
+// that minted it, and not kept, so the next request mints again; a token minted after
+// the drop is kept.
+func TestATokenMintedAcrossAForgetIsNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
+	w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+	type result struct {
+		token string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		tok, err := w.adapter.token(context.Background(), 42, github.Repository{}, "")
+		done <- result{tok, err}
+	}()
+	<-h.minting
+	w.adapter.forgetTokens(42)
+	close(h.release)
+	if r := <-done; r.token != ghToken || r.err != nil {
+		t.Fatalf("the token minted in flight: %v", r.err)
+	}
+	w.adapter.mu.Lock()
+	n := len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d tokens kept, the one minted across the drop among them", n)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, github.Repository{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, github.Repository{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	w.adapter.mu.Lock()
+	n = len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if mints != 2 || n != 1 {
+		t.Errorf("%d mints and %d tokens kept, want 2 and 1", mints, n)
+	}
+}
+
+// TestDeliveriesOfAnEventWithoutAHandlerAreNotKept posts many deliveries of push and
+// pull_request, and one each of workflow_run and an event GitHub may add, which no
+// handler takes: each is answered 202, as a delivery kept is, and logged unhandled,
+// and the store keeps none of them, so the next delivery kept is the first.
+func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	body := `{"action":"opened","installation":{"id":42},"repository":{"full_name":"acme/widgets"}}`
+	var guids []string
+	for i := range 200 {
+		event := []string{"push", "pull_request"}[i%2]
+		switch i {
+		case 198:
+			event = "workflow_run"
+		case 199:
+			event = "some_future_event"
+		}
+		guid := fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i)
+		guids = append(guids, guid)
+		if rec := post(w.mux, event, guid, body, sign(body)); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: status %d", event, rec.Code)
+		}
+	}
+	for _, guid := range guids {
+		if d, err := w.st.Lookup(guid); err == nil {
+			t.Fatalf("%s %s is kept", d.Event, guid)
+		}
+	}
+	if pending, err := w.st.Pending(); err != nil || len(pending) != 0 {
+		t.Errorf("pending %d %v", len(pending), err)
+	}
+	if n := strings.Count(w.log.String(), `"outcome":"unhandled"`); n != 200 {
+		t.Errorf("%d deliveries logged unhandled", n)
+	}
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	if d, err := w.st.Lookup(guid1); err != nil || d.Seq != 1 {
+		t.Errorf("the delivery kept next is %d: %v", d.Seq, err)
 	}
 }
 
@@ -403,7 +775,8 @@ func TestAListingNamesTheConnectionAndMakesItsLinkLive(t *testing.T) {
 
 // TestDeliveriesOfAnInstallationNotLinkedAreNotKept sends many deliveries of an
 // installation that is not linked, of each event, and checks each is answered 202 and
-// none is kept, but the installation event's created and deleted, which are.
+// none is kept, but the installation event's created and deleted, which are. An event
+// no handler takes is logged unhandled, before its installation is looked at.
 func TestDeliveriesOfAnInstallationNotLinkedAreNotKept(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	Link(w.st, 42, testConnection, linkLive)
@@ -433,8 +806,9 @@ func TestDeliveriesOfAnInstallationNotLinkedAreNotKept(t *testing.T) {
 			t.Fatalf("delivery %d is kept, %s", i, s)
 		}
 	}
-	if n := strings.Count(w.log.String(), `"outcome":"not_linked"`); n != 300 || w.apiary.count() != 0 {
-		t.Errorf("%d lines, %d requests", n, w.apiary.count())
+	notLinked, unhandled := strings.Count(w.log.String(), `"outcome":"not_linked"`), strings.Count(w.log.String(), `"outcome":"unhandled"`)
+	if notLinked != 200 || unhandled != 100 || w.apiary.count() != 0 {
+		t.Errorf("%d lines not_linked, %d unhandled, %d requests", notLinked, unhandled, w.apiary.count())
 	}
 	// The installation event's created and deleted are kept, and a linked
 	// installation's deliveries.

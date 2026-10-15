@@ -44,6 +44,9 @@ type Adapter struct {
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
+	// gens are the installations' token generations, which [Adapter.forgetTokens]
+	// moves on: a token minted across a move is used and not kept.
+	gens map[int64]uint64
 	// turns are the collections' turns, see [Adapter.collectionTurn], by key. now is
 	// the clock a fill's start is read from; nil is time.Now.
 	turns map[string]chan struct{}
@@ -63,7 +66,8 @@ func (a *Adapter) log() *slog.Logger {
 }
 
 // Register registers the adapter's handlers: installation, installation_repositories,
-// issues and issue_comment. workflow_run has none yet, so its deliveries are done.
+// issues and issue_comment. workflow_run, pull_request and push have none yet, so their
+// deliveries are not kept, see [Receiver.Handlers].
 func (a *Adapter) Register(hs *Handlers) {
 	hs.HandleFunc("installation", a.linked(a.installation))
 	hs.HandleFunc("installation_repositories", a.linked(a.installationRepositories))
@@ -126,11 +130,13 @@ func (a *Adapter) pacer(installation int64) *github.Pacer {
 
 // token is an installation token for installation, limited to repo, or, when repo is
 // empty, the listing token that reads which repositories it reaches; permission is the
-// one it grants on issues. A token is kept until shortly before it expires.
+// one it grants on issues. A token is kept until shortly before it expires, unless the
+// installation's tokens were dropped while it was minted.
 func (a *Adapter) token(ctx context.Context, installation int64, repo github.Repository, permission string) (string, error) {
 	key := strconv.FormatInt(installation, 10) + " " + strings.ToLower(repo.String()) + " " + permission
 	a.mu.Lock()
 	t, ok := a.tokens[key]
+	gen := a.gens[installation]
 	a.mu.Unlock()
 	if ok && time.Until(t.ExpiresAt) > tokenMargin {
 		return t.Token, nil
@@ -146,6 +152,9 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.gens[installation] != gen {
+		return t.Token, nil
+	}
 	if a.tokens == nil {
 		a.tokens = map[string]github.InstallationToken{}
 	}
@@ -156,18 +165,27 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 // forgetOn401 drops the installation's tokens when err is GitHub's 401, which a token
 // GitHub no longer takes brings, so the next request mints a new one; it returns err.
 func (a *Adapter) forgetOn401(installation int64, err error) error {
-	if !github.Unauthorized(err) {
-		return err
+	if github.Unauthorized(err) {
+		a.forgetTokens(installation)
 	}
+	return err
+}
+
+// forgetTokens drops the installation's tokens, so the next request mints a new one,
+// and moves its generation on, so a mint in flight does not keep its token.
+func (a *Adapter) forgetTokens(installation int64) {
 	prefix := strconv.FormatInt(installation, 10) + " "
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.gens == nil {
+		a.gens = map[int64]uint64{}
+	}
+	a.gens[installation]++
 	for key := range a.tokens {
 		if strings.HasPrefix(key, prefix) {
 			delete(a.tokens, key)
 		}
 	}
-	return err
 }
 
 // String says the adapter's App and how many tokens it keeps, never a token or the
@@ -324,13 +342,16 @@ func (a *Adapter) endConnection(ctx context.Context, connection string) error {
 }
 
 // installationRepositories handles the installation_repositories event: each
-// repository removed is disconnected, removed, and forgotten, and the installation's
+// repository removed that the store holds as the installation's is disconnected,
+// removed, and forgotten, one it does not hold is passed, and the installation's
 // repositories are listed again, which a listing of more than one page needs, since it
-// never says it is complete.
+// never says it is complete. The installation's tokens are dropped first, so the
+// listing never reads with a token minted before the change.
 func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) error {
 	if d.Action != "added" && d.Action != "removed" {
 		return nil
 	}
+	a.forgetTokens(d.InstallationID)
 	var ev struct {
 		Removed []struct {
 			FullName string `json:"full_name"`
@@ -341,7 +362,14 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	}
 	var refs []string
 	for _, r := range ev.Removed {
-		if r.FullName != "" {
+		if r.FullName == "" {
+			continue
+		}
+		installation, ok, err := reachOf(a.Store, r.FullName)
+		if err != nil {
+			return err
+		}
+		if ok && installation == d.InstallationID {
 			refs = append(refs, r.FullName)
 		}
 	}

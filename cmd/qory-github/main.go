@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/rand"
@@ -125,9 +126,12 @@ policy that selects it.`,
 // setupPublicHelp is the paragraph setup's help adds after the App's description where
 // QORY_FEATURES names factory, see [cli.Factory], for the App --public-url makes.
 const setupPublicHelp = `With --public-url, the App is instead public, with a webhook at the public URL and
-` + github.WebhookPath + `, the events issues, issue_comment and workflow_run, and actions and
-issues write, contents and metadata read. It is qory-github-server's App: setup then
-prints qory-github-server serve's settings in place of the declaration and the policy.`
+` + github.WebhookPath + `, the events issues, issue_comment, workflow_run, pull_request and
+push, and actions, checks, contents, issues and pull requests write, administration,
+members and metadata read. It is qory-github-server's App: setup then prints
+qory-github-server serve's settings in place of the declaration and the policy.
+setup asks which GitHub account the App is for, and suggests the name qory- and its
+handle, which you can change on GitHub's form.`
 
 // setupLong is setup's help where QORY_FEATURES names factory: [setupHelp]'s, with
 // [setupPublicHelp] after its paragraph on the App.
@@ -235,6 +239,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	help := setupHelp
 	if cli.Factory() {
 		help.Long = setupLong()
+		fs.Lookup("name").Usage = "the App's name (default qory-github- and six random hex digits, or with --public-url qory- and the account's handle)"
 		publicURL = fs.String("public-url", "", "where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, webhook, events and permissions, and its client secret and webhook secret are written beside the key")
 	}
 	if err := help.Parse(fs, args, stderr); err != nil {
@@ -254,28 +259,132 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("--public-url %w", err)
 		}
 	}
+	dir := ""
 	if *keyFile == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return err
 		}
-		dir := filepath.Join(home, ".config", "qory")
+		dir = filepath.Join(home, ".config", "qory")
 		*keyFile = filepath.Join(dir, "github-app.pem")
 		if err := checkKeyFile(*keyFile); err != nil {
 			return err
 		}
+	}
+	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
+	handle := *org
+	if public != "" {
+		s.PublicURL, s.ClientSecretFile, s.WebhookSecretFile = public, clientSecretFile(*keyFile), webhookSecretFile(*keyFile)
+		// Without --org, setup asks which account the App is for, once every check
+		// setup makes before it creates anything has passed.
+		if *org == "" {
+			if err := checkKeyFile(s.KeyFile); err != nil {
+				return err
+			}
+			if err := s.Check(); err != nil {
+				return err
+			}
+			login, kind, err := askAccount(ctx, s.Client, stdout)
+			if err != nil {
+				return err
+			}
+			handle = login
+			if kind == github.AccountOrganization {
+				s.Org = login
+			} else {
+				fmt.Fprintf(stdout, "Sign in to GitHub as %s to create the App.\n", login)
+			}
+		}
+	}
+	if dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 	}
-	if *name == "" {
-		*name = "qory-github-" + randomSuffix()
-	}
-	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
-	if public != "" {
-		s.PublicURL, s.ClientSecretFile, s.WebhookSecretFile = public, clientSecretFile(*keyFile), webhookSecretFile(*keyFile)
+	if s.Name == "" {
+		// With --public-url the name GitHub's form is filled in with is qory- and the
+		// account's handle, which the person may change there.
+		s.Name = "qory-github-" + randomSuffix()
+		if public != "" {
+			s.Name = "qory-" + handle
+		}
 	}
 	return runSetup(ctx, s, stdout)
+}
+
+// errNoAccountAnswer is setup's error when it needs the App's account and cannot ask:
+// standard input is not a terminal, or ends before an answer.
+var errNoAccountAnswer = errors.New("setup needs the GitHub account for the App: give --org or run it in a terminal")
+
+// stdin is where setup reads the answer to its question, and stdinTerminal whether it is
+// a terminal; a test replaces both.
+var (
+	stdin         io.Reader = os.Stdin
+	stdinTerminal           = func() bool {
+		info, err := os.Stdin.Stat()
+		return err == nil && info.Mode()&os.ModeCharDevice != 0
+	}
+)
+
+// askAccount asks on stdout which GitHub account the App is for, reads the answer from
+// [stdin], and looks it up with GitHub through c: it returns the account's login and
+// kind, [github.AccountOrganization] or [github.AccountUser]. An empty answer, or one
+// GitHub has no organisation or user by, is asked again. Standard input that is not a
+// terminal, or that ends before an answer, is [errNoAccountAnswer]; any other error
+// from GitHub is returned as it is.
+func askAccount(ctx context.Context, c github.Client, stdout io.Writer) (string, string, error) {
+	if !stdinTerminal() {
+		return "", "", errNoAccountAnswer
+	}
+	// The lines are read apart, so an interrupt ends setup while it waits for one; the
+	// reader stops at the next line once the question is answered.
+	lines, done := make(chan string), make(chan struct{})
+	defer close(done)
+	r := bufio.NewReader(stdin)
+	go func() {
+		defer close(lines)
+		for {
+			line, err := r.ReadString('\n')
+			if line != "" {
+				select {
+				case lines <- line:
+				case <-done:
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	for {
+		fmt.Fprint(stdout, "GitHub account for the App, an organisation or a user: ")
+		var line string
+		var ok bool
+		select {
+		case line, ok = <-lines:
+		case <-ctx.Done():
+			fmt.Fprintln(stdout)
+			return "", "", ctx.Err()
+		}
+		if !ok {
+			fmt.Fprintln(stdout)
+			return "", "", errNoAccountAnswer
+		}
+		handle := strings.TrimSpace(line)
+		if handle == "" {
+			continue
+		}
+		login, kind, err := c.Account(ctx, handle)
+		if errors.Is(err, github.ErrNoAccount) {
+			fmt.Fprintf(stdout, "GitHub has no account %s\n", handle)
+			continue
+		}
+		if err != nil {
+			return "", "", err
+		}
+		return login, kind, nil
+	}
 }
 
 // runSetup is setup past its flags, so a test drives it with a page opener the test supplies.

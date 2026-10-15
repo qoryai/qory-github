@@ -172,6 +172,10 @@ type Receiver struct {
 	Log *slog.Logger
 	// Stored, when set, is called after a delivery is kept, such as [Worker.Notify].
 	Stored func()
+	// Handlers, when set, are those the [Worker] runs: a delivery of an event none of
+	// them takes, such as push, is answered as one kept and is not kept, since the
+	// worker would mark it done and do nothing else. Nil keeps every delivery.
+	Handlers *Handlers
 	// Linked, when set, says whether an installation is linked to Qory Apiary: a
 	// delivery of an installation that is not is answered 202 and not kept, but for the
 	// installation event's created and deleted, see [linkedOrAnnounced].
@@ -263,9 +267,10 @@ func (rc *Receiver) Mux() *http.ServeMux {
 //     request, just after its headers;
 //   - 503 when the body's bytes would take the bodies held past their budget, eight
 //     times [MaxBody];
-//   - 202 when the delivery is kept, or when it is of an installation that is not
-//     linked, see [Receiver.Linked], which is not kept; 200 when the store has its GUID
-//     already, which drops it; and 500 when the store fails.
+//   - 202 when the delivery is kept; or when [Receiver.Handlers] has no handler for its
+//     event, or it is of an installation that is not linked, see [Receiver.Linked],
+//     either of which keeps nothing; 200 when the store has its GUID already, which
+//     drops it; and 500 when the store fails.
 //
 // Nothing is kept for any answer but 202. The body is read as it arrives, into a buffer
 // that grows with it: nothing is set aside, nor taken from the budget, by the length
@@ -314,6 +319,11 @@ func (rc *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var action string
 	if json.Unmarshal(payload.Action, &action) != nil || !eventShape.MatchString(action) {
 		action = ""
+	}
+	if rc.Handlers != nil && rc.Handlers.handler(event) == nil {
+		rc.log(event, action, guid, "unhandled")
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
 	if keep, err := rc.linkedOrAnnounced(event, action, payload.Installation.ID); err != nil || !keep {
 		if err != nil {

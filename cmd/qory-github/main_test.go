@@ -432,6 +432,10 @@ func fakeGitHub(t *testing.T) string {
 			io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/github/webhook"}`)
 			return
 		}
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/users/") {
+			lookUp(w, r)
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/app-manifests/abc/conversions" {
 			http.NotFound(w, r)
 			return
@@ -450,6 +454,74 @@ func fakeGitHub(t *testing.T) string {
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
+}
+
+// fakeAccounts are the accounts fakeGitHub's GET /users/{handle} answers, by handle in
+// lower case, as GitHub writes their login and kind; down answers 502. looked are the
+// handles it was asked for.
+var fakeAccounts = struct {
+	sync.Mutex
+	accounts map[string][2]string
+	looked   []string
+}{accounts: map[string][2]string{
+	"acme":     {"acme", "Organization"},
+	"octo-org": {"Octo-Org", "Organization"},
+	"octocat":  {"octocat", "User"},
+	"mona-bot": {"mona-bot", "Bot"},
+}}
+
+// lookUp answers GET /users/{handle} as GitHub does, for fakeAccounts; a request with
+// a token is refused, since setup looks an account up without one.
+func lookUp(w http.ResponseWriter, r *http.Request) {
+	handle := strings.TrimPrefix(r.URL.Path, "/users/")
+	fakeAccounts.Lock()
+	defer fakeAccounts.Unlock()
+	fakeAccounts.looked = append(fakeAccounts.looked, handle)
+	a, ok := fakeAccounts.accounts[strings.ToLower(handle)]
+	switch {
+	case r.Header.Get("Authorization") != "":
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"message":"Bad credentials"}`)
+	case handle == "down":
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"message":"Bad Gateway"}`)
+	case !ok:
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"message":"Not Found"}`)
+	default:
+		json.NewEncoder(w).Encode(map[string]any{"login": a[0], "id": 1, "type": a[1]})
+	}
+}
+
+// looked are the handles fakeGitHub was asked to look up since the test began, and the
+// test forgets them when it ends.
+func looked(t *testing.T) []string {
+	t.Helper()
+	fakeAccounts.Lock()
+	defer fakeAccounts.Unlock()
+	return slices.Clone(fakeAccounts.looked)
+}
+
+// resetLooked forgets the handles looked up now and when the test ends.
+func resetLooked(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		fakeAccounts.Lock()
+		defer fakeAccounts.Unlock()
+		fakeAccounts.looked = nil
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// answering makes setup's standard input, for the test, a terminal that answers
+// answers, or, when terminal is false, input that is not a terminal and holds answers.
+func answering(t *testing.T, terminal bool, answers string) {
+	t.Helper()
+	savedIn, savedTerminal := stdin, stdinTerminal
+	t.Cleanup(func() { stdin, stdinTerminal = savedIn, savedTerminal })
+	stdin = strings.NewReader(answers)
+	stdinTerminal = func() bool { return terminal }
 }
 
 // fakeHook is how fakeGitHub answers for the App's webhook: handed is the exchange's
@@ -832,7 +904,16 @@ func TestQoryGithubHasNoServeOrAccessKey(t *testing.T) {
 // the page posts.
 func setupWhole(t *testing.T, args ...string) (int, string, string, string) {
 	t.Helper()
-	var manifest string
+	code, out, errs, manifest, _ := setupRun(t, append([]string{"--name", "qory-github-test"}, args...)...)
+	return code, out, errs, manifest
+}
+
+// setupRun is setupWhole without the App's name, and returns as well the action of the
+// page's form, where the manifest goes; manifest and action are empty when no page was
+// opened.
+func setupRun(t *testing.T, args ...string) (int, string, string, string, string) {
+	t.Helper()
+	var manifest, action string
 	saved := opener
 	t.Cleanup(func() { opener = saved })
 	opener = func(local string) error {
@@ -847,11 +928,14 @@ func setupWhole(t *testing.T, args ...string) (int, string, string, string) {
 			return fmt.Errorf("the page contains no manifest:\n%s", b)
 		}
 		manifest = html.UnescapeString(string(m[1]))
+		if a := regexp.MustCompile(`action="([^"]+)"`).FindSubmatch(b); a != nil {
+			action = html.UnescapeString(string(a[1]))
+		}
 		return approve(local)
 	}
 	var out, errs bytes.Buffer
-	code := run(context.Background(), append([]string{"setup", "--api-url", fakeGitHub(t), "--name", "qory-github-test"}, args...), &out, &errs)
-	return code, out.String(), errs.String(), manifest
+	code := run(context.Background(), append([]string{"setup", "--api-url", fakeGitHub(t)}, args...), &out, &errs)
+	return code, out.String(), errs.String(), manifest, action
 }
 
 // setupPrinted is what setup printed at ce7d970, before Connect, for the App 123456
@@ -914,8 +998,10 @@ const setupFlagsBefore = `flags:
 // --public-url it does the same.
 func TestSetupWithoutFactoryIsAsItWas(t *testing.T) {
 	resetHook(t)
+	resetLooked(t)
 	for _, features := range []string{"", "all", "factory"} {
 		t.Setenv("QORY_FEATURES", features)
+		answering(t, true, "acme\n")
 		dir := t.TempDir()
 		file := filepath.Join(dir, "github-app.pem")
 		code, out, errs, manifest := setupWhole(t, "--key-file", file)
@@ -934,6 +1020,15 @@ func TestSetupWithoutFactoryIsAsItWas(t *testing.T) {
 		}
 		if sent := hookSent(t); len(sent) != 0 {
 			t.Errorf("QORY_FEATURES=%q: setup set %d webhook secrets", features, len(sent))
+		}
+		if b, _ := io.ReadAll(stdin); len(looked(t)) != 0 || string(b) != "acme\n" {
+			t.Errorf("QORY_FEATURES=%q: setup asked: it looked up %v and read %d bytes", features, looked(t), 5-len(b))
+		}
+		// The App's name is qory-github- and six random hex digits by default.
+		_, _, _, manifest, _ = setupRun(t, "--key-file", filepath.Join(dir, "other.pem"))
+		var m struct{ Name string }
+		if json.Unmarshal([]byte(manifest), &m); !regexp.MustCompile(`^qory-github-[0-9a-f]{6}$`).MatchString(m.Name) {
+			t.Errorf("QORY_FEATURES=%q: the default name is %q", features, m.Name)
 		}
 		var help bytes.Buffer
 		run(context.Background(), []string{"setup", "-h"}, &bytes.Buffer{}, &help)
@@ -960,6 +1055,7 @@ func TestSetupWithFactoryKeepsTheClientSecretForConnect(t *testing.T) {
 	resetHook(t)
 	dir := t.TempDir()
 	file := filepath.Join(dir, "github-app.pem")
+	answering(t, true, "octocat\n")
 	code, out, errs, manifest := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com/")
 	secretFile := filepath.Join(dir, "github-app.client-secret")
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
@@ -982,7 +1078,11 @@ App's webhook:
 	if code != 0 || errs != "" || printed != want || strings.Contains(out, testClientSecret) || strings.Contains(out, sent[0]) {
 		t.Errorf("exit %d, stderr %q, setup prints\n%s\nwant\n%s", code, errs, printed, want)
 	}
-	u, _ := url.Parse(strings.TrimPrefix(strings.SplitN(out, "\n", 2)[0], "Approve the App in the browser. If none opened, open "))
+	asked := "GitHub account for the App, an organisation or a user: Sign in to GitHub as octocat to create the App.\n"
+	if !strings.HasPrefix(out, asked) {
+		t.Errorf("setup asks\n%s", out)
+	}
+	u, _ := url.Parse(strings.TrimPrefix(strings.SplitN(strings.TrimPrefix(out, asked), "\n", 2)[0], "Approve the App in the browser. If none opened, open "))
 	if want := manifestServe("https://qory-github.example.com", u.Scheme+"://"+u.Host+"/callback"); manifest != want {
 		t.Errorf("the manifest is\n%s\nwant\n%s", manifest, want)
 	}
@@ -1037,8 +1137,8 @@ App's webhook:
 // manifestServe is the manifest setup posts with factory and --public-url public, with
 // the redirect URL redirect.
 func manifestServe(public, redirect string) string {
-	return `{"callback_urls":["` + public + `/v1/connect/authorized"],"default_events":["issues","issue_comment","workflow_run"],` +
-		`"default_permissions":{"actions":"write","contents":"read","issues":"write","metadata":"read"},` +
+	return `{"callback_urls":["` + public + `/v1/connect/authorized"],"default_events":["issues","issue_comment","workflow_run","pull_request","push"],` +
+		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
 		`"hook_attributes":{"active":true,"url":"` + public + `/github/webhook"},"name":"qory-github-test","public":true,"redirect_url":"` + redirect + `",` +
 		`"request_oauth_on_install":false,"setup_on_update":true,"setup_url":"` + public + `/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
 }
@@ -1055,6 +1155,7 @@ func TestSetupWithFactoryKeepsTheWebhookSecretGitHubHandsOut(t *testing.T) {
 	fakeHook.Unlock()
 	dir := t.TempDir()
 	file := filepath.Join(dir, "github-app.pem")
+	answering(t, true, "octocat\n")
 	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
 	webhookPath, _ := json.Marshal(webhookFile)
@@ -1087,6 +1188,7 @@ func TestSetupSaysAfterItsOutputThatTheWebhookSecretIsNotSet(t *testing.T) {
 	fakeHook.Unlock()
 	dir := t.TempDir()
 	file := filepath.Join(dir, "github-app.pem")
+	answering(t, true, "octocat\n")
 	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
 	secretFile := filepath.Join(dir, "github-app.client-secret")
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
@@ -1123,6 +1225,7 @@ func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
 	t.Cleanup(func() { fakeClientSecret = testClientSecret })
 	dir := t.TempDir()
 	file := filepath.Join(dir, "github-app.pem")
+	answering(t, true, "octocat\n")
 	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
 	_, printed, _ := strings.Cut(out, "\n\n")
 	webhookFile := filepath.Join(dir, "github-app.webhook-secret")
@@ -1173,6 +1276,7 @@ func TestSetupSaysOnOneLineThatNeitherSecretIsKept(t *testing.T) {
 	t.Cleanup(func() { fakeClientSecret = testClientSecret })
 	dir := t.TempDir()
 	file := filepath.Join(dir, "github-app.pem")
+	answering(t, true, "octocat\n")
 	code, out, errs, _ := setupWhole(t, "--key-file", file, "--public-url", "https://qory-github.example.com")
 	_, printed, _ := strings.Cut(out, "\n\n")
 	if code != 1 || printed != setupPrintedServe(file) || strings.Count(errs, "\n") != 1 ||
@@ -1209,9 +1313,12 @@ func TestSetupHelpSaysWhatAppPublicURLMakes(t *testing.T) {
 	withFactory := strings.Replace(setupLongBefore, "setup waits ten minutes at most.\n\n", `setup waits ten minutes at most.
 
 With --public-url, the App is instead public, with a webhook at the public URL and
-/github/webhook, the events issues, issue_comment and workflow_run, and actions and
-issues write, contents and metadata read. It is qory-github-server's App: setup then
-prints qory-github-server serve's settings in place of the declaration and the policy.
+/github/webhook, the events issues, issue_comment, workflow_run, pull_request and
+push, and actions, checks, contents, issues and pull requests write, administration,
+members and metadata read. It is qory-github-server's App: setup then prints
+qory-github-server serve's settings in place of the declaration and the policy.
+setup asks which GitHub account the App is for, and suggests the name qory- and its
+handle, which you can change on GitHub's form.
 
 `, 1)
 	for features, want := range map[string]string{"": setupLongBefore, "all": setupLongBefore, "factory": withFactory} {
@@ -1223,5 +1330,141 @@ prints qory-github-server serve's settings in place of the declaration and the p
 		if long, _, _ := strings.Cut(help.String(), "usage:\n"); long != want {
 			t.Errorf("QORY_FEATURES=%q: setup -h prints\n%s\nwant\n%s", features, long, want)
 		}
+		// With factory, --name's default says the one --public-url gives.
+		name := "the App's name (default qory-github- and six random hex digits)"
+		if features == "factory" {
+			name = "the App's name (default qory-github- and six random hex digits, or with --public-url qory- and the account's handle)"
+		}
+		if !strings.Contains(help.String(), "  -name string\n    \t"+name+"\n") {
+			t.Errorf("QORY_FEATURES=%q: setup -h prints\n%s", features, help.String())
+		}
+	}
+}
+
+// asking is setup's question for the App's account.
+const asking = "GitHub account for the App, an organisation or a user: "
+
+// approving is the start of the line setup prints once it has opened the page.
+const approving = "Approve the App in the browser. If none opened, open "
+
+// TestSetupAsksForTheAccountWithAPublicURL answers setup's question with factory and
+// --public-url and no --org, and pins what it prints before the page opens, where the
+// page sends the manifest, the App's name, and the handles it looked up: an
+// organisation's handle makes the App under it, as --org does; a user's makes it under
+// the account signed in to GitHub, after a line saying to sign in as that user; an
+// empty line, a handle GitHub has no account by, one not of GitHub's shape, and one of
+// another kind of account are asked again; GitHub's login is the handle; --name wins.
+func TestSetupAsksForTheAccountWithAPublicURL(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	resetHook(t)
+	for _, tc := range []struct {
+		answers string
+		args    []string
+		asked   string
+		action  string
+		name    string
+		looked  []string
+	}{
+		{"acme\n", nil, asking, "/organizations/acme/settings/apps/new", "qory-acme", []string{"acme"}},
+		{"octocat\n", nil, asking + "Sign in to GitHub as octocat to create the App.\n", "/settings/apps/new", "qory-octocat", []string{"octocat"}},
+		{"octo-org", nil, asking, "/organizations/Octo-Org/settings/apps/new", "qory-Octo-Org", []string{"octo-org"}},
+		{"\n  \nacme\n", nil, asking + asking + asking, "/organizations/acme/settings/apps/new", "qory-acme", []string{"acme"}},
+		{"nobody\n acme \n", nil, asking + "GitHub has no account nobody\n" + asking, "/organizations/acme/settings/apps/new", "qory-acme", []string{"nobody", "acme"}},
+		{"-acme\nac--me\nacme/x\nmona-bot\r\noctocat\r\n", nil,
+			asking + "GitHub has no account -acme\n" + asking + "GitHub has no account ac--me\n" + asking + "GitHub has no account acme/x\n" + asking + "GitHub has no account mona-bot\n" + asking + "Sign in to GitHub as octocat to create the App.\n",
+			"/settings/apps/new", "qory-octocat", []string{"mona-bot", "octocat"}},
+		{"ACME\n", nil, asking, "/organizations/acme/settings/apps/new", "qory-acme", []string{"ACME"}},
+		{"acme\n", []string{"--name", "widgets-app"}, asking, "/organizations/acme/settings/apps/new", "widgets-app", []string{"acme"}},
+		{"octocat\n", []string{"--name", "widgets-app"}, asking + "Sign in to GitHub as octocat to create the App.\n", "/settings/apps/new", "widgets-app", []string{"octocat"}},
+	} {
+		resetLooked(t)
+		answering(t, true, tc.answers)
+		dir := t.TempDir()
+		args := append([]string{"--key-file", filepath.Join(dir, "github-app.pem"), "--public-url", "https://qory-github.example.com"}, tc.args...)
+		code, out, errs, manifest, action := setupRun(t, args...)
+		var m struct{ Name string }
+		json.Unmarshal([]byte(manifest), &m)
+		u, _ := url.Parse(action)
+		if code != 0 || errs != "" || !strings.HasPrefix(out, tc.asked+approving) || u == nil || u.Host != "github.com" || u.Path != tc.action || m.Name != tc.name {
+			t.Errorf("%q %v: exit %d, stderr %q, the form's action %s, the name %q, setup prints\n%s", tc.answers, tc.args, code, errs, action, m.Name, out)
+		}
+		if got := looked(t); !slices.Equal(got, tc.looked) {
+			t.Errorf("%q: looked up %v, want %v", tc.answers, got, tc.looked)
+		}
+	}
+}
+
+// TestSetupWithAnOrgAsksNothing pins that with factory, --public-url and --org setup
+// asks nothing and looks nothing up: the App is under the organisation, named qory- and
+// its handle unless --name names it.
+func TestSetupWithAnOrgAsksNothing(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	resetHook(t)
+	resetLooked(t)
+	for _, tc := range []struct {
+		args []string
+		name string
+	}{
+		{[]string{"--org", "octo-org"}, "qory-octo-org"},
+		{[]string{"--org", "octo-org", "--name", "widgets-app"}, "widgets-app"},
+	} {
+		answering(t, false, "")
+		dir := t.TempDir()
+		args := append([]string{"--key-file", filepath.Join(dir, "github-app.pem"), "--public-url", "https://qory-github.example.com"}, tc.args...)
+		code, out, errs, manifest, action := setupRun(t, args...)
+		var m struct{ Name string }
+		json.Unmarshal([]byte(manifest), &m)
+		if code != 0 || errs != "" || !strings.HasPrefix(out, approving) || !strings.Contains(action, "/organizations/octo-org/settings/apps/new?") || m.Name != tc.name {
+			t.Errorf("%v: exit %d, stderr %q, the form's action %s, the name %q, setup prints\n%s", tc.args, code, errs, action, m.Name, out)
+		}
+	}
+	if got := looked(t); len(got) != 0 {
+		t.Errorf("looked up %v", got)
+	}
+}
+
+// TestSetupThatCannotAskCreatesNothing pins that with factory, --public-url and no
+// --org, setup whose standard input is not a terminal, or ends before an answer, fails
+// saying to give --org or run it in a terminal; that GitHub's 502 to the look-up fails
+// it with GitHub's answer; and that in each case nothing is created, listened on or
+// opened, the default key file's directory among them. A key file that exists is
+// refused before setup asks.
+func TestSetupThatCannotAskCreatesNothing(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	const cannot = "qory-github setup: setup needs the GitHub account for the App: give --org or run it in a terminal\n"
+	for _, tc := range []struct {
+		terminal     bool
+		answers, out string
+		errs         string
+	}{
+		{false, "acme\n", "", cannot},
+		{true, "", asking + "\n", cannot},
+		{true, "\n", asking + asking + "\n", cannot},
+		{true, "nobody\n", asking + "GitHub has no account nobody\n" + asking + "\n", cannot},
+		{true, "down\nacme\n", asking, "qory-github setup: looking up the GitHub account: GitHub answered 502: Bad Gateway\n"},
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		answering(t, tc.terminal, tc.answers)
+		opened := false
+		saved := opener
+		opener = func(string) error { opened = true; return nil }
+		var out, errs bytes.Buffer
+		code := run(context.Background(), []string{"setup", "--api-url", fakeGitHub(t), "--public-url", "https://qory-github.example.com"}, &out, &errs)
+		opener = saved
+		entries, _ := os.ReadDir(home)
+		if code != 1 || out.String() != tc.out || errs.String() != tc.errs || opened || len(entries) != 0 {
+			t.Errorf("%v %q: exit %d, stdout %q, stderr %q, opened %v, the home directory holds %v", tc.terminal, tc.answers, code, out.String(), errs.String(), opened, entries)
+		}
+	}
+	// A key file that exists is refused first.
+	dir := t.TempDir()
+	file := filepath.Join(dir, "github-app.pem")
+	os.WriteFile(file, []byte("someone's"), 0o600)
+	answering(t, false, "")
+	var out, errs bytes.Buffer
+	code := run(context.Background(), []string{"setup", "--api-url", "http://127.0.0.1:1", "--key-file", file, "--public-url", "https://qory-github.example.com"}, &out, &errs)
+	if code != 1 || out.Len() != 0 || errs.String() != "qory-github setup: the key file "+file+" exists; choose another or move it away\n" {
+		t.Errorf("a key file that exists: exit %d, %q %q", code, out.String(), errs.String())
 	}
 }
