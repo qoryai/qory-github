@@ -2038,6 +2038,9 @@ func TestAPassNoNewerThanTheConnectionsNewestIsRefused(t *testing.T) {
 				rec = victim.connect(rig.passAt(testConnection, newer), "42")
 			}
 			refused(t, rec, refuseHeld)
+			if victim.cookie != nil {
+				t.Errorf("%s, %s: the cookie is kept", free, as)
+			}
 			made.Store(true)
 			rig.c.stop()
 			rig.adapter.listRepositories(context.Background(), 42)
@@ -2158,4 +2161,26 @@ func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 		t.Errorf("disconnects %v", sent)
 	}
 	rig.c.stop()
+}
+
+// TestAFirstListingAnswered403ForbiddenIsSentAgain has Qory Apiary answer a pending
+// link's first listing 403 forbidden: it is logged, and sent again with the waits that
+// double, and the link stays.
+func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false, time.Now().Add(returnFor))
+	eventually(t, "three waits", func() bool { rig.mu.Lock(); defer rig.mu.Unlock(); return len(rig.waits) >= 3 })
+	rig.c.stop()
+	rig.mu.Lock()
+	waits := slices.Clone(rig.waits[:3])
+	rig.mu.Unlock()
+	if !slices.Equal(waits, []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second}) {
+		t.Errorf("waited %v", waits)
+	}
+	rig.linked(t, 42, testConnection, linkPending)
+	if !strings.Contains(rig.log.String(), `"msg":"Qory Apiary answered a listing 403 forbidden, so it is sent again later","connection":"`+testConnection+`","installation":42`) {
+		t.Errorf("the log %s", rig.log.String())
+	}
 }

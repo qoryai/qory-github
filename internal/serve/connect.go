@@ -1017,15 +1017,16 @@ func (c *Connect) listFailed(installation int64, connection string, err error) {
 // listSoon sends, after the answer, the first listing of connection for the
 // installation, while the browser carries the linked connect return to Qory Apiary,
 // which answers the listing 403 connection_unknown until it has taken the return. That
-// 403, and a failure that passes, no answer, a 429, a 5xx or an answer not signed, is
-// sent again, the waits doubling from [firstListingWait] up to [firstListingMaxWait],
+// 403, and a failure that passes, no answer, a 429, a 5xx, an answer not signed or a
+// 403 forbidden, which is logged, is sent again, the waits doubling from [firstListingWait] up to [firstListingMaxWait],
 // until the return, which expires at returnExpires, has expired and [returnSkew] more
 // has passed: then the link's last listing settles it, see [Adapter.listFor], sent
 // again past failures that pass, the waits doubling up to [lastListingMaxWait]. A signed
 // 204 makes the link live. Once a connect for another connection has replaced the link,
 // each listing is the replaced connection's, empty, see [Adapter.listReplaced]. It stops
-// once the link is live or settled, once Qory Apiary refuses otherwise, which is logged
-// and which the round's listing takes up again, and once [Connect.stop] has run. again,
+// once the link is live or settled, once Qory Apiary refuses otherwise, a 409
+// connection_suspended among them, which keeps the link, which is logged and which the
+// round's listing takes up again, and once [Connect.stop] has run. again,
 // a re-connect, fills the linked collections again once the listing is taken, see
 // [Connect.refill].
 func (c *Connect) listSoon(installation int64, connection string, again bool, returnExpires time.Time) {
@@ -1060,6 +1061,12 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 			}
 			var refused *refusedError
 			passing := !errors.As(err, &refused) || refused.status >= 500 || refused.status == http.StatusTooManyRequests
+			if refusedAs(err, http.StatusForbidden, codeForbidden) {
+				// A 403 forbidden never drops a link: it is sent again, as a failure that passes.
+				passing = true
+				// placeholder: wording waits for the user
+				c.log().Warn("Qory Apiary answered a listing 403 forbidden, so it is sent again later", slog.String("connection", connection), slog.Int64("installation", installation))
+			}
 			if err != nil && !passing && (last || !refusedAs(err, http.StatusForbidden, codeConnectionUnknown)) {
 				c.listFailed(installation, connection, err)
 				return

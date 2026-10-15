@@ -335,7 +335,9 @@ func (a *Adapter) listConnection(ctx context.Context, installation int64, connec
 // listing this is, last, is settled by the listing: a signed 204 makes it live, as any
 // listing's does; a signed 403 connection_unknown says the connection was not made, and
 // the link is dropped, with its collections' records, see [dropInstallation]; a 409
-// connection_ended drops it as any does; any other answer keeps it, to be listed again.
+// connection_ended drops it as any does; any other answer keeps it, to be listed again:
+// a 409 connection_suspended, which says the connection was made, and a 403 forbidden
+// among them.
 // Before that a 403 drops nothing, since Qory Apiary answers 403 connection_unknown by
 // design until the browser brings the return.
 func (a *Adapter) listFor(ctx context.Context, installation int64, connection string, last bool) error {
@@ -373,7 +375,8 @@ func (a *Adapter) listFor(ctx context.Context, installation int64, connection st
 // listReplaced sends Qory Apiary, for connection, which a connect replaced on the
 // installation, see [keepReplaced], a complete listing with no collections, which
 // never names the installation's repositories, holding the installation's lock: a
-// signed 204 says the connection was made meanwhile, and it is ended, see
+// signed 204, or a 409 connection_suspended, which Qory Apiary answers only for a
+// connection made, says the connection was made meanwhile, and it is ended, see
 // [Adapter.endConnection], so the installation stays linked to one connection; a 409
 // connection_ended, or a 403 connection_unknown to its last listing, past the replaced
 // link's return's expiry and [returnSkew] more, or last, says it was not made, and it is
@@ -392,7 +395,7 @@ func (a *Adapter) listReplaced(ctx context.Context, installation int64, connecti
 	})
 	last = last || !a.clock().Before(time.Unix(r.Return, 0).Add(returnSkew))
 	switch {
-	case err == nil:
+	case err == nil, refusedAs(err, http.StatusConflict, codeConnectionSuspended):
 		if err := a.endConnection(ctx, connection); err != nil {
 			return err
 		}

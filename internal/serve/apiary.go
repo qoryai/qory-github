@@ -91,6 +91,7 @@ const (
 	// connection, ends it, see [noteAnswer]. A 403 forbidden, a request outside the
 	// access key's rights, never ends a connection.
 	codeConnectionUnknown = "connection_unknown"
+	codeForbidden         = "forbidden"
 )
 
 // The tries of POST /v1/connections/disconnect that Qory Apiary answers 403, as it

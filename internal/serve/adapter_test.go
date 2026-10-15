@@ -1841,8 +1841,9 @@ func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
 
 // TestAPendingLinksLastListingDecidesIt lists a pending link past its connect return's
 // expiry and returnSkew more: a signed 204 makes it live; a 403 connection_unknown drops
-// it and logs it; a 409 connection_ended drops it; a 500, an answer not signed under the
-// pin, or a 403 with another code keeps it. Before that moment, a 403
+// it and logs it; a 409 connection_ended drops it; a 409 connection_suspended, which
+// says the connection was made, a 500, an answer not signed under the pin, or a 403
+// forbidden keeps it. Before that moment, a 403
 // connection_unknown keeps it.
 func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 	past := time.Now().Add(-returnSkew - time.Minute).Unix()
@@ -1853,13 +1854,14 @@ func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 		ret      int64
 		want     string
 	}{
-		"204":                    {0, "", false, past, linkLive},
-		"403 connection_unknown": {403, `{"error":"connection_unknown"}`, false, past, ""},
-		"409 connection_ended":   {409, `{"error":"connection_ended"}`, false, past, ""},
-		"500":                    {500, `{"error":"internal"}`, false, past, linkPending},
-		"not signed":             {0, "", true, past, linkPending},
-		"403 forbidden":          {403, `{"error":"forbidden"}`, false, past, linkPending},
-		"before the moment":      {403, `{"error":"connection_unknown"}`, false, time.Now().Add(returnFor).Unix(), linkPending},
+		"204":                      {0, "", false, past, linkLive},
+		"403 connection_unknown":   {403, `{"error":"connection_unknown"}`, false, past, ""},
+		"409 connection_ended":     {409, `{"error":"connection_ended"}`, false, past, ""},
+		"500":                      {500, `{"error":"internal"}`, false, past, linkPending},
+		"409 connection_suspended": {409, `{"error":"connection_suspended"}`, false, past, linkPending},
+		"not signed":               {0, "", true, past, linkPending},
+		"403 forbidden":            {403, `{"error":"forbidden"}`, false, past, linkPending},
+		"before the moment":        {403, `{"error":"connection_unknown"}`, false, time.Now().Add(returnFor).Unix(), linkPending},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: tc.ret})
@@ -1881,5 +1883,69 @@ func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 		if (err == nil) != (name == "204" || name == "403 connection_unknown") && name != "409 connection_ended" {
 			t.Errorf("%s: err %v", name, err)
 		}
+	}
+}
+
+// TestAReplacedConnectionAnsweredSuspendedIsEnded lists a connection a connect replaced
+// on the installation 42 while Qory Apiary answers its listing 409
+// connection_suspended, which it answers only for a connection made: the connection is
+// ended, POST /v1/connections/disconnect, and forgotten, and 42 stays linked to the
+// connection that replaced it.
+func TestAReplacedConnectionAnsweredSuspendedIsEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeCollections {
+			return 409, `{"error":"connection_suspended"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listFor(context.Background(), 42, otherConnection, false); err != nil {
+		t.Errorf("err %v", err)
+	}
+	if sent := w.apiary.sent(routeConnectionsDisconnect); len(sent) != 1 || sent[0].body["connection_id"] != otherConnection {
+		t.Errorf("disconnects %v", sent)
+	}
+	if _, ok, _ := replacedOf(w.st, otherConnection); ok {
+		t.Error("the replaced connection is kept")
+	}
+	if l, _, _ := linkOf(w.st, 42); l.Connection != testConnection || l.State != linkPending {
+		t.Errorf("the link %+v", l)
+	}
+	if !strings.Contains(w.log.String(), `"msg":"the replaced connection was made meanwhile, so it is disconnected","connection":"`+otherConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestTheContractsRefusalFixturesAreRead has Qory Apiary answer a listing with each of
+// the contract's refusal fixtures that serve reads, signed, and checks serve reads its
+// status and code. A fixture the contract's revision does not hold is skipped:
+// connection-unknown.json came after 6f182ad.
+func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status int
+		code   string
+	}{
+		"connection-unknown.json":    {403, codeConnectionUnknown},
+		"connection-ended.json":      {409, codeConnectionEnded},
+		"connection-suspended.json":  {409, codeConnectionSuspended},
+		"collection-not-linked.json": {409, codeCollectionNotLinked},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, err := fs.ReadFile(contracts.FS, "fixtures/adapter/refusal/"+name)
+			if errors.Is(err, fs.ErrNotExist) {
+				t.Skipf("the contract's revision has no %s", name)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			Link(w.st, 42, testConnection, linkLive)
+			w.apiary.refuse = func(string, int) (int, string) { return tc.status, string(b) }
+			if err := w.client.Items(context.Background(), widgetsItem()); !refusedAs(err, tc.status, tc.code) {
+				t.Errorf("err %v", err)
+			}
+		})
 	}
 }
