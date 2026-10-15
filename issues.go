@@ -10,25 +10,20 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 )
 
-// What Qory Apiary takes. It refuses a request that exceeds one of these and cuts
-// nothing, so the adapter never sends one that does: an item, a comment or a
-// collection that breaks one, in a listing or in a webhook's event, is skipped, and
-// logged by its ref, never by its text. Lengths are counted in characters, Unicode
-// code points. A request is at most contracts.MaxRequest bytes, and lists at most
-// maxPerBatch items, comments or collections.
-const (
-	maxTitle    = 1024
-	maxBody     = 65536
-	maxLabels   = 100
-	maxRef      = 200
-	maxURL      = 2048
-	maxPerBatch = 100
-)
+// Qory Apiary refuses a whole request when one field in it breaks the contract's
+// limits, [contractLimits], and cuts nothing, so the adapter never sends a field that
+// does. A text that is only too long is cut to the limit: a title, a body, a person's
+// name, a label, a reason and a collection's title. A label left empty is dropped, a
+// label the same as one before it is dropped, and the labels past the most an item has
+// are dropped. A field that cannot be cut into the contract, a ref, a URL, a target's
+// path or an empty title, skips its item, comment or collection, which is logged by
+// its ref, never by its text, and the rest are sent. A request is at most
+// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
+// collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -108,30 +103,65 @@ type (
 )
 
 // WebHost is the system an item's target names: the website of the API the client
-// reaches, github.com for GitHub's, and for a test the loopback host and port.
+// reaches, github.com for GitHub's, and for a test the loopback host. It is the host
+// lower-cased and without its port, as the contract's pattern for a system takes it.
 func (c Client) WebHost() string {
 	u, err := url.Parse(c.base())
 	if err != nil || u.Hostname() == APIHost {
 		return GitHost
 	}
-	return u.Host
+	h := strings.ToLower(u.Hostname())
+	if !contractLimits().system.MatchString(h) {
+		// CheckAPIURL admits only GitHub's API or a loopback host, and a loopback
+		// address such as ::1 does not fit the contract's pattern for a host name, so
+		// the system is localhost, which does and names the same machine.
+		return "localhost"
+	}
+	return h
 }
 
 // authorOf is who a user is on the wire: a bot is an automation, anyone else a person.
-// A user GitHub no longer has is its ghost.
+// The name is cut to the contract's limit. A user GitHub no longer has, or one without
+// a login, is its ghost.
 func authorOf(u *ghUser) contracts.Person {
-	if u == nil {
-		return contracts.Person{Name: "ghost", Kind: KindPerson}
+	p := contracts.Person{Kind: KindPerson}
+	if u != nil {
+		p.Name = cut(u.Login, contractLimits().name)
+		if u.Type == "Bot" {
+			p.Kind = KindAutomation
+		}
 	}
-	if u.Type == "Bot" {
-		return contracts.Person{Name: u.Login, Kind: KindAutomation}
+	if p.Name == "" {
+		p.Name = "ghost"
 	}
-	return contracts.Person{Name: u.Login, Kind: KindPerson}
+	return p
 }
 
-// collectionOf is a repository's issues as a collection, without a target.
+// collectionOf is a repository's issues as a collection, without a target, its title
+// cut to the contract's limit.
 func collectionOf(r ghRepo) contracts.Collection {
-	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: r.FullName}
+	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: cut(r.FullName, contractLimits().title)}
+}
+
+// labelsOf are an issue's labels as the contract takes them: each cut to the limit of a
+// label, an empty one dropped, one the same as a label before it dropped, and none past
+// the most labels an item has.
+func labelsOf(ls []ghLabel) []string {
+	lim := contractLimits()
+	labels := make([]string, 0, min(len(ls), lim.labels))
+	seen := make(map[string]bool, cap(labels))
+	for _, l := range ls {
+		if len(labels) == lim.labels {
+			break
+		}
+		name := cut(l.Name, lim.label)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		labels = append(labels, name)
+	}
+	return labels
 }
 
 // stateReasons words GitHub's reasons an issue is closed for.
@@ -144,6 +174,7 @@ func stateReason(state string, reason *string) *string {
 		return nil
 	}
 	if w, ok := stateReasons[*reason]; ok {
+		w = cut(w, contractLimits().stateReason)
 		return &w
 	}
 	return nil
@@ -161,10 +192,7 @@ func utc(s string) (string, bool) {
 // itemOf is an issue of the repository r as an item whose target is on system, or why
 // it is skipped.
 func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
-	labels := make([]string, 0, len(is.Labels))
-	for _, l := range is.Labels {
-		labels = append(labels, l.Name)
-	}
+	lim := contractLimits()
 	state := StateOpen
 	if is.State == StateClosed {
 		state = StateClosed
@@ -176,15 +204,15 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
 	it := contracts.Item{
 		Ref:          r.FullName + "#" + strconv.FormatInt(is.Number, 10),
 		URL:          is.HTMLURL,
-		Title:        is.Title,
-		Body:         body,
+		Title:        cut(is.Title, lim.title),
+		Body:         cut(body, lim.body),
 		BodyFormat:   FormatMarkdown,
 		Type:         "issue",
 		State:        state,
 		StateReason:  stateReason(state, is.StateReason),
-		Labels:       labels,
+		Labels:       labelsOf(is.Labels),
 		FiledBy:      authorOf(is.User),
-		CommentCount: is.Comments,
+		CommentCount: max(is.Comments, 0),
 		Target:       &contracts.Target{System: system, Path: r.FullName},
 	}
 	var ok1, ok2 bool
@@ -193,23 +221,20 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string) {
 	switch {
 	case !ok1 || !ok2:
 		return it, "a time is not RFC 3339"
-	case utf8.RuneCountInString(it.Title) < 1 || utf8.RuneCountInString(it.Title) > maxTitle:
-		return it, "its title is empty or longer than 1,024 characters"
-	case utf8.RuneCountInString(it.Body) > maxBody:
-		return it, "its body is longer than 65,536 characters"
-	case len(it.Labels) > maxLabels:
-		return it, "it has more than 100 labels"
+	case it.Title == "":
+		return it, "its title is empty"
 	}
 	if why := checkRef(it.Ref); why != "" {
 		return it, why
 	}
-	if why := checkRef(it.Target.Path); why != "" {
+	if why := checkPath(it.Target.Path); why != "" {
 		return it, why
 	}
 	return it, checkURL(it.URL)
 }
 
-// commentOf is a comment as the wire says it, or why it is skipped.
+// commentOf is a comment as the wire says it, its body cut to the contract's limit, or
+// why it is skipped.
 func commentOf(c ghComment) (contracts.Comment, string) {
 	body := ""
 	if c.Body != nil {
@@ -219,17 +244,14 @@ func commentOf(c ghComment) (contracts.Comment, string) {
 		Ref:        strconv.FormatInt(c.ID, 10),
 		URL:        c.HTMLURL,
 		Author:     authorOf(c.User),
-		Body:       body,
+		Body:       cut(body, contractLimits().body),
 		BodyFormat: FormatMarkdown,
 	}
 	var ok1, ok2 bool
 	sc.CreatedAt, ok1 = utc(c.CreatedAt)
 	sc.UpdatedAt, ok2 = utc(c.UpdatedAt)
-	switch {
-	case !ok1 || !ok2:
+	if !ok1 || !ok2 {
 		return sc, "a time is not RFC 3339"
-	case utf8.RuneCountInString(sc.Body) > maxBody:
-		return sc, "its body is longer than 65,536 characters"
 	}
 	if why := checkRef(sc.Ref); why != "" {
 		return sc, why
@@ -239,26 +261,38 @@ func commentOf(c ghComment) (contracts.Comment, string) {
 
 // checkCollection is why a collection is skipped, or "".
 func checkCollection(c contracts.Collection) string {
-	if n := utf8.RuneCountInString(c.Title); n < 1 || n > maxTitle {
-		return "its title is empty or longer than 1,024 characters"
+	if n := contractLimits().title; c.Title == "" || tooLong(c.Title, n) {
+		return fmt.Sprintf("its title is empty or longer than %d characters", n)
 	}
 	if why := checkRef(c.Ref); why != "" {
 		return why
+	}
+	if c.Target != nil {
+		if why := checkPath(c.Target.Path); why != "" {
+			return why
+		}
 	}
 	return checkURL(c.URL)
 }
 
 func checkRef(ref string) string {
-	if n := utf8.RuneCountInString(ref); n < 1 || n > maxRef {
-		return "a ref is empty or longer than 200 characters"
+	if n := contractLimits().ref; ref == "" || tooLong(ref, n) {
+		return fmt.Sprintf("a ref is empty or longer than %d characters", n)
+	}
+	return ""
+}
+
+func checkPath(path string) string {
+	if n := contractLimits().path; path == "" || tooLong(path, n) {
+		return fmt.Sprintf("its target's path is empty or longer than %d characters", n)
 	}
 	return ""
 }
 
 func checkURL(s string) string {
 	u, err := url.Parse(s)
-	if err != nil || u.Scheme != "https" || u.Host == "" || len(s) > maxURL {
-		return "its URL is not https or is longer than 2,048 characters"
+	if n := contractLimits().url; err != nil || u.Scheme != "https" || u.Host == "" || tooLong(s, n) {
+		return fmt.Sprintf("its URL is not https or is longer than %d characters", n)
 	}
 	return ""
 }
@@ -551,7 +585,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 				skipped = true
 				continue
 			}
-			if len(pending) == maxPerBatch || used+n+1 > contracts.MaxRequest {
+			if len(pending) == contractLimits().collections || used+n+1 > contracts.MaxRequest {
 				if err := send(ctx, false); err != nil {
 					return stop(err)
 				}
@@ -681,7 +715,7 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 				l.logf("skipped the item %s: %s", it.Ref, why)
 				continue
 			}
-			if len(pending) == maxPerBatch || used+n+1 > contracts.MaxRequest {
+			if len(pending) == contractLimits().items || used+n+1 > contracts.MaxRequest {
 				sent, err := send(ctx, false)
 				if err != nil {
 					return stop(err)
@@ -739,7 +773,7 @@ func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, ite
 					l.logf("skipped the comment %s on %s: %s", sc.Ref, x.item.Ref, why)
 					continue
 				}
-				if len(req.Comments) == maxPerBatch || used+n+1 > contracts.MaxRequest {
+				if len(req.Comments) == contractLimits().comments || used+n+1 > contracts.MaxRequest {
 					if err := l.Sink.Comments(ctx, req); err != nil {
 						return err
 					}

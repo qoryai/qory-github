@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 const (
@@ -81,6 +84,52 @@ type fakeApiary struct {
 	changes  []contracts.Change
 }
 
+// bodySchemas are the contract's schemas of the bodies Qory Apiary takes, by route,
+// compiled once: the fake checks every body it receives against its route's.
+var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
+	out := map[string]*jsonschema.Schema{}
+	for route, name := range map[string]string{
+		routeAdapter:     "adapter.schema.json",
+		routeCollections: "source-collections.schema.json",
+		routeItems:       "source-items.schema.json",
+		routeComments:    "source-item-comments.schema.json",
+		routeDisconnect:  "sources-disconnect.schema.json",
+	} {
+		s, err := contracts.Compile(name)
+		if err != nil {
+			panic(err)
+		}
+		out[route] = s
+	}
+	return out
+})
+
+// checkBody reports a body that breaks its route's schema in the contract.
+func checkBody(t *testing.T, route string, b []byte) {
+	t.Helper()
+	s := bodySchemas()[route]
+	if s == nil {
+		t.Errorf("%s: no schema of the contract takes a body there", route)
+		return
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
+	if err == nil {
+		err = s.Validate(doc)
+	}
+	if err != nil {
+		t.Errorf("%s: the body breaks the contract: %v", route, err)
+	}
+}
+
+// widgetsItem is a request that sends one item of acme/widgets, as the contract takes it.
+func widgetsItem() contracts.SourceItems {
+	return contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{{
+		Ref: "acme/widgets#1", URL: "https://github.com/acme/widgets/issues/1", Type: "issue", Title: "Widget 1 is broken",
+		BodyFormat: github.FormatMarkdown, FiledBy: contracts.Person{Name: "alice", Kind: github.KindPerson}, Labels: []string{},
+		State: github.StateOpen, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+	}}}
+}
+
 // timeShape is a time as the contract writes it.
 var timeShape = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`)
 
@@ -115,6 +164,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if tm, _ := got.body["time"].(string); !timeShape.MatchString(tm) {
 			f.t.Errorf("%s: the time is %q", r.URL.Path, tm)
 		}
+		checkBody(f.t, r.URL.Path, b)
 	} else if req.Timestamp == "" {
 		f.t.Errorf("%s: a GET without X-Qory-Timestamp", r.URL.Path)
 	}

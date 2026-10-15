@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 )
@@ -365,24 +366,21 @@ func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
 	}
 }
 
-// TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef lists issues and a comment that
-// each break a limit, and checks they are left out and logged by their ref alone.
+// TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef lists issues and a comment with
+// a field that cannot be cut into the contract, and checks they are left out, logged by
+// their ref alone, and the rest are sent.
 func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 	secret := "SECRETTEXT"
-	longBody, longTitle, manyLabels, httpURL := issue(2, 0), issue(3, 0), issue(4, 0), issue(5, 0)
-	longBody["body"] = secret + strings.Repeat("a", 65_536)
-	longTitle["title"] = secret + strings.Repeat("a", 1024)
-	var labels []any
-	for i := range 101 {
-		labels = append(labels, map[string]any{"name": "l" + strconv.Itoa(i)})
-	}
-	manyLabels["labels"] = labels
+	noTitle, httpURL := issue(3, 0), issue(5, 0)
+	noTitle["title"] = ""
+	noTitle["body"] = secret
 	httpURL["html_url"] = "http://github.com/acme/widgets/issues/5"
-	atLimit := issue(6, 0)
-	atLimit["body"] = strings.Repeat("ü", 65_536)
+	httpURL["body"] = secret
+	httpComment := comment(10, "bob", "User", secret)
+	httpComment["html_url"] = "http://github.com/acme/widgets/issues/1#issuecomment-10"
 	f := &fakeIssues{
-		issues:   []map[string]any{issue(1, 2), longBody, longTitle, manyLabels, httpURL, atLimit},
-		comments: map[int][]map[string]any{1: {comment(10, "bob", "User", secret+strings.Repeat("b", 65_536)), comment(11, "bob", "User", "fine")}},
+		issues:   []map[string]any{issue(1, 2), noTitle, httpURL, issue(6, 0)},
+		comments: map[int][]map[string]any{1: {httpComment, comment(11, "bob", "User", "fine")}},
 	}
 	s := &sink{}
 	var logs []string
@@ -398,14 +396,78 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 		t.Errorf("comments %+v", cs)
 	}
 	want := []string{
-		"skipped the item acme/widgets#2: its body is longer than 65,536 characters",
-		"skipped the item acme/widgets#3: its title is empty or longer than 1,024 characters",
-		"skipped the item acme/widgets#4: it has more than 100 labels",
-		"skipped the item acme/widgets#5: its URL is not https or is longer than 2,048 characters",
-		"skipped the comment 10 on acme/widgets#1: its body is longer than 65,536 characters",
+		"skipped the item acme/widgets#3: its title is empty",
+		"skipped the item acme/widgets#5: its URL is not https or is longer than 2048 characters",
+		"skipped the comment 10 on acme/widgets#1: its URL is not https or is longer than 2048 characters",
 	}
 	if !reflect.DeepEqual(logs, want) {
 		t.Errorf("logged\n%s", strings.Join(logs, "\n"))
+	}
+}
+
+// TestATextPastItsLimitIsCutToIt lists issues and a comment whose texts are longer than
+// the contract takes, and checks each is cut to its limit on a character's boundary,
+// labels left empty or the same as one before are dropped, the labels past 100 are
+// dropped, and nothing is skipped or logged.
+func TestATextPastItsLimitIsCutToIt(t *testing.T) {
+	longBody, longTitle, manyLabels, longName, atLimit := issue(2, 1), issue(3, 0), issue(4, 0), issue(5, 0), issue(6, 0)
+	longBody["body"] = strings.Repeat("ü", 70_000)
+	longTitle["title"] = strings.Repeat("ü", 1030)
+	labels := []any{
+		map[string]any{"name": strings.Repeat("a", 100) + "1"},
+		map[string]any{"name": ""},
+		map[string]any{"name": strings.Repeat("a", 100) + "2"},
+		map[string]any{"name": "b"},
+		map[string]any{"name": "b"},
+	}
+	for i := range 120 {
+		labels = append(labels, map[string]any{"name": "l" + strconv.Itoa(i)})
+	}
+	manyLabels["labels"] = labels
+	longName["user"] = map[string]any{"login": strings.Repeat("n", 300), "type": "User"}
+	atLimit["body"] = strings.Repeat("ü", 65_536)
+	f := &fakeIssues{
+		issues:   []map[string]any{longBody, longTitle, manyLabels, longName, atLimit},
+		comments: map[int][]map[string]any{2: {comment(20, strings.Repeat("m", 300), "Bot", strings.Repeat("c", 70_000))}},
+	}
+	s := &sink{}
+	var logs []string
+	if err := f.lister(t, s, &logs).ListIssues(context.Background(), widgets); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 0 {
+		t.Errorf("logged %v", logs)
+	}
+	items := s.items()
+	if len(items) != 1 || len(items[0].Items) != 5 {
+		t.Fatalf("items %+v", items)
+	}
+	got := items[0].Items
+	if got[0].Body != strings.Repeat("ü", 65_536) {
+		t.Errorf("body of %d characters", utf8.RuneCountInString(got[0].Body))
+	}
+	if got[1].Title != strings.Repeat("ü", 1024) {
+		t.Errorf("title of %d characters", utf8.RuneCountInString(got[1].Title))
+	}
+	want := []string{strings.Repeat("a", 100), "b"}
+	for i := range 98 {
+		want = append(want, "l"+strconv.Itoa(i))
+	}
+	if !reflect.DeepEqual(got[2].Labels, want) {
+		t.Errorf("labels %q", got[2].Labels)
+	}
+	if got[3].FiledBy != (contracts.Person{Name: strings.Repeat("n", 100), Kind: KindPerson}) {
+		t.Errorf("filed by %+v", got[3].FiledBy)
+	}
+	if got[4].Body != strings.Repeat("ü", 65_536) {
+		t.Errorf("a body at the limit is changed")
+	}
+	cs := s.comments()
+	if len(cs) != 1 || len(cs[0].Comments) != 1 {
+		t.Fatalf("comments %+v", cs)
+	}
+	if c := cs[0].Comments[0]; c.Body != strings.Repeat("c", 65_536) || c.Author != (contracts.Person{Name: strings.Repeat("m", 100), Kind: KindAutomation}) {
+		t.Errorf("comment of %d characters by %+v", utf8.RuneCountInString(c.Body), c.Author)
 	}
 }
 
@@ -491,7 +553,7 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	if err := l.ListRepositories(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	host := strings.TrimPrefix(f.srv.URL, "http://")
+	host := "127.0.0.1"
 	if len(s.reqs) != 1 {
 		t.Fatalf("requests %+v", s.reqs)
 	}
@@ -503,7 +565,7 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 {
 		t.Errorf("collections %+v", got)
 	}
-	if !reflect.DeepEqual(logs, []string{"skipped the collection acme/broken: its URL is not https or is longer than 2,048 characters"}) {
+	if !reflect.DeepEqual(logs, []string{"skipped the collection acme/broken: its URL is not https or is longer than 2048 characters"}) {
 		t.Errorf("logged %v", logs)
 	}
 	if strings.Join(f.requested(), " ") != "/installation/repositories?per_page=100 /installation/repositories?page=2&per_page=100 /installation/repositories?page=3&per_page=100" {
@@ -512,7 +574,7 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 }
 
 func TestTheTargetsSystemIsGitHubsWebsite(t *testing.T) {
-	for api, want := range map[string]string{"": "github.com", "https://api.github.com": "github.com", "https://api.github.com/": "github.com", "http://127.0.0.1:8080": "127.0.0.1:8080"} {
+	for api, want := range map[string]string{"": "github.com", "https://api.github.com": "github.com", "https://api.github.com/": "github.com", "http://127.0.0.1:8080": "127.0.0.1", "http://LocalHost:8080": "localhost", "http://[::1]:8080": "localhost"} {
 		if got := (Client{API: api}).WebHost(); got != want {
 			t.Errorf("%q: %s, want %s", api, got, want)
 		}
@@ -669,8 +731,8 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 	long := issue(1, 0)
 	long["body"] = strings.Repeat("a", 70_000)
 	got, _ := IssuesWebhook(event("edited", long, nil), "github.com", nil)
-	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "acme/widgets#1", Why: "its body is longer than 65,536 characters"}}) {
-		t.Errorf("long body: %+v", got.Skipped)
+	if len(got.Items) != 1 || len(got.Skipped) != 0 || got.Items[0].Items[0].Body != strings.Repeat("a", 65_536) {
+		t.Errorf("long body: %d requests, skipped %+v", len(got.Items), got.Skipped)
 	}
 	if _, err := IssuesWebhook([]byte("{"), "github.com", nil); err == nil {
 		t.Error("a payload that is not JSON is taken")
@@ -820,22 +882,23 @@ func TestCommentsGoInRequestsOfAHundred(t *testing.T) {
 }
 
 // TestAWebhooksEventHasTheListingsChecks sends events from a repository Qory Apiary
-// would refuse as a collection, and a deleted comment whose body was too long.
+// would refuse as a collection, and a comment whose body is too long, which is cut, and
+// deleted, which is sent without it.
 func TestAWebhooksEventHasTheListingsChecks(t *testing.T) {
 	bad := map[string]any{"repository": map[string]any{"full_name": "acme/widgets", "html_url": "http://github.com/acme/widgets"}}
 	got, _ := IssuesWebhook(event("opened", issue(1, 0), bad), "github.com", nil)
-	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "acme/widgets#1", Why: "its collection: its URL is not https or is longer than 2,048 characters"}}) {
+	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "acme/widgets#1", Why: "its collection: its URL is not https or is longer than 2048 characters"}}) {
 		t.Errorf("issues: %+v", got)
 	}
 	bad["comment"] = comment(5, "bob", "User", "c")
 	got, _ = IssueCommentWebhook(event("created", issue(1, 1), bad), "qory-test")
-	if len(got.Comments) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "5", Why: "its collection: its URL is not https or is longer than 2,048 characters"}}) {
+	if len(got.Comments) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "5", Why: "its collection: its URL is not https or is longer than 2048 characters"}}) {
 		t.Errorf("issue_comment: %+v", got)
 	}
 	long := comment(5, "bob", "User", strings.Repeat("a", 70_000))
 	got, _ = IssueCommentWebhook(event("edited", issue(1, 1), map[string]any{"comment": long}), "qory-test")
-	if len(got.Comments) != 0 || len(got.Skipped) != 1 {
-		t.Errorf("edited: %+v", got.Skipped)
+	if len(got.Comments) != 1 || len(got.Skipped) != 0 || got.Comments[0].Comments[0].Body != strings.Repeat("a", 65_536) {
+		t.Errorf("edited: %d requests, skipped %+v", len(got.Comments), got.Skipped)
 	}
 	got, _ = IssueCommentWebhook(event("deleted", issue(1, 1), map[string]any{"comment": long}), "qory-test")
 	if len(got.Comments) != 1 || len(got.Skipped) != 0 || got.Comments[0].Comments[0].Body != "" || !got.Comments[0].Comments[0].Deleted {

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -297,6 +298,56 @@ func TestTheFeedLinksACollectionAndFillsIt(t *testing.T) {
 	}
 }
 
+// TestTextsPastTheContractsLimitsReachQoryApiaryValid fills a collection from GitHub's
+// API on a loopback host and port, and delivers an event, whose issue has a label of 101
+// characters and a filer of 300, and whose comment has an author of 300, and checks
+// every body reaches Qory Apiary as the contract takes it: the fake checks each against
+// the contract's schema, and the texts are cut and the system is the host alone.
+func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if !strings.Contains(strings.TrimPrefix(w.gh.srv.URL, "http://"), ":") {
+		t.Fatalf("GitHub's API is at %s, without a port", w.gh.srv.URL)
+	}
+	is := ghIssue(1, 1)
+	is["labels"] = []any{map[string]any{"name": strings.Repeat("a", 101)}}
+	is["user"] = map[string]any{"login": strings.Repeat("n", 300), "type": "User"}
+	w.gh.issues = []map[string]any{is}
+	w.gh.comments[1] = []map[string]any{{
+		"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.",
+		"user": map[string]any{"login": strings.Repeat("m", 300), "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+	}}
+	Link(w.st, 42)
+	setReach(w.st, "acme/widgets", 42)
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ev := issueEvent(42, "acme/widgets", "edited")
+	ev["issue"] = is
+	w.deliver(t, "issues", guid1, ev)
+	items := w.apiary.sent(routeItems)
+	if len(items) != 2 {
+		t.Fatalf("%d items requests", len(items))
+	}
+	for _, sent := range items {
+		var req contracts.SourceItems
+		json.Unmarshal(sent.raw, &req)
+		it := req.Items[0]
+		if len(req.Items) != 1 || !reflect.DeepEqual(it.Labels, []string{strings.Repeat("a", 100)}) || it.FiledBy.Name != strings.Repeat("n", 100) || it.Target == nil || it.Target.System != "127.0.0.1" {
+			t.Errorf("sent %s", sent.raw)
+		}
+	}
+	comments := w.apiary.sent(routeComments)
+	if len(comments) != 1 {
+		t.Fatalf("%d comments requests", len(comments))
+	}
+	var req contracts.SourceItemComments
+	json.Unmarshal(comments[0].raw, &req)
+	if len(req.Comments) != 1 || req.Comments[0].Author.Name != strings.Repeat("m", 100) {
+		t.Errorf("sent %s", comments[0].raw)
+	}
+}
+
 // TestTheFeedTakesInAWorkItemOnceThroughAReplay reads a work item taken in, which
 // labels the issue and comments once, and reads the feed again from the start, which
 // posts no second comment; and stores the sync interval, clamped.
@@ -388,7 +439,7 @@ func TestAnAnswerNotSignedUnderThePinIsRefused(t *testing.T) {
 	w.apiary.signer = newKey(t)
 	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
 	linkCollection(w.st, "acme/widgets")
-	err := w.client.Items(context.Background(), contracts.SourceItems{Version: 1, CollectionRef: "acme/widgets", Items: []contracts.Item{}})
+	err := w.client.Items(context.Background(), widgetsItem())
 	if err == nil || IsPermanent(err) || !strings.Contains(err.Error(), "is not signed under a key of apiary_public_key") {
 		t.Errorf("err %v", err)
 	}
@@ -454,7 +505,7 @@ func TestQoryApiarysRefusals(t *testing.T) {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		linkCollection(w.st, "acme/widgets")
 		w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
-		err := w.client.Items(context.Background(), contracts.SourceItems{Version: 1, CollectionRef: "acme/widgets", Items: []contracts.Item{}})
+		err := w.client.Items(context.Background(), widgetsItem())
 		if err == nil || IsPermanent(err) != tc.permanent || IsHeld(err) != tc.held || !strings.Contains(err.Error(), strconv.Itoa(tc.status)) {
 			t.Errorf("%d %s: err %v", tc.status, tc.body, err)
 		}
