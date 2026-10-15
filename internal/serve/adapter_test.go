@@ -182,6 +182,234 @@ func TestRepositoriesRemovedAreDisconnected(t *testing.T) {
 	}
 }
 
+// lastListed are the refs of the collections the last listing sent Qory Apiary, one
+// part.
+func (w *wired) lastListed(t *testing.T) []string {
+	t.Helper()
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) == 0 {
+		t.Fatal("no listing is sent")
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[len(sent)-1].raw, &req)
+	if !req.Listing.Complete || req.Listing.Part != 1 {
+		t.Errorf("the listing is not complete in one part: %s", sent[len(sent)-1].raw)
+	}
+	var refs []string
+	for _, c := range req.Collections {
+		refs = append(refs, c.Ref)
+	}
+	return refs
+}
+
+// installed sets the repositories the fake GitHub lists for the installation 42.
+func (f *fakeGitHub) installed(repos ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos = repos
+}
+
+// repositoriesEvent is an installation_repositories event of the installation 42: action
+// with the repository selection selection, the repositories added and those removed.
+func repositoriesEvent(action, selection string, added, removed []string) map[string]any {
+	list := func(names []string) []any {
+		out := []any{}
+		for _, n := range names {
+			out = append(out, map[string]any{"full_name": n, "name": n[strings.Index(n, "/")+1:], "private": false})
+		}
+		return out
+	}
+	return map[string]any{
+		"action": action, "installation": map[string]any{"id": 42}, "repository_selection": selection,
+		"repositories_added": list(added), "repositories_removed": list(removed),
+	}
+}
+
+// disconnected are the disconnects Qory Apiary was sent, collection and reason, from the
+// one numbered from on, counted from 0.
+func (w *wired) disconnected(from int) []string {
+	var got []string
+	for _, r := range w.apiary.sent(routeDisconnect)[from:] {
+		got = append(got, r.body["collection_ref"].(string)+" "+r.body["reason"].(string))
+	}
+	return got
+}
+
+// TestASelectionSwitchedToAllRepositoriesIsListed switches an installation that GitHub
+// gave a selection of repositories to all of the account's, which GitHub delivers as
+// installation_repositories added, repository_selection all, with each repository the
+// installation now reaches beside the selection: the installation is listed again, the
+// new repositories in it, each kept as reached by the installation, and nothing is
+// disconnected.
+func TestASelectionSwitchedToAllRepositoriesIsListed(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	w.gh.installed("acme/widgets")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "selected", []string{"acme/widgets"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets"}) {
+		t.Fatalf("listed %v", got)
+	}
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("added", "all", []string{"acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}) {
+		t.Errorf("listed %v", got)
+	}
+	for _, ref := range []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"} {
+		if inst, ok, err := reachOf(w.st, ref); inst != 42 || !ok || err != nil {
+			t.Errorf("%s: %d %v %v", ref, inst, ok, err)
+		}
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if s := state(w.st, guid2); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+}
+
+// TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers switches an installation
+// on all of the account's repositories to a selection, which GitHub delivers as
+// installation_repositories removed, repository_selection selected, with each
+// repository left out: each is disconnected, removed, and forgotten, and the
+// installation is listed again with the selection alone.
+func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	w.gh.installed("acme/gadgets")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/widgets", "acme/tools", "acme/docs"}))
+	if got := w.disconnected(0); !slices.Equal(got, []string{"acme/widgets removed", "acme/tools removed", "acme/docs removed"}) {
+		t.Errorf("disconnected %v", got)
+	}
+	for _, ref := range []string{"acme/widgets", "acme/tools", "acme/docs"} {
+		if _, ok, _ := reachOf(w.st, ref); ok {
+			t.Errorf("%s: the removed repository's installation is kept", ref)
+		}
+	}
+	if inst, ok, _ := reachOf(w.st, "acme/gadgets"); inst != 42 || !ok {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/gadgets"}) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestRemovingARepositoryNeverKnownIsHarmless removes from the installation a
+// repository serve never listed: its disconnect is sent, which Qory Apiary takes as it
+// takes any, the delivery is done, and the repositories serve knows stay as they were.
+func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	setReach(w.st, "acme/widgets", 42)
+	setReach(w.st, "acme/gadgets", 42)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/never"}))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{"acme/never removed"}) {
+		t.Errorf("disconnected %v", got)
+	}
+	for _, ref := range []string{"acme/widgets", "acme/gadgets"} {
+		if inst, ok, _ := reachOf(w.st, ref); inst != 42 || !ok {
+			t.Errorf("%s: %d %v", ref, inst, ok)
+		}
+	}
+	if _, ok, _ := reachOf(w.st, "acme/never"); ok {
+		t.Error("acme/never is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets", "acme/gadgets"}) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas adds and removes
+// repositories in turn, a selection grown, switched to all and back to a selection, and
+// checks after each that the listing and the repositories kept are the installation's
+// and that each repository removed is disconnected once.
+func TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	guids := []string{guid1, guid2, guid3, "a4c5d6e7-1b2c-11ef-8f4b-0242ac120004", "b5d6e7f8-1c2d-11ef-8f4b-0242ac120005"}
+	for i, step := range []struct {
+		action, selection string
+		added, removed    []string
+		repos             []string
+		disconnected      []string
+	}{
+		{"added", "selected", []string{"acme/widgets"}, nil, []string{"acme/widgets"}, nil},
+		{"added", "selected", []string{"acme/gadgets"}, nil, []string{"acme/widgets", "acme/gadgets"}, nil},
+		{"removed", "selected", nil, []string{"acme/widgets"}, []string{"acme/gadgets"}, []string{"acme/widgets removed"}},
+		{"added", "all", []string{"acme/widgets", "acme/tools"}, nil, []string{"acme/widgets", "acme/gadgets", "acme/tools"}, nil},
+		{"removed", "selected", nil, []string{"acme/gadgets", "acme/tools"}, []string{"acme/widgets"}, []string{"acme/gadgets removed", "acme/tools removed"}},
+	} {
+		before := len(w.apiary.sent(routeDisconnect))
+		w.gh.installed(step.repos...)
+		w.deliver(t, "installation_repositories", guids[i], repositoriesEvent(step.action, step.selection, step.added, step.removed))
+		if got := w.lastListed(t); !slices.Equal(got, step.repos) {
+			t.Errorf("step %d: listed %v, want %v", i+1, got, step.repos)
+		}
+		if got := w.disconnected(before); !slices.Equal(got, step.disconnected) {
+			t.Errorf("step %d: disconnected %v, want %v", i+1, got, step.disconnected)
+		}
+		refs, _ := reachedBy(w.st, 42)
+		for i := range refs {
+			refs[i] = strings.ToLower(refs[i])
+		}
+		slices.Sort(refs)
+		want := slices.Sorted(slices.Values(step.repos))
+		if !slices.Equal(refs, want) {
+			t.Errorf("step %d: kept %v, want %v", i+1, refs, want)
+		}
+	}
+}
+
+// TestEveryTokenServeMintsIsNarrowedToItsStep lists an installation's repositories,
+// fills a collection and applies a work item's change, each step serve mints a token
+// for, and pins every mint: each names its permissions, since a mint that names none
+// is granted every permission the installation has, and none asks for one the App
+// holds for steps serve does not take with an installation token, so an App with more
+// permissions does not widen serve's tokens. The listing reads metadata alone, on every
+// repository; the fill reads issues and the change writes them, on one repository.
+func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets"}, nil))
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, "acme/widgets")
+	if err := w.adapter.fill(context.Background(), "acme/widgets"); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	want := []string{
+		`{"permissions":{"metadata":"read"}}`,
+		`{"permissions":{"issues":"read"},"repositories":["widgets"]}`,
+		`{"permissions":{"issues":"write"},"repositories":["widgets"]}`,
+	}
+	if !slices.Equal(mints, want) {
+		t.Errorf("mints\n%s\nwant\n%s", strings.Join(mints, "\n"), strings.Join(want, "\n"))
+	}
+	for _, m := range mints {
+		var body struct {
+			Permissions map[string]string `json:"permissions"`
+		}
+		if err := json.Unmarshal([]byte(m), &body); err != nil || len(body.Permissions) == 0 {
+			t.Errorf("a mint names no permission: %s", m)
+		}
+		for _, wider := range []string{"contents", "pull_requests", "actions", "checks", "administration", "members"} {
+			if _, ok := body.Permissions[wider]; ok {
+				t.Errorf("a mint asks for %s: %s", wider, m)
+			}
+		}
+	}
+}
+
 // TestAnInstallationSuspendedThenDeletedDisconnectsItsCollections suspends the
 // installation, which disconnects its collections paused, and deletes it, which
 // disconnects them ended and unlinks it; another installation's stay.

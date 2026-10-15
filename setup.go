@@ -140,14 +140,67 @@ const (
 // serveManifest changes the manifest m to the App serve needs, under serve's public
 // URL publicURL: public, so it can be installed on an account other than its owner's;
 // what Connect needs, see [ConnectManifest]; a webhook, active, at [WebhookPath], for
-// the events issues, issue_comment and workflow_run; and the permissions actions write,
-// issues write, contents read and metadata read, in place of those [Manifest] sets.
+// the events issues, issue_comment, workflow_run, pull_request and push; and, in place
+// of those [Manifest] sets, the permissions metadata read, issues write, members read,
+// contents write, pull_requests write, actions write, checks write and administration
+// read, which an installation approves once, when it is made. Each installation token
+// serve mints is narrowed to its step all the same, see [Client.MintListingToken] and
+// [Client.MintInstallationToken].
 func serveManifest(m map[string]any, publicURL string) {
 	ConnectManifest(m, publicURL)
 	m["public"] = true
 	m["hook_attributes"] = map[string]any{"url": publicURL + WebhookPath, "active": true}
-	m["default_events"] = []string{"issues", "issue_comment", "workflow_run"}
-	m["default_permissions"] = map[string]string{"actions": "write", "issues": "write", "contents": "read", "metadata": "read"}
+	m["default_events"] = []string{"issues", "issue_comment", "workflow_run", "pull_request", "push"}
+	m["default_permissions"] = map[string]string{
+		"metadata": "read", "issues": "write", "members": "read", "contents": "write",
+		"pull_requests": "write", "actions": "write", "checks": "write", "administration": "read",
+	}
+}
+
+// The kinds of GitHub account [Client.Account] answers, as GitHub names them.
+const (
+	AccountOrganization = "Organization"
+	AccountUser         = "User"
+)
+
+// ErrNoAccount is [Client.Account]'s error for a handle GitHub has no organisation or
+// user by.
+var ErrNoAccount = errors.New("GitHub has no organisation or user by the handle")
+
+// handleShape is a GitHub account's handle, 39 characters at most: ASCII letters and
+// digits, with single hyphens between them, never first or last.
+var handleShape = regexp.MustCompile(`^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`)
+
+// Account looks the account handle up with GitHub, GET /users/{handle} without a
+// token, and returns its login, as GitHub writes it, and its kind, [AccountOrganization]
+// or [AccountUser]. A handle not of GitHub's shape is never sent: it, GitHub's 404 and
+// an account of another kind are [ErrNoAccount]. Any other answer, or an API that
+// cannot be reached, is an error as every other request's.
+func (c Client) Account(ctx context.Context, handle string) (login, kind string, err error) {
+	if len(handle) > 39 || !handleShape.MatchString(handle) {
+		return "", "", ErrNoAccount
+	}
+	var got struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	}
+	if err := c.call(ctx, "looking up the GitHub account", http.MethodGet, "/users/"+url.PathEscape(handle), "", nil, http.StatusOK, &got); err != nil {
+		var answered *answerError
+		if errors.As(err, &answered) && answered.status == http.StatusNotFound {
+			return "", "", ErrNoAccount
+		}
+		return "", "", err
+	}
+	if got.Type != AccountOrganization && got.Type != AccountUser {
+		return "", "", ErrNoAccount
+	}
+	// GitHub writes the login as its account has it, which may differ from the handle
+	// in case alone; anything else is not the account asked for, and the handle stays.
+	login = handle
+	if strings.EqualFold(got.Login, handle) {
+		login = got.Login
+	}
+	return login, got.Type, nil
 }
 
 var codeShape = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
@@ -170,24 +223,8 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 // anything else it refuses a web URL [CheckWebURL] refuses and an API [CheckAPIURL]
 // refuses.
 func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) {
-	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
+	if err := s.Check(); err != nil {
 		return "", nil, err
-	}
-	if err := CheckAPIURL(s.Client.base()); err != nil {
-		return "", nil, err
-	}
-	if s.KeyFile == "" {
-		return "", nil, errors.New("no key file")
-	}
-	if _, err := os.Stat(s.KeyFile); err == nil {
-		return "", nil, fmt.Errorf("the key file %s exists; choose another or move it away", s.KeyFile)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", nil, fmt.Errorf("the key file: %w", err)
-	}
-	if s.PublicURL != "" {
-		if err := s.checkConnect(); err != nil {
-			return "", nil, err
-		}
 	}
 	web := webBase(s.Web)
 	state := randomHex()
@@ -261,6 +298,31 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 		}
 	}
 	return local + pagePath, done, nil
+}
+
+// Check refuses what [Setup.Start] refuses before it listens, so a caller refuses it
+// before it asks anything: a web URL [CheckWebURL] refuses, an API [CheckAPIURL]
+// refuses, no key file or one that exists, and with [Setup.PublicURL] what
+// [Setup.checkConnect] refuses. It creates, listens on and opens nothing.
+func (s Setup) Check() error {
+	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
+		return err
+	}
+	if err := CheckAPIURL(s.Client.base()); err != nil {
+		return err
+	}
+	if s.KeyFile == "" {
+		return errors.New("no key file")
+	}
+	if _, err := os.Stat(s.KeyFile); err == nil {
+		return fmt.Errorf("the key file %s exists; choose another or move it away", s.KeyFile)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the key file: %w", err)
+	}
+	if s.PublicURL != "" {
+		return s.checkConnect()
+	}
+	return nil
 }
 
 // afterApprovalTimeout is how long each call setup makes once the person has approved

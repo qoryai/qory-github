@@ -62,7 +62,8 @@ func (a *Adapter) log() *slog.Logger {
 }
 
 // Register registers the adapter's handlers: installation, installation_repositories,
-// issues and issue_comment. workflow_run has none yet, so its deliveries are done.
+// issues and issue_comment. workflow_run, pull_request and push have none yet, so their
+// deliveries are done.
 func (a *Adapter) Register(hs *Handlers) {
 	hs.HandleFunc("installation", a.linked(a.installation))
 	hs.HandleFunc("installation_repositories", a.linked(a.installationRepositories))

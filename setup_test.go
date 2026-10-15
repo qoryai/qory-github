@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -515,8 +516,8 @@ func TestTheManifestWithAPublicURLIsTheAppServeNeeds(t *testing.T) {
 	wait()
 	b, _ := json.Marshal(m)
 	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
-		`"default_events":["issues","issue_comment","workflow_run"],` +
-		`"default_permissions":{"actions":"write","contents":"read","issues":"write","metadata":"read"},` +
+		`"default_events":["issues","issue_comment","workflow_run","pull_request","push"],` +
+		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
 		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/github/webhook"},` +
 		`"name":"qory-github-test","public":true,"redirect_url":"` + origin(local) + `/callback","request_oauth_on_install":false,` +
 		`"setup_on_update":true,"setup_url":"https://qory-github.example.com/base/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
@@ -792,5 +793,73 @@ func TestEachCallAfterTheApprovalHasATimeout(t *testing.T) {
 	s = serveSetup(t.TempDir(), serve(t, &fakeGitHub{}))
 	if _, err := s.exchange(ctx, "abc"); err == nil || !strings.HasPrefix(err.Error(), "exchanging the code for the App: GitHub's API could not be reached: ") {
 		t.Errorf("a cancelled context: err %v", err)
+	}
+}
+
+// TestAnAccountIsLookedUpWithoutAToken looks handles up with a fake GitHub and pins
+// the answers: an organisation and a user by their login as GitHub writes it, and
+// ErrNoAccount for GitHub's 404 and for an account of another kind; a handle not of
+// GitHub's shape is never sent; any other answer is an error that says what failed.
+// No request carries a token.
+func TestAnAccountIsLookedUpWithoutAToken(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.EscapedPath())
+		if r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/users/ACME":
+			io.WriteString(w, `{"login":"acme","type":"Organization"}`)
+		case "/users/octocat":
+			io.WriteString(w, `{"login":"octocat","type":"User"}`)
+		case "/users/mona-bot":
+			io.WriteString(w, `{"login":"mona-bot","type":"Bot"}`)
+		case "/users/other":
+			io.WriteString(w, `{"login":"someone-else","type":"User"}`)
+		case "/users/down":
+			w.WriteHeader(http.StatusBadGateway)
+			io.WriteString(w, `{"message":"Bad Gateway"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		}
+	}))
+	defer srv.Close()
+	c := Client{API: srv.URL}
+	for _, tc := range []struct{ handle, login, kind string }{
+		{"ACME", "acme", AccountOrganization},
+		{"octocat", "octocat", AccountUser},
+		{"other", "other", AccountUser},
+	} {
+		login, kind, err := c.Account(context.Background(), tc.handle)
+		if login != tc.login || kind != tc.kind || err != nil {
+			t.Errorf("%s: %q %q %v", tc.handle, login, kind, err)
+		}
+	}
+	for _, handle := range []string{"nobody", "mona-bot"} {
+		if _, _, err := c.Account(context.Background(), handle); err != ErrNoAccount {
+			t.Errorf("%s: %v", handle, err)
+		}
+	}
+	paths = nil
+	for _, handle := range []string{"", "-acme", "acme-", "ac--me", "acme/x", "acme x", "../acme", "acme%2F", "\u00e9", strings.Repeat("a", 40)} {
+		if _, _, err := c.Account(context.Background(), handle); err != ErrNoAccount {
+			t.Errorf("%q: %v", handle, err)
+		}
+	}
+	if _, _, err := c.Account(context.Background(), strings.Repeat("a", 39)); err != ErrNoAccount || len(paths) != 1 {
+		t.Errorf("39 letters: %v, %v", err, paths)
+	}
+	if paths[0] != "GET /users/"+strings.Repeat("a", 39) {
+		t.Errorf("handles not of GitHub's shape were sent: %v", paths)
+	}
+	if _, _, err := c.Account(context.Background(), "down"); err == nil || err.Error() != "looking up the GitHub account: GitHub answered 502: Bad Gateway" {
+		t.Errorf("down: %v", err)
+	}
+	tr := &sentTransport{}
+	if _, _, err := (Client{API: "https://ghe.acme.example", HTTP: &http.Client{Transport: tr}}).Account(context.Background(), "acme"); err == nil || tr.sent {
+		t.Errorf("another API: %v, sent %v", err, tr.sent)
 	}
 }
