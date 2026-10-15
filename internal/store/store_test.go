@@ -182,6 +182,31 @@ func TestAValueIsKeptUnderItsNamespaceUntilItExpires(t *testing.T) {
 	}
 }
 
+func TestEachWalksANamespaceWithoutWhatExpired(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	s.Put("ns", "b", []byte("2"), 0)
+	s.Put("ns", "a", []byte("1"), 0)
+	s.Put("ns", "c", []byte("3"), time.Minute)
+	s.Put("other", "d", []byte("4"), 0)
+	c.Add(time.Minute)
+	var got []string
+	if err := s.Each("ns", func(k string, v []byte) error { got = append(got, k+"="+string(v)); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, " ") != "a=1 b=2" {
+		t.Errorf("walked %v", got)
+	}
+	stop := errors.New("stop")
+	n := 0
+	if err := s.Each("ns", func(string, []byte) error { n++; return stop }); err != stop || n != 1 {
+		t.Errorf("err %v after %d", err, n)
+	}
+	if err := s.Each("none", func(string, []byte) error { return stop }); err != nil {
+		t.Errorf("an empty namespace: %v", err)
+	}
+}
+
 func TestTheStoreIsOnlyItsOwners(t *testing.T) {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "state")

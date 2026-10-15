@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -75,6 +76,21 @@ func TestMintInstallationTokenRefusesBeforeAnythingIsSent(t *testing.T) {
 	}
 }
 
+// TestAMintGitHubRefusesForGoodWrapsErrMintRefused has GitHub answer the mint 404 and
+// 422, as for an installation gone or a repository it no longer reaches, and checks the
+// error wraps ErrMintRefused, and that a 401 or a 500 does not.
+func TestAMintGitHubRefusesForGoodWrapsErrMintRefused(t *testing.T) {
+	repos, _ := ParseRepositories("acme/widgets")
+	for status, want := range map[int]bool{404: true, 422: true, 401: false, 500: false} {
+		f := &fakeGitHub{accounts: map[int64]string{7: "acme"}, status: status}
+		c := serve(t, f)
+		_, err := c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"issues": "read"}})
+		if err == nil || errors.Is(err, ErrMintRefused) != want {
+			t.Errorf("%d: err %v", status, err)
+		}
+	}
+}
+
 // TestMintInstallationTokenChecksTheInstallationAndNeverSaysTheToken mints for an
 // installation of another account, which is refused before the mint, and with a mint
 // GitHub refuses, whose error carries no secret.
@@ -83,13 +99,37 @@ func TestMintInstallationTokenChecksTheInstallationAndNeverSaysTheToken(t *testi
 	f := &fakeGitHub{accounts: map[int64]string{7: "otherlogin"}}
 	c := serve(t, f)
 	_, err := c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"issues": "write"}})
-	if err != errNotTheOwners || f.mintPath != "" {
+	if err == nil || err.Error() != "GitHub refuses to mint the installation token: the installation is not the App's installation on the repositories' owner" || !errors.Is(err, ErrMintRefused) || f.mintPath != "" {
 		t.Errorf("err %v, minted at %q", err, f.mintPath)
 	}
 	f = &fakeGitHub{accounts: map[int64]string{7: "acme"}, status: 401}
 	c = serve(t, f)
 	_, err = c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"issues": "write"}})
 	if err == nil || err.Error() != "minting the installation token: GitHub answered 401: Bad credentials" {
+		t.Errorf("err %v", err)
+	}
+}
+
+// TestMintListingTokenAsksForMetadataAlone mints the token a listing of the
+// installation's repositories reads with, and checks the mint names no repository and
+// asks for metadata read alone, after the installation is checked.
+func TestMintListingTokenAsksForMetadataAlone(t *testing.T) {
+	f := &fakeGitHub{accounts: map[int64]string{7: "acme"}}
+	c := serve(t, f)
+	tok, err := c.MintListingToken(context.Background(), appID, key(t), 7)
+	if err != nil || tok.Token != fakeToken {
+		t.Fatalf("%v %v", tok, err)
+	}
+	got, _ := json.Marshal(f.mint)
+	if string(got) != `{"permissions":{"metadata":"read"}}` || strings.Join(f.checks, " ") != "/app/installations/7" {
+		t.Errorf("the mint requested %s, checks %v", got, f.checks)
+	}
+	for _, id := range []int64{0, -1} {
+		if _, err := c.MintListingToken(context.Background(), appID, key(t), id); err == nil {
+			t.Errorf("installation %d: no error", id)
+		}
+	}
+	if _, err := c.MintListingToken(context.Background(), appID, nil, 7); err == nil || err.Error() != "no private key" {
 		t.Errorf("err %v", err)
 	}
 }

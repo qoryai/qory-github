@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/hmac"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/ownerfile"
 	"github.com/qoryai/qory-github/internal/store"
 )
@@ -69,21 +72,58 @@ const (
 // period is over.
 const refusalEvery = time.Second
 
-// ReadWebhookSecret reads the App's webhook secret from a file that only its owner has
-// any permission on, as [github.ReadKeyFile] reads a key: the same checks, a bounded
-// read. One line break at the end of the file, \n or \r\n, is not part of the secret,
-// and a secret shorter than 16 bytes is refused. An error never contains the secret.
+// ReadWebhookSecret reads the App's webhook secret from the file webhook_secret_file
+// names, which only its owner may have any permission on, as [github.ReadKeyFile] reads
+// a key: the same checks, a bounded read. One line break at the end of the file, \n or
+// \r\n, is not part of the secret, and a secret shorter than 16 bytes is refused. An
+// error names the setting, never the path or the secret.
 func ReadWebhookSecret(path string) ([]byte, error) {
-	b, err := ownerfile.ReadFile(path, maxSecretFile, "the webhook secret file", "a webhook secret")
+	b, err := ownerfile.ReadNamed(path, maxSecretFile, "the file webhook_secret_file names", "a webhook secret")
 	if err != nil {
 		return nil, err
 	}
 	b = bytes.TrimSuffix(b, []byte("\n"))
 	b = bytes.TrimSuffix(b, []byte("\r"))
 	if len(b) < minSecret {
-		return nil, fmt.Errorf("the webhook secret in %s is shorter than %d bytes; set a longer random secret on the App and in the file", path, minSecret)
+		return nil, fmt.Errorf("the webhook secret in the file webhook_secret_file names is shorter than %d bytes; set a longer random secret on the App and in the file", minSecret)
 	}
 	return b, nil
+}
+
+// readKey reads the App's private key from the file private_key_file names, as
+// [github.ReadKeyFile] reads it, with an error that names the setting, never the path.
+func readKey(path string) (*rsa.PrivateKey, error) {
+	b, err := ownerfile.ReadNamed(path, github.MaxKeyFile, "the file private_key_file names", "a key")
+	if err != nil {
+		return nil, err
+	}
+	return github.ParseKey(b)
+}
+
+// maxAccessKeyFile is the most an access key secret file may hold; one byte more is
+// read to tell a larger file apart. A secret is 47 characters.
+const maxAccessKeyFile = 4 << 10
+
+// ReadAccessKeySecret reads the adapter's access key from a file that only its owner
+// has any permission on, as [ReadWebhookSecret] reads a secret: its secret, qak_ and 43
+// characters, and one line break at the end of the file, \n or \r\n, which is not part
+// of it. A published fixture key, whose secret anyone can read, is refused. An error
+// names the setting, access_key_secret_file, never the path or the secret.
+func ReadAccessKeySecret(path string) (*accesskey.Key, error) {
+	b, err := ownerfile.ReadNamed(path, maxAccessKeyFile, "the file access_key_secret_file names", "an access key secret")
+	if err != nil {
+		return nil, err
+	}
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	b = bytes.TrimSuffix(b, []byte("\r"))
+	k, err := accesskey.ParseSecret(string(b))
+	if err != nil {
+		return nil, fmt.Errorf("the file access_key_secret_file names: %w", err)
+	}
+	if k.PublicKey().Fixture() {
+		return nil, errors.New("the file access_key_secret_file names holds a published fixture key, whose secret anyone can read")
+	}
+	return k, nil
 }
 
 var (

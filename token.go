@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"net/http"
@@ -66,6 +67,44 @@ func (c Client) MintInstallationToken(ctx context.Context, req Request) (Install
 			return InstallationToken{}, fmt.Errorf("the permission %s is neither read nor write", name)
 		}
 	}
+	return c.mintFor(ctx, req)
+}
+
+// MintListingToken requests from GitHub a token for the installation installationID
+// that reads which repositories it reaches and nothing more: metadata read, on every
+// repository the installation reaches, which [Lister.ListRepositories] lists with it.
+// The installation is checked with GitHub first, as [Client.MintInstallationToken]
+// checks it. It keeps nothing.
+func (c Client) MintListingToken(ctx context.Context, appID string, key *rsa.PrivateKey, installationID int64) (InstallationToken, error) {
+	if err := CheckAPIURL(c.base()); err != nil {
+		return InstallationToken{}, err
+	}
+	if !appIDShape.MatchString(appID) {
+		return InstallationToken{}, errors.New("the App id is not an id, 1 to 64 letters, digits or dots")
+	}
+	if key == nil {
+		return InstallationToken{}, errors.New("no private key")
+	}
+	if installationID <= 0 {
+		return InstallationToken{}, errors.New("no installation; an installation token is one installation's")
+	}
+	return c.mintFor(ctx, Request{AppID: appID, Key: key, InstallationID: installationID, Permissions: map[string]string{"metadata": "read"}})
+}
+
+// ErrMintRefused is wrapped in the error of a mint GitHub refuses for good: the
+// installation is not the App's on the repositories' owner, or GitHub answers the mint
+// 404 or 422, as it answers for an installation gone or a repository it no longer
+// reaches, renamed or removed from it. Asking again does not change it.
+var ErrMintRefused = errors.New("GitHub refuses to mint the installation token")
+
+// errNotTheInstallation is [errNotTheOwners] for a token the adapter mints, whose
+// installation no setting names.
+var errNotTheInstallation = errors.New("the installation is not the App's installation on the repositories' owner")
+
+// mintFor mints the token req asks for, once its installation is checked: limited to
+// its repositories, or to none when it names none, and to its permissions. req is
+// checked already. A mint refused for good wraps [ErrMintRefused].
+func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, error) {
 	now := time.Now
 	if c.Now != nil {
 		now = c.Now
@@ -75,22 +114,31 @@ func (c Client) MintInstallationToken(ctx context.Context, req Request) (Install
 		return InstallationToken{}, err
 	}
 	if err := c.checkInstallation(ctx, jwt, req.InstallationID, req.Repositories); err != nil {
+		if err == errNotTheOwners {
+			err = fmt.Errorf("%w: %w", ErrMintRefused, errNotTheInstallation)
+		}
 		return InstallationToken{}, err
-	}
-	names := make([]string, len(req.Repositories))
-	for i, r := range req.Repositories {
-		names[i] = r.Name
 	}
 	var got struct {
 		Token     string `json:"token"`
 		ExpiresAt string `json:"expires_at"`
 	}
-	body := map[string]any{"repositories": names, "permissions": req.Permissions}
+	body := map[string]any{"permissions": req.Permissions}
+	if len(req.Repositories) > 0 {
+		names := make([]string, len(req.Repositories))
+		for i, r := range req.Repositories {
+			names[i] = r.Name
+		}
+		body["repositories"] = names
+	}
 	const minting = "minting the installation token"
 	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(req.InstallationID, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {
 		var answered *answerError
 		if errors.As(err, &answered) && answered.redirect() {
 			return InstallationToken{}, errMintRedirected
+		}
+		if errors.As(err, &answered) && (answered.status == http.StatusNotFound || answered.status == http.StatusUnprocessableEntity) {
+			err = fmt.Errorf("%w: %w", ErrMintRefused, err)
 		}
 		return InstallationToken{}, err
 	}

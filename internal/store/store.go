@@ -396,6 +396,25 @@ func (s *Store) Get(ns, key string) ([]byte, error) {
 	return out, err
 }
 
+// Each calls fn with each key in the namespace ns and its value, in the keys' order,
+// leaving out what has expired, and stops at fn's first error, which it returns. fn
+// must not call the store: the namespace is read in one transaction, held while fn runs.
+func (s *Store) Each(ns string, fn func(key string, value []byte) error) error {
+	now := s.now()
+	return s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(kvBucket).Bucket([]byte(ns))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			if expiredAt(v, now) {
+				return nil
+			}
+			return fn(string(k), append([]byte{}, v[8:]...))
+		})
+	})
+}
+
 // Delete drops the value under key in the namespace ns, if there is one.
 func (s *Store) Delete(ns, key string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {

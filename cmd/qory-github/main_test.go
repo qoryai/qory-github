@@ -27,6 +27,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/conformance"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
@@ -835,9 +836,9 @@ func TestServeIsPresentWithFactory(t *testing.T) {
 func TestServeRefusesSettingsItDoesNotKnow(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	file := filepath.Join(t.TempDir(), "serve.json")
-	os.WriteFile(file, []byte(`{"app_id":1,"private_key_file":"/k","webhook_secret_file":"/s","listen":":0","state_dir":"/d","api_url":"https://api.github.com"}`), 0o600)
+	os.WriteFile(file, []byte(`{"app_id":1,"private_key_file":"/k","webhook_secret_file":"/s","listen":":0","state_dir":"/d","github_url":"https://api.github.com"}`), 0o600)
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "api_url"`) || out.Len() != 0 {
+	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "github_url"`) || out.Len() != 0 {
 		t.Errorf("exit %d: %q", code, errs.String())
 	}
 }
@@ -849,7 +850,15 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	key, _ := keyFile(t)
 	secret := filepath.Join(dir, "secret")
 	os.WriteFile(secret, []byte("s3cr3t-0123456789abcdef\n"), 0o600)
-	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state")})
+	access, _ := accesskey.Generate()
+	server, _ := accesskey.Generate()
+	accessFile := filepath.Join(dir, "access-key")
+	os.WriteFile(accessFile, []byte(access.Secret()+"\n"), 0o600)
+	// Qory Apiary is a loopback port nothing listens on: serve serves all the same,
+	// and declares the adapter again after a wait.
+	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state"),
+		"app_slug": "qory-acme", "apiary_url": "http://127.0.0.1:1", "public_url": "https://qory-github.example.com", "access_key_id": "ak_0123456789abcdef",
+		"access_key_secret_file": accessFile, "apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": server.PublicKey().String()}}})
 	file := filepath.Join(dir, "serve.json")
 	os.WriteFile(file, settings, 0o600)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -867,7 +876,7 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	cancel()
 	select {
 	case code := <-done:
-		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") {
+		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") || strings.Contains(errs.String(), access.Secret()) {
 			t.Errorf("exit %d, stdout %q, stderr %s", code, out.String(), errs.String())
 		}
 	case <-time.After(10 * time.Second):

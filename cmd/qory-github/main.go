@@ -230,11 +230,15 @@ proxy in front terminates TLS.
 
 serve checks each delivery's signature with the App's webhook secret, keeps it in a
 store in the state directory and answers GitHub at once; it handles the delivery
-after. It runs until it is stopped with SIGINT or SIGTERM.
+after. For each installation linked to Qory Apiary it sends the repositories, issues
+and comments to Qory Apiary, and it reads Qory Apiary's change feed and writes on GitHub
+what the feed says. It runs until it is stopped with SIGINT or SIGTERM.
 
 The settings are one JSON document in FILE: app_id, private_key_file,
-webhook_secret_file, listen and state_dir. The private key and the webhook secret are
-each in a file only its owner may read.`,
+webhook_secret_file, listen, state_dir, app_slug, apiary_url, public_url,
+access_key_id, access_key_secret_file and apiary_public_key, and api_url, which may be
+left out for GitHub's API. The private key, the webhook secret and the access key's
+secret are each in a file only its owner may read.`,
 	example: `  qory-github serve --settings /etc/qory-github/serve.json`,
 }
 
@@ -377,7 +381,7 @@ func runServe(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	return serve.Run(ctx, s, serve.Options{Handlers: &serve.Handlers{}, Log: log})
+	return serve.Run(ctx, s, serve.Options{Log: log})
 }
 
 // setup creates the App with a person's approval in the browser, writes its key and
