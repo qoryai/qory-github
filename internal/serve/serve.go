@@ -81,7 +81,6 @@ func endedIn(st *store.Store, log *slog.Logger) func(connection string) {
 		case err != nil:
 			log.Error("dropping an ended connection", slog.String("connection", connection), slog.String("error", err.Error()))
 		case dropped:
-			// placeholder: wording waits for the user
 			log.Info("the connection ended in Qory Apiary, so its installation is no longer linked", slog.String("connection", connection))
 		}
 	}

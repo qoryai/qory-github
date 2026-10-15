@@ -51,6 +51,11 @@ type Adapter struct {
 	// the clock a fill's start is read from; nil is time.Now.
 	turns map[string]chan struct{}
 	now   func() time.Time
+	// installs are the installations' locks, see [Adapter.lockInstallation], by id.
+	// lockWaits, when set, is called each time a lock is held by another and its taker
+	// waits.
+	installs  map[int64]chan struct{}
+	lockWaits func(installation int64)
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most.
@@ -273,9 +278,61 @@ func (a *Adapter) listRepositories(ctx context.Context, installation int64) erro
 	return a.listConnection(ctx, installation, l.Connection)
 }
 
+// lockInstallation takes the installation's lock, waiting while another holds it until
+// ctx is done, and returns what gives it back, or ctx's error. A listing of the
+// installation and the change of its link that the listing's answer makes, [goLive],
+// hold it, and so does a connect from its first read of the link to its write, see
+// [Connect.link], so no answer to a listing lands between a connect's read and its
+// write. It is held across requests to GitHub and Qory Apiary, one installation's
+// alone.
+func (a *Adapter) lockInstallation(ctx context.Context, installation int64) (func(), error) {
+	a.mu.Lock()
+	if a.installs == nil {
+		a.installs = map[int64]chan struct{}{}
+	}
+	lock, ok := a.installs[installation]
+	if !ok {
+		lock = make(chan struct{}, 1)
+		a.installs[installation] = lock
+	}
+	waits := a.lockWaits
+	a.mu.Unlock()
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	default:
+	}
+	if waits != nil {
+		waits(installation)
+	}
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // listConnection sends Qory Apiary the repositories the installation reaches, as
-// collections of connection, see [reachSink].
+// collections of connection, see [reachSink], holding the installation's lock, and
+// only while the installation is linked to connection: once its link names another
+// connection, or none, it sends nothing.
 func (a *Adapter) listConnection(ctx context.Context, installation int64, connection string) error {
+	unlock, err := a.lockInstallation(ctx, installation)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	l, ok, err := linkOf(a.Store, installation)
+	if err != nil || !ok || l.Connection != connection {
+		return err
+	}
+	return a.listLocked(ctx, installation, connection)
+}
+
+// listLocked is [Adapter.listConnection] for a caller that holds the installation's
+// lock and has read its link.
+func (a *Adapter) listLocked(ctx context.Context, installation int64, connection string) error {
 	l := github.Lister{
 		Client:       a.GitHub,
 		Pacer:        a.pacer(installation),
@@ -316,7 +373,6 @@ func (a *Adapter) installation(ctx context.Context, d Delivery) error {
 		defer installMu.Unlock()
 		return dropInstallation(a.Store, d.InstallationID)
 	case "suspend":
-		// placeholder: wording waits for the user
 		a.log().Info("GitHub suspended the installation, so its link stays and it is read again later", slog.Int64("installation", d.InstallationID))
 	case "unsuspend":
 		return a.listRepositories(ctx, d.InstallationID)

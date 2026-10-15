@@ -50,29 +50,40 @@ const (
 )
 
 // link is what the store keeps of a linked installation: the connection in Qory Apiary,
-// ac_ and 16 characters, and the link's state, [linkPending] or [linkLive].
+// ac_ and 16 characters; the link's state, [linkPending] or [linkLive]; and when the
+// connect pass the link was made under expires, in Unix seconds, or 0 when no pass
+// made it. Qory Apiary issues a connection's passes in order, so the pass that expires
+// later is the newer, see [Connect.link].
 type link struct {
 	Connection string `json:"connection_id"`
 	State      string `json:"state"`
+	Pass       int64  `json:"pass_expires_at,omitempty"`
 }
 
 // connectionShape is a connection's id, the contract's pattern.
 var connectionShape = regexp.MustCompile(`^ac_[0-9a-hjkmnp-tv-z]{16}$`)
 
 // installMu orders the changes of the installations' links, each of which reads a link
-// before it writes it.
+// before it writes it. It is held for the store's reads and writes alone, never across
+// a request: a listing and the link it decides on take the installation's lock, see
+// [Adapter.lockInstallation].
 var installMu sync.Mutex
 
 // Link links the installation to the connection, in state, so its deliveries are
 // handled.
 func Link(st *store.Store, installation int64, connection, state string) error {
+	return putLink(st, installation, link{Connection: connection, State: state})
+}
+
+// putLink keeps the installation's link l.
+func putLink(st *store.Store, installation int64, l link) error {
 	if installation <= 0 {
 		return errors.New("an installation's id is positive")
 	}
-	if !connectionShape.MatchString(connection) || (state != linkPending && state != linkLive) {
+	if !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 {
 		return errors.New("a link names a connection and is pending or live")
 	}
-	b, err := json.Marshal(link{Connection: connection, State: state})
+	b, err := json.Marshal(l)
 	if err != nil {
 		return err
 	}
@@ -103,14 +114,15 @@ func linkOf(st *store.Store, installation int64) (link, bool, error) {
 		return link{}, false, err
 	}
 	var l link
-	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) {
+	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 {
 		return link{}, false, errors.New("the store's entry for an installation is not one")
 	}
 	return l, true, nil
 }
 
 // goLive marks the installation's link live when it is pending and names connection, as
-// Qory Apiary's signed 204 to a listing that names connection says.
+// Qory Apiary's signed 204 to a listing that names connection says. A link that names
+// another connection stays as it is.
 func goLive(st *store.Store, installation int64, connection string) error {
 	installMu.Lock()
 	defer installMu.Unlock()
@@ -118,7 +130,23 @@ func goLive(st *store.Store, installation int64, connection string) error {
 	if err != nil || !ok || l.Connection != connection || l.State == linkLive {
 		return err
 	}
-	return Link(st, installation, connection, linkLive)
+	l.State = linkLive
+	return putLink(st, installation, l)
+}
+
+// linkedTo are the installations whose links name connection.
+func linkedTo(st *store.Store, connection string) ([]int64, error) {
+	var installations []int64
+	err := st.Each(nsInstallations, func(key string, v []byte) error {
+		var l link
+		if json.Unmarshal(v, &l) == nil && l.Connection == connection {
+			if id, err := strconv.ParseInt(key, 10, 64); err == nil && id > 0 {
+				installations = append(installations, id)
+			}
+		}
+		return nil
+	})
+	return installations, err
 }
 
 // connectionOf is the connection of the collection ref: that of the link of the
@@ -141,16 +169,7 @@ func connectionOf(st *store.Store, ref string) (string, error) {
 // about a connection that a new connect has replaced since drops nothing. It says
 // whether it dropped a link.
 func dropConnection(st *store.Store, connection string) (bool, error) {
-	var installations []int64
-	err := st.Each(nsInstallations, func(key string, v []byte) error {
-		var l link
-		if json.Unmarshal(v, &l) == nil && l.Connection == connection {
-			if id, err := strconv.ParseInt(key, 10, 64); err == nil && id > 0 {
-				installations = append(installations, id)
-			}
-		}
-		return nil
-	})
+	installations, err := linkedTo(st, connection)
 	if err != nil {
 		return false, err
 	}

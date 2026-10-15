@@ -407,7 +407,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The installation no longer reaches acme/old.
 		w.WriteHeader(422)
 		io.WriteString(w, `{"message":"There is at least one repository that does not exist or is not accessible to the parent installation."}`)
-	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens":
+	case r.Method == "POST" && (r.URL.Path == "/app/installations/42/access_tokens" || r.URL.Path == "/app/installations/9/access_tokens"):
 		f.mints = append(f.mints, string(b))
 		w.WriteHeader(201)
 		io.WriteString(w, `{"token":"`+ghToken+`","expires_at":"2099-01-01T00:00:00Z"}`)
