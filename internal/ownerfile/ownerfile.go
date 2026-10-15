@@ -1,6 +1,7 @@
-// Package ownerfile opens the files and directories qory-github keeps a secret in, or
-// reads one from: a private key, a webhook secret, the local store. Each must be the
-// user's that qory-github runs as, and grant group and others no permission.
+// Package ownerfile opens the files and directories the program, qory-github or
+// qory-github-server, keeps a secret in, or reads one from: a private key, a webhook
+// secret, the local store. Each must be the user's that the program runs as, and grant
+// group and others no permission.
 package ownerfile
 
 import (
@@ -13,6 +14,11 @@ import (
 	"strings"
 	"syscall"
 )
+
+// Program is the program's name, which an error about a file that belongs to another
+// user names: qory-github unless the program sets its name at start, as
+// qory-github-server does.
+var Program = "qory-github"
 
 // Open opens the file at path with flag and, when it creates the file, perm, never
 // through a symbolic link and without waiting on a pipe, and checks what it opened: a
@@ -163,7 +169,7 @@ func owned(info fs.FileInfo, subject, mode string) error {
 		return fmt.Errorf("%s is %s: group or others have permissions on it; make it %s", subject, info.Mode().Perm(), mode)
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
-		return fmt.Errorf("%s belongs to another user than the one qory-github runs as", subject)
+		return fmt.Errorf("%s belongs to another user than the one %s runs as", subject, Program)
 	}
 	return nil
 }

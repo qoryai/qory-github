@@ -8,14 +8,17 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github/internal/ownerfile"
 )
 
 // keyFile is the App's private key, in a file only its owner reads.
@@ -164,4 +167,20 @@ func (l *lockedBuffer) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.b.String()
+}
+
+// othersFile is a file's info as Stat gives it, 0600 and another user's.
+type othersFile struct{ fs.FileInfo }
+
+func (othersFile) Mode() fs.FileMode { return 0o600 }
+func (othersFile) Sys() any          { return &syscall.Stat_t{Uid: uint32(os.Geteuid() + 1)} }
+
+// TestAnotherUsersFileNamesQoryGithubServer pins that a secret file or the store that
+// belongs to another user is refused with an error that names the program running,
+// qory-github-server.
+func TestAnotherUsersFileNamesQoryGithubServer(t *testing.T) {
+	err := ownerfile.Check(othersFile{}, "the store /var/lib/qory-github/qory-github.db")
+	if want := "the store /var/lib/qory-github/qory-github.db belongs to another user than the one qory-github-server runs as"; err == nil || err.Error() != want {
+		t.Errorf("err %v, want %q", err, want)
+	}
 }

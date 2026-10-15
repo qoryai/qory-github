@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/qoryai/qory-github/internal/cli"
+	"github.com/qoryai/qory-github/internal/ownerfile"
 	"github.com/qoryai/qory-github/internal/serve"
 )
 
@@ -36,7 +37,11 @@ func main() {
 // built from, see [cli.ProgramVersion].
 var version string
 
-func init() { version = cli.ProgramVersion(version, debug.ReadBuildInfo) }
+// init sets the program's version, and its name in the errors of [ownerfile].
+func init() {
+	version = cli.ProgramVersion(version, debug.ReadBuildInfo)
+	ownerfile.Program = "qory-github-server"
+}
 
 // usage is what the program prints when it is run without a command it knows. Its
 // commands are listed only where QORY_FEATURES names factory, see [cli.Factory].

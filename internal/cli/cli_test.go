@@ -92,8 +92,8 @@ func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
 }
 
 // TestFactory pins how QORY_FEATURES is read: factory is on where a list of features
-// names it, and off where the variable is unset, blank, all or all-…, or where the list
-// names all or all-… among its features.
+// names it, and off where the variable is unset, blank, all, or all- followed by the
+// features left out, or where the list names all or all- and more among its features.
 func TestFactory(t *testing.T) {
 	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
 		t.Setenv("QORY_FEATURES", features)

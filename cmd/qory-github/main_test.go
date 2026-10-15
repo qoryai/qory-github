@@ -28,6 +28,7 @@ import (
 
 	"github.com/qoryai/integrations/conformance"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/ownerfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -949,5 +950,20 @@ func TestSetupSaysAfterItsOutputThatTheClientSecretIsNotKept(t *testing.T) {
 	}
 	if _, err := os.Stat(file); err != nil {
 		t.Errorf("the key: %v", err)
+	}
+}
+
+// othersFile is a file's info as Stat gives it, 0600 and another user's.
+type othersFile struct{ fs.FileInfo }
+
+func (othersFile) Mode() fs.FileMode { return 0o600 }
+func (othersFile) Sys() any          { return &syscall.Stat_t{Uid: uint32(os.Geteuid() + 1)} }
+
+// TestAnotherUsersFileNamesQoryGithub pins that a key file that belongs to another user
+// is refused with an error that names qory-github, as it did before qory-github-server.
+func TestAnotherUsersFileNamesQoryGithub(t *testing.T) {
+	err := ownerfile.Check(othersFile{}, "the private key file /k.pem")
+	if want := "the private key file /k.pem belongs to another user than the one qory-github runs as"; err == nil || err.Error() != want {
+		t.Errorf("err %v, want %q", err, want)
 	}
 }

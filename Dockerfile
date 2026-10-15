@@ -22,7 +22,10 @@
 #
 #   chown 65532:65532 FILE && chmod 0600 FILE   # for each secret file
 #
-# or run the container with --user set to the uid and gid that own the files. A volume
+# or run the container with --user set to the uid and gid that own the files. The state
+# directory must then belong to that uid too: the image's /var/lib/qory-github is
+# 65532's, and serve refuses a state directory that belongs to another user, so mount
+# there, or at the settings' state_dir, a directory that uid owns, 0700. A volume
 # mechanism that adds group permission to the files it mounts, such as Kubernetes'
 # fsGroup, makes serve refuse them.
 #
