@@ -592,12 +592,14 @@ func (p *pages) read(path string) error {
 }
 
 // A listing reads GitHub's pages by number, and a page's contents shift when an
-// earlier one loses an entry, so a listing can miss one. A listing of issues or of an
-// issue's comments never says it is complete, then: it adds and updates what it sees,
-// never closes or drops what it does not, and closing and deleting come from webhooks'
-// events alone. The one exception is a listing of the installation's repositories that
-// GitHub answers with one page and that skips none, which nothing can shift; see
-// [Lister.ListRepositories].
+// earlier one loses an entry, so a listing can miss one. [Lister.ListIssues] and the
+// listings of an issue's comments never say they are complete, then: they add and
+// update what they see, never close or drop what they do not, and closing and deleting
+// come from webhooks' events alone. Two listings do say it: a listing of the
+// installation's repositories that GitHub answers with one page and that skips none,
+// which nothing can shift, see [Lister.ListRepositories]; and the listing of open
+// issues by GraphQL's cursor, which does not skip one, see
+// [Lister.ListOpenIssuesComplete].
 
 // listingEnd is how long the request that ends a listing stopped early may take,
 // even when the listing stopped because its context is done.
@@ -753,85 +755,134 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if why := checkCollection(coll); why != "" {
 		return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
 	}
-	system := l.Client.WebHost()
-	var pending []listed
-	ended := false
-	send := func(ctx context.Context, last bool) ([]listed, error) {
-		if len(pending) == 0 {
-			ended = last
-			return nil, nil
-		}
-		listing.Part++
-		part := listing
-		req := contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: make([]contracts.Item, 0, len(pending)), Listing: &part}
-		for _, x := range pending {
-			req.Items = append(req.Items, x.item)
-		}
-		sent := pending
-		pending = nil
-		if err := l.Sink.Items(ctx, req); err != nil {
-			return nil, err
-		}
-		ended = last
-		return sent, nil
-	}
-	envelope := sized(contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: []contracts.Item{}, Listing: &contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
-	used := envelope
-	stop := func(err error) error {
-		if ended {
-			return err
-		}
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
-		defer cancel()
-		_, end := send(ctx, false)
-		return errors.Join(err, end)
-	}
+	o := l.openParts(p, repo, listing, coll)
 	what := "listing the issues of " + repo.String()
 	read := pages{what: what, max: maxIssuePages}
 	path := "/repos/" + repo.String() + "/issues?state=all&sort=created&direction=asc&per_page=100"
 	for path != "" {
 		if err := read.read(path); err != nil {
-			return stop(err)
+			return o.stop(ctx, err)
 		}
 		var page []ghIssue
 		next, err := l.get(ctx, p, what, path, &page)
 		if err != nil {
-			return stop(repositoryGone(err))
+			return o.stop(ctx, repositoryGone(err))
 		}
 		for _, is := range page {
 			if is.PullRequest != nil || is.State != StateOpen {
 				continue
 			}
-			it, why, cuts := itemOf(system, r, is)
-			n := size(it)
-			if why == "" && envelope+n > contracts.MaxRequest {
-				why = "it is larger than a request may be"
+			if err := o.add(ctx, r, is); err != nil {
+				return o.stop(ctx, err)
 			}
-			if why != "" {
-				l.logf("skipped the item %s: %s", it.Ref, why)
-				continue
-			}
-			l.logCuts(cuts)
-			if len(pending) == contractLimits().items || used+n+1 > contracts.MaxRequest {
-				sent, err := send(ctx, false)
-				if err != nil {
-					return stop(err)
-				}
-				used = envelope
-				if err := l.listComments(ctx, p, repo, sent); err != nil {
-					return stop(err)
-				}
-			}
-			pending = append(pending, listed{item: it, number: is.Number, comments: is.Comments})
-			used += n + 1
 		}
 		path = next
 	}
-	sent, err := send(ctx, true)
-	if err != nil {
-		return stop(err)
+	return o.end(ctx, false)
+}
+
+// openParts sends the open issues a listing reads to Qory Apiary, in parts of at most
+// 100 items and 1 MiB, and after each part the comments of its items; see
+// [Lister.ListIssues].
+type openParts struct {
+	l       Lister
+	p       *Pacer
+	repo    Repository
+	system  string
+	listing contracts.Listing
+	coll    contracts.Collection
+	pending []listed
+	// envelope is the size of a part without items, and used the size of the part
+	// pending.
+	envelope, used int
+	// ended is whether the last part is sent, or there was none to send.
+	ended bool
+	// skipped is whether an item was left out, which a listing that says it is complete
+	// never does, since Qory Apiary would close it.
+	skipped bool
+}
+
+// openParts starts sending the parts of listing, the open issues of repo, the
+// collection coll.
+func (l Lister) openParts(p *Pacer, repo Repository, listing contracts.Listing, coll contracts.Collection) *openParts {
+	o := &openParts{l: l, p: p, repo: repo, system: l.Client.WebHost(), listing: listing, coll: coll}
+	o.envelope = sized(contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: []contracts.Item{}, Listing: &contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	o.used = o.envelope
+	return o
+}
+
+// add adds the open issue is of the repository r to the part pending, or skips and
+// logs it. A part that is full first goes, with its items' comments.
+func (o *openParts) add(ctx context.Context, r ghRepo, is ghIssue) error {
+	it, why, cuts := itemOf(o.system, r, is)
+	n := size(it)
+	if why == "" && o.envelope+n > contracts.MaxRequest {
+		why = "it is larger than a request may be"
 	}
-	return l.listComments(ctx, p, repo, sent)
+	if why != "" {
+		o.l.logf("skipped the item %s: %s", it.Ref, why)
+		o.skipped = true
+		return nil
+	}
+	o.l.logCuts(cuts)
+	if len(o.pending) == contractLimits().items || o.used+n+1 > contracts.MaxRequest {
+		sent, err := o.send(ctx, false, false)
+		if err != nil {
+			return err
+		}
+		if err := o.l.listComments(ctx, o.p, o.repo, sent); err != nil {
+			return err
+		}
+	}
+	o.pending = append(o.pending, listed{item: it, number: is.Number, comments: is.Comments})
+	o.used += n + 1
+	return nil
+}
+
+// send sends the part pending, which complete says is the complete listing's last, and
+// returns its items. last marks the listing's last part. Nothing pending sends nothing,
+// since the contract refuses a part without items.
+func (o *openParts) send(ctx context.Context, last, complete bool) ([]listed, error) {
+	if len(o.pending) == 0 {
+		o.ended = last
+		return nil, nil
+	}
+	o.listing.Part++
+	part := o.listing
+	part.Complete = complete
+	req := contracts.SourceItems{Version: contracts.Version, CollectionRef: o.coll.Ref, Items: make([]contracts.Item, 0, len(o.pending)), Listing: &part}
+	for _, x := range o.pending {
+		req.Items = append(req.Items, x.item)
+	}
+	sent := o.pending
+	o.pending, o.used = nil, o.envelope
+	if err := o.l.Sink.Items(ctx, req); err != nil {
+		return nil, err
+	}
+	o.ended = last
+	return sent, nil
+}
+
+// end sends the last part, which says the listing is complete when complete does, and
+// then its items' comments.
+func (o *openParts) end(ctx context.Context, complete bool) error {
+	sent, err := o.send(ctx, true, complete)
+	if err != nil {
+		return o.stop(ctx, err)
+	}
+	return o.l.listComments(ctx, o.p, o.repo, sent)
+}
+
+// stop ends a listing stopped early by err: the items read and not sent go as its last
+// part, which never says it is complete, even once ctx is done.
+func (o *openParts) stop(ctx context.Context, err error) error {
+	if o.ended {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
+	defer cancel()
+	_, end := o.send(ctx, false, false)
+	return errors.Join(err, end)
 }
 
 // listComments reads and sends the comments of the items that have any. An item's
