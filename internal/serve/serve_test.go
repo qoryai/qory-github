@@ -163,6 +163,77 @@ func TestADeliveryWithoutTheSignatureIsRefusedAndNothingIsKept(t *testing.T) {
 	}
 }
 
+func TestAnEventWithDigitsIsTaken(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st}
+	body := `{"action":"v2_edited","installation":{"id":42}}`
+	for i, event := range []string{"projects_v2", "projects_v2_item", "projects_v2_status_update", "a" + strings.Repeat("b", 63)} {
+		guid := fmt.Sprintf("72d3162e-cc78-11e3-81ab-4c9367dc%04d", i)
+		if w := post(rc.Mux(), event, guid, body, sign(body)); w.Code != http.StatusAccepted {
+			t.Errorf("%s: status %d: %s", event, w.Code, w.Body)
+		}
+		if d, err := st.Lookup(guid); err != nil || d.Event != event || d.Action != "v2_edited" {
+			t.Errorf("%s: %+v %v", event, d, err)
+		}
+	}
+}
+
+func TestABodyBeyondTheReadingBoundIsRefusedUnread(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxReading: 2}
+	rc.init()
+	// Two bodies are being read.
+	rc.reading <- struct{}{}
+	rc.reading <- struct{}{}
+	read := false
+	r := httptest.NewRequest(http.MethodPost, WebhookPath, readerFunc(func(p []byte) (int, error) {
+		read = true
+		return 0, io.EOF
+	}))
+	r.Header.Set("X-GitHub-Event", "issues")
+	r.Header.Set("X-GitHub-Delivery", guid1)
+	r.Header.Set("X-Hub-Signature-256", sign(body1))
+	w := httptest.NewRecorder()
+	rc.Mux().ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable || read {
+		t.Errorf("status %d, body read %v", w.Code, read)
+	}
+	if p := pending(t, st); len(p) != 0 {
+		t.Errorf("kept %+v", p)
+	}
+	// Once a read is over, a delivery is taken again.
+	<-rc.reading
+	if w := post(rc.Mux(), "issues", guid1, body1, sign(body1)); w.Code != http.StatusAccepted {
+		t.Errorf("status %d", w.Code)
+	}
+}
+
+// readerFunc is a function that is an [io.Reader].
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestRefusalsAreLoggedOnceASecond(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	var log syncBuffer
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: slog.New(slog.NewJSONHandler(&log, nil)), now: func() time.Time { return now }}
+	for range 5 {
+		if w := post(rc.Mux(), "issues", guid1, body1, ""); w.Code != http.StatusUnauthorized {
+			t.Fatalf("status %d", w.Code)
+		}
+	}
+	if n := strings.Count(log.String(), `"outcome":"refused"`); n != 1 {
+		t.Errorf("%d lines in a second:\n%s", n, log.String())
+	}
+	now = now.Add(time.Second)
+	post(rc.Mux(), "issues", guid1, body1, "")
+	lines := strings.Split(strings.TrimSpace(log.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[1], `"refusals_dropped":4`) {
+		t.Errorf("the log:\n%s", log.String())
+	}
+}
+
 func TestADeliveryLargerThanTheCapIsRefused(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
 	rc := &Receiver{Secret: []byte(secret), Store: st}
@@ -195,13 +266,17 @@ func TestADeliveryWithoutItsHeadersOrJSONIsRefused(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
 	rc := &Receiver{Secret: []byte(secret), Store: st}
 	for name, tc := range map[string]struct{ event, guid, body string }{
-		"no event":        {"", guid1, body1},
-		"no GUID":         {"issues", "", body1},
-		"a GUID too long": {"issues", guid1 + "0", body1},
-		"not a GUID":      {"issues", "not-a-guid", body1},
-		"an odd event":    {"Issues\n", guid1, body1},
-		"not JSON":        {"issues", guid1, "payload=%7B%7D"},
-		"a JSON array":    {"issues", guid1, "[]"},
+		"no event":            {"", guid1, body1},
+		"no GUID":             {"issues", "", body1},
+		"a GUID too long":     {"issues", guid1 + "0", body1},
+		"not a GUID":          {"issues", "not-a-guid", body1},
+		"an odd event":        {"Issues\n", guid1, body1},
+		"an upper-case event": {"Issues", guid1, body1},
+		"a leading digit":     {"2fa", guid1, body1},
+		"a hyphen":            {"pull-request", guid1, body1},
+		"an event too long":   {"a" + strings.Repeat("b", 64), guid1, body1},
+		"not JSON":            {"issues", guid1, "payload=%7B%7D"},
+		"a JSON array":        {"issues", guid1, "[]"},
 	} {
 		if w := post(rc.Mux(), tc.event, tc.guid, tc.body, sign(tc.body)); w.Code != http.StatusBadRequest {
 			t.Errorf("%s: status %d", name, w.Code)
@@ -400,6 +475,62 @@ func TestOneInstallationsDeliveriesAreHandledInOrder(t *testing.T) {
 	}
 }
 
+func TestNoMoreThanTheBoundOfInstallationsRunAtOnce(t *testing.T) {
+	var running, most atomic.Int32
+	release := make(chan struct{})
+	hs := &Handlers{}
+	hs.HandleFunc("issues", func(context.Context, Delivery) error {
+		n := running.Add(1)
+		for {
+			m := most.Load()
+			if n <= m || most.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		<-release
+		running.Add(-1)
+		return nil
+	})
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	w := &Worker{Store: st, Handlers: hs, maxLanes: 2}
+	rc := &Receiver{Secret: []byte(secret), Store: st, Stored: w.Notify}
+	w.Start()
+	defer w.Stop(5 * time.Second)
+	guids := []string{guid1, guid2, guid3, "72d3162e-cc78-11e3-81ab-4c9367dc0000"}
+	for i, g := range guids {
+		body := fmt.Sprintf(`{"installation":{"id":%d}}`, i+1)
+		post(rc.Mux(), "issues", g, body, sign(body))
+	}
+	eventually(t, "two run", func() bool { return running.Load() == 2 })
+	time.Sleep(50 * time.Millisecond)
+	if n := running.Load(); n != 2 {
+		t.Errorf("%d run at once", n)
+	}
+	close(release)
+	eventually(t, "all done", func() bool {
+		for _, g := range guids {
+			if state(st, g) != store.Done {
+				return false
+			}
+		}
+		return true
+	})
+	if m := most.Load(); m != 2 {
+		t.Errorf("at most %d ran at once, want 2", m)
+	}
+}
+
+func TestAHandlersPanicIsLoggedWithoutItsValue(t *testing.T) {
+	hs := &Handlers{}
+	hs.HandleFunc("issues", func(_ context.Context, d Delivery) error { panic(string(d.Body)) })
+	h := newHarness(t, filepath.Join(t.TempDir(), "state"), hs, 1)
+	post(h.mux, "issues", guid1, body1, sign(body1))
+	eventually(t, "logged", func() bool { return strings.Contains(h.log.String(), `"outcome":"failed"`) })
+	if !strings.Contains(h.log.String(), "the handler for issues panicked") || strings.Contains(h.log.String(), "must not") {
+		t.Errorf("the log: %s", h.log.String())
+	}
+}
+
 func TestPendingDeliveriesAreHandledAfterARestart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	st, err := store.Open(dir, store.Options{})
@@ -546,10 +677,17 @@ func TestAWebhookSecretFileOthersMayReadIsRefused(t *testing.T) {
 	if b, err := ReadWebhookSecret(own); err != nil || string(b) != secret {
 		t.Errorf("%q %v", b, err)
 	}
-	empty := filepath.Join(dir, "empty")
-	writeFile(t, empty, "\n", 0o600)
-	if _, err := ReadWebhookSecret(empty); err == nil || !strings.Contains(err.Error(), "is empty") {
-		t.Errorf("err %v", err)
+	for _, short := range []string{"\n", "fifteen-bytes!!\n", "fifteen-bytes!!\r\n"} {
+		file := filepath.Join(dir, "short")
+		writeFile(t, file, short, 0o600)
+		if _, err := ReadWebhookSecret(file); err == nil || !strings.Contains(err.Error(), "shorter than 16 bytes") || strings.Contains(err.Error(), "fifteen") {
+			t.Errorf("%q: err %v", short, err)
+		}
+	}
+	sixteen := filepath.Join(dir, "sixteen")
+	writeFile(t, sixteen, "sixteen-bytes!!!", 0o600)
+	if _, err := ReadWebhookSecret(sixteen); err != nil {
+		t.Errorf("sixteen bytes: %v", err)
 	}
 	large := filepath.Join(dir, "large")
 	writeFile(t, large, strings.Repeat("a", maxSecretFile+1), 0o600)

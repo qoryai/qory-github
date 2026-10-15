@@ -205,8 +205,10 @@ func TestTheStoreIsOnlyItsOwners(t *testing.T) {
 	}
 	link := filepath.Join(parent, "link")
 	os.Symlink(dir, link)
-	if _, err := Open(link, Options{}); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Errorf("a link: %v", err)
+	for _, path := range []string{link, link + "/", link + "//", link + "/."} {
+		if _, err := Open(path, Options{}); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("the link %s: %v", path, err)
+		}
 	}
 	file := filepath.Join(parent, "file")
 	os.WriteFile(file, nil, 0o600)
@@ -219,5 +221,33 @@ func TestTheStoreIsOnlyItsOwners(t *testing.T) {
 	os.Chmod(filepath.Join(loose, FileName), 0o644)
 	if _, err := Open(loose, Options{}); err == nil || !strings.Contains(err.Error(), "the store") || !strings.Contains(err.Error(), "make it 0600") {
 		t.Errorf("a store file others read: %v", err)
+	}
+}
+
+func TestAStoreFileReplacedBetweenTheOpensIsRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	other := filepath.Join(t.TempDir(), "other.db")
+	os.WriteFile(other, nil, 0o600)
+	betweenOpens = func(path string) {
+		os.Remove(path)
+		os.Symlink(other, path)
+	}
+	defer func() { betweenOpens = func(string) {} }()
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "was replaced") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("err %v", err)
+	}
+	betweenOpens = func(path string) {
+		os.Remove(path)
+		os.WriteFile(path, nil, 0o600)
+	}
+	dir = filepath.Join(t.TempDir(), "state")
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "was replaced") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("a new file: %v", err)
 	}
 }

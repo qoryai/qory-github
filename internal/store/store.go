@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/qoryai/qory-github/internal/ownerfile"
@@ -46,6 +47,13 @@ var (
 	kvBucket         = []byte("kv")
 )
 
+// errReplaced is the store's file when it is not the one [Open] checked.
+var errReplaced = errors.New("the store's file is not the one checked")
+
+// betweenOpens runs between the check of the store's file and bbolt's open of it; a
+// test replaces the file there.
+var betweenOpens = func(string) {}
+
 // Store is the open store.
 type Store struct {
 	db  *bolt.DB
@@ -72,8 +80,33 @@ func Open(dir string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	checked, err := f.Stat()
 	f.Close()
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("the store: %w", err)
+	}
+	// bbolt opens the path again. The file it opens, never through a link, must be the
+	// one checked above, so a file put in its place between the two opens is refused.
+	open := func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		f, err := os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, errReplaced
+		}
+		if err != nil {
+			return nil, err
+		}
+		info, err := f.Stat()
+		if err != nil || !os.SameFile(info, checked) {
+			f.Close()
+			return nil, errReplaced
+		}
+		return f, nil
+	}
+	betweenOpens(path)
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second, OpenFile: open})
+	if errors.Is(err, errReplaced) {
+		return nil, fmt.Errorf("the store %s was replaced while it was opened", path)
+	}
 	if errors.Is(err, bolt.ErrTimeout) {
 		return nil, fmt.Errorf("the store %s is open in another process; one qory-github serve runs on a state directory", path)
 	}

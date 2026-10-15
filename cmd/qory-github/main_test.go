@@ -797,7 +797,7 @@ func TestNoCommandIsUsage(t *testing.T) {
 // TestServeIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory, serve
 // is in no usage and is answered as a command the program does not know.
 func TestServeIsAbsentWithoutFactory(t *testing.T) {
-	for _, features := range []string{"", "all", "all-security", "factory2", "observability,security"} {
+	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
 		t.Setenv("QORY_FEATURES", features)
 		var unknownOut, unknownErrs bytes.Buffer
 		unknown := run(context.Background(), []string{"bogus"}, &unknownOut, &unknownErrs)
@@ -815,7 +815,7 @@ func TestServeIsAbsentWithoutFactory(t *testing.T) {
 }
 
 func TestServeIsPresentWithFactory(t *testing.T) {
-	for _, features := range []string{"factory", "observability, factory ", " factory,"} {
+	for _, features := range []string{"factory", "observability, factory ", " factory,", "observability,security,secrets,factory"} {
 		t.Setenv("QORY_FEATURES", features)
 		var out, errs bytes.Buffer
 		if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "\n  serve        ") {
@@ -848,7 +848,7 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	dir := t.TempDir()
 	key, _ := keyFile(t)
 	secret := filepath.Join(dir, "secret")
-	os.WriteFile(secret, []byte("s3cr3t\n"), 0o600)
+	os.WriteFile(secret, []byte("s3cr3t-0123456789abcdef\n"), 0o600)
 	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state")})
 	file := filepath.Join(dir, "serve.json")
 	os.WriteFile(file, settings, 0o600)

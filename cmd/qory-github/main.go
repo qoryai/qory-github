@@ -94,19 +94,33 @@ qory-github <command> -h prints a command's help.
 More: ` + more
 }
 
-// factory is whether the environment variable QORY_FEATURES names factory, which
-// switches on the command serve, the webhook receiver. QORY_FEATURES is the list that
-// Qory Apiary reads too: names separated by commas, white space around each ignored.
-// factory is on only where the list names it: like Qory Apiary's opt-in features, all
-// and all-<features> leave it off. A name qory-github does not know is ignored, since
-// other programs read the same variable.
+// factory is whether the environment variable QORY_FEATURES switches on factory, the
+// command serve, the webhook receiver. It reads the variable as Qory Apiary reads it
+// for an opt-in feature, in qoryai/apiary's features module, factory being one:
+//
+//   - unset, blank, all, and all- followed by the features left out, all-security,factory
+//     among them, leave factory off: all names every feature but the opt-in ones;
+//   - a list of the features on, names separated by commas with white space around
+//     each ignored, switches factory on when it names factory;
+//   - a list that names all or all-… among its features is refused by Qory Apiary, and
+//     leaves factory off here.
+//
+// Qory Apiary also refuses a name it does not know, which qory-github cannot tell, since
+// the list names the features of every program that reads it: such a name is ignored.
 func factory() bool {
-	for _, name := range strings.Split(os.Getenv("QORY_FEATURES"), ",") {
-		if strings.TrimSpace(name) == "factory" {
-			return true
-		}
+	v := strings.TrimSpace(os.Getenv("QORY_FEATURES"))
+	if v == "all" || strings.HasPrefix(v, "all-") {
+		return false
 	}
-	return false
+	on := false
+	for _, name := range strings.Split(v, ",") {
+		name = strings.TrimSpace(name)
+		if name == "all" || strings.HasPrefix(name, "all-") {
+			return false
+		}
+		on = on || name == "factory"
+	}
+	return on
 }
 
 // help is one command's help. short is its line in usage; -h prints the rest, and the

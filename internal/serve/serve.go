@@ -91,7 +91,7 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	worker.Start()
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(ln) }()
+	go func() { served <- srv.Serve(limit(ln, maxConns)) }()
 	log.Info("serving", slog.String("address", ln.Addr().String()), slog.String("path", WebhookPath))
 	if opts.Listening != nil {
 		opts.Listening(ln.Addr())

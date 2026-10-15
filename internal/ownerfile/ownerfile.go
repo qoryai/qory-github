@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -17,8 +18,10 @@ import (
 // file that is not a regular one, that grants group or others any permission, or that
 // belongs to another user than the one the program runs as is refused and closed. what
 // names the file in an error, such as "the private key file"; an error never says what
-// the file contains.
+// the file contains. path is cleaned first, so a trailing slash cannot make the open
+// follow a link.
 func Open(path string, flag int, perm fs.FileMode, what string) (*os.File, error) {
+	path = filepath.Clean(path)
 	f, err := os.OpenFile(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, perm)
 	if errors.Is(err, syscall.ELOOP) {
 		return nil, fmt.Errorf("%s %s is a symbolic link; use the path of the file itself", what, path)
@@ -64,8 +67,10 @@ func ReadFile(path string, max int, what, holds string) ([]byte, error) {
 // Dir makes the directory at path, 0700, when it does not exist, its parent existing,
 // and checks it: one that is a symbolic link, that is not a directory, that grants group
 // or others any permission, or that belongs to another user than the one the program
-// runs as is refused. what names it in an error, such as "the state directory".
+// runs as is refused. what names it in an error, such as "the state directory". path
+// is cleaned first: Lstat of link/ would read the directory the link points to.
 func Dir(path, what string) error {
+	path = filepath.Clean(path)
 	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("%s: %w", what, err)
 	}
