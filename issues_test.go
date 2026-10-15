@@ -428,7 +428,7 @@ func TestAListingStoppedEarlyEndsWithAPart(t *testing.T) {
 	}{
 		{"a page of issues fails", &fakeIssues{pageSize: 2, issues: many(5, 0), failIssues: 2}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 1},
 		{"a page of issues fails after a part", &fakeIssues{pageSize: 100, issues: many(250, 0), failIssues: 3}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 2},
-		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the issues of acme/widgets: GitHub's next page is not on its API, so it is not read", 1},
+		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the issues of acme/widgets: the next page GitHub names is not on the API, so it is not read", 1},
 		{"Qory Apiary fails a part", &fakeIssues{pageSize: 100, issues: many(150, 0)}, &sink{failAt: 1}, "Qory Apiary is not reachable", 2},
 		{"comments fail before the last part", &fakeIssues{pageSize: 1, issues: many(150, 1), comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}, failComments: 2}, &sink{}, "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", 2},
 	} {
@@ -684,6 +684,8 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 	marker := comment(6, "qory-test[bot]", "Bot", "<!-- qory:work-item 3 -->\nWork in Qory Apiary.")
 	personsMarker := comment(7, "bob", "User", "<!-- qory:work-item 3 --> quoted")
 	otherBot := comment(8, "other-app[bot]", "Bot", "<!-- qory:work-item 3 -->")
+	// A login GitHub would give a bot alone, but not of type Bot, is not the App.
+	notABot := comment(9, "qory-test[bot]", "User", "<!-- qory:work-item 3 -->")
 	for _, tc := range []struct {
 		action  string
 		issue   map[string]any
@@ -700,6 +702,7 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 		{"deleted", issue(1, 1), marker, ""},
 		{"created", issue(1, 1), personsMarker, "7 bob person false"},
 		{"created", issue(1, 1), otherBot, "8 other-app[bot] automation false"},
+		{"created", issue(1, 1), notABot, "9 qory-test[bot] person false"},
 		{"pinned", issue(1, 1), byPerson, ""},
 	} {
 		got, err := IssueCommentWebhook(event(tc.action, tc.issue, map[string]any{"comment": tc.comment}), "qory-test")

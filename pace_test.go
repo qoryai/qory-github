@@ -200,21 +200,46 @@ func TestOneInstallationsRequestsGoOneAtATime(t *testing.T) {
 func TestTheNextPageIsOnTheAPIAlone(t *testing.T) {
 	const base = "https://api.github.com"
 	for _, tc := range []struct {
-		link, next string
-		ok         bool
+		links []string
+		next  string
+		ok    bool
 	}{
-		{"", "", true},
-		{`<https://api.github.com/repositories/1/issues?page=2>; rel="next", <https://api.github.com/repositories/1/issues?page=5>; rel="last"`, "/repositories/1/issues?page=2", true},
-		{`<https://api.github.com/repositories/1/issues?page=1>; rel="prev", <https://api.github.com/repositories/1/issues?page=1>; rel="first"`, "", true},
-		{`<https://api.github.com:443/x?page=2>; rel="next"`, "/x?page=2", true},
-		{`<https://elsewhere.example/x?page=2>; rel="next"`, "", false},
-		{`<http://api.github.com/x?page=2>; rel="next"`, "", false},
-		{`<https://user@api.github.com/x?page=2>; rel="next"`, "", false},
+		{nil, "", true},
+		{[]string{""}, "", true},
+		{[]string{`<https://api.github.com/repositories/1/issues?page=2>; rel="next", <https://api.github.com/repositories/1/issues?page=5>; rel="last"`}, "/repositories/1/issues?page=2", true},
+		{[]string{`<https://api.github.com/repositories/1/issues?page=1>; rel="prev", <https://api.github.com/repositories/1/issues?page=1>; rel="first"`}, "", true},
+		{[]string{`<https://api.github.com:443/x?page=2>; rel="next"`}, "/x?page=2", true},
+		// Every Link header is read, rel in any case, among several values.
+		{[]string{`<https://api.github.com/x?page=1>; rel="prev"`, `<https://api.github.com/x?page=3>; REL="Next"`}, "/x?page=3", true},
+		{[]string{`<https://api.github.com/x?page=4>; rel="last next"`}, "/x?page=4", true},
+		{[]string{`<https://api.github.com/x?page=4>; rel="nextpage"`}, "", true},
+		{[]string{`<https://elsewhere.example/x?page=2>; rel="next"`}, "", false},
+		{[]string{`<http://api.github.com/x?page=2>; rel="next"`}, "", false},
+		{[]string{`<https://api.github.com:8443/x?page=2>; rel="next"`}, "", false},
+		{[]string{`<https://user@api.github.com/x?page=2>; rel="next"`}, "", false},
+		{[]string{`<https:x?page=2>; rel="next"`}, "", false},
+		{[]string{`<https://api.github.com>; rel="next"`}, "", false},
 	} {
-		next, ok := nextPage(tc.link, base)
-		if next != tc.next || ok != tc.ok {
-			t.Errorf("%s: %q %v, want %q %v", tc.link, next, ok, tc.next, tc.ok)
+		next, err := nextPage(tc.links, base)
+		if next != tc.next || (err == nil) != tc.ok {
+			t.Errorf("%q: %q %v, want %q %v", tc.links, next, err, tc.next, tc.ok)
 		}
+	}
+}
+
+// TestAnAnswerOverItsCapIsRefused has GitHub answer more than the cap, and checks the
+// answer is refused rather than cut.
+func TestAnAnswerOverItsCapIsRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "[")
+		io.WriteString(w, strings.Repeat(" ", maxAnswer))
+		io.WriteString(w, "]")
+	}))
+	defer srv.Close()
+	var out []any
+	_, err := Client{API: srv.URL}.get(context.Background(), &Pacer{}, true, "listing", "/x", fakeToken, &out)
+	if err == nil || err.Error() != "listing: GitHub's answer is larger than 67108864 bytes" {
+		t.Errorf("err %v", err)
 	}
 }
 

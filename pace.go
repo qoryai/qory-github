@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,26 +223,70 @@ func secondaryLimit(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(e.Message), "rate limit")
 }
 
-// get reads one page from the API with an installation token, paced by p, and decodes
-// it into out. It returns the path and query of the next page, from the Link header's
-// next, or "" on the last page. A next page on another scheme or host than the API's
-// is refused, so the token goes to GitHub's API alone. Like [Client.call], it follows
-// no redirect, and its error begins with what and never says the request, its path or
-// its token.
-func (c Client) get(ctx context.Context, p *Pacer, listing bool, what, path, token string, out any) (string, error) {
+// maxAnswer is the largest answer [Client.send] reads, 64 MiB: a page of a hundred
+// issues or comments of GitHub's longest, 65,536 characters, fits when no character
+// takes more than ten bytes, which holds for UTF-8 and for a character of the Basic
+// Multilingual Plane escaped as \uXXXX. A larger answer is refused, never read in part.
+const maxAnswer = 64 << 20
+
+// apiReply is GitHub's answer to one request [Client.send] made: its status, its header
+// and its body.
+type apiReply struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// err is the answer as an [answerError] for the request what names.
+func (a *apiReply) err(what string) error {
+	var e struct {
+		Message string `json:"message"`
+	}
+	json.Unmarshal(a.body, &e)
+	if e.Message == "" {
+		e.Message = http.StatusText(a.status)
+	}
+	return &answerError{what: what, status: a.status, message: e.Message}
+}
+
+// send makes one request to the API with an installation token, paced by p, nil being
+// a pacer of its own, and returns GitHub's answer whatever its status, so the caller
+// reads the status, and the Link header for a list's next page. listing marks a
+// listing's request, see [Pacer]. It is [Client.call] with the answer handed back: it
+// refuses an API [CheckAPIURL] refuses before anything is sent, follows no redirect,
+// refuses an answer larger than [maxAnswer] having read at most one byte more, and its
+// error begins with what and never says the request, its path, its header or its body.
+func (c Client) send(ctx context.Context, p *Pacer, listing bool, what, method, path, tok string, body any) (*apiReply, error) {
 	base := c.base()
 	if err := CheckAPIURL(base); err != nil {
-		return "", err
+		return nil, err
 	}
-	send := func(ctx context.Context) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(base, "/")+path, nil)
+	var b []byte
+	if body != nil {
+		var err error
+		if b, err = json.Marshal(body); err != nil {
+			return nil, err
+		}
+	}
+	if p == nil {
+		p = &Pacer{}
+	}
+	request := func(ctx context.Context) (*http.Response, error) {
+		var r io.Reader
+		if body != nil {
+			r = bytes.NewReader(b)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+path, r)
 		if err != nil {
 			return nil, fmt.Errorf("%s: the request could not be made: %w", what, unsent(err, path))
 		}
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 		req.Header.Set("User-Agent", "qory-github")
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 		hc := http.Client{Timeout: 30 * time.Second}
 		if c.HTTP != nil {
 			hc = *c.HTTP
@@ -253,73 +298,91 @@ func (c Client) get(ctx context.Context, p *Pacer, listing bool, what, path, tok
 		}
 		return resp, nil
 	}
-	resp, err := p.do(ctx, listing, send)
+	resp, err := p.do(ctx, listing, request)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return "", fmt.Errorf("%s: %w", what, err)
+			return nil, fmt.Errorf("%s: %w", what, err)
 		}
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
-	// A page of a hundred issues with long bodies is a few megabytes at most.
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	a, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
 	if err != nil {
-		return "", fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))
+		return nil, fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))
 	}
-	if resp.StatusCode != http.StatusOK {
-		var e struct {
-			Message string `json:"message"`
-		}
-		json.Unmarshal(b, &e)
-		if e.Message == "" {
-			e.Message = http.StatusText(resp.StatusCode)
-		}
-		return "", &answerError{what: what, status: resp.StatusCode, message: e.Message}
+	if len(a) > maxAnswer {
+		return nil, fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, maxAnswer)
 	}
-	if err := json.Unmarshal(b, out); err != nil {
+	return &apiReply{status: resp.StatusCode, header: resp.Header, body: a}, nil
+}
+
+// get reads one page from the API with an installation token, paced by p, and decodes
+// it into out. It returns the path and query of the next page, see [nextPage], or "" on
+// the last page. Like [Client.send], it follows no redirect, and its error begins with
+// what and never says the request, its path or its token.
+func (c Client) get(ctx context.Context, p *Pacer, listing bool, what, path, token string, out any) (string, error) {
+	a, err := c.send(ctx, p, listing, what, http.MethodGet, path, token, nil)
+	if err != nil {
+		return "", err
+	}
+	if a.status != http.StatusOK {
+		return "", a.err(what)
+	}
+	if err := json.Unmarshal(a.body, out); err != nil {
 		return "", fmt.Errorf("%s: GitHub's answer: %w", what, err)
 	}
-	next, ok := nextPage(resp.Header.Get("Link"), base)
-	if !ok {
-		return "", fmt.Errorf("%s: GitHub's next page is not on its API, so it is not read", what)
+	next, err := nextPage(a.header.Values("Link"), c.base())
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", what, err)
 	}
 	return next, nil
 }
 
-// nextPage is the path and query of the Link header's next page, "" when there is
-// none, and false when it is on another scheme or host than base.
-func nextPage(link, base string) (string, bool) {
-	for part := range strings.SplitSeq(link, ",") {
-		target, params, ok := strings.Cut(strings.TrimSpace(part), ";")
-		if !ok || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
-			continue
-		}
-		next := false
-		for param := range strings.SplitSeq(params, ";") {
-			if k, v, ok := strings.Cut(strings.TrimSpace(param), "="); ok && strings.EqualFold(k, "rel") && strings.Contains(" "+strings.Trim(v, `"`)+" ", " next ") {
-				next = true
+// errNextElsewhere refuses a next page that is not on the API.
+var errNextElsewhere = errors.New("the next page GitHub names is not on the API, so it is not read")
+
+// nextPage is the path and query of the next page that links, every Link header of an
+// answer, name: the first entry whose rel, among the values it lists, is next in any
+// case. It is "" when there is none. A next page on another scheme, host name or port
+// than base's, with a user, opaque, or with a path that does not start with /, is
+// [errNextElsewhere], so the token goes to GitHub's API alone; a port left out is the
+// scheme's, so https://api.github.com and https://api.github.com:443 are the same.
+func nextPage(links []string, base string) (string, error) {
+	for _, l := range links {
+		for part := range strings.SplitSeq(l, ",") {
+			target, params, ok := strings.Cut(strings.TrimSpace(part), ";")
+			if !ok || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+				continue
 			}
+			next := false
+			for param := range strings.SplitSeq(params, ";") {
+				k, v, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(k), "rel") && slices.ContainsFunc(strings.Fields(strings.Trim(strings.TrimSpace(v), `"`)), func(r string) bool { return strings.EqualFold(r, "next") }) {
+					next = true
+				}
+			}
+			if !next {
+				continue
+			}
+			u, err := url.Parse(strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">"))
+			b, berr := url.Parse(base)
+			if err != nil || berr != nil || u.Scheme != b.Scheme || u.Hostname() != b.Hostname() || effectivePort(u) != effectivePort(b) || u.User != nil || u.Opaque != "" || !strings.HasPrefix(u.EscapedPath(), "/") {
+				return "", errNextElsewhere
+			}
+			return u.RequestURI(), nil
 		}
-		if !next {
-			continue
-		}
-		u, err := url.Parse(strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">"))
-		b, berr := url.Parse(base)
-		if err != nil || berr != nil || u.Scheme != b.Scheme || u.Hostname() != b.Hostname() || port(u) != port(b) || u.User != nil || !strings.HasPrefix(u.Path, "/") {
-			return "", false
-		}
-		return u.RequestURI(), true
 	}
-	return "", true
+	return "", nil
 }
 
-// port is a URL's port, its scheme's when it says none.
-func port(u *url.URL) string {
+// effectivePort is the URL's port, or its scheme's when it names none: 80 for http,
+// 443 for https and any other.
+func effectivePort(u *url.URL) string {
 	if p := u.Port(); p != "" {
 		return p
 	}
-	if u.Scheme == "https" {
-		return "443"
+	if u.Scheme == "http" {
+		return "80"
 	}
-	return "80"
+	return "443"
 }

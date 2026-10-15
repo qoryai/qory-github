@@ -1,18 +1,15 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // Change is one entry of Qory Apiary's change feed: a work item Qory Apiary took in
@@ -96,12 +93,6 @@ var (
 // maxChangeURL is the longest work item URL a change may carry.
 const maxChangeURL = 2048
 
-// maxAnswer is the largest answer [Client.send] reads, 64 MiB: a page of a hundred
-// comments of GitHub's longest, 65,536 characters, fits when no character takes more
-// than ten bytes, which holds for UTF-8 and for a character of the Basic Multilingual
-// Plane escaped as \uXXXX. A larger answer is refused, never read in part.
-const maxAnswer = 64 << 20
-
 // maxMarkerPages is how many pages of an issue's comments, a hundred to a page, are read
 // looking for the work item's comment. An issue with more is refused, not commented on
 // a second time.
@@ -164,11 +155,12 @@ func checkChangeURL(s string) error {
 
 // marker is the first line of the comment a take in posts, by which a repeat finds it.
 func marker(workItemID string) string {
-	return "<!-- qory:work-item " + workItemID + " -->"
+	return workItemMarker + workItemID + " -->"
 }
 
 // ApplyChange writes on GitHub what one entry of Qory Apiary's change feed says about an
-// issue, with a token token returns for the issue's repository. slug is the App's slug:
+// issue, with a token token returns for the issue's repository, each request paced by p,
+// the installation's [Pacer], which nil makes one of its own. slug is the App's slug:
 // only a comment by its bot, slug[bot], counts as the one a take in posted.
 //
 // The change is checked before anything is sent, see [Change], and refused whole when it
@@ -187,7 +179,7 @@ func marker(workItemID string) string {
 // error may pass, and the change can be applied again; a slug that is not one is among
 // them, since it is the caller's setting and not the change. No error contains the
 // token.
-func (c Client) ApplyChange(ctx context.Context, token TokenFunc, slug string, e Change) error {
+func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug string, e Change) error {
 	if e.Status != StatusTakenIn && e.Status != StatusUndone {
 		return nil
 	}
@@ -211,18 +203,21 @@ func (c Client) ApplyChange(ctx context.Context, token TokenFunc, slug string, e
 	if tok == "" {
 		return fmt.Errorf("the installation token for %s is empty", issue.repo)
 	}
-	if e.Status == StatusUndone {
-		return c.undo(ctx, tok, issue)
+	if p == nil {
+		p = &Pacer{}
 	}
-	return c.takeIn(ctx, tok, slug, issue, e)
+	if e.Status == StatusUndone {
+		return c.undo(ctx, p, tok, issue)
+	}
+	return c.takeIn(ctx, p, tok, slug, issue, e)
 }
 
 // takeIn creates the label when the repository has none, adds it to the issue, and posts
 // the work item's comment when the App's bot has not.
-func (c Client) takeIn(ctx context.Context, tok, slug string, issue issueRef, e Change) error {
+func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, e Change) error {
 	const creating = "creating the label " + takeInLabel
 	label := map[string]string{"name": takeInLabel, "color": takeInLabelColor, "description": takeInLabelDescription}
-	a, err := c.send(ctx, creating, http.MethodPost, "/repos/"+issue.repo.String()+"/labels", tok, label)
+	a, err := c.send(ctx, p, false, creating, http.MethodPost, "/repos/"+issue.repo.String()+"/labels", tok, label)
 	if err != nil {
 		return err
 	}
@@ -230,20 +225,20 @@ func (c Client) takeIn(ctx context.Context, tok, slug string, issue issueRef, e 
 		return failed(a, creating, repoGone)
 	}
 	const adding = "adding the label " + takeInLabel + " to the issue"
-	a, err = c.send(ctx, adding, http.MethodPost, issue.path()+"/labels", tok, map[string][]string{"labels": {takeInLabel}})
+	a, err = c.send(ctx, p, false, adding, http.MethodPost, issue.path()+"/labels", tok, map[string][]string{"labels": {takeInLabel}})
 	if err != nil {
 		return err
 	}
 	if a.status != http.StatusOK {
 		return failed(a, adding, issueGone|mayNotWrite)
 	}
-	found, err := c.commented(ctx, tok, slug, issue, marker(e.WorkItemID))
+	found, err := c.commented(ctx, p, tok, slug, issue, marker(e.WorkItemID))
 	if err != nil || found {
 		return err
 	}
 	const commenting = "commenting on the issue"
 	body := marker(e.WorkItemID) + "\nQory took this into Factory: <" + e.URL + ">"
-	a, err = c.send(ctx, commenting, http.MethodPost, issue.path()+"/comments", tok, map[string]string{"body": body})
+	a, err = c.send(ctx, p, false, commenting, http.MethodPost, issue.path()+"/comments", tok, map[string]string{"body": body})
 	if err != nil {
 		return err
 	}
@@ -255,14 +250,13 @@ func (c Client) takeIn(ctx context.Context, tok, slug string, issue issueRef, e 
 
 // commented is whether the App's bot, slug[bot] of type Bot, has a comment on the issue
 // that starts with the marker. It reads the comments a page at a time, following the
-// Link header's next page only on the API's scheme and host; a comment anyone
-// else wrote counts for nothing, so pasting the marker does not stop the comment.
-func (c Client) commented(ctx context.Context, tok, slug string, issue issueRef, mark string) (bool, error) {
+// next page [nextPage] reads, on the API alone; a comment anyone else wrote counts for nothing, so pasting the marker does not stop the comment.
+func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, mark string) (bool, error) {
 	const reading = "reading the issue's comments"
 	bot := slug + "[bot]"
 	path := issue.path() + "/comments?per_page=100"
 	for range maxMarkerPages {
-		a, err := c.send(ctx, reading, http.MethodGet, path, tok, nil)
+		a, err := c.send(ctx, p, false, reading, http.MethodGet, path, tok, nil)
 		if err != nil {
 			return false, err
 		}
@@ -285,11 +279,11 @@ func (c Client) commented(ctx context.Context, tok, slug string, issue issueRef,
 				return true, nil
 			}
 		}
-		next, ok, err := c.nextCommentsPage(a.header.Values("Link"))
+		next, err := nextPage(a.header.Values("Link"), c.base())
 		if err != nil {
 			return false, fmt.Errorf("%s: %w", reading, err)
 		}
-		if !ok {
+		if next == "" {
 			return false, nil
 		}
 		path = next
@@ -299,9 +293,9 @@ func (c Client) commented(ctx context.Context, tok, slug string, issue issueRef,
 
 // undo removes the label from the issue. A 404, the label not on the issue, and a 410,
 // the issue deleted, both leave the issue without the label, so either is done.
-func (c Client) undo(ctx context.Context, tok string, issue issueRef) error {
+func (c Client) undo(ctx context.Context, p *Pacer, tok string, issue issueRef) error {
 	const removing = "removing the label " + takeInLabel + " from the issue"
-	a, err := c.send(ctx, removing, http.MethodDelete, issue.path()+"/labels/"+takeInLabel, tok, nil)
+	a, err := c.send(ctx, p, false, removing, http.MethodDelete, issue.path()+"/labels/"+takeInLabel, tok, nil)
 	if err != nil {
 		return err
 	}
@@ -354,69 +348,6 @@ func (a *apiReply) rateLimited() bool {
 	return strings.Contains(strings.ToLower(e.Message), "rate limit")
 }
 
-// nextCommentsPage is the path and query of the Link header's next page, when there is
-// one. A next page on another scheme, host name or port than the API's is refused, so
-// the token goes to GitHub's API alone; a port left out is the scheme's, so
-// https://api.github.com and https://api.github.com:443 are the same.
-func (c Client) nextCommentsPage(links []string) (string, bool, error) {
-	for _, l := range links {
-		for part := range strings.SplitSeq(l, ",") {
-			target, params, ok := strings.Cut(strings.TrimSpace(part), ";")
-			if !ok || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
-				continue
-			}
-			next := false
-			for p := range strings.SplitSeq(params, ";") {
-				if strings.TrimSpace(p) == `rel="next"` {
-					next = true
-				}
-			}
-			if !next {
-				continue
-			}
-			u, err := url.Parse(strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">"))
-			base, berr := url.Parse(c.base())
-			if err != nil || berr != nil || u.Scheme != base.Scheme || u.Hostname() != base.Hostname() || effectivePort(u) != effectivePort(base) || u.User != nil || u.Opaque != "" || !strings.HasPrefix(u.EscapedPath(), "/") {
-				return "", false, errors.New("the next page GitHub names is not on the API, so it is not read")
-			}
-			return u.RequestURI(), true, nil
-		}
-	}
-	return "", false, nil
-}
-
-// effectivePort is the URL's port, or its scheme's when it names none: 443 for https,
-// 80 for http.
-func effectivePort(u *url.URL) string {
-	if p := u.Port(); p != "" {
-		return p
-	}
-	if u.Scheme == "http" {
-		return "80"
-	}
-	return "443"
-}
-
-// apiReply is GitHub's answer to one request [Client.send] made: its status, its header
-// and its body.
-type apiReply struct {
-	status int
-	header http.Header
-	body   []byte
-}
-
-// err is the answer as an [answerError] for the request what names.
-func (a *apiReply) err(what string) error {
-	var e struct {
-		Message string `json:"message"`
-	}
-	json.Unmarshal(a.body, &e)
-	if e.Message == "" {
-		e.Message = http.StatusText(a.status)
-	}
-	return &answerError{what: what, status: a.status, message: e.Message}
-}
-
 // labelExists is whether the answer is GitHub's 422 for a label the repository has
 // already: an error whose code is already_exists.
 func (a *apiReply) labelExists() bool {
@@ -437,53 +368,4 @@ func (a *apiReply) labelExists() bool {
 		}
 	}
 	return false
-}
-
-// send makes one request to the API with an installation token and returns GitHub's
-// answer whatever its status, so the caller reads the status, and the Link header for
-// a list's next page. It is [Client.call] with the answer handed back: it refuses an
-// API [CheckAPIURL] refuses before anything is sent, follows no redirect, and its error
-// begins with what and never says the request, its path, its header or its body.
-func (c Client) send(ctx context.Context, what, method, path, tok string, body any) (*apiReply, error) {
-	base := c.base()
-	if err := CheckAPIURL(base); err != nil {
-		return nil, err
-	}
-	var r io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		r = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+path, r)
-	if err != nil {
-		return nil, fmt.Errorf("%s: the request could not be made: %w", what, unsent(err, path))
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "qory-github")
-	req.Header.Set("Authorization", "Bearer "+tok)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	hc := http.Client{Timeout: 30 * time.Second}
-	if c.HTTP != nil {
-		hc = *c.HTTP
-	}
-	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
-	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
-	if err != nil {
-		return nil, fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))
-	}
-	if len(b) > maxAnswer {
-		return nil, fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, maxAnswer)
-	}
-	return &apiReply{status: resp.StatusCode, header: resp.Header, body: b}, nil
 }

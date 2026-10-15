@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The App's slug, its bot, and the installation token the fake GitHub takes: synthetic,
@@ -182,7 +184,7 @@ func (f *fakeTakeIn) posts() []string {
 func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 	f := &fakeTakeIn{}
 	c, token, asked := serveTakeIn(t, f)
-	if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+	if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
@@ -215,7 +217,7 @@ func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 		t.Errorf("a token was asked for %v", *asked)
 	}
 
-	if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+	if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.posts(); len(got) != 1 {
@@ -231,7 +233,7 @@ func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 func TestATakeInWhereTheLabelExistsLabelsTheIssue(t *testing.T) {
 	f := &fakeTakeIn{repoLabel: map[string]any{"name": "qory", "color": "000000"}}
 	c, token, _ := serveTakeIn(t, f)
-	if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+	if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 		t.Fatal(err)
 	}
 	if f.repoLabel["color"] != "000000" {
@@ -254,7 +256,7 @@ func TestAnotherValidationErrorFailsTheTakeIn(t *testing.T) {
 	}))
 	defer srv.Close()
 	token := func(context.Context, Repository) (string, error) { return takeInToken, nil }
-	err := Client{API: srv.URL}.ApplyChange(context.Background(), token, takeInSlug, takenIn)
+	err := Client{API: srv.URL}.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
 	if want := "creating the label qory: GitHub answered 422: Validation Failed"; err == nil || err.Error() != want {
 		t.Errorf("err %v, want %s", err, want)
 	}
@@ -271,7 +273,7 @@ func TestOnlyTheBotsMarkerCounts(t *testing.T) {
 		commentBy(takeInBot, "Bot", "quoted: "+takenInComment),
 	}}
 	c, token, _ := serveTakeIn(t, f)
-	if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+	if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.posts(); len(got) != 1 || got[0] != takenInComment {
@@ -289,7 +291,7 @@ func TestTheCommentIsFoundOnALaterPage(t *testing.T) {
 		commentBy(takeInBot, "Bot", takenInComment),
 	}}
 	c, token, _ := serveTakeIn(t, f)
-	if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+	if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.posts(); len(got) != 0 {
@@ -308,7 +310,7 @@ func TestANextPageOnAnotherHostIsNotRead(t *testing.T) {
 	defer other.Close()
 	f := &fakeTakeIn{pageSize: 1, nextHost: other.URL, comments: []takeInComment{commentBy("someone", "User", "first"), commentBy("someone", "User", "second")}}
 	c, token, _ := serveTakeIn(t, f)
-	err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn)
+	err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
 	if want := "reading the issue's comments: the next page GitHub names is not on the API, so it is not read"; err == nil || err.Error() != want {
 		t.Errorf("err %v, want %s", err, want)
 	}
@@ -326,7 +328,7 @@ func TestUndoneRemovesTheLabelAlone(t *testing.T) {
 	undone := takenIn
 	undone.Status = StatusUndone
 	for range 2 {
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, undone); err != nil {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, undone); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -346,7 +348,7 @@ func TestAGoneIssueIsAPermanentError(t *testing.T) {
 	for _, status := range []int{404, 410} {
 		f := &fakeTakeIn{issueStatus: status}
 		c, token, _ := serveTakeIn(t, f)
-		err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn)
+		err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
 		if !errors.Is(err, ErrIssueGone) {
 			t.Errorf("%d: err %v, want ErrIssueGone", status, err)
 		}
@@ -358,7 +360,7 @@ func TestAGoneIssueIsAPermanentError(t *testing.T) {
 		}
 		undone := takenIn
 		undone.Status = StatusUndone
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, undone); err != nil {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, undone); err != nil {
 			t.Errorf("%d: undo: %v", status, err)
 		}
 	}
@@ -417,7 +419,7 @@ func TestAnInvalidChangeIsRefusedBeforeAnything(t *testing.T) {
 			e := takenIn
 			e.Status = status
 			tc.edit(&e)
-			err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), token, takeInSlug, e)
+			err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), nil, token, takeInSlug, e)
 			if err == nil || !strings.HasPrefix(err.Error(), "the change's "+tc.want+" ") || !errors.Is(err, ErrInvalidChange) {
 				t.Errorf("%s, %s: err %v, want the change's %s", tc.name, status, err, tc.want)
 			}
@@ -444,7 +446,7 @@ func TestAnUnknownStatusIsLeftAlone(t *testing.T) {
 			token := func(context.Context, Repository) (string, error) { asked = true; return takeInToken, nil }
 			e := takenIn
 			e.Status, e.Ref = status, ref
-			if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), token, takeInSlug, e); err != nil || tr.sent || asked {
+			if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, token, takeInSlug, e); err != nil || tr.sent || asked {
 				t.Errorf("%q, %q: err %v, sent %v, asked %v", status, ref, err, tr.sent, asked)
 			}
 		}
@@ -456,16 +458,16 @@ func TestAnUnknownStatusIsLeftAlone(t *testing.T) {
 func TestATokenThatCannotBeHadSendsNothing(t *testing.T) {
 	tr := &sentTransport{}
 	token := func(context.Context, Repository) (string, error) { return "", errors.New("no installation") }
-	err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), token, takeInSlug, takenIn)
+	err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
 	if want := "the installation token for acme/widgets: no installation"; err == nil || err.Error() != want || tr.sent {
 		t.Errorf("err %v, want %s; sent %v", err, want, tr.sent)
 	}
 	empty := func(context.Context, Repository) (string, error) { return "", nil }
-	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), empty, takeInSlug, takenIn); err == nil || tr.sent {
+	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, empty, takeInSlug, takenIn); err == nil || tr.sent {
 		t.Errorf("an empty token: err %v, sent %v", err, tr.sent)
 	}
 	working := func(context.Context, Repository) (string, error) { return takeInToken, nil }
-	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), working, takeInSlug+"]", takenIn); err == nil || !strings.HasPrefix(err.Error(), "the App's slug is not one") || tr.sent {
+	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, working, takeInSlug+"]", takenIn); err == nil || !strings.HasPrefix(err.Error(), "the App's slug is not one") || tr.sent {
 		t.Errorf("a slug that is not one: err %v, sent %v", err, tr.sent)
 	}
 }
@@ -491,7 +493,7 @@ func TestAURLHoldsOnlyWhatRFC3986Allows(t *testing.T) {
 		c, token, _ := serveTakeIn(t, f)
 		e := takenIn
 		e.URL = allowed
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, e); err != nil {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, e); err != nil {
 			t.Fatal(err)
 		}
 		if want := "<!-- qory:work-item wi_42 -->\nQory took this into Factory: <" + allowed + ">"; len(f.posts()) != 1 || f.posts()[0] != want {
@@ -530,7 +532,7 @@ func TestTheDefaultPortIsTheSameAPI(t *testing.T) {
 		_, token, _ := serveTakeIn(t, f)
 		tr := &toServer{addr: strings.TrimPrefix(f.srv.URL, "http://")}
 		c := Client{API: tc.api, HTTP: &http.Client{Transport: tr}}
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err != nil {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 			t.Errorf("%s, next on %s: %v", tc.api, tc.next, err)
 		}
 		if len(f.posts()) != 0 || !slices.Contains(f.requests, "GET /repositories/1/issues/7/comments?per_page=100&page=2") {
@@ -541,7 +543,7 @@ func TestTheDefaultPortIsTheSameAPI(t *testing.T) {
 		f := &fakeTakeIn{pageSize: 1, nextHost: next, comments: []takeInComment{commentBy("someone", "User", "first"), commentBy("someone", "User", "second")}}
 		_, token, _ := serveTakeIn(t, f)
 		c := Client{API: "https://api.github.com:443", HTTP: &http.Client{Transport: &toServer{addr: strings.TrimPrefix(f.srv.URL, "http://")}}}
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, takenIn); err == nil || !strings.Contains(err.Error(), "the next page GitHub names is not on the API") {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err == nil || !strings.Contains(err.Error(), "the next page GitHub names is not on the API") {
 			t.Errorf("next on %s: err %v", next, err)
 		}
 	}
@@ -596,7 +598,7 @@ func TestWhatAskingAgainWouldNotChangeIsPermanent(t *testing.T) {
 			if tc.at == remove {
 				e.Status = StatusUndone
 			}
-			err := c.ApplyChange(context.Background(), token, takeInSlug, e)
+			err := c.ApplyChange(context.Background(), (&fakeClock{}).pacer(), token, takeInSlug, e)
 			if err == nil {
 				t.Errorf("%s answered %d: no error", tc.at, a.status)
 				continue
@@ -628,7 +630,7 @@ func TestSendFollowsNoRedirect(t *testing.T) {
 				w.Header().Set("Location", "/moved")
 				w.WriteHeader(status)
 			}))
-			a, err := Client{API: srv.URL, HTTP: hc}.send(context.Background(), "reading", http.MethodGet, "/repos/acme/widgets/issues/7/comments", takeInToken, nil)
+			a, err := Client{API: srv.URL, HTTP: hc}.send(context.Background(), nil, false, "reading", http.MethodGet, "/repos/acme/widgets/issues/7/comments", takeInToken, nil)
 			srv.Close()
 			if err != nil || a.status != status || followed {
 				t.Errorf("%d: err %v, followed %v", status, err, followed)
@@ -650,15 +652,30 @@ func TestARefusedChangeIsPermanent(t *testing.T) {
 	} {
 		e := takenIn
 		edit(&e)
-		if err := c.ApplyChange(context.Background(), token, takeInSlug, e); !errors.Is(err, ErrInvalidChange) {
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, e); !errors.Is(err, ErrInvalidChange) {
 			t.Errorf("%+v: err %v, want ErrInvalidChange", e, err)
 		}
 	}
-	if err := c.ApplyChange(context.Background(), token, "qory test", takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
+	if err := c.ApplyChange(context.Background(), nil, token, "qory test", takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
 		t.Errorf("a slug that is not one: err %v", err)
 	}
 	failing := func(context.Context, Repository) (string, error) { return "", errors.New("no installation") }
-	if err := c.ApplyChange(context.Background(), failing, takeInSlug, takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
+	if err := c.ApplyChange(context.Background(), nil, failing, takeInSlug, takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
 		t.Errorf("a token that cannot be had: err %v", err)
+	}
+}
+
+// TestATakeInGoesThroughTheInstallationsPacer has GitHub say no request remains after
+// the label is created, and checks that the take in's next request waits for the reset
+// on the pacer it is handed, the one every caller for the installation shares.
+func TestATakeInGoesThroughTheInstallationsPacer(t *testing.T) {
+	f := &fakeTakeIn{answers: map[string]fakeAnswer{"POST /repos/acme/widgets/labels": {status: 201, header: map[string]string{"X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": unix(600 * time.Second)}, body: `{}`}}}
+	c, token, _ := serveTakeIn(t, f)
+	clock := &fakeClock{}
+	if err := c.ApplyChange(context.Background(), clock.pacer(), token, takeInSlug, takenIn); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(clock.slept, []time.Duration{600 * time.Second}) || len(f.posts()) != 1 {
+		t.Errorf("slept %v, posted %q", clock.slept, f.posts())
 	}
 }
