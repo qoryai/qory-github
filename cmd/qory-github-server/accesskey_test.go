@@ -117,9 +117,16 @@ func newFakeApiary(t *testing.T, rp reply) *fakeApiary {
 	return f
 }
 
-// code is an enrolment code that carries the fingerprint of key, as a person copies it.
+// code is an integration's enrolment code that carries the fingerprint of key, as a
+// person copies it.
 func code(key *accesskey.Key) string {
-	return "qec_" + codeCore[:13] + "-" + codeCore[13:] + "." + key.Fingerprint()
+	return codeOf(accesskey.CodePrefixAdapter, key)
+}
+
+// codeOf is an enrolment code with prefix that carries the fingerprint of key, as a
+// person copies it.
+func codeOf(prefix string, key *accesskey.Key) string {
+	return prefix + codeCore[:13] + "-" + codeCore[13:] + "." + key.Fingerprint()
 }
 
 // enrolRun runs access-key enrol with factory on, and a fixed host name.
@@ -167,7 +174,7 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 		t.Fatalf("the secret file holds no secret: %v", err)
 	}
 	got := f.got.Load()
-	if got.PublicKey != key.PublicKey().String() || got.Name != "adapter-host.example.com" || got.Code != "qec_"+codeCore+"."+f.signer.Fingerprint() {
+	if got.PublicKey != key.PublicKey().String() || got.Name != "adapter-host.example.com" || got.Code != "qeci_"+codeCore+"."+f.signer.Fingerprint() {
 		t.Errorf("enrolled %s named %q with the code %q; the secret file holds %s", got.PublicKey, got.Name, got.Code, key.PublicKey())
 	}
 	pin, _ := json.Marshal(accesskey.Pin{{Alg: "ed25519", PublicKey: f.signer.PublicKey().String()}})
@@ -224,7 +231,7 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{"--secret-file", filepath.Join(dir, "sec\nret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\nret")) + " contains a control character; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "sec\u009bret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\u009bret")) + " contains a control character; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "sec\xffret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\xffret")) + " is not UTF-8; choose another with --secret-file"},
-		{[]string{"--secret-file", filepath.Join(dir, "qec_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "qeci_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "QAK_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "x-qrk_"), "http://apiary.example.com", c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", file, "http://apiary.example.com", c}, serverShape},
@@ -233,8 +240,8 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{"--secret-file", file, "https://user@apiary.example.com", c}, serverShape},
 		{[]string{"--secret-file", file, "https://apiary.example.com?a=1", c}, serverShape},
 		{[]string{"--secret-file", file, c, f.url}, serverShape},
-		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + "U." + f.signer.Fingerprint()}, "the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"},
-		{[]string{"--secret-file", file, f.url, "qec_" + codeCore + ".!" + f.signer.Fingerprint()}, "the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"},
+		{[]string{"--secret-file", file, f.url, "qeci_" + codeCore + "U." + f.signer.Fingerprint()}, notACode},
+		{[]string{"--secret-file", file, f.url, "qeci_" + codeCore + ".!" + f.signer.Fingerprint()}, notACode},
 		{[]string{"--secret-file", file, f.url}, "want two arguments, the server and the code"},
 		{[]string{f.url, c}, "--secret-file is required"},
 	} {
@@ -252,6 +259,110 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 	}
 	if _, err := os.Lstat(file); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a secret file was written: %v", err)
+	}
+}
+
+// notACode is the error of a code that is not an enrolment code.
+const notACode = "the code is not an enrolment code: qeci_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"
+
+// TestEnrolRefusesACodeOfAnotherKind pins that a node's, a node pool's or a gateway's
+// code, its prefix in either case, is refused with one line that names its kind and
+// not the code, before the secret file's directory is probed, a key is made or
+// anything is sent, and that an integration's code in either case is taken.
+func TestEnrolRefusesACodeOfAnotherKind(t *testing.T) {
+	f := newFakeApiary(t, adapterEnrolled)
+	defer func(g func() (*accesskey.Key, error)) { generateKey = g }(generateKey)
+	generated := 0
+	generateKey = func() (*accesskey.Key, error) {
+		generated++
+		return accesskey.Generate()
+	}
+	defer func(r func(string) error) { removeProbe = r }(removeProbe)
+	probed := 0
+	removeProbe = func(p string) error {
+		probed++
+		return os.Remove(p)
+	}
+	for prefix, what := range map[string]string{
+		accesskey.CodePrefixNode:    "a node",
+		accesskey.CodePrefixPool:    "a node pool",
+		accesskey.CodePrefixGateway: "a gateway",
+	} {
+		for _, p := range []string{prefix, strings.ToUpper(prefix)} {
+			dir := t.TempDir()
+			c := codeOf(p, f.signer)
+			status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, c)
+			want := "qory-github-server access-key: this code is for " + what + ": use a code from the integration's Access key tab\n"
+			if status != 1 || out != "" || errs != want {
+				t.Errorf("%s: exit %d, stdout %q, stderr %q; want %q", p, status, out, errs, want)
+			}
+			noLeak(t, "", c, out, errs)
+			if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+				t.Errorf("%s: the directory holds %v", p, entries)
+			}
+		}
+	}
+	if n := f.requests.Load(); n != 0 || generated != 0 || probed != 0 {
+		t.Errorf("%d requests were sent, %d keys made and %d probes made", n, generated, probed)
+	}
+	for _, p := range []string{accesskey.CodePrefixAdapter, strings.ToUpper(accesskey.CodePrefixAdapter)} {
+		before := f.requests.Load()
+		status, _, errs := enrolRun(t, "--secret-file", filepath.Join(t.TempDir(), "secret"), f.url, codeOf(p, f.signer))
+		if status != 0 || f.requests.Load() != before+1 {
+			t.Errorf("%s: exit %d, %d requests, stderr %q", p, status, f.requests.Load()-before, errs)
+		}
+	}
+}
+
+// TestEnrolRefusesWhatIsNotAnEnrolmentCode pins that a code with the prefix enrolment
+// codes had before, qec_, one with an unknown prefix, and a malformed code of each kind
+// are refused with the one error that quotes no part of the code, and nothing is sent.
+func TestEnrolRefusesWhatIsNotAnEnrolmentCode(t *testing.T) {
+	f := newFakeApiary(t, adapterEnrolled)
+	fp := f.signer.Fingerprint()
+	for _, c := range []string{
+		"qec_" + codeCore + "." + fp,
+		"QEC_" + codeCore + "." + fp,
+		"qecx_" + codeCore + "." + fp,
+		"qak_" + codeCore + "." + fp,
+		codeCore + "." + fp,
+		"qeci_" + codeCore + "Z." + fp,
+		"qeci_" + codeCore[:25] + "." + fp,
+		"qeci_" + codeCore,
+		"qecn_" + codeCore + "U." + fp,
+		"qecp_" + codeCore + ".!" + fp,
+		"QECG_" + codeCore + "." + fp + "." + fp + "." + fp,
+	} {
+		file := filepath.Join(t.TempDir(), "secret")
+		status, out, errs := enrolRun(t, "--secret-file", file, f.url, c)
+		if want := "qory-github-server access-key: " + notACode + "\n"; status != 1 || out != "" || errs != want {
+			t.Errorf("%s: exit %d, stdout %q, stderr %q", c, status, out, errs)
+		}
+		noLeak(t, "", c, out, errs)
+		if _, err := os.Lstat(file); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s: a secret file was written: %v", c, err)
+		}
+	}
+	if n := f.requests.Load(); n != 0 {
+		t.Errorf("%d requests were sent", n)
+	}
+}
+
+// TestHasCodeOrSecretFindsEachPrefix pins that what starts an enrolment code of each
+// kind, an access key secret or a run key is found anywhere in a value, in any case,
+// and that the prefix enrolment codes had before is not.
+func TestHasCodeOrSecretFindsEachPrefix(t *testing.T) {
+	for _, p := range []string{accesskey.CodePrefixNode, accesskey.CodePrefixPool, accesskey.CodePrefixGateway, accesskey.CodePrefixAdapter, accesskey.SecretPrefix, "qrk_"} {
+		for _, v := range []string{p, strings.ToUpper(p), strings.ToUpper(p[:2]) + p[2:], "/etc/qory-github/" + p + "x", "https://" + strings.ToUpper(p) + "x.example.com"} {
+			if !hasCodeOrSecret(v) {
+				t.Errorf("%q: not found", v)
+			}
+		}
+	}
+	for _, v := range []string{"/etc/qory-github/access-key-secret", "https://apiary.example.com", "qec_x", "qeca_x", "qec-i_x"} {
+		if hasCodeOrSecret(v) {
+			t.Errorf("%q: found", v)
+		}
 	}
 }
 
@@ -299,9 +410,9 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 			want: fmt.Sprintf(unverified, 307)},
 		"an answer larger than 64 KiB": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", pad: accesskey.MaxAnswer},
 			want: fmt.Sprintf(unverified, 201)},
-		"a node's code": {reply: reply{status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef"},
+		"a node's key for an integration's code": {reply: reply{status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef"},
 			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the node nd_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
-		"a gateway's code": {reply: reply{status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef"},
+		"a gateway's key for an integration's code": {reply: reply{status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef"},
 			want: "access key fingerprint {fp}\nqory-github-server access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the gateway ng_0123456789abcdef, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's Access key tab in Organisation settings\n"},
 		"a kind that does not match the id": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "nd_0123456789abcdef"},
 			want: "access key fingerprint {fp}\nqory-github-server access-key: the enrolment did not complete: the enrolment answer: node_kind \"adapter\" does not match the node id nd_0123456789abcdef; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"},
