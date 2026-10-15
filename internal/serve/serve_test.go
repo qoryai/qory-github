@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -178,40 +179,158 @@ func TestAnEventWithDigitsIsTaken(t *testing.T) {
 	}
 }
 
-func TestABodyBeyondTheReadingBoundIsRefusedUnread(t *testing.T) {
+// rawDelivery is a delivery's request line and headers, its Content-Length length, as
+// a sender writes them on a connection.
+func rawDelivery(guid string, length int) string {
+	return fmt.Sprintf("POST %s HTTP/1.1\r\nHost: example.com\r\nX-GitHub-Event: issues\r\nX-GitHub-Delivery: %s\r\nX-Hub-Signature-256: %s\r\nContent-Length: %d\r\n\r\n", WebhookPath, guid, sign(body1), length)
+}
+
+func held(rc *Receiver) (int64, int64) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.held, rc.peak
+}
+
+func TestASenderThatSendsNothingHoldsNothing(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rc := &Receiver{Secret: []byte(secret), Store: st, maxReading: 2}
-	rc.init()
-	// Two bodies are being read.
-	rc.reading <- struct{}{}
-	rc.reading <- struct{}{}
-	read := false
-	r := httptest.NewRequest(http.MethodPost, WebhookPath, readerFunc(func(p []byte) (int, error) {
-		read = true
-		return 0, io.EOF
-	}))
-	r.Header.Set("X-GitHub-Event", "issues")
-	r.Header.Set("X-GitHub-Delivery", guid1)
-	r.Header.Set("X-Hub-Signature-256", sign(body1))
-	w := httptest.NewRecorder()
-	rc.Mux().ServeHTTP(w, r)
-	if w.Code != http.StatusServiceUnavailable || read {
-		t.Errorf("status %d, body read %v", w.Code, read)
+	// The budget is one body: a sender that held it by what it claims would leave none.
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: int64(len(body1))}
+	srv := httptest.NewServer(rc.Mux())
+	defer srv.Close()
+	for i := range 5 {
+		c, err := net.Dial("tcp", srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		io.WriteString(c, rawDelivery(fmt.Sprintf("72d3162e-cc78-11e3-81ab-4c9367dc%04d", i), len(body1)))
+	}
+	time.Sleep(100 * time.Millisecond)
+	if h, _ := held(rc); h != 0 {
+		t.Errorf("senders that sent nothing hold %d bytes", h)
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+WebhookPath, strings.NewReader(body1))
+	req.Header.Set("X-GitHub-Event", "issues")
+	req.Header.Set("X-GitHub-Delivery", guid1)
+	req.Header.Set("X-Hub-Signature-256", sign(body1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("a genuine delivery: status %d", resp.StatusCode)
+	}
+}
+
+func TestTheBudgetIsNeverExceededNorTakenFromTheLengthClaimed(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st, maxBudget: int64(len(body1))}
+	larger := body1 + strings.Repeat(" ", 10)
+	if w := post(rc.Mux(), "issues", guid1, larger, sign(larger)); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("a body beyond the budget: status %d", w.Code)
 	}
 	if p := pending(t, st); len(p) != 0 {
 		t.Errorf("kept %+v", p)
 	}
-	// Once a read is over, a delivery is taken again.
-	<-rc.reading
-	if w := post(rc.Mux(), "issues", guid1, body1, sign(body1)); w.Code != http.StatusAccepted {
-		t.Errorf("status %d", w.Code)
+	// A length claimed far beyond the budget takes nothing from it: the body that
+	// arrives is what counts.
+	r := httptest.NewRequest(http.MethodPost, WebhookPath, strings.NewReader(body1))
+	r.ContentLength = MaxBody
+	r.Header.Set("X-GitHub-Event", "issues")
+	r.Header.Set("X-GitHub-Delivery", guid2)
+	r.Header.Set("X-Hub-Signature-256", sign(body1))
+	w := httptest.NewRecorder()
+	rc.Mux().ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Errorf("a body within the budget, its length claimed larger: status %d", w.Code)
+	}
+	h, peak := held(rc)
+	if h != 0 || peak > rc.maxBudget || peak != int64(len(body1)) {
+		t.Errorf("held %d, peak %d, budget %d", h, peak, rc.maxBudget)
 	}
 }
 
-// readerFunc is a function that is an [io.Reader].
-type readerFunc func([]byte) (int, error)
+func TestTheBudgetIsHeldUntilTheHandlingIsOver(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	st := openStore(t, dir)
+	var during int64
+	rc := &Receiver{Secret: []byte(secret), Store: st}
+	rc.Stored = func() { during, _ = held(rc) }
+	post(rc.Mux(), "issues", guid1, body1, sign(body1))
+	if h, _ := held(rc); during != int64(len(body1)) || h != 0 {
+		t.Errorf("held %d while the delivery was kept, %d after", during, h)
+	}
+}
 
-func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+func TestASenderThatSendsTooSlowlyIsCut(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	rc := &Receiver{Secret: []byte(secret), Store: st, progress: 300 * time.Millisecond}
+	srv := httptest.NewServer(rc.Mux())
+	defer srv.Close()
+	c, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	io.WriteString(c, rawDelivery(guid1, 100000))
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		// 10 bytes each 50 ms is far below 32 KiB in 300 ms.
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			if _, err := io.WriteString(c, strings.Repeat("a", 10)); err != nil {
+				return
+			}
+		}
+	}()
+	begun := time.Now()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("no answer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestTimeout || time.Since(begun) > 2*time.Second {
+		t.Errorf("status %d after %s", resp.StatusCode, time.Since(begun))
+	}
+	if p := pending(t, st); len(p) != 0 {
+		t.Errorf("kept %+v", p)
+	}
+	if h, _ := held(rc); h != 0 {
+		t.Errorf("held %d after the cut", h)
+	}
+}
+
+func TestThrottleCountsWhatItDropsAndFlushesTheCount(t *testing.T) {
+	flushed := make(chan int, 1)
+	th := &throttle{every: 50 * time.Millisecond, flush: func(n int) { flushed <- n }}
+	if ok, _ := th.allow(); !ok {
+		t.Fatal("the first line is dropped")
+	}
+	for range 3 {
+		if ok, _ := th.allow(); ok {
+			t.Fatal("a line within the period is allowed")
+		}
+	}
+	select {
+	case n := <-flushed:
+		if n != 3 {
+			t.Errorf("flushed %d, want 3", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the count is never flushed")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if ok, dropped := th.allow(); !ok || dropped != 0 {
+		t.Errorf("after the flush: %v %d", ok, dropped)
+	}
+}
 
 func TestRefusalsAreLoggedOnceASecond(t *testing.T) {
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
@@ -781,4 +900,89 @@ func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "state")); !os.IsNotExist(err) {
 		t.Errorf("the state directory is made: %v", err)
 	}
+}
+
+// running runs serve with opts on a loopback port, and returns its address and its log.
+// It stops when the test ends.
+func running(t *testing.T, opts Options) (string, *syncBuffer) {
+	t.Helper()
+	dir := t.TempDir()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(dir, "app.pem")
+	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})), 0o600)
+	secretFile := filepath.Join(dir, "secret")
+	writeFile(t, secretFile, secret, 0o600)
+	s := Settings{AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state")}
+	log := &syncBuffer{}
+	opts.Log = slog.New(slog.NewJSONHandler(log, nil))
+	addr := make(chan net.Addr, 1)
+	opts.Listening = func(a net.Addr) { addr <- a }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, s, opts) }()
+	t.Cleanup(func() { cancel(); <-done })
+	select {
+	case a := <-addr:
+		return a.String(), log
+	case err := <-done:
+		t.Fatalf("Run: %v", err)
+	}
+	return "", nil
+}
+
+// idle opens a connection to addr and makes one request on it, which it keeps open.
+func idle(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	io.WriteString(c, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	return c
+}
+
+func TestAnIdleConnectionIsClosedAfterTheIdleTimeout(t *testing.T) {
+	if idleTimeout != 5*time.Second {
+		t.Errorf("the idle timeout is %s", idleTimeout)
+	}
+	addr, _ := running(t, Options{idleTimeout: 200 * time.Millisecond})
+	c := idle(t, addr)
+	begun := time.Now()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF || time.Since(begun) > 2*time.Second {
+		t.Errorf("read %v after %s, want the connection closed", err, time.Since(begun))
+	}
+}
+
+func TestAFullConnectionBoundIsLogged(t *testing.T) {
+	addr, log := running(t, Options{maxConns: 1})
+	first := idle(t, addr)
+	second, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	eventually(t, "logged", func() bool { return strings.Contains(log.String(), `"msg":"connections at the bound","max":1`) })
+	// Once the first closes, the second is served.
+	first.Close()
+	io.WriteString(second, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	second.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(second), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 }

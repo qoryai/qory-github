@@ -7,9 +7,16 @@
 // delivery to the [Handler] its event is registered with in [Handlers], one
 // installation's deliveries in the order they arrived. TLS is the operator's proxy's:
 // serve listens on plain HTTP.
+//
+// Put serve behind a proxy that holds the whole request body before it passes the
+// request on, as nginx does by default (proxy_request_buffering on). Then a sender that
+// sends a body slowly holds the proxy's buffer, not serve's: serve reads each body at
+// the proxy's speed, and its byte budget and progress deadline, see [Receiver.ServeHTTP],
+// cut only senders that reach it directly.
 package serve
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -22,15 +29,15 @@ import (
 )
 
 // The server's bounds. A delivery is read within 15 seconds, 25 MiB at most, and
-// answered within a minute of its headers; a connection is idle two minutes at most.
-// GitHub counts a delivery not answered within ten seconds as failed, so a body that
-// takes longer to arrive is lost already, and the shorter bound frees a read slot
-// sooner from a sender that sends slowly.
+// answered within a minute of its headers; GitHub counts a delivery not answered within
+// ten seconds as failed, so a body that takes longer to arrive is lost already. A
+// connection is idle five seconds at most, so idle connections do not hold the
+// [maxConns] slots.
 const (
 	readHeaderTimeout = 10 * time.Second
 	readTimeout       = 15 * time.Second
 	writeTimeout      = time.Minute
-	idleTimeout       = 2 * time.Minute
+	idleTimeout       = 5 * time.Second
 	maxHeaderBytes    = 64 << 10
 	// shutdownBound is how long a stop waits for the requests under way to be answered,
 	// and handlerGrace how long for the handlers that run to return.
@@ -49,6 +56,10 @@ type Options struct {
 	Log *slog.Logger
 	// Listening, when set, is called with the address serve listens on, once it does.
 	Listening func(net.Addr)
+
+	// idleTimeout and maxConns replace [idleTimeout] and [maxConns] in a test.
+	idleTimeout time.Duration
+	maxConns    int
 }
 
 // Run serves until ctx is done. Before it listens it reads the App's private key and
@@ -88,13 +99,13 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
+		IdleTimeout:       cmp.Or(opts.idleTimeout, idleTimeout),
 		MaxHeaderBytes:    maxHeaderBytes,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	worker.Start()
 	served := make(chan error, 1)
-	go func() { served <- srv.Serve(limit(ln, maxConns)) }()
+	go func() { served <- srv.Serve(limit(ln, cmp.Or(opts.maxConns, maxConns), log)) }()
 	log.Info("serving", slog.String("address", ln.Addr().String()), slog.String("path", WebhookPath))
 	if opts.Listening != nil {
 		opts.Listening(ln.Addr())

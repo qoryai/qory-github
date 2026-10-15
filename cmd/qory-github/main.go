@@ -95,18 +95,18 @@ More: ` + more
 }
 
 // factory is whether the environment variable QORY_FEATURES switches on factory, the
-// command serve, the webhook receiver. It reads the variable as Qory Apiary reads it
-// for an opt-in feature, in qoryai/apiary's features module, factory being one:
+// command serve, the webhook receiver. factory is not a Qory Apiary feature: Qory Apiary
+// refuses QORY_FEATURES=factory at boot as an unknown feature. qory-github reads the
+// variable by the rules Qory Apiary applies to the name of an opt-in feature:
 //
 //   - unset, blank, all, and all- followed by the features left out, all-security,factory
-//     among them, leave factory off: all names every feature but the opt-in ones;
+//     among them, leave factory off;
 //   - a list of the features on, names separated by commas with white space around
 //     each ignored, switches factory on when it names factory;
-//   - a list that names all or all-… among its features is refused by Qory Apiary, and
-//     leaves factory off here.
+//   - a list that names all or all-… among its features, which Qory Apiary refuses,
+//     leaves factory off.
 //
-// Qory Apiary also refuses a name it does not know, which qory-github cannot tell, since
-// the list names the features of every program that reads it: such a name is ignored.
+// Any other name in the list is ignored.
 func factory() bool {
 	v := strings.TrimSpace(os.Getenv("QORY_FEATURES"))
 	if v == "all" || strings.HasPrefix(v, "all-") {

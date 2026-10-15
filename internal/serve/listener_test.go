@@ -2,6 +2,7 @@ package serve
 
 import (
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ func TestAConnectionBeyondTheBoundWaitsForOneToClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := limit(inner, 1)
+	ln := limit(inner, 1, nil)
 	defer ln.Close()
 	accepted := make(chan net.Conn, 2)
 	go func() {
@@ -52,7 +53,7 @@ func TestClosingTheListenerWakesAnAcceptThatWaits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := limit(inner, 1)
+	ln := limit(inner, 1, nil)
 	c, _ := net.Dial("tcp", inner.Addr().String())
 	defer c.Close()
 	held, err := ln.Accept()
@@ -71,5 +72,32 @@ func TestClosingTheListenerWakesAnAcceptThatWaits(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Accept still waits")
+	}
+}
+
+func TestAnAcceptedConnectionCanCloseItsWritingSide(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := limit(inner, 1, nil)
+	defer ln.Close()
+	c, _ := net.Dial("tcp", inner.Addr().String())
+	defer c.Close()
+	got, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	cw, ok := got.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("the connection has no CloseWrite")
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Errorf("the client reads %v, want the end of the stream", err)
 	}
 }
