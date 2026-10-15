@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/qory-github/internal/ownerfile"
 	"github.com/qoryai/qory-github/internal/store"
 )
@@ -84,6 +85,32 @@ func ReadWebhookSecret(path string) ([]byte, error) {
 		return nil, fmt.Errorf("the webhook secret in %s is shorter than %d bytes; set a longer random secret on the App and in the file", path, minSecret)
 	}
 	return b, nil
+}
+
+// maxAccessKeyFile is the most an access key secret file may hold; one byte more is
+// read to tell a larger file apart. A secret is 47 characters.
+const maxAccessKeyFile = 4 << 10
+
+// ReadAccessKeySecret reads the adapter's access key from a file that only its owner
+// has any permission on, as [ReadWebhookSecret] reads a secret: its secret, qak_ and 43
+// characters, and one line break at the end of the file, \n or \r\n, which is not part
+// of it. A published fixture key, whose secret anyone can read, is refused. An error
+// never contains the secret.
+func ReadAccessKeySecret(path string) (*accesskey.Key, error) {
+	b, err := ownerfile.ReadFile(path, maxAccessKeyFile, "the access key secret file", "an access key secret")
+	if err != nil {
+		return nil, err
+	}
+	b = bytes.TrimSuffix(b, []byte("\n"))
+	b = bytes.TrimSuffix(b, []byte("\r"))
+	k, err := accesskey.ParseSecret(string(b))
+	if err != nil {
+		return nil, fmt.Errorf("the access key secret file %s: %w", path, err)
+	}
+	if k.PublicKey().Fixture() {
+		return nil, fmt.Errorf("the access key secret file %s holds a published fixture key, whose secret anyone can read", path)
+	}
+	return k, nil
 }
 
 var (

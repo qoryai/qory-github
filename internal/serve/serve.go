@@ -8,6 +8,12 @@
 // installation's deliveries in the order they arrived. TLS is the operator's proxy's:
 // serve listens on plain HTTP.
 //
+// serve is the GitHub adapter of Qory Apiary: the [Adapter] sends Qory Apiary the
+// repositories, issues and comments of the installations linked to it, through the
+// [Apiary] client, every request signed with the adapter's access key and every answer
+// checked under the pin. The change feed's reader, one for each serve, applies on
+// GitHub what Qory Apiary's feed says.
+//
 // Put serve behind a proxy that holds the whole request body before it passes the
 // request on, as nginx does by default (proxy_request_buffering on). Then a sender that
 // sends a body slowly holds the proxy's buffer, not serve's, and serve reads each body
@@ -52,8 +58,7 @@ const (
 
 // Options are what [Run] runs with besides the settings.
 type Options struct {
-	// Handlers are the handlers by event name; nil has none, so every delivery is
-	// marked done as it is.
+	// Handlers are the handlers by event name; nil is the [Adapter]'s.
 	Handlers *Handlers
 	// Log takes serve's lines; nil logs nothing.
 	Log *slog.Logger
@@ -67,21 +72,26 @@ type Options struct {
 	refusalEvery time.Duration
 }
 
-// Run serves until ctx is done. Before it listens it reads the App's private key and
-// the webhook secret, so a wrong file stops it at once, and opens the store. When ctx
-// is done it stops taking deliveries, waits for the requests under way and the
-// handlers that run, each within a bound, and closes the store.
+// Run serves until ctx is done. Before it listens it reads the App's private key, the
+// webhook secret and the access key's secret, so a wrong file stops it at once, and
+// opens the store. Then it reads Qory Apiary's change feed, after it declares the
+// adapter, until it stops. When ctx is done it stops taking deliveries, waits for the
+// requests under way and the handlers that run, each within a bound, stops the feed's
+// reader, and closes the store.
 func Run(ctx context.Context, s Settings, opts Options) error {
 	log := opts.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	// The key is read so that a wrong one stops serve before it listens. Nothing here
-	// signs with it.
-	if _, err := github.ReadKeyFile(s.PrivateKeyFile); err != nil {
+	key, err := github.ReadKeyFile(s.PrivateKeyFile)
+	if err != nil {
 		return err
 	}
 	secret, err := ReadWebhookSecret(s.WebhookSecretFile)
+	if err != nil {
+		return err
+	}
+	accessKey, err := ReadAccessKeySecret(s.AccessKeySecretFile)
 	if err != nil {
 		return err
 	}
@@ -93,11 +103,29 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	if _, err := st.Sweep(); err != nil {
 		return err
 	}
+	instance, err := instanceID(st)
+	if err != nil {
+		return err
+	}
+	apiary := &Apiary{
+		URL: s.ApiaryURL, KeyID: s.AccessKeyID, Key: accessKey, Pin: s.ApiaryPublicKey, InstanceID: instance, Log: log,
+		Unlinked: func(ref string) {
+			if err := unlinkCollection(st, ref); err != nil {
+				log.Error("marking a collection not linked", slog.String("error", err.Error()))
+			}
+		},
+	}
+	adapter := &Adapter{Store: st, GitHub: github.Client{API: s.APIURL}, AppID: s.AppID, Key: key, Slug: s.AppSlug, Sink: apiary, Log: log}
+	handlers := opts.Handlers
+	if handlers == nil {
+		handlers = &Handlers{}
+		adapter.Register(handlers)
+	}
 	ln, err := net.Listen("tcp", s.Listen)
 	if err != nil {
 		return err
 	}
-	worker := &Worker{Store: st, Handlers: opts.Handlers, Log: log}
+	worker := &Worker{Store: st, Handlers: handlers, Log: log}
 	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, refusalEvery: opts.refusalEvery}
 	srv := &http.Server{
 		Handler:           rc.Mux(),
@@ -109,6 +137,13 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 	worker.Start()
+	feedCtx, stopFeed := context.WithCancel(context.Background())
+	defer stopFeed()
+	fed := make(chan struct{})
+	go func() {
+		defer close(fed)
+		(&feed{apiary: apiary, adapter: adapter, store: st, publicURL: s.PublicURL, log: log}).run(feedCtx)
+	}()
 	served := make(chan error, 1)
 	limited := limit(ln, cmp.Or(opts.maxConns, maxConns), log)
 	go func() { served <- srv.Serve(limited) }()
@@ -140,8 +175,12 @@ loop:
 		srv.Close()
 	}
 	worker.Stop(handlerGrace)
+	stopFeed()
+	<-fed
 	// A count of lines held back is logged before serve stops.
 	rc.stopLog()
+	apiary.init()
+	apiary.unauthorized.stop()
 	limited.full.stop()
 	log.Info("stopped")
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {

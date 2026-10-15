@@ -5,13 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -21,12 +17,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/store"
 )
 
@@ -650,6 +649,44 @@ func TestAHandlersErrorIsTriedAgainThenFails(t *testing.T) {
 	}
 }
 
+func TestAPermanentErrorFailsTheDeliveryAtOnce(t *testing.T) {
+	for _, err := range []error{Permanent(errors.New("Qory Apiary answered 403 forbidden")), fmt.Errorf("taking in: %w", github.ErrIssueGone), github.ErrUnreachable, github.ErrInvalidChange} {
+		var calls atomic.Int32
+		hs := &Handlers{}
+		hs.HandleFunc("issues", func(context.Context, Delivery) error { calls.Add(1); return err })
+		h := newHarness(t, filepath.Join(t.TempDir(), "state"), hs, 5)
+		post(h.mux, "issues", guid1, body1, sign(body1))
+		eventually(t, "failed", func() bool { return state(h.st, guid1) == store.Failed })
+		eventually(t, "logged", func() bool { return strings.Contains(h.log.String(), `"permanent":true`) })
+		if n := calls.Load(); n != 1 {
+			t.Errorf("%v: called %d times, want 1", err, n)
+		}
+	}
+	if Permanent(nil) != nil || Held(nil) != nil || IsPermanent(errors.New("GitHub answered 502")) || IsHeld(errors.New("x")) {
+		t.Error("nil or a plain error is marked")
+	}
+}
+
+// TestAHeldErrorIsTriedUntilItPasses has a handler held more times than the attempts,
+// as a 401 holds it while the access key waits for its approval, and checks the
+// delivery is done once it passes, never failed meanwhile.
+func TestAHeldErrorIsTriedUntilItPasses(t *testing.T) {
+	var calls atomic.Int32
+	hs := &Handlers{}
+	hs.HandleFunc("issues", func(context.Context, Delivery) error {
+		if calls.Add(1) <= 6 {
+			return Held(errors.New("Qory Apiary answered 401 unauthorized"))
+		}
+		return nil
+	})
+	h := newHarness(t, filepath.Join(t.TempDir(), "state"), hs, 2)
+	post(h.mux, "issues", guid1, body1, sign(body1))
+	eventually(t, "done", func() bool { return state(h.st, guid1) == store.Done })
+	if n := calls.Load(); n != 7 {
+		t.Errorf("called %d times, want 7", n)
+	}
+}
+
 func TestAHandlersPanicFailsItsDeliveryAlone(t *testing.T) {
 	hs := &Handlers{}
 	hs.HandleFunc("issues", func(context.Context, Delivery) error { panic("a bug") })
@@ -827,23 +864,48 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 	os.Chmod(path, mode)
 }
 
+// pinJSON is a pin with one key that is no fixture's.
+const pinJSON = `[{"alg":"ed25519","public_key":"Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}]`
+
 func TestReadSettings(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "serve.json")
-	writeFile(t, file, `{"app_id":123456,"private_key_file":"/k.pem","webhook_secret_file":"/s","listen":"127.0.0.1:8080","state_dir":"/var/lib/qory-github"}`, 0o644)
+	writeFile(t, file, `{"app_id":123456,"private_key_file":"/k.pem","webhook_secret_file":"/s","listen":"127.0.0.1:8080","state_dir":"/var/lib/qory-github",
+		"app_slug":"qory-acme","apiary_url":"https://apiary.example.com/","public_url":"https://qory-github.example.com/","access_key_id":"ak_0123456789abcdef",
+		"access_key_secret_file":"/a","apiary_public_key":`+pinJSON+`}`, 0o644)
 	s, err := ReadSettings(file)
-	want := Settings{AppID: "123456", PrivateKeyFile: "/k.pem", WebhookSecretFile: "/s", Listen: "127.0.0.1:8080", StateDir: "/var/lib/qory-github"}
-	if err != nil || s != want {
+	want := Settings{AppID: "123456", PrivateKeyFile: "/k.pem", WebhookSecretFile: "/s", Listen: "127.0.0.1:8080", StateDir: "/var/lib/qory-github",
+		AppSlug: "qory-acme", APIURL: "https://api.github.com", ApiaryURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com",
+		AccessKeyID: "ak_0123456789abcdef", AccessKeySecretFile: "/a", ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}}}
+	if err != nil || !reflect.DeepEqual(s, want) {
 		t.Fatalf("%+v %v", s, err)
 	}
-	base := map[string]any{"app_id": "Iv1.abc", "private_key_file": "/k.pem", "webhook_secret_file": "/s", "listen": ":8080", "state_dir": "/d"}
+	base := map[string]any{"app_id": "Iv1.abc", "private_key_file": "/k.pem", "webhook_secret_file": "/s", "listen": ":8080", "state_dir": "/d",
+		"app_slug": "qory-acme", "api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://qory-github.example.com/github",
+		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON)}
+	b, _ := json.Marshal(base)
+	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://qory-github.example.com/github" {
+		t.Errorf("%+v %v", s, err)
+	}
 	for name, tc := range map[string]struct {
 		change map[string]any
 		want   string
 	}{
-		"an unknown field":    {map[string]any{"api_url": "https://api.github.com"}, `unknown fields "api_url"`},
+		"an unknown field":    {map[string]any{"github_url": "https://api.github.com"}, `unknown fields "github_url"`},
+		"a bad slug":          {map[string]any{"app_slug": "secret value"}, "/app_slug: is not an App's slug"},
+		"another API":         {map[string]any{"api_url": "https://secret.example.com"}, "/api_url: the API is neither"},
+		"Qory Apiary on http": {map[string]any{"apiary_url": "http://secret.example.com"}, "/apiary_url: is neither an https origin"},
+		"Qory Apiary's path":  {map[string]any{"apiary_url": "https://apiary.example.com/secret"}, "/apiary_url: is neither an https origin"},
+		"a user":              {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
+		"a public http URL":   {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
+		"a public query":      {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
+		"a bad key id":        {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
+		"a pin of no list":    {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
+		"a pin of a bad key":  {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
+		"a fixture pin":       {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "rcFAEfgtHFbZVqpPnXPYhYNhpgYEhSXg0Ixjjcdd2Mc"}}}, "/apiary_public_key: lists a published fixture key"},
+		"a secret in the pin": {map[string]any{"apiary_public_key": "qak_secret value"}, "/apiary_public_key: the document contains an access key secret"},
 		"an odd unknown name": {map[string]any{"a\nb": 1}, `unknown fields "a\nb"`},
-		"a missing field":     {map[string]any{"state_dir": nil}, "/state_dir: is not a string that is not empty"},
+		"a null field":        {map[string]any{"state_dir": nil}, "/state_dir: is not a string that is not empty"},
 		"an empty path":       {map[string]any{"private_key_file": ""}, "/private_key_file: is not a string"},
 		"a bad App id":        {map[string]any{"app_id": "secret value"}, "/app_id: is not an App's id"},
 		"a negative App id":   {map[string]any{"app_id": -1}, "/app_id: is neither"},
@@ -867,8 +929,10 @@ func TestReadSettings(t *testing.T) {
 		}
 	}
 	delete(base, "listen")
-	b, _ := json.Marshal(base)
-	if _, err := parseSettings(b); err == nil || !strings.Contains(err.Error(), "missing fields listen") {
+	delete(base, "access_key_id")
+	delete(base, "api_url")
+	b, _ = json.Marshal(base)
+	if _, err := parseSettings(b); err == nil || !strings.HasSuffix(err.Error(), "missing fields listen, access_key_id") {
 		t.Errorf("err %v", err)
 	}
 	for doc, want := range map[string]string{
@@ -929,15 +993,9 @@ func TestAWebhookSecretFileOthersMayReadIsRefused(t *testing.T) {
 
 func TestRunServesUntilItsContextIsDone(t *testing.T) {
 	dir := t.TempDir()
-	k, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyFile := filepath.Join(dir, "app.pem")
-	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})), 0o600)
-	secretFile := filepath.Join(dir, "secret")
-	writeFile(t, secretFile, secret, 0o600)
-	s := Settings{AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state")}
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 
 	handled := make(chan string, 1)
 	hs := &Handlers{}
@@ -985,27 +1043,84 @@ func TestRunServesUntilItsContextIsDone(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run does not return")
 	}
-	if strings.Contains(log.String(), "must not") || strings.Contains(log.String(), "PRIVATE KEY") {
+	if strings.Contains(log.String(), "must not") || strings.Contains(log.String(), "PRIVATE KEY") || strings.Contains(log.String(), access.Secret()) {
 		t.Errorf("the log carries the body, the secret or the key: %s", log.String())
 	}
 	// The store is closed: it opens again.
 	openStore(t, s.StateDir)
 }
 
-func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
+// TestRunDeclaresTheAdapterAtStart runs serve and checks its first request to Qory
+// Apiary, POST /v1/adapter: signed, with its time, the connect page under the public
+// URL and the sync serve declares; and that the instance id is kept across a restart.
+func TestRunDeclaresTheAdapterAtStart(t *testing.T) {
 	dir := t.TempDir()
-	secretFile := filepath.Join(dir, "secret")
-	writeFile(t, secretFile, secret, 0o644)
-	k, _ := rsa.GenerateKey(rand.Reader, 2048)
-	keyFile := filepath.Join(dir, "app.pem")
-	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})), 0o600)
-	listened := false
-	err := Run(context.Background(), Settings{AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state")}, Options{Listening: func(net.Addr) { listened = true }})
-	if err == nil || !strings.Contains(err.Error(), "group or others") || listened {
-		t.Errorf("err %v, listened %v", err, listened)
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	for i := range 2 {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- Run(ctx, s, Options{}) }()
+		eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > i && len(apiary.sent("GET "+routeChanges)) > i })
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "state")); !os.IsNotExist(err) {
-		t.Errorf("the state directory is made: %v", err)
+	declared := apiary.sent(routeAdapter)
+	if len(declared) != 2 {
+		t.Fatalf("declared %d times", len(declared))
+	}
+	b := declared[0].body
+	sync, _ := json.Marshal(b["sync"])
+	if len(b) != 4 || b["version"] != 1.0 || b["connect_url"] != "https://qory-github.example.com/v1/connect" || string(sync) != `{"default_interval":3600,"minimum_interval":900,"sends_changes":true}` {
+		t.Errorf("declared %s", declared[0].raw)
+	}
+	if declared[0].instance != declared[1].instance || !strings.HasPrefix(declared[0].instance, "i_") {
+		t.Errorf("the instance ids %s and %s", declared[0].instance, declared[1].instance)
+	}
+}
+
+func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
+	access := newKey(t)
+	for _, loose := range []string{"secret", "access-key"} {
+		dir := t.TempDir()
+		s := settingsFiles(t, dir, access, "https://apiary.example.com", pinOf(newKey(t)))
+		os.Chmod(filepath.Join(dir, loose), 0o644)
+		listened := false
+		err := Run(context.Background(), s, Options{Listening: func(net.Addr) { listened = true }})
+		if err == nil || !strings.Contains(err.Error(), "group or others") || listened || strings.Contains(err.Error(), access.Secret()) {
+			t.Errorf("%s: err %v, listened %v", loose, err, listened)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "state")); !os.IsNotExist(err) {
+			t.Errorf("%s: the state directory is made: %v", loose, err)
+		}
+	}
+}
+
+func TestReadAccessKeySecret(t *testing.T) {
+	dir := t.TempDir()
+	k := newKey(t)
+	file := filepath.Join(dir, "access-key")
+	for _, content := range []string{k.Secret(), k.Secret() + "\n", k.Secret() + "\r\n"} {
+		writeFile(t, file, content, 0o600)
+		got, err := ReadAccessKeySecret(file)
+		if err != nil || got.PublicKey() != k.PublicKey() {
+			t.Errorf("%q: %v", content, err)
+		}
+	}
+	for content, want := range map[string]string{
+		"qak_secret value":  "the access key secret",
+		k.Secret() + "\n\n": "the access key secret",
+		// The fixture access key of the contract, whose secret is published.
+		"qak_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA": "a published fixture key",
+	} {
+		writeFile(t, file, content, 0o600)
+		_, err := ReadAccessKeySecret(file)
+		if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "qak_") {
+			t.Errorf("%q: err %v", content, err)
+		}
 	}
 }
 
@@ -1014,15 +1129,9 @@ func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
 func running(t *testing.T, opts Options) (string, *syncBuffer, func()) {
 	t.Helper()
 	dir := t.TempDir()
-	k, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyFile := filepath.Join(dir, "app.pem")
-	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})), 0o600)
-	secretFile := filepath.Join(dir, "secret")
-	writeFile(t, secretFile, secret, 0o600)
-	s := Settings{AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state")}
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 	log := &syncBuffer{}
 	opts.Log = slog.New(slog.NewJSONHandler(log, nil))
 	addr := make(chan net.Addr, 1)

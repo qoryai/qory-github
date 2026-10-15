@@ -249,8 +249,8 @@ func (a *apiReply) err(what string) error {
 	return &answerError{what: what, status: a.status, message: e.Message}
 }
 
-// send makes one request to the API with an installation token, paced by p, nil being
-// a pacer of its own, and returns GitHub's answer whatever its status, so the caller
+// send makes one request to the API with an installation token, paced by p, or by a new
+// Pacer when p is nil, and returns GitHub's answer whatever its status, so the caller
 // reads the status, and the Link header for a list's next page. listing marks a
 // listing's request, see [Pacer]. It is [Client.call] with the answer handed back: it
 // refuses an API [CheckAPIURL] refuses before anything is sent, follows no redirect,

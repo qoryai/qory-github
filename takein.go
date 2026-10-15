@@ -90,6 +90,16 @@ var (
 	slugShape = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$`)
 )
 
+// CheckSlug refuses what is not an App's slug: 1 to 100 letters, digits, dots,
+// underscores or hyphens, starting with a letter or a digit. Its bot's login is the
+// slug and [bot]. The error names the rule, never the value.
+func CheckSlug(slug string) error {
+	if !slugShape.MatchString(slug) {
+		return errors.New("is not an App's slug, 1 to 100 letters, digits, dots, underscores or hyphens")
+	}
+	return nil
+}
+
 // maxChangeURL is the longest work item URL a change may carry.
 const maxChangeURL = 2048
 
@@ -160,7 +170,7 @@ func marker(workItemID string) string {
 
 // ApplyChange writes on GitHub what one entry of Qory Apiary's change feed says about an
 // issue, with a token token returns for the issue's repository, each request paced by p,
-// the installation's [Pacer], which nil makes one of its own. slug is the App's slug:
+// the installation's [Pacer], or a new Pacer when p is nil. slug is the App's slug:
 // only a comment by its bot, slug[bot], counts as the one a take in posted.
 //
 // The change is checked before anything is sent, see [Change], and refused whole when it

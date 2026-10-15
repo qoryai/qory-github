@@ -93,3 +93,27 @@ func TestMintInstallationTokenChecksTheInstallationAndNeverSaysTheToken(t *testi
 		t.Errorf("err %v", err)
 	}
 }
+
+// TestMintListingTokenAsksForMetadataAlone mints the token a listing of the
+// installation's repositories reads with, and checks the mint names no repository and
+// asks for metadata read alone, after the installation is checked.
+func TestMintListingTokenAsksForMetadataAlone(t *testing.T) {
+	f := &fakeGitHub{accounts: map[int64]string{7: "acme"}}
+	c := serve(t, f)
+	tok, err := c.MintListingToken(context.Background(), appID, key(t), 7)
+	if err != nil || tok.Token != fakeToken {
+		t.Fatalf("%v %v", tok, err)
+	}
+	got, _ := json.Marshal(f.mint)
+	if string(got) != `{"permissions":{"metadata":"read"}}` || strings.Join(f.checks, " ") != "/app/installations/7" {
+		t.Errorf("the mint requested %s, checks %v", got, f.checks)
+	}
+	for _, id := range []int64{0, -1} {
+		if _, err := c.MintListingToken(context.Background(), appID, key(t), id); err == nil {
+			t.Errorf("installation %d: no error", id)
+		}
+	}
+	if _, err := c.MintListingToken(context.Background(), appID, nil, 7); err == nil || err.Error() != "no private key" {
+		t.Errorf("err %v", err)
+	}
+}

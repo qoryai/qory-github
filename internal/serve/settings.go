@@ -8,11 +8,15 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github"
 )
 
 // Settings are what serve runs with: one JSON document in a file, --settings FILE. They
@@ -33,11 +37,35 @@ type Settings struct {
 	Listen string
 	// StateDir is the directory the store is in, see [store.Open].
 	StateDir string
+	// AppSlug is the App's slug: its bot, slug[bot], writes the work item comment.
+	AppSlug string
+	// APIURL is GitHub's API, which [github.CheckAPIURL] takes; the field may be left
+	// out for [github.APIURL].
+	APIURL string
+	// ApiaryURL is Qory Apiary's origin, https, or for a test http on a loopback host:
+	// every request to Qory Apiary goes there, and nowhere else.
+	ApiaryURL string
+	// PublicURL is where serve is reached from outside, https: Qory Apiary sends a
+	// person to connect GitHub to its connect page under it.
+	PublicURL string
+	// AccessKeyID is the adapter's access key's id in Qory Apiary, ak_ and 16
+	// characters.
+	AccessKeyID string
+	// AccessKeySecretFile is a file that contains the access key's secret, qak_ and
+	// 43 characters, read with [ReadAccessKeySecret]. One adapter key serves one serve.
+	AccessKeySecretFile string
+	// ApiaryPublicKey is the pin: Qory Apiary's public keys, a list of {"alg":
+	// "ed25519", "public_key": "<base64url>"}, which every answer of Qory Apiary is
+	// checked under before it is used.
+	ApiaryPublicKey accesskey.Pin
 }
 
 // fields are the settings' fields, in the order an error lists the missing ones. A
 // field that is added later is added here and in [ReadSettings]'s switch.
-var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir"}
+var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key"}
+
+// optional are the fields that may be left out, each with its default.
+var optional = []string{"api_url"}
 
 // maxSettingsFile is the most a settings file may hold, far more than its fields need.
 const maxSettingsFile = 1 << 20
@@ -50,6 +78,8 @@ var appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 // but white space. Every field is required, and a field it does not know is refused. An
 // error says where the settings are wrong and what is wrong there, never a value: a
 // field's name is quoted as Go quotes a string.
+//
+// Every field is required but api_url, which is GitHub's API when it is left out.
 func ReadSettings(path string) (Settings, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -94,16 +124,19 @@ func parseSettings(b []byte) (Settings, error) {
 		return Settings{}, fmt.Errorf("the settings are invalid: unknown fields %s", strings.Join(unknown, ", "))
 	}
 	for _, name := range fields {
-		if _, ok := doc[name]; !ok {
+		if _, ok := doc[name]; !ok && !slices.Contains(optional, name) {
 			missing = append(missing, name)
 		}
 	}
 	if len(missing) > 0 {
 		return Settings{}, fmt.Errorf("the settings are invalid: missing fields %s", strings.Join(missing, ", "))
 	}
-	var s Settings
+	s := Settings{APIURL: github.APIURL}
 	for _, name := range fields {
-		raw := doc[name]
+		raw, ok := doc[name]
+		if !ok {
+			continue
+		}
 		var err error
 		switch name {
 		case "app_id":
@@ -118,6 +151,30 @@ func parseSettings(b []byte) (Settings, error) {
 			}
 		case "state_dir":
 			s.StateDir, err = text(raw)
+		case "app_slug":
+			if s.AppSlug, err = text(raw); err == nil {
+				err = github.CheckSlug(s.AppSlug)
+			}
+		case "api_url":
+			if s.APIURL, err = text(raw); err == nil {
+				err = github.CheckAPIURL(s.APIURL)
+			}
+		case "apiary_url":
+			if s.ApiaryURL, err = text(raw); err == nil {
+				s.ApiaryURL, err = checkOrigin(s.ApiaryURL)
+			}
+		case "public_url":
+			if s.PublicURL, err = text(raw); err == nil {
+				s.PublicURL, err = checkPublicURL(s.PublicURL)
+			}
+		case "access_key_id":
+			if s.AccessKeyID, err = text(raw); err == nil && accesskey.CheckID(s.AccessKeyID) != nil {
+				err = errors.New("is not ak_ and 16 lower-case Crockford base32 characters")
+			}
+		case "access_key_secret_file":
+			s.AccessKeySecretFile, err = text(raw)
+		case "apiary_public_key":
+			s.ApiaryPublicKey, err = pin(raw)
 		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("the settings are invalid: /%s: %w", name, err)
@@ -150,6 +207,54 @@ func appID(raw json.RawMessage) (string, error) {
 		return "", errors.New("is neither a positive 64-bit integer nor an App's client id")
 	}
 	return strconv.FormatInt(r.Num().Int64(), 10), nil
+}
+
+// checkOrigin takes Qory Apiary's origin, a scheme and a host with a port or none:
+// https, or for a test http on a loopback host, localhost, 127.0.0.1 or [::1], as
+// Forager's server URL is. A trailing slash is dropped.
+func checkOrigin(s string) (string, error) {
+	const rule = "is neither an https origin nor, for a test, http on a loopback host"
+	if accesskey.ContainsSecret(s) {
+		return "", errors.New(rule)
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return "", errors.New(rule)
+	}
+	switch host := u.Hostname(); {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "::1"):
+	default:
+		return "", errors.New(rule)
+	}
+	return strings.TrimSuffix(s, "/"), nil
+}
+
+// checkPublicURL takes where serve is reached from outside: https, a host, and a path
+// or none, without a user, a query or a fragment. A trailing slash is dropped.
+func checkPublicURL(s string) (string, error) {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || accesskey.ContainsSecret(s) {
+		return "", errors.New("is not an https URL without a user, a query or a fragment")
+	}
+	return strings.TrimSuffix(s, "/"), nil
+}
+
+// pin is the apiary_public_key field: Qory Apiary's public keys, as
+// [accesskey.ParsePin] reads them, none of them a published fixture key, whose secret
+// anyone can read.
+func pin(raw json.RawMessage) (accesskey.Pin, error) {
+	p, err := accesskey.ParsePin(raw)
+	if errors.Is(err, accesskey.ErrSecretInDocument) {
+		return nil, err
+	}
+	if err != nil {
+		return nil, errors.New(`is not a list of {"alg": "ed25519", "public_key": "<32 bytes, base64url>"}, each a key that can be used, none twice`)
+	}
+	if p.Fixture() {
+		return nil, errors.New("lists a published fixture key, whose secret anyone can read")
+	}
+	return p, nil
 }
 
 // checkListen takes an address and a port, host:port, [::1]:port or :port, the port a

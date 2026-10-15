@@ -14,7 +14,9 @@ import (
 type Delivery = store.Delivery
 
 // Handler handles the deliveries of one event. It returns nil once the delivery is
-// handled, and an error to have it tried again later. A delivery may be handed to it
+// handled, and an error to have it tried again later: an error [Permanent] marks fails
+// the delivery at once, and one [Held] marks has it tried again for as long as it
+// takes. A delivery may be handed to it
 // again after a restart, so handling one twice must do no harm. Its error is logged, so
 // it never contains a secret, a token or the body. It returns soon after ctx is
 // cancelled, which a stop does.
@@ -90,8 +92,11 @@ const (
 // are handled one after another in the order they arrived; those of different
 // installations at once. A delivery whose event has no handler is marked done. A
 // handler's error is tried again after a wait that doubles each time, [Worker.Attempts]
-// times in all, and the delivery is then marked failed. A delivery stays pending until
-// one of these, so one that a stop interrupted is handled after the next start.
+// times in all, and the delivery is then marked failed. A [Permanent] error marks it
+// failed at once. A [Held] error is tried again after a wait that doubles to a minute,
+// and counts as no attempt, so the installation's later deliveries wait behind it. A
+// delivery stays pending until one of these, so one that a stop interrupted is handled
+// after the next start.
 type Worker struct {
 	// Store keeps the deliveries.
 	Store *store.Store
@@ -302,7 +307,8 @@ func (w *Worker) handle(meta Delivery) bool {
 	if attempts <= 0 {
 		attempts = DefaultAttempts
 	}
-	for attempt := 1; ; attempt++ {
+	attempt, held := 1, 0
+	for {
 		err := call(w.ctx, h, d)
 		if err == nil {
 			return w.settle(d, store.Done, "done")
@@ -311,11 +317,21 @@ func (w *Worker) handle(meta Delivery) bool {
 			w.outcome(d, "interrupted")
 			return true
 		}
-		if attempt >= attempts {
+		var wait time.Duration
+		switch {
+		case IsHeld(err):
+			held++
+			wait = w.backoff(held)
+		case IsPermanent(err):
+			return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt), slog.Bool("permanent", true), slog.String("error", err.Error()))
+		case attempt >= attempts:
 			return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt), slog.String("error", err.Error()))
+		default:
+			wait = w.backoff(attempt)
+			attempt++
 		}
 		select {
-		case <-time.After(w.backoff(attempt)):
+		case <-time.After(wait):
 		case <-w.stopping:
 			w.outcome(d, "interrupted")
 			return true
