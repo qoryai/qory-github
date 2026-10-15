@@ -342,7 +342,8 @@ func (c Client) base() string {
 }
 
 // call makes one request to the API, the one what names, such as "minting the
-// installation token", and decodes the answer. It refuses an API [CheckAPIURL] refuses
+// installation token", and decodes the answer into out; a nil out reads the status
+// alone and decodes nothing. It refuses an API [CheckAPIURL] refuses
 // before anything is sent, so every request, a mint's and setup's, goes to GitHub's API
 // alone. It follows no redirect, whatever client it is handed, so neither the App's token
 // nor setup's code goes on to where one points: a redirect is an answer like another,
@@ -396,6 +397,9 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 			e.Message = http.StatusText(resp.StatusCode)
 		}
 		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("%s: GitHub's answer: %w", what, err)

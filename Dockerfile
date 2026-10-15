@@ -7,7 +7,7 @@
 #
 # Build from the repository's root:
 #
-#   docker build --build-arg VERSION=0.3.0 -t qory-github-server .
+#   docker build --build-arg VERSION=dev -t qory-github-server .
 #
 # Run, with the settings and the secret files mounted by the operator:
 #

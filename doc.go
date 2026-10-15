@@ -18,5 +18,6 @@
 //
 // The package keeps nothing. The settings, the App's private key among them, are handed
 // to it on every call, by whoever has them, and nothing it is handed is written
-// anywhere but [Setup]'s key file, which is the key's first home.
+// anywhere but [Setup]'s files: the key file, which is the key's first home, and with
+// [Setup.PublicURL] the App's client secret file and webhook secret file.
 package github

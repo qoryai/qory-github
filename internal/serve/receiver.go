@@ -26,20 +26,21 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// WebhookPath is where GitHub sends the App's webhook deliveries, by POST.
-const WebhookPath = "/github/webhook"
+// WebhookPath is where GitHub sends the App's webhook deliveries, by POST: the path
+// setup gives the App's webhook under serve's public URL, [github.WebhookPath].
+const WebhookPath = github.WebhookPath
 
 // MaxBody is the largest delivery the receiver takes, 25 MiB: GitHub caps a payload at
 // 25 MB and sends none larger.
 const MaxBody = 25 << 20
 
 // maxSecretFile is the most a webhook secret file may hold; one byte more is read to
-// tell a larger file apart. A secret is far shorter.
-const maxSecretFile = 4 << 10
+// tell a larger file apart. A secret is far shorter. setup keeps to it too.
+const maxSecretFile = github.MaxWebhookSecretFile
 
 // minSecret is the shortest webhook secret taken, in bytes: a shorter one is guessed
-// sooner, and the signature it makes proves less.
-const minSecret = 16
+// sooner, and the signature it makes proves less. setup keeps to it too.
+const minSecret = github.MinWebhookSecret
 
 // readBudget is how many bytes of bodies the receiver holds at once, eight times
 // [MaxBody]. A body is read before its signature can be checked, so a sender with no

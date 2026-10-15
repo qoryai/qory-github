@@ -196,11 +196,9 @@ func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 	if strings.Join(f.requests, "\n") != strings.Join(want, "\n") {
 		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(f.requests, "\n"), strings.Join(want, "\n"))
 	}
-	label := map[string]any{"name": "qory", "color": "6E56CF", "description": "Qory took this into Factory. The work item is in Qory Apiary."}
-	b, _ := json.Marshal(f.repoLabel)
-	w, _ := json.Marshal(label)
-	if string(b) != string(w) {
-		t.Errorf("the label created is %s, want %s", b, w)
+	// The label is created with its name and colour alone, no description.
+	if b, _ := json.Marshal(f.repoLabel); string(b) != `{"color":"6E56CF","name":"qory"}` {
+		t.Errorf("the label created is %s", b)
 	}
 	if f.bodies[1] != `{"labels":["qory"]}` {
 		t.Errorf("the issue's labels are added with %s", f.bodies[1])

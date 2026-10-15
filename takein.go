@@ -33,13 +33,11 @@ const (
 	StatusUndone  = "undone"
 )
 
-// takeInLabel is the label a taken in issue carries, and takeInLabelColor and
-// takeInLabelDescription are what the label is created with in a repository that has
-// none.
+// takeInLabel is the label a taken in issue carries, and takeInLabelColor the colour it
+// is created with, without a description, in a repository that has none.
 const (
-	takeInLabel            = "qory"
-	takeInLabelColor       = "6E56CF"
-	takeInLabelDescription = "Qory took this into Factory. The work item is in Qory Apiary."
+	takeInLabel      = "qory"
+	takeInLabelColor = "6E56CF"
 )
 
 // TokenFunc returns an installation token that may write the issues of repo, that one
@@ -226,7 +224,7 @@ func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug
 // the work item's comment when the App's bot has not.
 func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, e Change) error {
 	const creating = "creating the label " + takeInLabel
-	label := map[string]string{"name": takeInLabel, "color": takeInLabelColor, "description": takeInLabelDescription}
+	label := map[string]string{"name": takeInLabel, "color": takeInLabelColor}
 	a, err := c.send(ctx, p, false, creating, http.MethodPost, "/repos/"+issue.repo.String()+"/labels", tok, label)
 	if err != nil {
 		return err
