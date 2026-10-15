@@ -76,9 +76,10 @@ type Options struct {
 // webhook secret, the access key's secret and the App's client secret, so a wrong file
 // stops it at once, and opens the store. It serves the webhook receiver and, beside it,
 // the connect page, see [Connect]. Then it reads Qory Apiary's change feed, after it
-// declares the adapter, until it stops. When ctx is done it stops taking deliveries,
-// waits for the requests under way and the handlers that run, each within a bound,
-// stops the fills a re-connect started and the feed's reader, and closes the store.
+// declares the adapter, until it stops, and pulls from GitHub what the webhooks missed,
+// see [puller]. When ctx is done it stops taking deliveries, waits for the requests
+// under way and the handlers that run, each within a bound, stops the fills a
+// re-connect started, the feed's reader and the pull, and closes the store.
 func Run(ctx context.Context, s Settings, opts Options) error {
 	log := opts.Log
 	if log == nil {
@@ -148,10 +149,18 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	worker.Start()
 	feedCtx, stopFeed := context.WithCancel(context.Background())
 	defer stopFeed()
-	fed := make(chan struct{})
+	fed, declared, pulled := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(fed)
-		(&feed{apiary: apiary, adapter: adapter, store: st, publicURL: s.PublicURL, log: log}).run(feedCtx)
+		(&feed{apiary: apiary, adapter: adapter, store: st, publicURL: s.PublicURL, log: log, declared: declared}).run(feedCtx)
+	}()
+	go func() {
+		defer close(pulled)
+		select {
+		case <-declared:
+			(&puller{adapter: adapter, store: st, log: log}).run(feedCtx)
+		case <-feedCtx.Done():
+		}
 	}()
 	served := make(chan error, 1)
 	limited := limit(ln, cmp.Or(opts.maxConns, maxConns), log)
@@ -187,6 +196,7 @@ loop:
 	connect.stop()
 	stopFeed()
 	<-fed
+	<-pulled
 	// A count of lines held back is logged before serve stops.
 	rc.stopLog()
 	adapter.stopLog()

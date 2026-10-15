@@ -43,6 +43,10 @@ type Adapter struct {
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
+	// turns are the collections' turns, see [Adapter.collectionTurn], by key. now is
+	// the clock a fill's start is read from; nil is time.Now.
+	turns map[string]chan struct{}
+	now   func() time.Time
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most.
@@ -403,7 +407,8 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // fill sends Qory Apiary the open issues of a collection it linked, and their comments.
 // A repository GitHub answers is gone or moved, [github.ErrRepositoryGone], or for which
 // GitHub refuses to mint a token for good, [github.ErrMintRefused], fails for good, so
-// the change feed passes it.
+// the change feed passes it. It waits for a pull of the collection that runs, and once
+// it has sent everything, the next pull reads what changed from when it began.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	repo, err := repository(ref)
 	if err != nil {
@@ -416,6 +421,12 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 	if !ok {
 		return Permanent(fmt.Errorf("filling %s: %w", ref, errNoInstallation))
 	}
+	done, err := a.waitTurn(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer done()
+	start := a.clock()
 	l := github.Lister{
 		Client: a.GitHub,
 		Pacer:  a.pacer(installation),
@@ -429,7 +440,10 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 	if errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused) {
 		return Permanent(err)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return keepPulled(a.Store, ref, pullMark{Since: start, Listed: start})
 }
 
 // applyChange writes on GitHub what a work_item entry of the feed says, with a token
