@@ -97,9 +97,9 @@ More: ` + more
 
 // factory is whether the environment variable QORY_FEATURES switches on factory, the
 // command serve, the webhook receiver, and the command access-key, which enrols its
-// access key for Qory Apiary. factory is not a Qory Apiary feature: Qory Apiary
-// refuses QORY_FEATURES=factory at boot as an unknown feature. qory-github reads the
-// variable by the rules Qory Apiary applies to the name of an opt-in feature:
+// access key for Qory Apiary. Qory Apiary's factory is an opt-in feature of the same
+// name, and qory-github reads the variable by the rules Qory Apiary applies to the name
+// of an opt-in feature:
 //
 //   - unset, blank, all, and all- followed by the features left out, all-security,factory
 //     among them, leave factory off;
