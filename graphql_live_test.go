@@ -399,8 +399,9 @@ func (c cursorPager) next(ctx context.Context) ([]int64, bool, error) {
 	return ns, more, err
 }
 
-// restPager is REST's paging by number, oldest first, of the issues in state, all or
-// open, the open ones kept and pull requests left out.
+// restPager is REST's listing of the issues in state, all or open, oldest first,
+// following the next page its Link header names, the open ones kept and pull requests
+// left out.
 type restPager struct {
 	l    Lister
 	p    *Pacer

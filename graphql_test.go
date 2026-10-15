@@ -485,7 +485,7 @@ func TestARateLimitInGraphQLsAnswerIsWaitedOut(t *testing.T) {
 	}{
 		{"a secondary limit", &fakeGraphQL{nodes: []map[string]any{node(1, 0)}, limited: 2}, "", "[1m0s 1m0s]", 3},
 		{"none remaining", &fakeGraphQL{nodes: []map[string]any{node(1, 0)}, limited: 1, limitHeaders: true}, "", "[2m0s]", 2},
-		{"a limit that holds", &fakeGraphQL{nodes: []map[string]any{node(1, 0)}, limited: 5}, "listing the open issues of acme/widgets: GitHub answered 1 errors, the first RATE_LIMITED: API rate limit exceeded", "[1m0s 1m0s 1m0s 1m0s]", 5},
+		{"a limit that holds", &fakeGraphQL{nodes: []map[string]any{node(1, 0)}, limited: 5}, "listing the open issues of acme/widgets: GitHub answered an error, RATE_LIMITED: API rate limit exceeded", "[1m0s 1m0s 1m0s 1m0s]", 5},
 	} {
 		s := &sink{}
 		var logs []string

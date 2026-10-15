@@ -239,6 +239,9 @@ func (g *issuePager) answered(got gqlOpenIssues) error {
 	}
 	if len(got.Errors) > 0 {
 		e := got.Errors[0]
+		if len(got.Errors) == 1 {
+			return fmt.Errorf("%s: GitHub answered an error, %s: %s", g.what, orUntyped(e.Type), e.Message)
+		}
 		return fmt.Errorf("%s: GitHub answered %d errors, the first %s: %s", g.what, len(got.Errors), orUntyped(e.Type), e.Message)
 	}
 	if got.Data.Repository == nil {

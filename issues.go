@@ -592,12 +592,14 @@ func (p *pages) read(path string) error {
 }
 
 // A listing reads GitHub's pages by number, and a page's contents shift when an
-// earlier one loses an entry, so a listing can miss one. A listing of issues or of an
-// issue's comments never says it is complete, then: it adds and updates what it sees,
-// never closes or drops what it does not, and closing and deleting come from webhooks'
-// events alone. The one exception is a listing of the installation's repositories that
-// GitHub answers with one page and that skips none, which nothing can shift; see
-// [Lister.ListRepositories].
+// earlier one loses an entry, so a listing can miss one. [Lister.ListIssues] and the
+// listings of an issue's comments never say they are complete, then: they add and
+// update what they see, never close or drop what they do not, and closing and deleting
+// come from webhooks' events alone. Two listings do say it: a listing of the
+// installation's repositories that GitHub answers with one page and that skips none,
+// which nothing can shift, see [Lister.ListRepositories]; and the listing of open
+// issues by GraphQL's cursor, which does not skip one, see
+// [Lister.ListOpenIssuesComplete].
 
 // listingEnd is how long the request that ends a listing stopped early may take,
 // even when the listing stopped because its context is done.
