@@ -390,6 +390,35 @@ func (s *Store) Put(ns, key string, value []byte, ttl time.Duration) error {
 	})
 }
 
+// PutNew keeps value under key in the namespace ns as [Store.Put] does, but only when
+// no value is there, or the one there has expired, and says whether it kept it. The
+// check and the write are one transaction, so of two calls for one key only one keeps
+// its value. ttl is not zero: what PutNew keeps expires.
+func (s *Store) PutNew(ns, key string, value []byte, ttl time.Duration) (bool, error) {
+	if ns == "" || key == "" {
+		return false, errors.New("a value is kept under a namespace and a key, neither empty")
+	}
+	if ttl <= 0 {
+		return false, errors.New("a value PutNew keeps has a time to live")
+	}
+	now := s.now()
+	v := binary.BigEndian.AppendUint64(make([]byte, 0, 8+len(value)), uint64(now.Add(ttl).UnixNano()))
+	v = append(v, value...)
+	kept := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b, err := tx.Bucket(kvBucket).CreateBucketIfNotExists([]byte(ns))
+		if err != nil {
+			return err
+		}
+		if old := b.Get([]byte(key)); old != nil && !expiredAt(old, now) {
+			return nil
+		}
+		kept = true
+		return b.Put([]byte(key), v)
+	})
+	return kept && err == nil, err
+}
+
 // Get is the value under key in the namespace ns, or [ErrNotFound] when there is none
 // or it expired.
 func (s *Store) Get(ns, key string) ([]byte, error) {
