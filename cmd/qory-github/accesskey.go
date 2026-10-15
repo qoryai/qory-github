@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -49,10 +51,19 @@ var (
 	enrolClient *http.Client
 )
 
-// accessKey runs access-key's one verb, enrol. -h alone prints enrol's help.
+// enrolFlags are enrol's flags: --secret-file, set in secretFile.
+func enrolFlags() (fs *flag.FlagSet, secretFile *string) {
+	fs = flag.NewFlagSet("access-key enrol", flag.ContinueOnError)
+	secretFile = fs.String("secret-file", "", "where the access key's secret is written; a file that exists is refused (required)")
+	return fs, secretFile
+}
+
+// accessKey runs access-key's one verb, enrol. -h alone prints enrol's help, with its
+// flags.
 func accessKey(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 1 && slices.Contains([]string{"-h", "-help", "--h", "--help"}, args[0]) {
-		return accessKeyHelp.parse(flag.NewFlagSet("access-key", flag.ContinueOnError), args, stderr)
+		fs, _ := enrolFlags()
+		return accessKeyHelp.parse(fs, args, stderr)
 	}
 	if len(args) == 0 || args[0] != "enrol" {
 		return errors.New("access-key has one command, enrol: qory-github access-key enrol --secret-file FILE SERVER CODE")
@@ -63,8 +74,7 @@ func accessKey(ctx context.Context, args []string, stdout, stderr io.Writer) err
 // enrol is access-key enrol. The lines for a person go to stderr, and the settings alone
 // to stdout. An error never contains the secret or the code.
 func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("access-key enrol", flag.ContinueOnError)
-	secretFile := fs.String("secret-file", "", "where the access key's secret is written; a file that exists is refused (required)")
+	fs, secretFile := enrolFlags()
 	if err := accessKeyHelp.parse(fs, args, stderr); err != nil {
 		return err
 	}
@@ -74,8 +84,13 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if *secretFile == "" {
 		return errors.New("--secret-file is required")
 	}
-	server := strings.TrimSuffix(fs.Arg(0), "/")
-	if err := checkServer(server); err != nil {
+	// A path that holds what starts a code or a secret is refused before anything else,
+	// with an error that does not quote it.
+	if hasCodeOrSecret(*secretFile) {
+		return errors.New("the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file")
+	}
+	server, err := checkServer(strings.TrimSuffix(fs.Arg(0), "/"))
+	if err != nil {
 		return err
 	}
 	code, err := accesskey.NormaliseCode(fs.Arg(1))
@@ -83,8 +98,10 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		// NormaliseCode's error can quote a part of the code, which no error contains.
 		return errors.New("the code is not an enrolment code: qec_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it")
 	}
-	// Everything that can be checked of the secret file is checked before the code is
-	// used: once Qory Apiary answers, the code is spent.
+	// The secret file is checked before the code is sent: its path, that no file is
+	// there, and that its directory exists and can be written. Qory Apiary's 201 spends
+	// the code, and a refusal leaves it as it was, so a secret that cannot be written
+	// after the 201 needs a new code.
 	file, err := filepath.Abs(*secretFile)
 	if err != nil {
 		return fmt.Errorf("the secret file: %w", err)
@@ -93,6 +110,9 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if err := checkSecretFile(file); err != nil {
+		return err
+	}
+	if err := checkWritable(filepath.Dir(file)); err != nil {
 		return err
 	}
 	name := accessKeyName()
@@ -138,25 +158,33 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 // checkServer takes Qory Apiary's origin, as accesskey's enrolment posts to it: an https
 // URL of a host and an optional port, and for a test an http one to localhost,
-// 127.0.0.1 or [::1], with nothing after but a slash, which the caller removes. The
-// error names the rule, never the URL, which may hold what does not belong in it.
-func checkServer(server string) error {
-	const shape = "the server is neither an https URL of a host and an optional port nor, for a test, an http one to localhost, 127.0.0.1 or [::1], with nothing after"
-	lower := strings.ToLower(server)
-	if accesskey.ContainsSecret(server) || strings.Contains(lower, strings.ToLower(accesskey.CodePrefix)) {
-		return errors.New(shape)
+// 127.0.0.1 or [::1], with nothing after but a slash, which the caller removes. It
+// returns the origin with its scheme and host in lower case, as the settings hold it.
+// The error names the rule, never the URL, which may hold what does not belong in it.
+func checkServer(server string) (string, error) {
+	shape := errors.New("the server is neither an https URL of a host and an optional port nor, for a test, an http one to localhost, 127.0.0.1 or [::1], with nothing after")
+	if hasCodeOrSecret(server) {
+		return "", shape
 	}
 	u, err := url.Parse(server)
 	if err != nil || u.Opaque != "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(server, "#") {
-		return errors.New(shape)
+		return "", shape
 	}
-	switch h := u.Hostname(); {
+	// url.Parse has the scheme in lower case already.
+	origin := u.Scheme + "://" + strings.ToLower(u.Host)
+	switch h := strings.ToLower(u.Hostname()); {
 	case u.Scheme == "https":
-		return nil
+		return origin, nil
 	case u.Scheme == "http" && (h == "localhost" || h == "127.0.0.1" || h == "::1"):
-		return nil
+		return origin, nil
 	}
-	return errors.New(shape)
+	return "", shape
+}
+
+// hasCodeOrSecret reports whether a value holds what starts an enrolment code, qec_, an
+// access key secret, qak_, or a run key, qrk_, in any case.
+func hasCodeOrSecret(v string) bool {
+	return accesskey.ContainsSecret(v) || strings.Contains(strings.ToLower(v), strings.ToLower(accesskey.CodePrefix))
 }
 
 // accessKeyName is the access key's name in Qory Apiary: this machine's host name, or its
@@ -172,8 +200,9 @@ func accessKeyName() string {
 
 // enrolFailed words an enrolment that got no verified 201, on the refusal's code alone,
 // never on an HTTP status: an answer that does not verify may come from anyone on the
-// path. Nothing was written, so an enrolment that may have succeeded cannot be finished:
-// its key is to be revoked.
+// path. A verified refusal leaves the code as it was, so the same command can use it
+// again. Nothing was written, so an enrolment that may have succeeded behind an answer
+// that did not verify cannot be finished: its key is to be revoked.
 func enrolFailed(err error, fingerprint string) error {
 	lost := "; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key " + fingerprint + " should it have been enrolled"
 	var ref *accesskey.Refusal
@@ -182,19 +211,19 @@ func enrolFailed(err error, fingerprint string) error {
 	}
 	switch ref.Code {
 	case accesskey.CodeUnauthorized:
-		return errors.New("this code was used or has expired; if you did not use it, tell your administrator in Qory Apiary, who must revoke the key it enrolled. Enrolling needs a new code")
+		return errors.New("this code was used, has expired or was cancelled; if you did not use it, tell your administrator in Qory Apiary, who must revoke the key it enrolled. Enrolling needs a new code")
 	case accesskey.CodeKeyInvalid:
 		names := ""
 		if len(ref.Names) > 0 {
 			names = " (" + strings.Join(ref.Names, ", ") + ")"
 		}
-		return fmt.Errorf("Qory Apiary refused the key%s. Enrolling needs a new code", names)
+		return fmt.Errorf("Qory Apiary refused the key%s; the code is not used: the same command, run within the code's 15 minutes, makes a new key", names)
 	case accesskey.CodeKeyLimit:
 		return errors.New("the work source already holds two keys: once an owner or administrator in Qory Apiary has revoked one, the same command, run within the code's 15 minutes, succeeds")
 	case accesskey.CodeRateLimited:
 		return errors.New("Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes")
 	case accesskey.CodeAnswerUnsigned:
-		return fmt.Errorf("Qory Apiary did not enrol the key (HTTP %d, unsigned)%s", ref.Status, lost)
+		return fmt.Errorf("Qory Apiary's answer did not verify (HTTP %d)%s", ref.Status, lost)
 	}
 	return fmt.Errorf("the enrolment did not complete: %w%s", err, lost)
 }
@@ -251,6 +280,25 @@ func checkSecretFile(file string) error {
 	if _, err := os.Stat(filepath.Dir(file)); err != nil {
 		return fmt.Errorf("the secret file's directory: %w", err)
 	}
+	return nil
+}
+
+// checkWritable refuses a directory the secret file cannot be created in, by creating a
+// file of a random name there, only where none exists, and removing it.
+func checkWritable(dir string) error {
+	b := make([]byte, 8)
+	rand.Read(b)
+	probe := filepath.Join(dir, ".qory-github-"+hex.EncodeToString(b))
+	f, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return fmt.Errorf("the secret file's directory %s cannot be written: %w", dir, err)
+	}
+	f.Close()
+	os.Remove(probe)
 	return nil
 }
 

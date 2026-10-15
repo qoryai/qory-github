@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,9 +24,8 @@ import (
 // may contain.
 const codeCore = "0123456789ABCDEFGHJKMNPQRS"
 
-// fakeApiary is Qory Apiary's enrolment endpoint as enrol uses it. It answers each
-// enrolment with status and, for a 201, the access key id, an id of kind, and its
-// signing key listed; answer may change the body and the signature before they are sent.
+// fakeApiary is Qory Apiary's enrolment endpoint as enrol uses it, answering each
+// enrolment as its reply says.
 type fakeApiary struct {
 	url      string
 	signer   *accesskey.Key
@@ -32,18 +33,44 @@ type fakeApiary struct {
 	got      atomic.Pointer[accesskey.EnrolmentRequest]
 }
 
+// reply is how the fake answers. A 201 names the access key ak_0123456789abcdef in the
+// node nodeID of kind; a 401 is unsigned and empty; any other status is a refusal with
+// the code refusal. Each but the 401 lists the signer's key, then extra's, and is
+// signed under the signer, a new key when it is nil; pad adds that many spaces after
+// the body before it is signed; hook runs before the answer is sent, and change may
+// change the status, the body and the signature then.
+type reply struct {
+	status       int
+	kind, nodeID string
+	refusal      string
+	signer       *accesskey.Key
+	extra        []*accesskey.Key
+	pad          int
+	hook         func()
+	change       answer
+}
+
+// adapterEnrolled is a reply that enrols the key in an adapter.
+var adapterEnrolled = reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef"}
+
 // answer is what the fake sends: the status, the body and the signature, which a test
 // may change from the correctly signed ones it is handed.
 type answer func(status int, body []byte, sig string) (int, []byte, string)
 
-func newFakeApiary(t *testing.T, status int, kind, nodeID string, change answer) *fakeApiary {
+func newFakeApiary(t *testing.T, rp reply) *fakeApiary {
 	t.Helper()
-	signer, err := accesskey.Generate()
-	if err != nil {
-		t.Fatal(err)
+	signer := rp.signer
+	if signer == nil {
+		var err error
+		if signer, err = accesskey.Generate(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	f := &fakeApiary{signer: signer}
 	listed := accesskey.Pin{{Alg: "ed25519", PublicKey: signer.PublicKey().String()}}
+	for _, k := range rp.extra {
+		listed = append(listed, accesskey.ServerKey{Alg: "ed25519", PublicKey: k.PublicKey().String()})
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests.Add(1)
 		if r.Method != http.MethodPost || r.URL.Path != accesskey.EnrolmentPath {
@@ -57,23 +84,30 @@ func newFakeApiary(t *testing.T, status int, kind, nodeID string, change answer)
 			return
 		}
 		f.got.Store(&req)
+		if rp.hook != nil {
+			rp.hook()
+		}
 		var doc any
-		switch status {
+		switch rp.status {
 		case http.StatusCreated:
-			doc = map[string]any{"version": 1, "access_key_id": "ak_0123456789abcdef", "node_id": nodeID, "node_kind": kind, "stored_secrets": false, "apiary_public_key": listed}
+			doc = map[string]any{"version": 1, "access_key_id": "ak_0123456789abcdef", "node_id": rp.nodeID, "node_kind": rp.kind, "stored_secrets": false, "apiary_public_key": listed}
 		case http.StatusUnauthorized:
-			w.WriteHeader(status)
+			w.WriteHeader(rp.status)
 			return
 		default:
-			doc = map[string]any{"error": "key_limit", "apiary_public_key": listed}
+			doc = map[string]any{"error": rp.refusal, "apiary_public_key": listed}
 		}
 		body, _ := json.Marshal(doc)
-		sig := signer.SignAnswer(accesskey.Answer{Enrolment: true, Status: status, RequestSignature: req.Proof, Body: body})
-		st := status
-		if change != nil {
-			st, body, sig = change(status, body, sig)
+		body = append(body, bytes.Repeat([]byte(" "), rp.pad)...)
+		sig := signer.SignAnswer(accesskey.Answer{Enrolment: true, Status: rp.status, RequestSignature: req.Proof, Body: body})
+		st := rp.status
+		if rp.change != nil {
+			st, body, sig = rp.change(st, body, sig)
 		}
 		w.Header().Set(accesskey.HeaderSignature, sig)
+		if st/100 == 3 {
+			w.Header().Set("Location", "https://elsewhere.example.com/")
+		}
 		w.WriteHeader(st)
 		w.Write(body)
 	}))
@@ -115,7 +149,7 @@ func noLeak(t *testing.T, secret, code string, outputs ...string) {
 }
 
 func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
-	f := newFakeApiary(t, http.StatusCreated, "adapter", "na_0123456789abcdef", nil)
+	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "access-key-secret")
 	c := code(f.signer)
 	status, out, errs := enrolRun(t, "--secret-file", file, f.url+"/", c)
@@ -166,7 +200,7 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 // or whose directory does not, and a server that is not Qory Apiary's origin over https
 // are refused before the code is sent.
 func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
-	f := newFakeApiary(t, http.StatusCreated, "adapter", "na_0123456789abcdef", nil)
+	f := newFakeApiary(t, adapterEnrolled)
 	dir := t.TempDir()
 	exists := filepath.Join(dir, "exists")
 	os.WriteFile(exists, []byte("kept\n"), 0o600)
@@ -185,6 +219,9 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 		{[]string{"--secret-file", filepath.Join(dir, "sec\nret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\nret")) + " contains a control character; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "sec\u009bret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\u009bret")) + " contains a control character; choose another with --secret-file"},
 		{[]string{"--secret-file", filepath.Join(dir, "sec\xffret"), f.url, c}, "the secret file's path " + strconv.Quote(filepath.Join(dir, "sec\xffret")) + " is not UTF-8; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "qec_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "QAK_x"), f.url, c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
+		{[]string{"--secret-file", filepath.Join(dir, "x-qrk_"), "http://apiary.example.com", c}, "the secret file's path contains what starts an enrolment code or a secret; choose another with --secret-file"},
 		{[]string{"--secret-file", file, "http://apiary.example.com", c}, "the server is neither an https URL"},
 		{[]string{"--secret-file", file, "ftp://apiary.example.com", c}, "the server is neither an https URL"},
 		{[]string{"--secret-file", file, "https://apiary.example.com/enrol", c}, "the server is neither an https URL"},
@@ -213,42 +250,69 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 	}
 }
 
+// fixtureSigner is the Forager contract's published fixture signing key of the server,
+// from the seed its known answers publish.
+func fixtureSigner(t *testing.T) *accesskey.Key {
+	t.Helper()
+	seed, _ := base64.RawURLEncoding.DecodeString("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A")
+	k, err := accesskey.NewKey(seed)
+	if err != nil || !k.PublicKey().Fixture() {
+		t.Fatalf("the seed is not a fixture key's: %v", err)
+	}
+	return k
+}
+
 // TestEnrolRefusesAnAnswerItCannotTrust pins that an answer whose signature does not
 // verify under the key the code names, a refusal, and a key enrolled for another kind
-// than an adapter write nothing, and say so in one line without the code.
+// than an adapter or under a published fixture key write nothing, and say so in one line
+// without the secret or the code. {fp} in want is the new key's fingerprint.
 func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 	other, _ := accesskey.Generate()
+	const unverified = "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer did not verify (HTTP %d); no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"
+	// corrupt flips one bit of the answer's signature, which is otherwise the right one.
+	corrupt := func(s int, b []byte, sig string) (int, []byte, string) {
+		raw, _ := base64.RawURLEncoding.DecodeString(sig)
+		raw[10] ^= 1
+		return s, b, base64.RawURLEncoding.EncodeToString(raw)
+	}
 	for name, tc := range map[string]struct {
-		status       int
-		kind, nodeID string
-		change       answer
-		otherCode    bool
-		want         string
+		reply     reply
+		otherCode bool
+		want      string
 	}{
-		"a bad signature": {status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: func(s int, b []byte, sig string) (int, []byte, string) {
-			return s, b, other.SignAnswer(accesskey.Answer{Enrolment: true, Status: s, Body: b})
-		}, want: "Qory Apiary did not enrol the key (HTTP 201, unsigned); no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key "},
-		"a changed body": {status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: func(s int, b []byte, sig string) (int, []byte, string) {
+		"a bad signature": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: corrupt},
+			want: fmt.Sprintf(unverified, 201)},
+		"a changed body": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: func(s int, b []byte, sig string) (int, []byte, string) {
 			return s, bytes.Replace(b, []byte("ak_0123456789abcdef"), []byte("ak_0123456789abcdeg"), 1), sig
-		}, want: "Qory Apiary did not enrol the key (HTTP 201, unsigned)"},
-		"no signature": {status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: func(s int, b []byte, _ string) (int, []byte, string) {
+		}}, want: fmt.Sprintf(unverified, 201)},
+		"no signature": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", change: func(s int, b []byte, _ string) (int, []byte, string) {
 			return s, b, ""
-		}, want: "Qory Apiary did not enrol the key (HTTP 201, unsigned)"},
-		"another server's key in the code": {status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", otherCode: true,
-			want: "Qory Apiary did not enrol the key (HTTP 201, unsigned)"},
-		"a node's code": {status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef",
-			want: "Qory Apiary enrolled the key as ak_0123456789abcdef in the node nd_0123456789abcdef, which is not a work source: the code was not made on the integration's page; no secret was written: have an owner or administrator in Qory Apiary revoke the key "},
-		"a gateway's code": {status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef",
-			want: "Qory Apiary enrolled the key as ak_0123456789abcdef in the gateway ng_0123456789abcdef, which is not a work source"},
-		"a kind that does not match the id": {status: http.StatusCreated, kind: "adapter", nodeID: "nd_0123456789abcdef",
-			want: `the enrolment did not complete: the enrolment answer: node_kind "adapter" does not match the node id nd_0123456789abcdef; no secret was written`},
-		"a used code": {status: http.StatusUnauthorized,
-			want: "this code was used or has expired; if you did not use it, tell your administrator in Qory Apiary, who must revoke the key it enrolled. Enrolling needs a new code"},
-		"two keys held": {status: http.StatusConflict,
-			want: "the work source already holds two keys: once an owner or administrator in Qory Apiary has revoked one, the same command, run within the code's 15 minutes, succeeds"},
+		}}, want: fmt.Sprintf(unverified, 201)},
+		"another server's key in the code": {reply: adapterEnrolled, otherCode: true,
+			want: fmt.Sprintf(unverified, 201)},
+		"a signed redirect": {reply: reply{status: http.StatusTemporaryRedirect, refusal: "key_limit"},
+			want: fmt.Sprintf(unverified, 307)},
+		"an answer larger than 64 KiB": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", pad: accesskey.MaxAnswer},
+			want: fmt.Sprintf(unverified, 201)},
+		"a node's code": {reply: reply{status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef"},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the node nd_0123456789abcdef, which is not a work source: the code was not made on the integration's page; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's page in Organisation settings\n"},
+		"a gateway's code": {reply: reply{status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef"},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary enrolled the key as ak_0123456789abcdef in the gateway ng_0123456789abcdef, which is not a work source: the code was not made on the integration's page; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}, and enrol with a code made on the integration's page in Organisation settings\n"},
+		"a kind that does not match the id": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "nd_0123456789abcdef"},
+			want: "access key fingerprint {fp}\nqory-github access-key: the enrolment did not complete: the enrolment answer: node_kind \"adapter\" does not match the node id nd_0123456789abcdef; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key {fp} should it have been enrolled\n"},
+		"a fixture key pinned": {reply: reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef", signer: fixtureSigner(t)},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key {fp}\n"},
+		"a used code": {reply: reply{status: http.StatusUnauthorized},
+			want: "access key fingerprint {fp}\nqory-github access-key: this code was used, has expired or was cancelled; if you did not use it, tell your administrator in Qory Apiary, who must revoke the key it enrolled. Enrolling needs a new code\n"},
+		"a key refused": {reply: reply{status: http.StatusConflict, refusal: "key_invalid"},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the key; the code is not used: the same command, run within the code's 15 minutes, makes a new key\n"},
+		"two keys held": {reply: reply{status: http.StatusConflict, refusal: "key_limit"},
+			want: "access key fingerprint {fp}\nqory-github access-key: the work source already holds two keys: once an owner or administrator in Qory Apiary has revoked one, the same command, run within the code's 15 minutes, succeeds\n"},
+		"too many attempts": {reply: reply{status: http.StatusTooManyRequests, refusal: "rate_limited"},
+			want: "access key fingerprint {fp}\nqory-github access-key: Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := newFakeApiary(t, tc.status, tc.kind, tc.nodeID, tc.change)
+			f := newFakeApiary(t, tc.reply)
 			file := filepath.Join(t.TempDir(), "secret")
 			c := code(f.signer)
 			if tc.otherCode {
@@ -262,14 +326,97 @@ func TestEnrolRefusesAnAnswerItCannotTrust(t *testing.T) {
 				return k, err
 			}
 			status, out, errs := enrolRun(t, "--secret-file", file, f.url, c)
-			if status != 1 || out != "" || !strings.Contains(errs, "\nqory-github access-key: "+tc.want) || strings.Count(errs, "\n") > 3 {
-				t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+			if want := strings.ReplaceAll(tc.want, "{fp}", made.Fingerprint()); status != 1 || out != "" || errs != want {
+				t.Errorf("exit %d, stdout %q, stderr:\n%s\nwant:\n%s", status, out, errs, want)
+			}
+			if n := f.requests.Load(); n != 1 {
+				t.Errorf("%d requests, want 1", n)
 			}
 			if _, err := os.Lstat(file); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("a secret file was written: %v", err)
 			}
 			noLeak(t, made.Secret(), c, out, errs)
 		})
+	}
+}
+
+// TestEnrolPinsOnlyTheKeyTheCodeNames pins that a correctly signed answer that lists
+// another key beside the one the code names is taken, and the settings pin the code's
+// key alone.
+func TestEnrolPinsOnlyTheKeyTheCodeNames(t *testing.T) {
+	extra, _ := accesskey.Generate()
+	rp := adapterEnrolled
+	rp.extra = []*accesskey.Key{extra}
+	f := newFakeApiary(t, rp)
+	file := filepath.Join(t.TempDir(), "secret")
+	status, out, errs := enrolRun(t, "--secret-file", file, f.url, code(f.signer))
+	pin, _ := json.Marshal(accesskey.Pin{{Alg: "ed25519", PublicKey: f.signer.PublicKey().String()}})
+	if status != 0 || !strings.Contains(out, `"apiary_public_key": `+string(pin)+"\n") || strings.Contains(out, extra.PublicKey().String()) {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+}
+
+// TestEnrolPrintsTheServerInLowerCase pins that apiary_url has the scheme and the host
+// in lower case, as the settings hold it, whatever case the operator typed.
+func TestEnrolPrintsTheServerInLowerCase(t *testing.T) {
+	for in, want := range map[string]string{
+		"HTTPS://Apiary.Example.com":       "https://apiary.example.com",
+		"Https://APIARY.example.com:8443/": "https://apiary.example.com:8443",
+		"HTTP://LocalHost:8080":            "http://localhost:8080",
+		"http://[::1]:8080":                "http://[::1]:8080",
+	} {
+		got, err := checkServer(strings.TrimSuffix(in, "/"))
+		if err != nil || got != want {
+			t.Errorf("%s: %q, %v; want %q", in, got, err, want)
+		}
+	}
+	f := newFakeApiary(t, adapterEnrolled)
+	file := filepath.Join(t.TempDir(), "secret")
+	server := strings.Replace(f.url, "http://127.0.0.1", "HTTP://127.0.0.1", 1)
+	status, out, errs := enrolRun(t, "--secret-file", file, server, code(f.signer))
+	if status != 0 || !strings.HasPrefix(out, `  "apiary_url": "`+f.url+`",`) {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+}
+
+// TestEnrolNeverWritesThroughALinkPlantedMeanwhile pins that a symbolic link planted at
+// the secret file's path while the enrolment is under way is not followed, and the
+// secret written nowhere.
+func TestEnrolNeverWritesThroughALinkPlantedMeanwhile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "secret")
+	target := filepath.Join(dir, "target")
+	rp := adapterEnrolled
+	rp.hook = func() { os.Symlink(target, file) }
+	f := newFakeApiary(t, rp)
+	status, out, errs := enrolRun(t, "--secret-file", file, f.url, code(f.signer))
+	if status != 1 || out != "" || !strings.Contains(errs, "\nqory-github access-key: the key is enrolled as ak_0123456789abcdef, and the secret file "+file+" exists; choose another or move it away; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key ") {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the secret was written through the link: %v", err)
+	}
+}
+
+// TestEnrolRefusesADirectoryItCannotWriteBeforeAnyRequest pins that the secret file's
+// directory is found unwritable before the code is sent.
+func TestEnrolRefusesADirectoryItCannotWriteBeforeAnyRequest(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes in any directory")
+	}
+	f := newFakeApiary(t, adapterEnrolled)
+	dir := filepath.Join(t.TempDir(), "read-only")
+	os.Mkdir(dir, 0o500)
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	status, out, errs := enrolRun(t, "--secret-file", filepath.Join(dir, "secret"), f.url, code(f.signer))
+	if want := "qory-github access-key: the secret file's directory " + dir + " cannot be written: permission denied\n"; status != 1 || out != "" || errs != want {
+		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
+	}
+	if n := f.requests.Load(); n != 0 {
+		t.Errorf("%d requests were sent", n)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("the directory holds %v", entries)
 	}
 }
 
@@ -283,7 +430,7 @@ func (failingFile) Close() error              { return nil }
 // TestEnrolSaysASecretItCouldNotWrite pins that a secret that could not be written once
 // the key is enrolled is said to be lost, without the secret, and the file is removed.
 func TestEnrolSaysASecretItCouldNotWrite(t *testing.T) {
-	f := newFakeApiary(t, http.StatusCreated, "adapter", "na_0123456789abcdef", nil)
+	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
 	defer func(c func(string) (secretFile, error)) { createSecretFile = c }(createSecretFile)
 	createSecretFile = func(path string) (secretFile, error) {
@@ -345,7 +492,7 @@ More: https://github.com/qoryai/qory-github/blob/main/README.md
 // access-key is in no usage, which is as it was, and is answered as a command the
 // program does not know.
 func TestAccessKeyIsAbsentWithoutFactory(t *testing.T) {
-	f := newFakeApiary(t, http.StatusCreated, "adapter", "na_0123456789abcdef", nil)
+	f := newFakeApiary(t, adapterEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
 	for _, features := range []string{"", "all", "all-security,factory", "factory2", "factory,all"} {
 		t.Setenv("QORY_FEATURES", features)
@@ -373,7 +520,7 @@ func TestAccessKeyIsPresentWithFactory(t *testing.T) {
 	}
 	for _, args := range [][]string{{"access-key", "-h"}, {"access-key", "enrol", "-h"}} {
 		errs.Reset()
-		if code := run(context.Background(), args, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github access-key enrol --secret-file FILE [--] SERVER CODE") || strings.Contains(errs.String(), "More:") {
+		if code := run(context.Background(), args, &out, &errs); code != 2 || !strings.Contains(errs.String(), "qory-github access-key enrol --secret-file FILE [--] SERVER CODE") || !strings.Contains(errs.String(), "\nflags:\n  -secret-file string\n    \twhere the access key's secret is written; a file that exists is refused (required)\n") || strings.Contains(errs.String(), "More:") {
 			t.Errorf("%v exits %d:\n%s", args, code, errs.String())
 		}
 	}
