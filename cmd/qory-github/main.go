@@ -71,12 +71,13 @@ func programVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 // more is where the program's page is; each command's help links to a section of it.
 const more = "https://github.com/qoryai/qory-github/blob/main/README.md"
 
-// usage is what the command prints when it is run without a command it knows. serve is
-// listed only where QORY_FEATURES names factory, see [factory].
+// usage is what the command prints when it is run without a command it knows. serve and
+// access-key are listed only where QORY_FEATURES names factory, see [factory].
 func usage() string {
 	serve := ""
 	if factory() {
-		serve = "  serve        " + serveHelp.short + "\n"
+		serve = "  serve        " + serveHelp.short + "\n" +
+			"  access-key   " + accessKeyHelp.short + "\n"
 	}
 	return `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
 GitHub and never holds the access token.
@@ -95,7 +96,8 @@ More: ` + more
 }
 
 // factory is whether the environment variable QORY_FEATURES switches on factory, the
-// command serve, the webhook receiver. factory is not a Qory Apiary feature: Qory Apiary
+// command serve, the webhook receiver, and the command access-key, which enrols its
+// access key for Qory Apiary. factory is not a Qory Apiary feature: Qory Apiary
 // refuses QORY_FEATURES=factory at boot as an unknown feature. qory-github reads the
 // variable by the rules Qory Apiary applies to the name of an opt-in feature:
 //
@@ -260,6 +262,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		err = runServe(ctx, args[1:], stderr)
+	case "access-key":
+		// Without factory, access-key is a command the program does not know.
+		if !factory() {
+			fmt.Fprintln(stderr, usage())
+			return 2
+		}
+		err = accessKey(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage())
 		return 2
