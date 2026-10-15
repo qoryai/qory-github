@@ -532,6 +532,100 @@ func TestAnEntryIsPassedOnceItHasFailedForADay(t *testing.T) {
 	}
 }
 
+// TestTwoEntriesThatFailOnOnePageArePassedEachAfterADay serves a page of two entries
+// GitHub answers 502 for, a linked collection and a take in, and a sync entry, on a
+// clock that moves a day between reads, and checks each failing entry is passed a day
+// after its own first failure, the first not tried again, and the cursor moves once
+// the sync is applied.
+func TestTwoEntriesThatFailOnOnePageArePassedEachAfterADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.reposDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeSync},
+	)
+	read := func(what string, passed bool) {
+		t.Helper()
+		err := w.feed.step(context.Background())
+		cursor, _ := w.st.Get(nsAdapter, keyCursor)
+		if passed && (err != nil || string(cursor) != "c_3") || !passed && (err == nil || !strings.Contains(err.Error(), "502") || len(cursor) != 0) {
+			t.Fatalf("%s: err %v, cursor %q", what, err, cursor)
+		}
+	}
+	read("the collection fails", false)
+	now = now.Add(23 * time.Hour)
+	read("the collection fails 23 hours later", false)
+	now = now.Add(time.Hour)
+	read("the collection is passed, and the take in fails", false)
+	now = now.Add(23 * time.Hour)
+	read("the take in fails 23 hours later", false)
+	now = now.Add(time.Hour)
+	read("the take in is passed, and the sync applied", true)
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "3600" {
+		t.Errorf("the sync is not applied: %q", v)
+	}
+	logged := w.log.String()
+	if strings.Count(logged, "a change of the feed has failed for a day, and is passed") != 2 || !strings.Contains(logged, `"kind":"collection"`) || !strings.Contains(logged, `"kind":"work_item"`) {
+		t.Errorf("the log %s", logged)
+	}
+}
+
+// TestAnOutageOfTheFeedDoesNotCountTowardADay has an entry fail, then the feed's reads
+// fail for a day, then the entry fail again, and checks it is not passed then, only once
+// its failures, the outage left out, add up to a day.
+func TestAnOutageOfTheFeedDoesNotCountTowardADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.issuesDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"})
+	if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+		t.Fatalf("err %v", err)
+	}
+	down := true
+	w.apiary.mu.Lock()
+	w.apiary.refuseGet = func(int) (int, string) {
+		if down {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	for range 25 {
+		now = now.Add(time.Hour)
+		if err := w.feed.step(context.Background()); !IsOutage(err) {
+			t.Fatalf("err %v", err)
+		}
+	}
+	w.apiary.mu.Lock()
+	down = false
+	w.apiary.mu.Unlock()
+	if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+		t.Fatalf("the entry is passed after the feed's outage: err %v", err)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("the cursor is kept")
+	}
+	// The entry failed an hour before the outage: a day of its failures is 23 hours
+	// after the outage.
+	now = now.Add(22 * time.Hour)
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the entry is passed before a day of its failures")
+	}
+	now = now.Add(time.Hour)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+}
+
 // TestAFeedEntryThatMayPassKeepsTheCursor links a collection whose fill Qory Apiary
 // answers 500, and checks the step fails and the cursor stays, so the entry is read
 // again.

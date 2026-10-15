@@ -44,13 +44,16 @@ type feed struct {
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
 
-	// stuck is the entry that failed last, not for good: the cursor its page was read
-	// after, its place in the page, and when it first failed. It is kept in memory
-	// alone, so a restart times the entry from its next failure again.
-	stuck struct {
-		after string
-		index int
-		since time.Time
+	// failing is what the feed keeps of the page read after the cursor after, by the
+	// entries' places in it: when each entry that failed, not for good, first failed,
+	// and the entries passed, which a read of the same page again skips. down is when
+	// the feed's reads began to fail, or zero. They are kept in memory alone, so a
+	// restart times the entries from their next failures again.
+	failing struct {
+		after  string
+		since  map[int]time.Time
+		passed map[int]bool
+		down   time.Time
 	}
 
 	once    sync.Once
@@ -89,7 +92,7 @@ func (f *feed) unknownLog() *throttle {
 // entry is never skipped by a stop or a restart, and one may be applied again, which
 // does no harm: every entry's action is one a repeat finds done. An entry that fails,
 // not for good, is read again after the wait, and passed and logged once it has failed
-// for stuckFor, so no entry stops the feed for ever. An answer that holds an entry
+// for stuckFor, see [feed.step], so no entry stops the feed for ever. An answer that holds an entry
 // serve cannot apply is refused whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
@@ -181,13 +184,23 @@ func known(ch contracts.Change) bool {
 
 // step reads one page of the feed after the cursor kept, applies its entries in order,
 // and keeps the page's cursor. An entry that fails for good is logged and passed; any
-// other error stops the page, whose cursor is not kept, to be read again, unless the
-// entry has failed since stuckFor ago or longer, first failing in this process, when
-// it is logged and passed too. A page that
-// holds an entry serve does not know is refused whole, an [*unknownChange], before any
-// of its entries is applied, and its cursor is not kept: Qory Apiary sends only the
-// kinds and statuses of the contract's revision, which serve implements, so such an
-// entry is Qory Apiary's defect, and passing it could lose what it says.
+// other error stops the page, whose cursor is not kept, to be read again.
+//
+// An entry that fails, not for good, is timed from its first failure: once it has
+// failed for stuckFor, it is logged and passed too. The feed keeps, for the page read
+// after the cursor, each entry's first failure and the entries passed, which a read
+// of the same page again skips, so every entry of a page is timed and passed alone,
+// and the page's cursor is kept once none is left; it forgets them when the cursor
+// moves. A time the feed cannot be read, its read failing or its answer refused, does
+// not count: the first failures are moved later by as long, so an outage of Qory
+// Apiary passes no entry. All this is kept in memory alone, so a restart times the
+// entries from their next failures again.
+//
+// A page that holds an entry serve does not know is refused whole, an
+// [*unknownChange], before any of its entries is applied, and its cursor is not kept:
+// Qory Apiary sends only the kinds and statuses of the contract's revision, which serve
+// implements, so such an entry is Qory Apiary's defect, and passing it could lose what
+// it says.
 func (f *feed) step(ctx context.Context) error {
 	cursor, err := f.store.Get(nsAdapter, keyCursor)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -195,40 +208,79 @@ func (f *feed) step(ctx context.Context) error {
 	}
 	page, err := f.apiary.Changes(ctx, string(cursor))
 	if err != nil {
+		f.feedDown()
 		return err
 	}
 	for _, ch := range page.Changes {
 		if !known(ch) {
+			f.feedDown()
 			return &unknownChange{after: string(cursor), kind: prefixOf(ch.Kind, maxLogged), status: prefixOf(ch.Status, maxLogged)}
 		}
 	}
+	f.feedUp(string(cursor))
 	for i, ch := range page.Changes {
+		if f.failing.passed[i] {
+			continue
+		}
 		err := f.apply(ctx, ch)
 		if IsPermanent(err) {
 			f.log.Error("a change of the feed failed, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
+			f.failing.passed[i] = true
 			continue
 		}
 		if err != nil {
-			if f.stuckSince(string(cursor), i) < stuckFor {
+			if f.failedFor(i) < stuckFor {
 				return err
 			}
 			f.log.Error("a change of the feed has failed for a day, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
+			f.failing.passed[i] = true
 		}
 	}
-	return f.store.Put(nsAdapter, keyCursor, []byte(page.Cursor), 0)
+	if err := f.store.Put(nsAdapter, keyCursor, []byte(page.Cursor), 0); err != nil {
+		return err
+	}
+	f.failing.after, f.failing.since, f.failing.passed = page.Cursor, map[int]time.Time{}, map[int]bool{}
+	return nil
 }
 
-// stuckSince is how long the entry at index of the page read after the cursor after
-// has failed, timed from its first failure this process saw in a row.
-func (f *feed) stuckSince(after string, index int) time.Duration {
-	now := time.Now()
+func (f *feed) clock() time.Time {
 	if f.now != nil {
-		now = f.now()
+		return f.now()
 	}
-	if f.stuck.after != after || f.stuck.index != index || f.stuck.since.IsZero() {
-		f.stuck.after, f.stuck.index, f.stuck.since = after, index, now
+	return time.Now()
+}
+
+// feedDown notes that the feed could not be read, from now unless it is noted already.
+func (f *feed) feedDown() {
+	if f.failing.down.IsZero() {
+		f.failing.down = f.clock()
 	}
-	return now.Sub(f.stuck.since)
+}
+
+// feedUp notes that the page after the cursor after was read: the entries' first
+// failures are moved later by as long as the feed could not be read, and forgotten,
+// with the entries passed, when the page is another cursor's.
+func (f *feed) feedUp(after string) {
+	if f.failing.after != after || f.failing.since == nil {
+		f.failing.after, f.failing.since, f.failing.passed = after, map[int]time.Time{}, map[int]bool{}
+	}
+	if !f.failing.down.IsZero() {
+		d := f.clock().Sub(f.failing.down)
+		for i, t := range f.failing.since {
+			f.failing.since[i] = t.Add(d)
+		}
+		f.failing.down = time.Time{}
+	}
+}
+
+// failedFor is how long the entry at index of the page read has failed, from its first
+// failure, not counting the time the feed could not be read.
+func (f *feed) failedFor(index int) time.Duration {
+	now := f.clock()
+	if _, ok := f.failing.since[index]; !ok {
+		f.failing.since[index] = now
+	}
+	return now.Sub(f.failing.since[index])
 }
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for

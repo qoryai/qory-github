@@ -97,6 +97,10 @@ func (c Client) MintListingToken(ctx context.Context, appID string, key *rsa.Pri
 // reaches, renamed or removed from it. Asking again does not change it.
 var ErrMintRefused = errors.New("GitHub refuses to mint the installation token")
 
+// errNotTheInstallation is [errNotTheOwners] for a token the adapter mints, whose
+// installation no setting names.
+var errNotTheInstallation = errors.New("the installation is not the App's installation on the repositories' owner")
+
 // mintFor mints the token req asks for, once its installation is checked: limited to
 // its repositories, or to none when it names none, and to its permissions. req is
 // checked already. A mint refused for good wraps [ErrMintRefused].
@@ -111,7 +115,7 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 	}
 	if err := c.checkInstallation(ctx, jwt, req.InstallationID, req.Repositories); err != nil {
 		if err == errNotTheOwners {
-			err = fmt.Errorf("%w: %w", ErrMintRefused, err)
+			err = fmt.Errorf("%w: %w", ErrMintRefused, errNotTheInstallation)
 		}
 		return InstallationToken{}, err
 	}

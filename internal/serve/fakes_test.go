@@ -293,8 +293,9 @@ type fakeGitHub struct {
 	// unauthorized answers the listing of acme/widgets's issues 401, as GitHub answers
 	// a token it no longer takes; issuesDown answers it 502. goneComments answers that
 	// issue's comments 404, as for an issue deleted while it is listed.
-	unauthorized, issuesDown bool
-	goneComments             int
+	// reposDown answers every request under /repos/ 502.
+	unauthorized, issuesDown, reposDown bool
+	goneComments                        int
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -341,6 +342,9 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(repos), "repositories": repos})
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+	case f.reposDown && strings.HasPrefix(r.URL.Path, "/repos/"):
+		w.WriteHeader(502)
+		io.WriteString(w, `{"message":"Bad Gateway"}`)
 	case r.Method == "GET" && r.URL.Path == widgets+"/issues" && f.issuesDown:
 		w.WriteHeader(502)
 		io.WriteString(w, `{"message":"Bad Gateway"}`)
