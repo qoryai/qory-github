@@ -42,7 +42,7 @@ public key. Only then is the secret written, to --secret-file, which only you ma
 read. enrol never writes over a file that exists, and never prints the secret.
 
 Then enrol prints the settings to add to serve's settings: apiary_url, access_key_id,
-access_key_secret_file and apiary_public_key.`,
+access_key_secret_file, apiary_public_key and adapter_id.`,
 	example: `  qory-github access-key enrol --secret-file /etc/qory-github/access-key-secret https://apiary.example.com "$code"`,
 }
 
@@ -153,7 +153,7 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("the key is enrolled as %s, and %w; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key %s", ans.AccessKeyID, err, fingerprint)
 	}
 	fmt.Fprintf(stderr, "wrote the access key's secret to %s\n", file)
-	fragment, err := enrolledSettings(server, ans.AccessKeyID, file, ans.Pin)
+	fragment, err := enrolledSettings(server, ans.AccessKeyID, file, ans.Pin, ans.NodeID)
 	if err != nil {
 		return err
 	}
@@ -312,9 +312,10 @@ func enrolFailed(err error, server, fingerprint string) error {
 	return fmt.Errorf("the enrolment did not complete: %w%s", err, lost)
 }
 
-// enrolledSettings is what enrol prints for serve's settings: the four members, one per
+// enrolledSettings is what enrol prints for serve's settings: the five members, one per
 // line, as they go into the settings' JSON object, with no braces around them.
-func enrolledSettings(server, id, file string, pin accesskey.Pin) (string, error) {
+// adapter_id is the work source the key is enrolled in, which a connect pass names.
+func enrolledSettings(server, id, file string, pin accesskey.Pin, adapter string) (string, error) {
 	var b strings.Builder
 	members := []struct {
 		name  string
@@ -324,6 +325,7 @@ func enrolledSettings(server, id, file string, pin accesskey.Pin) (string, error
 		{"access_key_id", id},
 		{"access_key_secret_file", file},
 		{"apiary_public_key", pin},
+		{"adapter_id", adapter},
 	}
 	for i, m := range members {
 		v, err := json.Marshal(m.value)

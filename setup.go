@@ -73,6 +73,12 @@ type Setup struct {
 	Open func(string) error
 	// Wait is how long a person has to approve; zero is ten minutes.
 	Wait time.Duration
+	// PublicURL, when set, is where serve is reached from outside, which
+	// [CheckPublicURL] takes: the App then gets what Connect needs, see
+	// [ConnectManifest], and its client secret is written to ClientSecretFile, which
+	// must be set then. Only serve uses them, where QORY_FEATURES names factory.
+	PublicURL        string
+	ClientSecretFile string
 }
 
 // App is the App [Setup] created.
@@ -85,6 +91,8 @@ type App struct {
 	KeyFile string
 	// Moved, when set, is why the key is not in [Setup.KeyFile].
 	Moved error
+	// ClientSecretFile is where its client secret is, when [Setup.PublicURL] is set.
+	ClientSecretFile string
 }
 
 // InstallURL is where a person installs the App on the repositories runs work on.
@@ -141,6 +149,11 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", nil, fmt.Errorf("the key file: %w", err)
 	}
+	if s.PublicURL != "" {
+		if err := s.checkConnect(); err != nil {
+			return "", nil, err
+		}
+	}
 	web := webBase(s.Web)
 	state := randomHex()
 	pagePath := "/" + randomHex()
@@ -149,7 +162,12 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 		return "", nil, err
 	}
 	local := "http://" + ln.Addr().String()
-	manifest, _ := json.Marshal(Manifest(s.Name, local+"/callback"))
+	m := Manifest(s.Name, local+"/callback")
+	if s.PublicURL != "" {
+		public, _ := CheckPublicURL(s.PublicURL)
+		ConnectManifest(m, public)
+	}
+	manifest, _ := json.Marshal(m)
 	action := web + "/settings/apps/new?state=" + state
 	if s.Org != "" {
 		action = web + "/organizations/" + url.PathEscape(s.Org) + "/settings/apps/new?state=" + state
@@ -226,6 +244,8 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 		ClientID string `json:"client_id"`
 		HTMLURL  string `json:"html_url"`
 		PEM      string `json:"pem"`
+		// ClientSecret is read only when [Setup.PublicURL] is set.
+		ClientSecret string `json:"client_secret"`
 	}
 	if err := s.Client.call(ctx, "exchanging the code for the App", http.MethodPost, "/app-manifests/"+code+"/conversions", "", nil, http.StatusCreated, &got); err != nil {
 		// GitHub does not redirect the exchange; should it, the code is not sent on.
@@ -244,7 +264,7 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	}
 	err := writeKeyFile(s.KeyFile, []byte(got.PEM))
 	if err == nil {
-		return app, nil
+		return s.keepClientSecret(app, got.ClientSecret)
 	}
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -253,6 +273,41 @@ func (s Setup) exchange(ctx context.Context, code string) (*App, error) {
 	if err2 := writeKeyFile(app.KeyFile, []byte(got.PEM)); err2 != nil {
 		return nil, fmt.Errorf("the App %d (%s, %s) is created, but its private key could not be written: %v, and beside it: %v; generate a private key at %s", got.ID, got.Slug, got.HTMLURL, err, err2, s.keysURL(got.Slug))
 	}
+	return s.keepClientSecret(app, got.ClientSecret)
+}
+
+// checkConnect refuses, before anything is created, a public URL [CheckPublicURL]
+// refuses, no client secret file, or one that exists.
+func (s Setup) checkConnect() error {
+	if _, err := CheckPublicURL(s.PublicURL); err != nil {
+		return err
+	}
+	if s.ClientSecretFile == "" {
+		return errors.New("no client secret file")
+	}
+	if _, err := os.Lstat(s.ClientSecretFile); err == nil {
+		return fmt.Errorf("the client secret file %s exists; choose another or move it away", s.ClientSecretFile)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the client secret file: %w", err)
+	}
+	return nil
+}
+
+// keepClientSecret writes the App's client secret to [Setup.ClientSecretFile], 0600,
+// when [Setup.PublicURL] is set, and returns app with where it is. GitHub shows a client
+// secret once, but a new one can be generated on the App's settings page, which the
+// error names when the file cannot be written; it never contains the secret.
+func (s Setup) keepClientSecret(app *App, secret string) (*App, error) {
+	if s.PublicURL == "" {
+		return app, nil
+	}
+	if app.ClientID == "" || secret == "" || strings.ContainsFunc(secret, func(r rune) bool { return r <= ' ' || r >= 0x7f }) {
+		return nil, fmt.Errorf("the App %d (%s) is created and its private key is in %s, but GitHub's answer holds no client id, or no client secret setup can keep; generate a client secret at %s", app.ID, app.Slug, app.KeyFile, s.keysURL(app.Slug))
+	}
+	if err := writeOwnerFile(s.ClientSecretFile, "the client secret file", []byte(secret+"\n")); err != nil {
+		return nil, fmt.Errorf("the App %d (%s) is created and its private key is in %s, but %v; generate a client secret at %s", app.ID, app.Slug, app.KeyFile, err, s.keysURL(app.Slug))
+	}
+	app.ClientSecretFile = s.ClientSecretFile
 	return app, nil
 }
 

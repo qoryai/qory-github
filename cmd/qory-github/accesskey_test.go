@@ -175,15 +175,16 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 	wantOut := `  "apiary_url": "` + f.url + `",
   "access_key_id": "ak_0123456789abcdef",
   "access_key_secret_file": ` + string(fileJSON) + `,
-  "apiary_public_key": ` + string(pin) + `
+  "apiary_public_key": ` + string(pin) + `,
+  "adapter_id": "na_0123456789abcdef"
 `
 	if out != wantOut {
 		t.Errorf("stdout:\n%s\nwant:\n%s", out, wantOut)
 	}
 	// The settings are members of serve's settings object.
 	var settings map[string]any
-	if err := json.Unmarshal([]byte("{"+out+"}"), &settings); err != nil || len(settings) != 4 {
-		t.Errorf("the settings are not four members of a JSON object: %v", err)
+	if err := json.Unmarshal([]byte("{"+out+"}"), &settings); err != nil || len(settings) != 5 {
+		t.Errorf("the settings are not five members of a JSON object: %v", err)
 	}
 	fp := key.Fingerprint()
 	wantErrs := "access key fingerprint " + fp + "\n" +
@@ -355,7 +356,7 @@ func TestEnrolPinsOnlyTheKeyTheCodeNames(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "secret")
 	status, out, errs := enrolRun(t, "--secret-file", file, f.url, code(f.signer))
 	pin, _ := json.Marshal(accesskey.Pin{{Alg: "ed25519", PublicKey: f.signer.PublicKey().String()}})
-	if status != 0 || !strings.Contains(out, `"apiary_public_key": `+string(pin)+"\n") || strings.Contains(out, extra.PublicKey().String()) {
+	if status != 0 || !strings.Contains(out, `"apiary_public_key": `+string(pin)+",\n") || strings.Contains(out, extra.PublicKey().String()) {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
 }

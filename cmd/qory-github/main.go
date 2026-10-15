@@ -236,11 +236,15 @@ after. For each installation linked to Qory Apiary it sends the repositories, is
 and comments to Qory Apiary, and it reads Qory Apiary's change feed and writes on GitHub
 what the feed says. It runs until it is stopped with SIGINT or SIGTERM.
 
+serve also answers the connect page under public_url, /v1/connect, where Qory Apiary
+sends a person who connects the App's installation.
+
 The settings are one JSON document in FILE: app_id, private_key_file,
 webhook_secret_file, listen, state_dir, app_slug, apiary_url, public_url,
-access_key_id, access_key_secret_file and apiary_public_key, and api_url, which may be
-left out for GitHub's API. The private key, the webhook secret and the access key's
-secret are each in a file only its owner may read.`,
+access_key_id, access_key_secret_file, apiary_public_key, adapter_id, client_id and
+client_secret_file, and api_url, which may be left out for GitHub's API. The private
+key, the webhook secret, the access key's secret and the App's client secret are each
+in a file only its owner may read.`,
 	example: `  qory-github serve --settings /etc/qory-github/serve.json`,
 }
 
@@ -402,6 +406,12 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	keyFile := fs.String("key-file", "", "where the private key is written (default ~/.config/qory/github-app.pem)")
 	api := fs.String("api-url", github.APIURL, "GitHub's API: https://api.github.com, or for a test http or https on a loopback host")
 	web := fs.String("web-url", github.WebURL, "GitHub's website: https://github.com, or for a test http or https on a loopback host")
+	// --public-url exists only where QORY_FEATURES names factory, see [factory]:
+	// without it setup's flags, its App and what it prints are as they were.
+	var publicURL *string
+	if factory() {
+		publicURL = fs.String("public-url", "", "where serve is reached from outside, https: the App then gets serve's Connect, and its client secret is written beside the key")
+	}
 	if err := setupHelp.parse(fs, args, stderr); err != nil {
 		return err
 	}
@@ -430,6 +440,13 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		*name = "qory-github-" + randomSuffix()
 	}
 	s := github.Setup{Org: *org, Name: *name, KeyFile: *keyFile, Web: *web, Client: github.Client{API: *api}, Open: opener}
+	if publicURL != nil && *publicURL != "" {
+		public, err := github.CheckPublicURL(*publicURL)
+		if err != nil {
+			return err
+		}
+		s.PublicURL, s.ClientSecretFile = public, clientSecretFile(*keyFile)
+	}
 	return runSetup(ctx, s, stdout)
 }
 
@@ -469,7 +486,40 @@ with the repositories the run works on, and allows GitHub's hosts beside the oth
 run reaches:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), integrations, github.Describe(version).Name, policy)
+	if app.ClientSecretFile != "" {
+		fragment, err := connectSettings(app.ClientID, app.ClientSecretFile)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, `
+The App's client secret is in %s, which only you may read. Add these settings to
+serve's settings, for Connect:
+
+%s`, fragment.file, fragment.members)
+	}
 	return nil
+}
+
+// connectFragment is what setup prints for serve's Connect: where the client secret
+// is, and the settings' members, one per line, with no braces around them.
+type connectFragment struct{ file, members string }
+
+// connectSettings is setup's [connectFragment] for the client id and the file the
+// client secret is in, made absolute.
+func connectSettings(clientID, file string) (connectFragment, error) {
+	abs, err := filepath.Abs(file)
+	if err != nil {
+		return connectFragment{}, err
+	}
+	id, _ := json.Marshal(clientID)
+	path, _ := json.Marshal(abs)
+	return connectFragment{file: abs, members: fmt.Sprintf("  \"client_id\": %s,\n  \"client_secret_file\": %s\n", id, path)}, nil
+}
+
+// clientSecretFile is where setup writes the App's client secret, beside the key file:
+// its name without .pem, and .client-secret.
+func clientSecretFile(keyFile string) string {
+	return strings.TrimSuffix(keyFile, ".pem") + ".client-secret"
 }
 
 // movedLine is the line setup prints when the key is in abs, beside file, since file could

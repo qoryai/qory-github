@@ -943,17 +943,19 @@ func TestReadSettings(t *testing.T) {
 	file := filepath.Join(dir, "serve.json")
 	writeFile(t, file, `{"app_id":123456,"private_key_file":"/k.pem","webhook_secret_file":"/s","listen":"127.0.0.1:8080","state_dir":"/var/lib/qory-github",
 		"app_slug":"qory-acme","apiary_url":"https://apiary.example.com/","public_url":"https://qory-github.example.com/","access_key_id":"ak_0123456789abcdef",
-		"access_key_secret_file":"/a","apiary_public_key":`+pinJSON+`}`, 0o644)
+		"access_key_secret_file":"/a","apiary_public_key":`+pinJSON+`,"adapter_id":"na_0123456789abcdef","client_id":"Iv1.abc","client_secret_file":"/c"}`, 0o644)
 	s, err := ReadSettings(file)
 	want := Settings{AppID: "123456", PrivateKeyFile: "/k.pem", WebhookSecretFile: "/s", Listen: "127.0.0.1:8080", StateDir: "/var/lib/qory-github",
 		AppSlug: "qory-acme", APIURL: "https://api.github.com", ApiaryURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com",
-		AccessKeyID: "ak_0123456789abcdef", AccessKeySecretFile: "/a", ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}}}
+		AccessKeyID: "ak_0123456789abcdef", AccessKeySecretFile: "/a", ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}},
+		AdapterID: "na_0123456789abcdef", ClientID: "Iv1.abc", ClientSecretFile: "/c"}
 	if err != nil || !reflect.DeepEqual(s, want) {
 		t.Fatalf("%+v %v", s, err)
 	}
 	base := map[string]any{"app_id": "Iv1.abc", "private_key_file": "/k.pem", "webhook_secret_file": "/s", "listen": ":8080", "state_dir": "/d",
 		"app_slug": "qory-acme", "api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://qory-github.example.com/github",
-		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON)}
+		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON),
+		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.abc", "client_secret_file": "/c"}
 	b, _ := json.Marshal(base)
 	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://qory-github.example.com/github" {
 		t.Errorf("%+v %v", s, err)
@@ -988,6 +990,9 @@ func TestReadSettings(t *testing.T) {
 		"a negative App id":    {map[string]any{"app_id": -1}, "/app_id: is neither"},
 		"no port":              {map[string]any{"listen": "127.0.0.1"}, "/listen: is not an address and a port"},
 		"a port too large":     {map[string]any{"listen": ":65536"}, "/listen: has a port"},
+		"a node's id":          {map[string]any{"adapter_id": "nd_0123456789abcdef"}, "/adapter_id: is not na_"},
+		"a bad client id":      {map[string]any{"client_id": "secret value"}, "/client_id: is not an App's client id"},
+		"a client secret path": {map[string]any{"client_secret_file": "-----BEGIN secret value"}, "/client_secret_file: holds a PEM block"},
 	} {
 		doc := map[string]any{}
 		for k, v := range base {
@@ -1038,7 +1043,7 @@ func TestReadSettings(t *testing.T) {
 // and the cause, never the path.
 func TestAFileASettingNamesIsNeverQuoted(t *testing.T) {
 	const pasted = "a-pasted-one-line-secret-0123456789"
-	for _, setting := range []string{"private_key_file", "webhook_secret_file", "access_key_secret_file"} {
+	for _, setting := range []string{"private_key_file", "webhook_secret_file", "access_key_secret_file", "client_secret_file"} {
 		dir := t.TempDir()
 		s := settingsFiles(t, dir, newKey(t), "https://apiary.example.com", pinOf(newKey(t)))
 		s.StateDir = filepath.Join(dir, "state")
@@ -1049,6 +1054,8 @@ func TestAFileASettingNamesIsNeverQuoted(t *testing.T) {
 			s.WebhookSecretFile = pasted
 		case "access_key_secret_file":
 			s.AccessKeySecretFile = pasted
+		case "client_secret_file":
+			s.ClientSecretFile = pasted
 		}
 		err := Run(context.Background(), s, Options{})
 		if err == nil || err.Error() != "the file "+setting+" names: no such file or directory" {
@@ -1146,6 +1153,15 @@ func TestRunServesUntilItsContextIsDone(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("not handled")
 	}
+	// The connect page is served beside the receiver.
+	resp, err = http.Get(strings.TrimSuffix(url, WebhookPath) + "/v1/connect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("the connect page answered %d %v", resp.StatusCode, resp.Header)
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -1196,7 +1212,7 @@ func TestRunDeclaresTheAdapterAtStart(t *testing.T) {
 
 func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
 	access := newKey(t)
-	for _, loose := range []string{"secret", "access-key"} {
+	for _, loose := range []string{"secret", "access-key", "client-secret"} {
 		dir := t.TempDir()
 		s := settingsFiles(t, dir, access, "https://apiary.example.com", pinOf(newKey(t)))
 		os.Chmod(filepath.Join(dir, loose), 0o644)
