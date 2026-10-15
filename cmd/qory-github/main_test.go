@@ -1313,9 +1313,10 @@ func TestSetupHelpSaysWhatAppPublicURLMakes(t *testing.T) {
 	withFactory := strings.Replace(setupLongBefore, "setup waits ten minutes at most.\n\n", `setup waits ten minutes at most.
 
 With --public-url, the App is instead public, with a webhook at the public URL and
-/github/webhook, the events issues, issue_comment and workflow_run, and actions and
-issues write, contents and metadata read. It is qory-github-server's App: setup then
-prints qory-github-server serve's settings in place of the declaration and the policy.
+/github/webhook, the events issues, issue_comment, workflow_run, pull_request and
+push, and actions, checks, contents, issues and pull requests write, administration,
+members and metadata read. It is qory-github-server's App: setup then prints
+qory-github-server serve's settings in place of the declaration and the policy.
 setup asks which GitHub account the App is for, and suggests the name qory- and its
 handle, which you can change on GitHub's form.
 
@@ -1328,6 +1329,14 @@ handle, which you can change on GitHub's form.
 		}
 		if long, _, _ := strings.Cut(help.String(), "usage:\n"); long != want {
 			t.Errorf("QORY_FEATURES=%q: setup -h prints\n%s\nwant\n%s", features, long, want)
+		}
+		// With factory, --name's default says the one --public-url gives.
+		name := "the App's name (default qory-github- and six random hex digits)"
+		if features == "factory" {
+			name = "the App's name (default qory-github- and six random hex digits, or with --public-url qory- and the account's handle)"
+		}
+		if !strings.Contains(help.String(), "  -name string\n    \t"+name+"\n") {
+			t.Errorf("QORY_FEATURES=%q: setup -h prints\n%s", features, help.String())
 		}
 	}
 }

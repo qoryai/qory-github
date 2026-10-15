@@ -63,7 +63,7 @@ func (a *Adapter) log() *slog.Logger {
 
 // Register registers the adapter's handlers: installation, installation_repositories,
 // issues and issue_comment. workflow_run, pull_request and push have none yet, so their
-// deliveries are done.
+// deliveries are not kept, see [Receiver.Handlers].
 func (a *Adapter) Register(hs *Handlers) {
 	hs.HandleFunc("installation", a.linked(a.installation))
 	hs.HandleFunc("installation_repositories", a.linked(a.installationRepositories))
@@ -156,9 +156,14 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 // forgetOn401 drops the installation's tokens when err is GitHub's 401, which a token
 // GitHub no longer takes brings, so the next request mints a new one; it returns err.
 func (a *Adapter) forgetOn401(installation int64, err error) error {
-	if !github.Unauthorized(err) {
-		return err
+	if github.Unauthorized(err) {
+		a.forgetTokens(installation)
 	}
+	return err
+}
+
+// forgetTokens drops the installation's tokens, so the next request mints a new one.
+func (a *Adapter) forgetTokens(installation int64) {
 	prefix := strconv.FormatInt(installation, 10) + " "
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -167,7 +172,6 @@ func (a *Adapter) forgetOn401(installation int64, err error) error {
 			delete(a.tokens, key)
 		}
 	}
-	return err
 }
 
 // String says the adapter's App and how many tokens it keeps, never a token or the
@@ -284,13 +288,16 @@ func (a *Adapter) installation(ctx context.Context, d Delivery) error {
 }
 
 // installationRepositories handles the installation_repositories event: each
-// repository removed is disconnected, removed, and forgotten, and the installation's
+// repository removed that the store holds as the installation's is disconnected,
+// removed, and forgotten, one it does not hold is passed, and the installation's
 // repositories are listed again, which a listing of more than one page needs, since it
-// never says it is complete.
+// never says it is complete. The installation's tokens are dropped first, so the
+// listing never reads with a token minted before the change.
 func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) error {
 	if d.Action != "added" && d.Action != "removed" {
 		return nil
 	}
+	a.forgetTokens(d.InstallationID)
 	var ev struct {
 		Removed []struct {
 			FullName string `json:"full_name"`
@@ -301,7 +308,14 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	}
 	var refs []string
 	for _, r := range ev.Removed {
-		if r.FullName != "" {
+		if r.FullName == "" {
+			continue
+		}
+		installation, ok, err := reachOf(a.Store, r.FullName)
+		if err != nil {
+			return err
+		}
+		if ok && installation == d.InstallationID {
 			refs = append(refs, r.FullName)
 		}
 	}

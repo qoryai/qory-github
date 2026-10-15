@@ -61,7 +61,7 @@ func newWired(t *testing.T, dir string) *wired {
 	hs := &Handlers{}
 	w.adapter.Register(hs)
 	worker := &Worker{Store: st, Handlers: hs, Log: logger, Attempts: 3, Backoff: func(int) time.Duration { return time.Millisecond }}
-	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify}
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify, Handlers: hs}
 	worker.Start()
 	t.Cleanup(func() { worker.Stop(5 * time.Second) })
 	w.mux = rc.Mux()
@@ -296,22 +296,24 @@ func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
 }
 
 // TestRemovingARepositoryNeverKnownIsHarmless removes from the installation a
-// repository serve never listed: its disconnect is sent, which Qory Apiary takes as it
-// takes any, the delivery is done, and the repositories serve knows stay as they were.
+// repository serve never listed, and one the store holds as another installation's:
+// no disconnect is sent for either, the delivery is done, the repositories serve knows
+// stay as they were, and the installation is listed again.
 func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	Link(w.st, 42)
 	setReach(w.st, "acme/widgets", 42)
 	setReach(w.st, "acme/gadgets", 42)
-	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/never"}))
+	setReach(w.st, "octo-org/tools", 43)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/never", "octo-org/tools"}))
 	if s := state(w.st, guid1); s != store.Done {
 		t.Errorf("the delivery is %v", s)
 	}
-	if got := w.disconnected(0); !slices.Equal(got, []string{"acme/never removed"}) {
+	if got := w.disconnected(0); len(got) != 0 {
 		t.Errorf("disconnected %v", got)
 	}
-	for _, ref := range []string{"acme/widgets", "acme/gadgets"} {
-		if inst, ok, _ := reachOf(w.st, ref); inst != 42 || !ok {
+	for ref, want := range map[string]int64{"acme/widgets": 42, "acme/gadgets": 42, "octo-org/tools": 43} {
+		if inst, ok, _ := reachOf(w.st, ref); inst != want || !ok {
 			t.Errorf("%s: %d %v", ref, inst, ok)
 		}
 	}
@@ -320,6 +322,38 @@ func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
 	}
 	if got := w.lastListed(t); !slices.Equal(got, []string{"acme/widgets", "acme/gadgets"}) {
 		t.Errorf("listed %v", got)
+	}
+}
+
+// TestAChangeOfRepositoriesListsWithANewToken lists the installation, which keeps its
+// listing token, then delivers installation_repositories added and removed in turn:
+// each drops the installation's tokens, so each listing after a change reads with a
+// token minted after it, and another installation's token is kept.
+func TestAChangeOfRepositoriesListsWithANewToken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.adapter.mu.Lock()
+	w.adapter.tokens["43 octo-org/tools read"] = github.InstallationToken{Token: "another", ExpiresAt: time.Now().Add(time.Hour)}
+	w.adapter.mu.Unlock()
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/gadgets"}, nil))
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/gadgets"}))
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	if len(mints) != 3 {
+		t.Errorf("%d listing tokens minted, want 3: %v", len(mints), mints)
+	}
+	w.adapter.mu.Lock()
+	_, kept := w.adapter.tokens["43 octo-org/tools read"]
+	w.adapter.mu.Unlock()
+	if !kept {
+		t.Error("another installation's token is dropped")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 3 {
+		t.Errorf("%d listings", n)
 	}
 }
 
@@ -407,6 +441,46 @@ func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
 				t.Errorf("a mint asks for %s: %s", wider, m)
 			}
 		}
+	}
+}
+
+// TestDeliveriesOfAnEventWithoutAHandlerAreNotKept posts many deliveries of push and
+// pull_request, and one each of workflow_run and an event GitHub may add, which no
+// handler takes: each is answered 202, as a delivery kept is, and logged unhandled,
+// and the store keeps none of them, so the next delivery kept is the first.
+func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42)
+	body := `{"action":"opened","installation":{"id":42},"repository":{"full_name":"acme/widgets"}}`
+	var guids []string
+	for i := range 200 {
+		event := []string{"push", "pull_request"}[i%2]
+		switch i {
+		case 198:
+			event = "workflow_run"
+		case 199:
+			event = "some_future_event"
+		}
+		guid := fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i)
+		guids = append(guids, guid)
+		if rec := post(w.mux, event, guid, body, sign(body)); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: status %d", event, rec.Code)
+		}
+	}
+	for _, guid := range guids {
+		if d, err := w.st.Lookup(guid); err == nil {
+			t.Fatalf("%s %s is kept", d.Event, guid)
+		}
+	}
+	if pending, err := w.st.Pending(); err != nil || len(pending) != 0 {
+		t.Errorf("pending %d %v", len(pending), err)
+	}
+	if n := strings.Count(w.log.String(), `"outcome":"unhandled"`); n != 200 {
+		t.Errorf("%d deliveries logged unhandled", n)
+	}
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	if d, err := w.st.Lookup(guid1); err != nil || d.Seq != 1 {
+		t.Errorf("the delivery kept next is %d: %v", d.Seq, err)
 	}
 }
 

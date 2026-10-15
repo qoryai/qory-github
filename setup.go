@@ -184,6 +184,7 @@ func (c Client) Account(ctx context.Context, handle string) (login, kind string,
 		Login string `json:"login"`
 		Type  string `json:"type"`
 	}
+	// placeholder: wording waits for the user
 	if err := c.call(ctx, "looking up the GitHub account", http.MethodGet, "/users/"+url.PathEscape(handle), "", nil, http.StatusOK, &got); err != nil {
 		var answered *answerError
 		if errors.As(err, &answered) && answered.status == http.StatusNotFound {
