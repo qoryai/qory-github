@@ -827,7 +827,8 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 // the contract takes, and checks each is cut to its limit on a character's boundary,
 // labels left empty or the same as one before are dropped, the labels past 100 are
 // dropped, nothing is skipped, so the listing is complete, and each cut is logged by
-// ref, field and length, never by its text.
+// ref, field and length, never by its text. Each item and comment names in truncated
+// the fields of it cut but its labels, and one with none of those cut has no truncated.
 func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	secret := "SECRETTEXT"
 	longBody, longTitle, manyLabels, longName, atLimit := node(2, 1), node(3, 0), node(4, 0), node(5, 0), node(6, 0)
@@ -893,11 +894,17 @@ func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	if got[4].Body != strings.Repeat("ü", 65_536) {
 		t.Errorf("a body at the limit is changed")
 	}
+	for i, want := range [][]string{{"body"}, {"title"}, nil, {"filed_by.name"}, nil} {
+		names, ok := truncatedMember(t, got[i])
+		if !reflect.DeepEqual(names, want) || ok != (want != nil) {
+			t.Errorf("%s: truncated %q", got[i].Ref, names)
+		}
+	}
 	cs := s.comments()
 	if len(cs) != 1 || len(cs[0].Comments) != 1 {
 		t.Fatalf("comments %+v", cs)
 	}
-	if c := cs[0].Comments[0]; c.Body != strings.Repeat("c", 65_536) || c.Author != (contracts.Person{Name: strings.Repeat("m", 100), Kind: KindAutomation}) {
+	if c := cs[0].Comments[0]; c.Body != strings.Repeat("c", 65_536) || c.Author != (contracts.Person{Name: strings.Repeat("m", 100), Kind: KindAutomation}) || !reflect.DeepEqual(c.Truncated, []string{"body", "author.name"}) {
 		t.Errorf("comment of %d characters by %+v", utf8.RuneCountInString(c.Body), c.Author)
 	}
 }

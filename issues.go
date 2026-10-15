@@ -17,16 +17,16 @@ import (
 
 // Qory Apiary refuses a whole request when one field in it breaks the contract's
 // limits, [contractLimits], and cuts nothing, so the adapter never sends a field that
-// does. GitHub's limits fit inside the contract's, so a text past its limit is not
-// expected; one that is anyway is cut to the limit, as [cut] says, and the cut is
-// logged as a [Cut]: a title, a body, a person's name, a label, a reason and a
-// collection's title. An empty label is dropped, a label the same as one before it is
-// dropped, and the labels past the most an item has are dropped, which is logged too.
-// A field that cannot be cut into the contract, a ref, a URL, a target's path, an
-// empty title or a time that is not RFC 3339, skips its item, comment or collection,
-// which is logged by its ref, never by its text, and the rest are sent. A request is
-// at most contracts.MaxRequest bytes, and lists at most the contract's most items,
-// comments or collections.
+// does. A text past its limit is cut to the limit, as [cut] says, and the cut is logged
+// as a [Cut]: a title, a body, a person's name, a label and a collection's title. A cut
+// of an item's title, body or filed_by.name, or of a comment's body or author.name, is
+// named in its truncated too. A state_reason past its limit is dropped, never cut. An
+// empty label is dropped, a label the same as one before it is dropped, and the labels
+// past the most an item has are dropped, which is logged too. A field that cannot be
+// cut into the contract, a ref, a URL, a target's path, an empty title or a time that
+// is not RFC 3339, skips its item, comment or collection, which is logged by its ref,
+// never by its text, and the rest are sent. A request is at most contracts.MaxRequest
+// bytes, and lists at most the contract's most items, comments or collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -141,6 +141,29 @@ func fit(cuts *[]Cut, ref, field, s string, n int) string {
 	return cut(s, n)
 }
 
+// The fields the contract's truncated names, on an item and on a comment, as [fit] and
+// [Cut] call them.
+var (
+	itemTruncated    = []string{"title", "body", "filed_by.name"}
+	commentTruncated = []string{"body", "author.name"}
+)
+
+// truncatedOf is the fields among names that cuts cut, each once in the order of
+// names, for an item's or a comment's truncated; nil when cuts cut none of them, so
+// truncated is left out.
+func truncatedOf(cuts []Cut, names []string) []string {
+	var out []string
+	for _, n := range names {
+		for _, c := range cuts {
+			if c.Field == n {
+				out = append(out, n)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // authorOf is who a user is on the wire, the field of ref: a bot is an automation,
 // anyone else a person. The name is fitted to the contract's limit. A user GitHub no
 // longer has, or one without a login, is its ghost.
@@ -189,14 +212,14 @@ func labelsOf(ls []ghLabel, cuts *[]Cut, ref string) []string {
 // stateReasons words GitHub's reasons an issue is closed for.
 var stateReasons = map[string]string{"completed": "Completed", "not_planned": "Not planned", "duplicate": "Duplicate"}
 
-// stateReason is why the closed issue ref is closed, in words, or nil: an open issue
-// has no reason, and a reason without words is left out.
-func stateReason(state string, reason *string, cuts *[]Cut, ref string) *string {
+// stateReason is why a closed issue is closed, in words, or nil: an open issue has no
+// reason, and a reason without words is left out, as is one whose words are past the
+// contract's limit of state_reason, which is dropped, never cut.
+func stateReason(state string, reason *string) *string {
 	if state != StateClosed || reason == nil {
 		return nil
 	}
-	if w, ok := stateReasons[*reason]; ok {
-		w = fit(cuts, ref, "state_reason", w, contractLimits().stateReason)
+	if w, ok := stateReasons[*reason]; ok && !tooLong(w, contractLimits().stateReason) {
 		return &w
 	}
 	return nil
@@ -233,7 +256,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 		BodyFormat:   FormatMarkdown,
 		Type:         "issue",
 		State:        state,
-		StateReason:  stateReason(state, is.StateReason, &cuts, ref),
+		StateReason:  stateReason(state, is.StateReason),
 		Labels:       labelsOf(is.Labels, &cuts, ref),
 		FiledBy:      authorOf(is.User, &cuts, ref, "filed_by.name"),
 		CommentCount: max(is.Comments, 0),
@@ -257,6 +280,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 	if why := checkURL(it.URL); why != "" {
 		return it, why, nil
 	}
+	it.Truncated = truncatedOf(cuts, itemTruncated)
 	return it, "", cuts
 }
 
@@ -288,6 +312,7 @@ func commentOf(c ghComment) (contracts.Comment, string, []Cut) {
 	if why := checkURL(sc.URL); why != "" {
 		return sc, why, nil
 	}
+	sc.Truncated = truncatedOf(cuts, commentTruncated)
 	return sc, "", cuts
 }
 

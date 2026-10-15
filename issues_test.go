@@ -583,3 +583,152 @@ func TestGone(t *testing.T) {
 		t.Error("an error that is not GitHub's answer is gone")
 	}
 }
+
+// truncatedMember is the truncated member of v's JSON, and whether it has one.
+func truncatedMember(t *testing.T, v any) ([]string, bool) {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	json.Unmarshal(b, &m)
+	got, ok := m["truncated"]
+	if !ok {
+		return nil, false
+	}
+	var names []string
+	for _, n := range got.([]any) {
+		names = append(names, n.(string))
+	}
+	return names, true
+}
+
+// TestACutFieldIsNamedInTruncated cuts each field of an item and of a comment that the
+// contract's truncated names, and several at once, and checks truncated names exactly
+// the fields cut, in the request the contract's schema takes; and that an uncut item or
+// comment, or an item whose labels alone are cut, has no truncated member.
+func TestACutFieldIsNamedInTruncated(t *testing.T) {
+	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	long := func(n int) string { return strings.Repeat("ü", n) }
+	for _, tc := range []struct {
+		name string
+		edit func(is *ghIssue)
+		want []string
+	}{
+		{"nothing cut", func(*ghIssue) {}, nil},
+		{"the title", func(is *ghIssue) { is.Title = long(1025) }, []string{"title"}},
+		{"the body", func(is *ghIssue) { is.Body = str(long(65_537)) }, []string{"body"}},
+		{"the filer's name", func(is *ghIssue) { is.User = &ghUser{Login: long(101), Type: "User"} }, []string{"filed_by.name"}},
+		{"a label alone", func(is *ghIssue) { is.Labels = []ghLabel{{long(101)}} }, nil},
+		{"the labels past the most alone", func(is *ghIssue) {
+			for i := range 101 {
+				is.Labels = append(is.Labels, ghLabel{"l" + strconv.Itoa(i)})
+			}
+		}, nil},
+		{"all three and a label", func(is *ghIssue) {
+			is.Title, is.Body, is.User, is.Labels = long(1025), str(long(65_537)), &ghUser{Login: long(101), Type: "Bot"}, []ghLabel{{long(101)}}
+		}, []string{"title", "body", "filed_by.name"}},
+	} {
+		is := ghIssue{
+			Number: 42, Title: "Widgets spin backwards", Body: str("They should not."), State: "open",
+			HTMLURL: "https://github.com/acme/widgets/issues/42", User: &ghUser{Login: "alice", Type: "User"},
+			CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+		}
+		tc.edit(&is)
+		it, why, cuts := itemOf("github.com", r, is)
+		got, ok := truncatedMember(t, it)
+		if why != "" || !reflect.DeepEqual(it.Truncated, tc.want) || ok != (tc.want != nil) || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("item, %s: truncated %q, member %v %q, %s", tc.name, it.Truncated, ok, got, why)
+		}
+		if tc.name != "nothing cut" && len(cuts) == 0 {
+			t.Errorf("item, %s: no cut logged", tc.name)
+		}
+		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{it}}); bad != "" {
+			t.Errorf("item, %s: %s", tc.name, bad)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(c *ghComment)
+		want []string
+	}{
+		{"nothing cut", func(*ghComment) {}, nil},
+		{"the body", func(c *ghComment) { c.Body = str(long(65_537)) }, []string{"body"}},
+		{"the author's name", func(c *ghComment) { c.User = &ghUser{Login: long(101), Type: "User"} }, []string{"author.name"}},
+		{"both", func(c *ghComment) { c.Body, c.User = str(long(65_537)), &ghUser{Login: long(101), Type: "Bot"} }, []string{"body", "author.name"}},
+	} {
+		c := ghComment{ID: 5, HTMLURL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Body: str("Same here."), User: &ghUser{Login: "bob", Type: "User"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}
+		tc.edit(&c)
+		sc, why, _ := commentOf(c)
+		got, ok := truncatedMember(t, sc)
+		if why != "" || !reflect.DeepEqual(sc.Truncated, tc.want) || ok != (tc.want != nil) || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("comment, %s: truncated %q, member %v %q, %s", tc.name, sc.Truncated, ok, got, why)
+		}
+		if bad := check(contracts.SourceItemComments{Version: contracts.Version, ItemRef: "acme/widgets#1", Comments: []contracts.Comment{sc}}); bad != "" {
+			t.Errorf("comment, %s: %s", tc.name, bad)
+		}
+	}
+}
+
+// TestAWebhooksCutIsNamedInTruncated sends an issues event whose title and filer's name
+// are past their limits, and an issue_comment event whose body is, and checks each
+// request names the fields cut, while an event with nothing cut names none.
+func TestAWebhooksCutIsNamedInTruncated(t *testing.T) {
+	is := issue(1, 1)
+	is["title"] = strings.Repeat("t", 1025)
+	is["user"] = map[string]any{"login": strings.Repeat("n", 101), "type": "User"}
+	got, err := IssuesWebhook(event("edited", is, nil), "github.com", nil)
+	if err != nil || len(got.Items) != 1 || !reflect.DeepEqual(got.Items[0].Items[0].Truncated, []string{"title", "filed_by.name"}) {
+		t.Fatalf("issues: %+v, %v", got, err)
+	}
+	if bad := check(got.Items[0]); bad != "" {
+		t.Error(bad)
+	}
+	got, _ = IssuesWebhook(event("edited", issue(1, 1), nil), "github.com", nil)
+	if _, ok := truncatedMember(t, got.Items[0].Items[0]); ok {
+		t.Error("an uncut item has truncated")
+	}
+	got, err = IssueCommentWebhook(event("created", issue(1, 1), map[string]any{"comment": comment(5, "bob", "User", strings.Repeat("c", 65_537))}), "qory-test")
+	if err != nil || len(got.Comments) != 1 || !reflect.DeepEqual(got.Comments[0].Comments[0].Truncated, []string{"body"}) {
+		t.Fatalf("issue_comment: %+v, %v", got, err)
+	}
+	if bad := check(got.Comments[0]); bad != "" {
+		t.Error(bad)
+	}
+	got, _ = IssueCommentWebhook(event("created", issue(1, 1), map[string]any{"comment": comment(5, "bob", "User", "c")}), "qory-test")
+	if _, ok := truncatedMember(t, got.Comments[0].Comments[0]); ok {
+		t.Error("an uncut comment has truncated")
+	}
+}
+
+// TestAStateReasonPastItsLimitIsDropped words a reason, for this test alone, longer
+// than the contract's limit of state_reason, and checks a closed issue with it has a
+// null state_reason, records no cut, and is an item the contract's schema takes; a
+// reason within the limit is sent as it is worded.
+func TestAStateReasonPastItsLimitIsDropped(t *testing.T) {
+	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	was := stateReasons["duplicate"]
+	t.Cleanup(func() { stateReasons["duplicate"] = was })
+	is := ghIssue{
+		Number: 42, Title: "Widgets spin backwards", State: "closed", StateReason: str("duplicate"),
+		HTMLURL: "https://github.com/acme/widgets/issues/42", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+	}
+	n := contractLimits().stateReason
+	for _, tc := range []struct {
+		words string
+		want  *string
+	}{
+		{strings.Repeat("d", n), str(strings.Repeat("d", n))},
+		{strings.Repeat("d", n+1), nil},
+	} {
+		stateReasons["duplicate"] = tc.words
+		it, why, cuts := itemOf("github.com", r, is)
+		if why != "" || len(cuts) != 0 || it.Truncated != nil || !reflect.DeepEqual(it.StateReason, tc.want) {
+			t.Errorf("%d characters: reason %v, cuts %+v, truncated %q, %s", len(tc.words), it.StateReason, cuts, it.Truncated, why)
+		}
+		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{it}}); bad != "" {
+			t.Errorf("%d characters: %s", len(tc.words), bad)
+		}
+	}
+}
