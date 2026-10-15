@@ -716,24 +716,30 @@ func partsOf(w *wired) string {
 	return strings.Join(out, ", ")
 }
 
-// TestTheFillAndTheDailyListingPassTheListingThrough lists 250 open issues by the fill
-// and by the daily listing, and checks each sends the listing's parts as it makes them,
-// the last alone complete; and that with an issue Qory Apiary would refuse, skipped, no
-// part says complete.
+// TestTheFillAndTheDailyListingPassTheListingThrough lists 250 and 200 open issues by
+// the fill and by the daily listing, and checks each sends the listing's parts as it
+// makes them, the last alone complete, a full one for 200; and that with an issue Qory
+// Apiary would refuse, skipped, no part says complete.
 func TestTheFillAndTheDailyListingPassTheListingThrough(t *testing.T) {
 	for _, c := range listingCallers {
-		for _, skip := range []bool{false, true} {
-			w, p := listingRig(t, 250)
-			want := "100 false, 100 false, 50 true"
-			if skip {
+		for _, tc := range []struct {
+			n    int
+			skip bool
+			want string
+		}{
+			{250, false, "100 false, 100 false, 50 true"},
+			{200, false, "100 false, 100 true"},
+			{250, true, "100 false, 100 false, 49 false"},
+		} {
+			w, p := listingRig(t, tc.n)
+			if tc.skip {
 				w.gh.issues[0]["title"] = ""
-				want = "100 false, 100 false, 49 false"
 			}
 			if err := c.run(context.Background(), w, p); err != nil {
 				t.Fatalf("%s: %v", c.name, err)
 			}
-			if got := partsOf(w); got != want {
-				t.Errorf("%s, skipped %v: parts %s, want %s", c.name, skip, got, want)
+			if got := partsOf(w); got != tc.want {
+				t.Errorf("%s, %d, skipped %v: parts %s, want %s", c.name, tc.n, tc.skip, got, tc.want)
 			}
 			if m := markOf(t, w); !m.Listed.Equal(pullStart) {
 				t.Errorf("%s: kept %+v", c.name, m)
@@ -810,30 +816,42 @@ func TestAListingThatFailsOrStopsNeverSaysComplete(t *testing.T) {
 	}
 }
 
-// TestARepositoryWithNoOpenIssueSendsNoPart lists a repository whose one issue is
-// closed, by the fill and by the daily listing, and checks no part is sent, no items
-// request without items, and no line says a listing was sent; the listing's start is
-// kept, since it finished.
-func TestARepositoryWithNoOpenIssueSendsNoPart(t *testing.T) {
+// TestARepositoryWithNoOpenIssueSendsOneEmptyCompletePart lists a repository whose one
+// issue is closed, by the fill and by the daily listing, and checks exactly one part is
+// sent, without items, that says the listing is complete, and the listing's start is
+// kept; and that when GitHub's answer to the first page fails, 502, GraphQL's errors or
+// a rate limit that holds, nothing is sent, no line says a listing was sent, and the
+// listing's start is not kept.
+func TestARepositoryWithNoOpenIssueSendsOneEmptyCompletePart(t *testing.T) {
 	for _, c := range listingCallers {
-		w, p := listingRig(t, 0)
-		w.gh.issues = []map[string]any{closedIssue(1)}
-		if err := c.run(context.Background(), w, p); err != nil {
-			t.Fatalf("%s: %v", c.name, err)
-		}
-		if got := partsOf(w); got != "" {
-			t.Errorf("%s: parts %s", c.name, got)
-		}
-		for _, r := range w.apiary.sent(routeItems) {
-			if items, _ := r.body["items"].([]any); len(items) == 0 {
-				t.Errorf("%s: an items request without items: %s", c.name, r.raw)
+		for _, fail := range []string{"", "502", "errors", "limited"} {
+			w, p := listingRig(t, 0)
+			w.gh.issues = []map[string]any{closedIssue(1)}
+			if fail != "" {
+				w.gh.gqlFailOn, w.gh.gqlFail = 1, fail
 			}
-		}
-		if log := w.log.String(); strings.Contains(log, "listing") || strings.Contains(log, "listed") {
-			t.Errorf("%s: the log %s", c.name, log)
-		}
-		if m := markOf(t, w); !m.Listed.Equal(pullStart) {
-			t.Errorf("%s: kept %+v", c.name, m)
+			err := c.run(context.Background(), w, p)
+			want, listed := "0 true", pullStart
+			if fail != "" {
+				want, listed = "", pullStart.Add(-25*time.Hour)
+				if err == nil {
+					t.Errorf("%s, %s: no error", c.name, fail)
+				}
+				if log := w.log.String(); strings.Contains(log, "listing") || strings.Contains(log, "listed") {
+					t.Errorf("%s, %s: the log %s", c.name, fail, log)
+				}
+			} else if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if got := partsOf(w); got != want {
+				t.Errorf("%s, %q: parts %s, want %s", c.name, fail, got, want)
+			}
+			if c.name == "the fill" && fail != "" {
+				listed = time.Time{}
+			}
+			if m := markOf(t, w); !m.Listed.Equal(listed) {
+				t.Errorf("%s, %q: kept %+v", c.name, fail, m)
+			}
 		}
 	}
 }

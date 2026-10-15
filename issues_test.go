@@ -334,7 +334,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 		t.Errorf("item %+v", it)
 	}
 	c, why, _ := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"})
-	if why != "" || c != (contracts.Comment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: contracts.Person{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
+	if why != "" || !reflect.DeepEqual(c, contracts.Comment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: contracts.Person{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
 		t.Errorf("comment %+v, %s", c, why)
 	}
 }

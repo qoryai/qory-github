@@ -489,7 +489,8 @@ func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarge
 // listing is complete unless an item was skipped, and Qory Apiary closes every item of
 // the collection it left out and did not hear of since it started. A listing that fails
 // or is stopped sends no part that says it is complete, and its start is not kept, so
-// the next pull lists again; a repository with no open issue sends nothing.
+// the next pull lists again. A repository with no open issue sends one part without
+// items that says the listing is complete.
 func (p *puller) pull(ctx context.Context, ref string, installation int64) error {
 	a := p.adapter
 	repo, err := repository(ref)

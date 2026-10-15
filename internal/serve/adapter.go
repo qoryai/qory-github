@@ -409,7 +409,7 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // unless an item was skipped, so Qory Apiary closes every item of the collection the
 // listing left out and did not hear of since it started. A fill that fails or is
 // stopped sends no part that says it is complete, and a repository with no open issue
-// sends nothing. A repository GitHub answers is gone or moved,
+// sends one part without items that does. A repository GitHub answers is gone or moved,
 // [github.ErrRepositoryGone], or for which GitHub refuses to mint a token for good,
 // [github.ErrMintRefused], fails for good, so the change feed passes it. It waits for a
 // pull of the collection that runs, and once it has sent everything, the next pull

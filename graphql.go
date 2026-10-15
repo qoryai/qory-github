@@ -281,10 +281,12 @@ func rateLimited(errs []gqlError) bool {
 // leaves the listing not complete, so Qory Apiary never closes an open issue for that.
 // Comments are no part of complete: no request of comments says it is complete.
 //
-// A repository with no open issue sends no part, since the contract refuses a part
-// without items, so nothing is closed for it. A listing stopped early, by an error or
-// its context, sends the items it read and had not sent as its last part, which never
-// says it is complete; one that fails on its first page sends nothing. A repository
+// A repository with no open issue, read without error, sends one part without items
+// that says the listing is complete, so Qory Apiary closes every item of the
+// collection it did not hear of since the listing started. A listing stopped early, by
+// an error or its context, sends the items it read and had not sent as its last part,
+// which never says it is complete, nor does any part before it; one that fails on its
+// first page sends nothing. A repository
 // GitHub answers it cannot resolve, or names otherwise, renamed or transferred, stops
 // the listing with an error that wraps [ErrRepositoryGone]; an issue whose comments
 // GitHub answers are gone has its comments skipped and logged by its ref, and the

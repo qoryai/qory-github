@@ -775,9 +775,11 @@ func (o *openParts) add(ctx context.Context, r ghRepo, is ghIssue) error {
 
 // send sends the part pending, which complete says is the complete listing's last, and
 // returns its items. last marks the listing's last part. Nothing pending sends nothing,
-// since the contract refuses a part without items.
+// unless the part is the complete listing's last: a part without items then says every
+// open issue is in the parts before it, or, as a listing's one part, that the
+// repository has none.
 func (o *openParts) send(ctx context.Context, last, complete bool) ([]listed, error) {
-	if len(o.pending) == 0 {
+	if len(o.pending) == 0 && !complete {
 		o.ended = last
 		return nil, nil
 	}

@@ -45,6 +45,9 @@ type fakeGraphQL struct {
 	sameCursor, noCursor, nullNode bool
 	// renameOn names the repository otherwise from that page on.
 	renameOn int
+	// closedToo answers the closed issues among the open ones, as GraphQL never
+	// should, so a page can hold no open issue.
+	closedToo bool
 	// onPage, when set, is called with each page's number and request before the page
 	// is answered, without g.mu held.
 	onPage   func(page int, r *http.Request)
@@ -133,7 +136,7 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var nodes []any
 	more := false
 	for _, n := range g.nodes {
-		if n["state"] != "OPEN" || n["number"].(int) <= after {
+		if n["state"] != "OPEN" && !g.closedToo || n["number"].(int) <= after {
 			continue
 		}
 		if len(nodes) == first {
@@ -376,10 +379,11 @@ func TestAGraphQLIssueMapsAsRESTsDoes(t *testing.T) {
 }
 
 // TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte lists 250 small
-// issues, 100 to a page, a hundred, none, and 40 with long bodies, and checks the parts:
-// at most 100 items and 1 MiB of JSON each, numbered from 1, one listing, the last
-// alone complete, and every item sent once. A repository with no open issue sends no
-// part, since the contract refuses one without items.
+// issues, 100 to a page, a hundred, two hundred, none, and 40 with long bodies, and
+// checks the parts: at most 100 items and 1 MiB of JSON each, numbered from 1, one
+// listing, the last alone complete, and every item sent once. A count that is a
+// multiple of 100 ends with a full part that says complete; a repository with no open
+// issue sends one part without items that says complete.
 func TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 	long := strings.Repeat("ü", 60_000)
 	for _, tc := range []struct {
@@ -391,7 +395,8 @@ func TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T
 	}{
 		{"small", 250, "", []int{100, 100, 50}, "- cursor:100 cursor:200"},
 		{"exactly a hundred", 100, "", []int{100}, "-"},
-		{"none", 0, "", []int{}, "-"},
+		{"two hundred", 200, "", []int{100, 100}, "- cursor:100"},
+		{"none", 0, "", []int{0}, "-"},
 		{"long bodies", 40, long, nil, "-"},
 	} {
 		g := &fakeGraphQL{}
@@ -439,7 +444,10 @@ func TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T
 // TestASkippedItemLeavesTheListingNotComplete lists an issue Qory Apiary would refuse,
 // with an empty title, and checks it is skipped and logged by its ref, the rest are
 // sent, and the listing does not say it is complete, so Qory Apiary closes nothing for
-// the item it did not get. A repository without an open issue sends nothing.
+// the item it did not get; a listing whose one item is skipped sends no part. A
+// repository without an open issue, read without error, sends exactly one part, without
+// items, that says the listing is complete, as does one whose pages GitHub answers
+// with no open issue.
 func TestASkippedItemLeavesTheListingNotComplete(t *testing.T) {
 	empty := node(2, 0)
 	empty["title"] = ""
@@ -458,11 +466,80 @@ func TestASkippedItemLeavesTheListingNotComplete(t *testing.T) {
 		t.Errorf("logged %v", logs)
 	}
 
-	g = &fakeGraphQL{}
+	g = &fakeGraphQL{nodes: []map[string]any{empty}}
 	s = &sink{}
 	l, _ = g.lister(t, s, &logs)
 	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil || len(s.reqs) != 0 {
-		t.Errorf("err %v, requests %+v", err, s.reqs)
+		t.Errorf("one item skipped: err %v, requests %+v", err, s.reqs)
+	}
+
+	closed := node(1, 0)
+	closed["state"] = "CLOSED"
+	for name, g := range map[string]*fakeGraphQL{
+		"no issue":                    {},
+		"a closed issue":              {nodes: []map[string]any{closed}},
+		"pages without an open issue": {nodes: closedNodes(3), closedToo: true},
+	} {
+		s := &sink{}
+		var logs []string
+		l, _ := g.lister(t, s, &logs)
+		err := l.listOpenComplete(context.Background(), widgets, 1)
+		refs, parts := sentParts(s)
+		if err != nil || len(s.reqs) != 1 || len(refs) != 0 || len(parts) != 1 || parts[0].Part != 1 || !parts[0].Complete || s.items()[0].Items == nil {
+			t.Errorf("%s: err %v, requests %+v", name, err, s.reqs)
+		}
+	}
+}
+
+// TestAnEmptyListingThatFailsSendsNothing reads a repository with no open issue, or
+// pages GitHub answers without one, and fails or stops the read on its first or second
+// page, and checks the listing returns its error and sends no part, so none says
+// complete.
+func TestAnEmptyListingThatFailsSendsNothing(t *testing.T) {
+	pages := func() []map[string]any { return closedNodes(3) }
+	cancelOn := func(page int) func(g *fakeGraphQL) context.Context {
+		return func(g *fakeGraphQL) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			g.onPage = func(p int, r *http.Request) {
+				if p == page {
+					cancel()
+					select {
+					case <-r.Context().Done():
+					case <-time.After(10 * time.Second):
+					}
+				}
+			}
+			return ctx
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		g    *fakeGraphQL
+		ctx  func(g *fakeGraphQL) context.Context
+	}{
+		{name: "a status on the first page", g: &fakeGraphQL{statusOn: 1, status: 502}},
+		{name: "GraphQL's errors on the first page", g: &fakeGraphQL{errorOn: 1}},
+		{name: "a rate limit that holds on the first page", g: &fakeGraphQL{limited: 5}},
+		{name: "the repository not found", g: &fakeGraphQL{notFound: true}},
+		{name: "the repository renamed", g: &fakeGraphQL{name: "acme/gadgets"}},
+		{name: "the context cancelled on the first page", g: &fakeGraphQL{}, ctx: cancelOn(1)},
+		{name: "a status on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, statusOn: 2, status: 502}},
+		{name: "GraphQL's errors on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, errorOn: 2}},
+		{name: "a rate limit that holds on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, limited: 5, limitFrom: 2}},
+		{name: "no cursor for the next page", g: &fakeGraphQL{nodes: pages(), closedToo: true, noCursor: true}},
+		{name: "the next cursor repeated", g: &fakeGraphQL{nodes: pages(), closedToo: true, sameCursor: true}},
+		{name: "the context cancelled on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true}, ctx: cancelOn(2)},
+	} {
+		s := &sink{}
+		var logs []string
+		l, _ := tc.g.lister(t, s, &logs)
+		ctx := context.Background()
+		if tc.ctx != nil {
+			ctx = tc.ctx(tc.g)
+		}
+		if err := l.listOpenComplete(ctx, widgets, 1); err == nil || len(s.reqs) != 0 {
+			t.Errorf("%s: err %v, requests %+v", tc.name, err, s.reqs)
+		}
 	}
 }
 
@@ -553,7 +630,7 @@ func TestARateLimitInGraphQLsAnswerIsWaitedOut(t *testing.T) {
 }
 
 // TestTheCompleteListingReadsABoundedNumberOfPages checks a listing of more than 2,000
-// pages stops with its error, and its last part is not complete.
+// pages stops with its error, and no part says it is complete.
 func TestTheCompleteListingReadsABoundedNumberOfPages(t *testing.T) {
 	g := &fakeGraphQL{}
 	for i := 1; i <= 2001; i++ {
@@ -567,8 +644,13 @@ func TestTheCompleteListingReadsABoundedNumberOfPages(t *testing.T) {
 		t.Errorf("err %v, %d pages", err, len(g.vars))
 	}
 	refs, parts := sentParts(s)
-	if len(refs) != 2000 || len(parts) == 0 || parts[len(parts)-1].Complete {
+	if len(refs) != 2000 || len(parts) == 0 {
 		t.Errorf("%d items, %d parts", len(refs), len(parts))
+	}
+	for _, p := range parts {
+		if p.Complete {
+			t.Errorf("part %d says it is complete", p.Part)
+		}
 	}
 }
 
@@ -578,6 +660,15 @@ func many(n, comments int) []map[string]any {
 	var out []map[string]any
 	for i := 1; i <= n; i++ {
 		out = append(out, node(i, comments))
+	}
+	return out
+}
+
+// closedNodes are n closed issues of acme/widgets as GraphQL says them.
+func closedNodes(n int) []map[string]any {
+	out := many(n, 0)
+	for _, c := range out {
+		c["state"], c["stateReason"] = "CLOSED", "COMPLETED"
 	}
 	return out
 }
