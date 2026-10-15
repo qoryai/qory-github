@@ -109,8 +109,8 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	apiary := &Apiary{
 		URL: s.ApiaryURL, KeyID: s.AccessKeyID, Key: accessKey, Pin: s.ApiaryPublicKey, InstanceID: instance, Log: log,
-		Unlinked: func(ref string) {
-			if err := unlinkCollection(st, ref); err != nil {
+		Unlinked: func(ref string, began uint64) {
+			if _, err := unlinkSince(st, ref, began); err != nil {
 				log.Error("marking a collection not linked", slog.String("error", err.Error()))
 			}
 		},

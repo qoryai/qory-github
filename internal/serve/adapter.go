@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -136,6 +137,39 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 	return t.Token, nil
 }
 
+// forgetOn401 drops the installation's tokens when err is GitHub's 401, which a token
+// GitHub no longer takes brings, so the next request mints a new one; it returns err.
+func (a *Adapter) forgetOn401(installation int64, err error) error {
+	if !github.Unauthorized(err) {
+		return err
+	}
+	prefix := strconv.FormatInt(installation, 10) + " "
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key := range a.tokens {
+		if strings.HasPrefix(key, prefix) {
+			delete(a.tokens, key)
+		}
+	}
+	return err
+}
+
+// String says the adapter's App and how many tokens it keeps, never a token or the
+// App's key, so an adapter printed by mistake gives none away.
+func (a *Adapter) String() string {
+	a.mu.Lock()
+	n := len(a.tokens)
+	a.mu.Unlock()
+	return fmt.Sprintf("serve.Adapter{AppID: %q, Slug: %q, tokens: %d kept}", a.AppID, a.Slug, n)
+}
+
+// GoString is String, for %#v.
+func (a *Adapter) GoString() string { return a.String() }
+
+// Format writes String for every verb, %+v and %#v among them, which would otherwise
+// print the fields, the tokens and the App's key among them.
+func (a *Adapter) Format(f fmt.State, _ rune) { io.WriteString(f, a.String()) }
+
 // logf logs a line a listing writes: what it skipped, by ref, never by text.
 func (a *Adapter) logf(format string, args ...any) {
 	a.log().Info(fmt.Sprintf(format, args...))
@@ -200,7 +234,7 @@ func (a *Adapter) listRepositories(ctx context.Context, installation int64) erro
 		Logf:   a.logf,
 		LogCut: a.logCut,
 	}
-	return l.ListRepositories(ctx)
+	return a.forgetOn401(installation, l.ListRepositories(ctx))
 }
 
 // installation handles the installation event: deleted disconnects each repository
@@ -319,27 +353,28 @@ func (a *Adapter) send(ctx context.Context, t github.ToSend) error {
 		a.logCut(c)
 	}
 	for _, req := range t.Items {
-		if err := a.sendLinked(ctx, req.CollectionRef, func() error { return a.Sink.Items(ctx, req) }); err != nil {
+		if err := a.sendLinked(ctx, req.CollectionRef, "items", func() error { return a.Sink.Items(ctx, req) }); err != nil {
 			return err
 		}
 	}
 	for _, req := range t.Comments {
 		collection, _, _ := strings.Cut(req.ItemRef, "#")
-		if err := a.sendLinked(ctx, collection, func() error { return a.Sink.Comments(ctx, req) }); err != nil {
+		if err := a.sendLinked(ctx, collection, "comments", func() error { return a.Sink.Comments(ctx, req) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// sendLinked calls send when the collection is linked.
-func (a *Adapter) sendLinked(ctx context.Context, collection string, send func() error) error {
+// sendLinked calls send, which sends the collection's items or comments, as what says,
+// when the collection is linked.
+func (a *Adapter) sendLinked(ctx context.Context, collection, what string, send func() error) error {
 	ok, err := collectionLinked(a.Store, collection)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		a.log().Info("the collection is not linked, so its item is not sent", slog.String("collection", collection))
+		a.log().Info("the collection is not linked, so its "+what+" are not sent", slog.String("collection", collection))
 		return nil
 	}
 	err = send()
@@ -376,7 +411,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		Logf:   a.logf,
 		LogCut: a.logCut,
 	}
-	return l.ListIssues(ctx, repo)
+	return a.forgetOn401(installation, l.ListIssues(ctx, repo))
 }
 
 // applyChange writes on GitHub what a work_item entry of the feed says, with a token
@@ -393,7 +428,7 @@ func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 	token := func(ctx context.Context, repo github.Repository) (string, error) {
 		return a.token(ctx, installation, repo, "write")
 	}
-	return a.GitHub.ApplyChange(ctx, a.pacer(installation), token, a.Slug, github.Change{WorkItemID: ch.WorkItemID, Ref: ch.Ref, Status: ch.Status, URL: ch.URL})
+	return a.forgetOn401(installation, a.GitHub.ApplyChange(ctx, a.pacer(installation), token, a.Slug, github.Change{WorkItemID: ch.WorkItemID, Ref: ch.Ref, Status: ch.Status, URL: ch.URL}))
 }
 
 // repository is a collection's ref as a repository, owner/name.

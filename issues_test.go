@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // fakeIssues is GitHub's API as a listing reads it: one repository, acme/widgets, its
@@ -141,16 +144,67 @@ func comment(id int, login, typ, body string) map[string]any {
 	}
 }
 
-// sink records the requests it is sent, and fails the call failAt, counted from 1.
+// sink records the requests it is sent, and fails the call failAt, counted from 1. It
+// checks each against the contract's schema, with the time the sink would set, and
+// keeps what breaks it in broken, which a lister's test reports when it ends.
 type sink struct {
 	mu     sync.Mutex
 	reqs   []any
 	failAt int
+	broken []string
+}
+
+// requestSchemas are the contract's schemas of the requests a sink is sent, compiled once.
+var requestSchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
+	out := map[string]*jsonschema.Schema{}
+	for _, name := range []string{"source-collections.schema.json", "source-items.schema.json", "source-item-comments.schema.json", "sources-disconnect.schema.json"} {
+		s, err := contracts.Compile(name)
+		if err != nil {
+			panic(err)
+		}
+		out[name] = s
+	}
+	return out
+})
+
+// check is why req breaks the contract's schema, or "".
+func check(req any) string {
+	const tm = "2026-01-02T03:04:05Z"
+	var name string
+	switch r := req.(type) {
+	case contracts.SourceCollections:
+		r.Time = tm
+		name, req = "source-collections.schema.json", r
+	case contracts.SourceItems:
+		r.Time = tm
+		name, req = "source-items.schema.json", r
+	case contracts.SourceItemComments:
+		r.Time = tm
+		name, req = "source-item-comments.schema.json", r
+	case contracts.SourcesDisconnect:
+		r.Time = tm
+		name, req = "sources-disconnect.schema.json", r
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return err.Error()
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
+	if err == nil {
+		err = requestSchemas()[name].Validate(doc)
+	}
+	if err != nil {
+		return fmt.Sprintf("%s: %#v", name, err)
+	}
+	return ""
 }
 
 func (s *sink) add(req any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if why := check(req); why != "" {
+		s.broken = append(s.broken, why)
+	}
 	s.reqs = append(s.reqs, req)
 	if len(s.reqs) == s.failAt {
 		return errors.New("Qory Apiary is not reachable")
@@ -191,6 +245,15 @@ func (f *fakeIssues) lister(t *testing.T, s Sink, logs *[]string) Lister {
 	}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
+	if sk, ok := s.(*sink); ok {
+		t.Cleanup(func() {
+			sk.mu.Lock()
+			defer sk.mu.Unlock()
+			for _, why := range sk.broken {
+				t.Errorf("a request breaks the contract: %s", why)
+			}
+		})
+	}
 	clock := &fakeClock{}
 	return Lister{
 		Client: Client{API: f.srv.URL},
@@ -208,7 +271,7 @@ var widgets = Repository{Owner: "acme", Name: "widgets"}
 // of issues, one a pull request, and checks that every page is read with the token,
 // the pull request is left out, comments are read, paged, only for an issue that has
 // any, the App's work item comment is left out while a person's comment with the same
-// words is kept, and the listing and each item's comments say they are complete.
+// words is kept, and neither the listing nor an item's comments say they are complete.
 func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testing.T) {
 	pr := issue(4, 3)
 	pr["pull_request"] = map[string]any{"url": "https://api.github.com/repos/acme/widgets/pulls/4"}
@@ -286,7 +349,8 @@ func TestAListingPagesDropsPullRequestsAndReadsCommentsWhereThereAreAny(t *testi
 
 // TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte lists 250 small issues and then
 // 40 with long bodies, and checks the parts: at most 100 items and 1 MiB of JSON each,
-// numbered from 1, only the last complete, and every item sent once.
+// numbered from 1, none complete, and every item sent once. A repository with no open
+// issue sends no part, since the contract refuses one without items.
 func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 	long := strings.Repeat("ü", 60_000)
 	for _, tc := range []struct {
@@ -297,7 +361,7 @@ func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 	}{
 		{"small", 250, "", []int{100, 100, 50}},
 		{"exactly a hundred", 100, "", []int{100}},
-		{"none", 0, "", []int{0}},
+		{"none", 0, "", []int{}},
 		{"long bodies", 40, long, nil},
 	} {
 		f := &fakeIssues{}
@@ -329,7 +393,7 @@ func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 			sizes = append(sizes, len(req.Items))
 			total += len(req.Items)
 		}
-		if tc.parts != nil && !reflect.DeepEqual(sizes, tc.parts) {
+		if tc.parts != nil && !slices.Equal(sizes, tc.parts) {
 			t.Errorf("%s: parts of %v, want %v", tc.name, sizes, tc.parts)
 		}
 		if tc.parts == nil && (len(items) < 2 || total != tc.n) {
@@ -339,7 +403,7 @@ func TestAListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T) {
 }
 
 // TestAnItemsCommentsGoInRequestsOfAMebibyte lists an issue with many long comments
-// and checks they go in several requests of at most 1 MiB, only the last complete.
+// and checks they go in several requests of at most 1 MiB, none complete.
 func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
 	long := strings.Repeat("x", 60_000)
 	f := &fakeIssues{issues: []map[string]any{issue(1, 40)}, comments: map[int][]map[string]any{}}
@@ -483,9 +547,10 @@ func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	}
 }
 
-// TestAListingStoppedEarlyEndsWithAPart stops listings in several places and checks
-// that each returns its error and ends with a part, none of which says it is complete.
-func TestAListingStoppedEarlyEndsWithAPart(t *testing.T) {
+// TestAListingStoppedEarlySendsWhatItRead stops listings in several places and checks
+// that each returns its error and sends the items it read and had not sent as a last
+// part, none of which says it is complete, and no part when it has none.
+func TestAListingStoppedEarlySendsWhatItRead(t *testing.T) {
 	many := func(n, comments int) []map[string]any {
 		var out []map[string]any
 		for i := 1; i <= n; i++ {
@@ -498,13 +563,14 @@ func TestAListingStoppedEarlyEndsWithAPart(t *testing.T) {
 		f     *fakeIssues
 		sink  *sink
 		err   string
-		parts int // items requests, the last of which is incomplete
+		parts int // items requests, none complete
 	}{
 		{"a page of issues fails", &fakeIssues{pageSize: 2, issues: many(5, 0), failIssues: 2}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 1},
 		{"a page of issues fails after a part", &fakeIssues{pageSize: 100, issues: many(250, 0), failIssues: 3}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 2},
-		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the issues of acme/widgets: the next page GitHub names is not on the API, so it is not read", 1},
-		{"Qory Apiary fails a part", &fakeIssues{pageSize: 100, issues: many(150, 0)}, &sink{failAt: 1}, "Qory Apiary is not reachable", 2},
-		{"comments fail before the last part", &fakeIssues{pageSize: 1, issues: many(150, 1), comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}, failComments: 2}, &sink{}, "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", 2},
+		{"the next page is elsewhere", &fakeIssues{pageSize: 2, issues: many(5, 0), elsewhere: true}, &sink{}, "listing the issues of acme/widgets: the next page GitHub names is not on the API, so it is not read", 0},
+		{"the first page fails", &fakeIssues{issues: many(1, 0), failIssues: 1}, &sink{}, "listing the issues of acme/widgets: GitHub answered 500: Server Error", 0},
+		{"Qory Apiary fails a part", &fakeIssues{pageSize: 100, issues: many(150, 0)}, &sink{failAt: 1}, "Qory Apiary is not reachable", 1},
+		{"comments fail before the last part", &fakeIssues{pageSize: 1, issues: many(150, 1), comments: map[int][]map[string]any{1: {comment(1, "bob", "User", "a"), comment(2, "bob", "User", "b")}}, failComments: 2}, &sink{}, "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", 1},
 	} {
 		var logs []string
 		err := tc.f.lister(t, tc.sink, &logs).ListIssues(context.Background(), widgets)
@@ -527,7 +593,7 @@ func TestAListingStoppedEarlyEndsWithAPart(t *testing.T) {
 			}
 		}
 	}
-	// A listing whose context is done ends with a part all the same.
+	// A listing whose context is done sends what it read all the same.
 	f := &fakeIssues{pageSize: 2, issues: many(5, 0)}
 	s := &sink{}
 	var logs []string

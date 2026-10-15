@@ -76,8 +76,13 @@ type fakeApiary struct {
 	signer *accesskey.Key
 	// refuse answers a POST, numbered from 1 among those to its route, when it returns a
 	// status other than 0.
-	refuse   func(route string, n int) (int, string)
-	revision *int
+	refuse func(route string, n int) (int, string)
+	// refuseGet answers a GET of the feed, numbered from 1, when it returns a status
+	// other than 0. hold, when set, holds every GET of the feed until its request is
+	// cancelled, as Qory Apiary holds a read while nothing follows the cursor.
+	refuseGet func(n int) (int, string)
+	hold      bool
+	revision  *int
 
 	mu       sync.Mutex
 	requests []apiaryRequest
@@ -169,6 +174,16 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("%s: a GET without X-Qory-Timestamp", r.URL.Path)
 	}
 	f.mu.Lock()
+	hold := f.hold
+	f.mu.Unlock()
+	if hold && r.Method == http.MethodGet {
+		f.mu.Lock()
+		f.requests = append(f.requests, got)
+		f.mu.Unlock()
+		<-r.Context().Done()
+		return
+	}
+	f.mu.Lock()
 	f.requests = append(f.requests, got)
 	n := 0
 	for _, x := range f.requests {
@@ -180,10 +195,15 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		body = f.page(r.URL.Query().Get("after"))
 	}
-	refuse := f.refuse
+	refuse, refuseGet := f.refuse, f.refuseGet
 	f.mu.Unlock()
 	if refuse != nil && r.Method == http.MethodPost {
 		if s, b := refuse(r.URL.Path, n); s != 0 {
+			status, body = s, b
+		}
+	}
+	if refuseGet != nil && r.Method == http.MethodGet {
+		if s, b := refuseGet(n); s != 0 {
 			status, body = s, b
 		}
 	}
@@ -211,7 +231,17 @@ func (f *fakeApiary) page(after string) string {
 	if f.revision != nil {
 		revision = *f.revision
 	}
-	b, _ := json.Marshal(contracts.Changes{Version: contracts.Version, Revision: revision, Cursor: "c_" + strconv.Itoa(len(f.changes)), Changes: f.changes[from:]})
+	// An entry of a kind the contract does not define, which contracts.Change does not
+	// write, is written as its kind and status.
+	entries := []any{}
+	for _, c := range f.changes[from:] {
+		if _, err := json.Marshal(c); err != nil {
+			entries = append(entries, map[string]any{"kind": c.Kind, "status": c.Status})
+			continue
+		}
+		entries = append(entries, c)
+	}
+	b, _ := json.Marshal(map[string]any{"version": contracts.Version, "revision": revision, "cursor": "c_" + strconv.Itoa(len(f.changes)), "changes": entries})
 	return string(b)
 }
 
@@ -241,7 +271,7 @@ func (f *fakeApiary) sent(route string) []apiaryRequest {
 	return out
 }
 
-// client is an Apiary client of the fake, with the adapter's key.
+// client is an [Apiary] client of the fake, with the adapter's key.
 func (f *fakeApiary) client(key *accesskey.Key) *Apiary {
 	return &Apiary{URL: f.srv.URL, KeyID: testKeyID, Key: key, Pin: pinOf(f.server), InstanceID: testInstance}
 }
@@ -260,6 +290,9 @@ type fakeGitHub struct {
 	posted   []string
 	mints    []string
 	requests []string
+	// unauthorized answers the listing of acme/widgets's issues 401, as GitHub answers
+	// a token it no longer takes.
+	unauthorized bool
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -302,6 +335,9 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(repos), "repositories": repos})
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+	case r.Method == "GET" && r.URL.Path == widgets+"/issues" && f.unauthorized:
+		w.WriteHeader(401)
+		io.WriteString(w, `{"message":"Bad credentials"}`)
 	case r.Method == "GET" && r.URL.Path == widgets+"/issues":
 		json.NewEncoder(w).Encode(append([]map[string]any{}, f.issues...))
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, widgets+"/issues/") && strings.HasSuffix(r.URL.Path, "/comments"):

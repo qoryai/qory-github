@@ -679,3 +679,19 @@ func TestATakeInGoesThroughTheInstallationsPacer(t *testing.T) {
 		t.Errorf("slept %v, posted %q", clock.slept, f.posts())
 	}
 }
+
+// TestCheckSlug checks the slugs an App may have are taken and others refused, by an
+// error that never says the value.
+func TestCheckSlug(t *testing.T) {
+	for _, ok := range []string{"q", "qory-acme", "Qory_Acme.2", "9lives", strings.Repeat("a", 100)} {
+		if err := CheckSlug(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "-qory", ".qory", "_qory", "qory acme", "qory/acme", "qory[bot]", "qöry", "qory\n", strings.Repeat("a", 101)} {
+		err := CheckSlug(bad)
+		if err == nil || err.Error() != "is not an App's slug, 1 to 100 letters, digits, dots, underscores or hyphens" {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+}

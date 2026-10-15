@@ -15,8 +15,8 @@ type Delivery = store.Delivery
 
 // Handler handles the deliveries of one event. It returns nil once the delivery is
 // handled, and an error to have it tried again later: an error [Permanent] marks fails
-// the delivery at once, and one [Held] marks has it tried again for as long as it
-// takes. A delivery may be handed to it
+// the delivery at once, one [Held] marks has it tried again for as long as it takes,
+// and one [Outage] marks has it tried again for a day. A delivery may be handed to it
 // again after a restart, so handling one twice must do no harm. Its error is logged, so
 // it never contains a secret, a token or the body. It returns soon after ctx is
 // cancelled, which a stop does.
@@ -79,6 +79,11 @@ const (
 	// to maxBackoff.
 	firstBackoff = 2 * time.Second
 	maxBackoff   = time.Minute
+	// outageFor is how long a delivery whose handler meets Qory Apiary's [Outage] is
+	// tried again, from its first attempt, after a wait that doubles from two seconds
+	// to outageMaxBackoff, so a deploy of Qory Apiary loses no delivery.
+	outageFor        = 24 * time.Hour
+	outageMaxBackoff = 5 * time.Minute
 	// rescan is how often the worker reads the store's pending deliveries when nothing
 	// wakes it.
 	rescan = time.Minute
@@ -94,9 +99,12 @@ const (
 // handler's error is tried again after a wait that doubles each time, [Worker.Attempts]
 // times in all, and the delivery is then marked failed. A [Permanent] error marks it
 // failed at once. A [Held] error is tried again after a wait that doubles to a minute,
-// and counts as no attempt, so the installation's later deliveries wait behind it. A
-// delivery stays pending until one of these, so one that a stop interrupted is handled
-// after the next start.
+// and counts as no attempt, so the installation's later deliveries wait behind it. An
+// [Outage] error, Qory Apiary's, counts as no attempt either: it is tried again after a
+// wait that doubles to five minutes, until a day has passed since the delivery's first
+// attempt, and the delivery is then marked failed and logged. A delivery stays pending
+// until one of these, so one that a stop interrupted is handled after the next start,
+// and its day counted again from then.
 type Worker struct {
 	// Store keeps the deliveries.
 	Store *store.Store
@@ -109,8 +117,12 @@ type Worker struct {
 	// [DefaultAttempts].
 	Attempts int
 	// Backoff is the wait after the attempt numbered attempt, from 1, failed; nil
-	// doubles from two seconds, to a minute at most.
+	// doubles from two seconds, to a minute at most, or to five minutes for an
+	// [Outage].
 	Backoff func(attempt int) time.Duration
+
+	// now is the clock an outage's day is counted by; nil is time.Now.
+	now func() time.Time
 
 	once     sync.Once
 	wake     chan struct{}
@@ -307,7 +319,8 @@ func (w *Worker) handle(meta Delivery) bool {
 	if attempts <= 0 {
 		attempts = DefaultAttempts
 	}
-	attempt, held := 1, 0
+	attempt, held, outage := 1, 0, 0
+	first := w.clock()
 	for {
 		err := call(w.ctx, h, d)
 		if err == nil {
@@ -324,6 +337,12 @@ func (w *Worker) handle(meta Delivery) bool {
 			wait = w.backoff(held)
 		case IsPermanent(err):
 			return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt), slog.Bool("permanent", true), slog.String("error", err.Error()))
+		case IsOutage(err):
+			if w.clock().Sub(first) >= outageFor {
+				return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt+outage), slog.Bool("outage", true), slog.String("error", err.Error()))
+			}
+			outage++
+			wait = w.backoffTo(outage, outageMaxBackoff)
 		case attempt >= attempts:
 			return w.settle(d, store.Failed, "failed", slog.Int("attempts", attempt), slog.String("error", err.Error()))
 		default:
@@ -378,13 +397,23 @@ func (w *Worker) outcome(d Delivery, outcome string, more ...slog.Attr) {
 }
 
 // backoff is the wait after the attempt numbered attempt failed.
-func (w *Worker) backoff(attempt int) time.Duration {
+func (w *Worker) backoff(attempt int) time.Duration { return w.backoffTo(attempt, maxBackoff) }
+
+// backoffTo is the wait after the attempt numbered attempt failed, doubling to most.
+func (w *Worker) backoffTo(attempt int, most time.Duration) time.Duration {
 	if w.Backoff != nil {
 		return w.Backoff(attempt)
 	}
 	b := firstBackoff
-	for i := 1; i < attempt && b < maxBackoff; i++ {
+	for i := 1; i < attempt && b < most; i++ {
 		b *= 2
 	}
-	return min(b, maxBackoff)
+	return min(b, most)
+}
+
+func (w *Worker) clock() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
 }

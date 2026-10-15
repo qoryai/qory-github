@@ -243,6 +243,33 @@ func TestAnAnswerOverItsCapIsRefused(t *testing.T) {
 	}
 }
 
+// TestA403IsReadWhole has GitHub answer 403 with a body past the 1 MiB the secondary
+// rate limit's check reads, and checks the answer comes back whole, and that a 403 past
+// the cap of an answer is refused, never cut.
+func TestA403IsReadWhole(t *testing.T) {
+	big := `{"message":"Must have admin rights","pad":"` + strings.Repeat("x", 2<<20) + `"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(403)
+		io.WriteString(w, big)
+	}))
+	defer srv.Close()
+	a, err := Client{API: srv.URL}.send(context.Background(), &Pacer{}, false, "commenting", http.MethodPost, "/x", fakeToken, map[string]string{"body": "b"})
+	if err != nil || a.status != 403 || string(a.body) != big {
+		t.Errorf("err %v, answer of %d bytes", err, len(a.body))
+	}
+	over := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(403)
+		io.WriteString(w, `{"message":"`)
+		io.WriteString(w, strings.Repeat("x", maxAnswer))
+		io.WriteString(w, `"}`)
+	}))
+	defer over.Close()
+	_, err = Client{API: over.URL}.send(context.Background(), &Pacer{}, false, "commenting", http.MethodPost, "/x", fakeToken, map[string]string{"body": "b"})
+	if err == nil || err.Error() != "commenting: GitHub's answer is larger than 67108864 bytes" {
+		t.Errorf("err %v", err)
+	}
+}
+
 // TestAPageNeverSaysTheToken has GitHub refuse a page and checks the token is in no
 // error.
 func TestAPageNeverSaysTheToken(t *testing.T) {

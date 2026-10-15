@@ -495,9 +495,11 @@ type Lister struct {
 	// Pacer is the installation's, shared with every other caller for it; nil is one
 	// for each listing.
 	Pacer *Pacer
-	// Token returns an installation token that reads the installation's issues, such
-	// as [Client.MintInstallationToken] mints. It is called before every request, so it
-	// keeps a token until shortly before it expires.
+	// Token returns an installation token for the listing: for [Lister.ListIssues]
+	// one that reads the repository's issues, such as [Client.MintInstallationToken]
+	// mints, and for [Lister.ListRepositories] one that reads which repositories the
+	// installation reaches, such as [Client.MintListingToken] mints. It is called before
+	// every request, so it keeps a token until shortly before it expires.
 	Token func(context.Context) (string, error)
 	// Slug is the App's, whose bot writes the work item comment.
 	Slug string
@@ -693,8 +695,11 @@ type listed struct {
 // listing missed, as one deleted or transferred while it was listed makes it miss one,
 // and an issue closed while its repository was not mirrored, stay as Qory Apiary has
 // them until that issue next changes on GitHub, and its webhook event brings it. A
-// listing stopped early, by an error or its context, still ends with a part; one that
-// cannot read the repository sends nothing.
+// listing stopped early, by an error or its context, still sends the items it read
+// and had not sent, as its last part; one that cannot read the repository sends
+// nothing. A part is never empty, since the contract refuses one without items, so a
+// repository with no open issue sends none, which loses nothing: no part says the
+// listing is complete.
 func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
 		return fmt.Errorf("%q is not owner/name", repo.String())
@@ -719,6 +724,10 @@ func (l Lister) ListIssues(ctx context.Context, repo Repository) error {
 	var pending []listed
 	ended := false
 	send := func(ctx context.Context, last bool) ([]listed, error) {
+		if len(pending) == 0 {
+			ended = last
+			return nil, nil
+		}
 		listing.Part++
 		part := listing
 		req := contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: make([]contracts.Item, 0, len(pending)), Listing: &part}

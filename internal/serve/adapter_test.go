@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +50,7 @@ func newWired(t *testing.T, dir string) *wired {
 	logger := slog.New(slog.NewJSONHandler(w.log, nil))
 	w.client = w.apiary.client(access)
 	w.client.Log = logger
-	w.client.Unlinked = func(ref string) { unlinkCollection(st, ref) }
+	w.client.Unlinked = func(ref string, began uint64) { unlinkSince(st, ref, began) }
 	w.client.Sleep = func(_ context.Context, d time.Duration) error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -398,22 +400,265 @@ func TestTheFeedTakesInAWorkItemOnceThroughAReplay(t *testing.T) {
 }
 
 // TestAFeedEntryThatFailsForGoodIsPassed reads a work item of a repository no listing
-// named and an entry of a kind serve does not know, both logged and passed, so the
-// cursor moves.
+// named and a collection whose ref is not owner/name, both logged and passed, so the
+// cursor moves, and the store holds no link for the bad ref.
 func TestAFeedEntryThatFailsForGoodIsPassed(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	w.apiary.add(
 		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/unknown#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
-		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "shelved", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "", Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: strings.Repeat("a", 300), Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme", Status: "unlinked"},
 	)
 	if err := w.feed.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_4" {
 		t.Errorf("the cursor %q", c)
 	}
-	if !strings.Contains(w.log.String(), "no installation is known") || !strings.Contains(w.log.String(), "is not one serve knows") || len(w.gh.requests) != 0 {
-		t.Errorf("the log %s, GitHub %v", w.log.String(), w.gh.requests)
+	logged := w.log.String()
+	if !strings.Contains(logged, "no installation is known") || strings.Count(logged, "the collection's ref is not owner/name") != 3 || len(w.gh.requests) != 0 {
+		t.Errorf("the log %s, GitHub %v", logged, w.gh.requests)
+	}
+	n := 0
+	w.st.Each(nsCollections, func(string, []byte) error { n++; return nil })
+	if n != 0 {
+		t.Errorf("%d collections stored", n)
+	}
+}
+
+// TestAFeedEntryThatMayPassKeepsTheCursor links a collection whose fill Qory Apiary
+// answers 500, and checks the step fails and the cursor stays, so the entry is read
+// again.
+func TestAFeedEntryThatMayPassKeepsTheCursor(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeItems {
+			return 500, `{"error":"internal"}`
+		}
+		return 0, ""
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"})
+	err := w.feed.step(context.Background())
+	if err == nil || IsPermanent(err) || !IsOutage(err) {
+		t.Errorf("err %v", err)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+}
+
+// TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole serves a page whose last entry
+// has a kind, or a status, serve does not know, and checks none of the page is
+// applied, its cursor is not kept, and the refusal is logged with the cursor it was
+// read after and the entry's kind and status; then serves a page serve knows, which
+// moves the feed on.
+func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
+	for _, bad := range []contracts.Change{
+		{Kind: "label", Status: "added"},
+		{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: "shelved", URL: "https://apiary.example.com/work-items/wi_42"},
+		{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "archived"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/gadgets", Status: "linked"}, bad)
+		var u *unknownChange
+		if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.after != "c_1" || u.kind != bad.Kind || u.status != bad.Status {
+			t.Errorf("%s %s: err %v", bad.Kind, bad.Status, err)
+		}
+		if ok, _ := collectionLinked(w.st, "acme/gadgets"); ok {
+			t.Errorf("%s %s: an entry of the refused page is applied", bad.Kind, bad.Status)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+			t.Errorf("%s %s: the cursor %q", bad.Kind, bad.Status, c)
+		}
+		// run logs the refusal and waits, then reads the same cursor again.
+		ctx, cancel := context.WithCancel(context.Background())
+		var waits []time.Duration
+		after := -1
+		w.feed.sleep = func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			switch {
+			case d == feedFirstBackoff && after < 0:
+				// Qory Apiary's next answer is one serve knows.
+				w.apiary.mu.Lock()
+				w.apiary.changes = w.apiary.changes[:2]
+				w.apiary.mu.Unlock()
+				after = 0
+			case after >= 0:
+				// The floor before that read, then the floor after it, which stops.
+				if after++; after == 2 {
+					cancel()
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
+		w.feed.run(ctx)
+		cancel()
+		logged := w.log.String()
+		want := `"level":"ERROR","msg":"an answer of the change feed holds an entry serve does not know, so none of it is applied","after":"c_1","kind":"` + bad.Kind + `","status":"` + bad.Status + `"`
+		if !strings.Contains(logged, want) {
+			t.Errorf("%s %s: the log %s", bad.Kind, bad.Status, logged)
+		}
+		if !slices.Contains(waits, feedFirstBackoff) {
+			t.Errorf("%s %s: waited %v", bad.Kind, bad.Status, waits)
+		}
+		if ok, _ := collectionLinked(w.st, "acme/gadgets"); !ok {
+			t.Errorf("%s %s: the page that followed is not applied", bad.Kind, bad.Status)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+			t.Errorf("%s %s: the cursor %q", bad.Kind, bad.Status, c)
+		}
+		gets := w.apiary.sent("GET " + routeChanges)
+		if len(gets) < 3 || gets[1].target != routeChanges+"?after=c_1" || gets[2].target != routeChanges+"?after=c_1" {
+			t.Errorf("%s %s: read %v", bad.Kind, bad.Status, gets)
+		}
+	}
+}
+
+// TestTheFeedWaitsFromItsLastRequest has Qory Apiary answer the feed's first read 429,
+// which the read waits out and sends again a second later, and checks the next read
+// waits a second from that retry, not from the step's start.
+func TestTheFeedWaitsFromItsLastRequest(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	var mu sync.Mutex
+	now := time.Now()
+	w.client.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	w.client.Sleep = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+		return nil
+	}
+	w.apiary.refuseGet = func(n int) (int, string) {
+		if n == 1 {
+			return 429, `{"error":"rate_limited"}`
+		}
+		return 0, ""
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits []time.Duration
+	w.feed.sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		cancel()
+		return ctx.Err()
+	}
+	w.feed.run(ctx)
+	if len(waits) != 1 || waits[0] != feedFloor {
+		t.Errorf("waited %v", waits)
+	}
+	if gets := w.apiary.sent("GET " + routeChanges); len(gets) != 2 {
+		t.Errorf("read %d times", len(gets))
+	}
+}
+
+// TestTheFeedStopsDuringALongRead has Qory Apiary hold the feed's read, and checks run
+// returns soon after its context is done.
+func TestTheFeedStopsDuringALongRead(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.hold = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { w.feed.run(ctx); close(done) }()
+	eventually(t, "the read is held", func() bool { return len(w.apiary.sent("GET "+routeChanges)) == 1 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return")
+	}
+}
+
+// TestA409OnCommentsUnlinksTheCollection has Qory Apiary answer comments with 409
+// collection_not_linked, and checks the collection is no longer linked.
+func TestA409OnCommentsUnlinksTheCollection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	linkCollection(w.st, "acme/widgets")
+	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
+	req := contracts.SourceItemComments{Version: contracts.Version, ItemRef: "acme/widgets#1", Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	if err := w.client.Comments(context.Background(), req); !IsPermanent(err) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := collectionLinked(w.st, "acme/widgets"); ok {
+		t.Error("the collection is still linked")
+	}
+}
+
+// TestA409ForARequestBeforeALinkKeepsTheLink has the change feed unlink and link the
+// collection again while a request for it is answered 409 collection_not_linked, and
+// checks the link stored after the request began stands.
+func TestA409ForARequestBeforeALinkKeepsTheLink(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	linkCollection(w.st, "acme/widgets")
+	w.apiary.refuse = func(string, int) (int, string) {
+		unlinkCollection(w.st, "acme/widgets")
+		linkCollection(w.st, "acme/widgets")
+		return 409, `{"error":"collection_not_linked"}`
+	}
+	if err := w.client.Items(context.Background(), widgetsItem()); !IsPermanent(err) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := collectionLinked(w.st, "acme/widgets"); !ok {
+		t.Error("a 409 for a request that began before the link unlinked the collection")
+	}
+}
+
+// TestAGitHub401DropsTheInstallationsTokens has GitHub answer a fill 401, and checks
+// the installation's tokens are dropped, so the next request mints a new one.
+func TestAGitHub401DropsTheInstallationsTokens(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.unauthorized = true
+	if err := w.adapter.fill(context.Background(), "acme/widgets"); !github.Unauthorized(err) {
+		t.Fatalf("err %v", err)
+	}
+	w.adapter.mu.Lock()
+	n := len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d tokens kept", n)
+	}
+	w.gh.mu.Lock()
+	w.gh.unauthorized = false
+	w.gh.mu.Unlock()
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, "acme/widgets")
+	if err := w.adapter.fill(context.Background(), "acme/widgets"); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.gh.mints) != 2 {
+		t.Errorf("%d tokens minted, want 2", len(w.gh.mints))
+	}
+}
+
+// TestAnAdapterPrintsNoTokenAndNoKey prints an adapter that keeps a token with every
+// verb, and checks neither the token nor the App's key is printed.
+func TestAnAdapterPrintsNoTokenAndNoKey(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, "acme/widgets", 42)
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, "acme/widgets")
+	if err := w.adapter.fill(context.Background(), "acme/widgets"); err != nil {
+		t.Fatal(err)
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x"} {
+		out := fmt.Sprintf(verb, w.adapter)
+		if strings.Contains(out, ghToken) || strings.Contains(out, appKey().D.String()) || strings.Contains(out, fmt.Sprintf("%x", ghToken)) {
+			t.Errorf("%s prints %s", verb, out)
+		}
+	}
+	if got := fmt.Sprintf("%+v", w.adapter); got != `serve.Adapter{AppID: "1", Slug: "qory-test", tokens: 1 kept}` {
+		t.Errorf("printed %s", got)
 	}
 }
 

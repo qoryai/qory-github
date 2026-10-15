@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/qory-github/internal/store"
@@ -65,14 +67,54 @@ func present(_ []byte, err error) (bool, error) {
 // and names are the same in any case.
 func collectionKey(ref string) string { return strings.ToLower(ref) }
 
+// The moments of the links this process stores. A request to Qory Apiary that is
+// answered 409 collection_not_linked may have begun before the change feed unlinked
+// the collection and linked it again; its answer then speaks of the unlink, and the
+// link stored after it stands. So each link stored takes the next moment from
+// linkClock, kept in linkedAt by store and collection, and a request notes the moment
+// it began, [linkMoment]: [unlinkSince] unlinks only when no link was stored after.
+// A link from before the process started has no moment, and is older than any request
+// of the process. linkMu orders a link and an unlink of one store.
+var (
+	linkClock atomic.Uint64
+	linkedAt  sync.Map // linkMark → uint64
+	linkMu    sync.Mutex
+)
+
+// linkMark is a collection of a store, the key of linkedAt.
+type linkMark struct {
+	st  *store.Store
+	key string
+}
+
+// linkMoment is the moment now, which a request notes when it begins.
+func linkMoment() uint64 { return linkClock.Load() }
+
 // linkCollection marks the collection linked, as the change feed says.
 func linkCollection(st *store.Store, ref string) error {
+	linkMu.Lock()
+	defer linkMu.Unlock()
+	linkedAt.Store(linkMark{st, collectionKey(ref)}, linkClock.Add(1))
 	return st.Put(nsCollections, collectionKey(ref), []byte("linked"), 0)
 }
 
-// unlinkCollection marks the collection not linked.
+// unlinkCollection marks the collection not linked, as the change feed says.
 func unlinkCollection(st *store.Store, ref string) error {
+	linkMu.Lock()
+	defer linkMu.Unlock()
 	return st.Delete(nsCollections, collectionKey(ref))
+}
+
+// unlinkSince marks the collection not linked, as Qory Apiary's answer to a request
+// that began at the moment began says, unless a link was stored after that moment, and
+// says whether it did.
+func unlinkSince(st *store.Store, ref string, began uint64) (bool, error) {
+	linkMu.Lock()
+	defer linkMu.Unlock()
+	if at, ok := linkedAt.Load(linkMark{st, collectionKey(ref)}); ok && at.(uint64) > began {
+		return false, nil
+	}
+	return true, st.Delete(nsCollections, collectionKey(ref))
 }
 
 // collectionLinked is whether the collection is linked.

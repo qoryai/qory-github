@@ -103,13 +103,26 @@ type Apiary struct {
 	// Sleep waits d or until ctx is done; nil waits on a timer.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Unlinked, when set, is called with a collection's ref when Qory Apiary answers
-	// that the collection is not linked, so serve stops sending its items.
-	Unlinked func(collectionRef string)
+	// that the collection is not linked, so serve stops sending its items, and with the
+	// [linkMoment] the request began at, so a link the change feed stored since is kept.
+	Unlinked func(collectionRef string, began uint64)
 	// Log takes the throttled line for a 401; nil logs nothing.
 	Log *slog.Logger
 
 	once         sync.Once
 	unauthorized *throttle
+
+	// mu guards changesSent, when the last request for the change feed was sent.
+	mu          sync.Mutex
+	changesSent time.Time
+}
+
+// lastChanges is when the last request for the change feed was sent, a 429's retry
+// among them, or the zero time.
+func (a *Apiary) lastChanges() time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.changesSent
 }
 
 func (a *Apiary) init() {
@@ -185,9 +198,12 @@ func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes,
 		target += "?" + url.Values{changesAfter: {cursor}}.Encode()
 	}
 	for try := 1; ; try++ {
+		a.mu.Lock()
+		a.changesSent = a.now()
+		a.mu.Unlock()
 		ans, err := a.send(ctx, what, http.MethodGet, target, nil, maxChangesAnswer, changesTimeout)
 		if err == nil {
-			err = a.judge(what, ans, "")
+			err = a.judge(what, ans, "", 0)
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
@@ -234,6 +250,7 @@ func checkChanges(body []byte) (contracts.Changes, error) {
 // waited out and the request built again, with a later time and so a new signature.
 // collection is the collection the request is for, when it is one collection's.
 func (a *Apiary) post(ctx context.Context, what, route, collection string, body func(time string) any) error {
+	began := linkMoment()
 	for try := 1; ; try++ {
 		b, err := json.Marshal(body(contracts.FormatTime(a.now())))
 		if err != nil {
@@ -244,7 +261,7 @@ func (a *Apiary) post(ctx context.Context, what, route, collection string, body 
 		}
 		ans, err := a.send(ctx, what, http.MethodPost, route, b, maxPostAnswer, postTimeout)
 		if err == nil {
-			err = a.judge(what, ans, collection)
+			err = a.judge(what, ans, collection, began)
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
@@ -269,7 +286,7 @@ type answer struct {
 // checks its signature under the pin, bound to this request's signature. A GET carries
 // and signs X-Qory-Timestamp; a POST's signature covers its body. A 401 is never
 // signed. An error is no answer; it begins with what and never says a header, the
-// body or a secret.
+// body or a secret. Qory Apiary out of reach, or its answer unread, is an [Outage].
 func (a *Apiary) send(ctx context.Context, what, method, target string, body []byte, max int64, timeout time.Duration) (*answer, error) {
 	var r io.Reader
 	if body != nil {
@@ -308,12 +325,12 @@ func (a *Apiary) send(ctx context.Context, what, method, target string, body []b
 		if errors.As(err, &u) {
 			err = u.Err
 		}
-		return nil, fmt.Errorf("%s: Qory Apiary could not be reached: %w", what, err)
+		return nil, Outage(fmt.Errorf("%s: Qory Apiary could not be reached: %w", what, err))
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s: Qory Apiary's answer could not be read: %w", what, err)
+		return nil, Outage(fmt.Errorf("%s: Qory Apiary's answer could not be read: %w", what, err))
 	}
 	if int64(len(b)) > max {
 		return nil, fmt.Errorf("%s: Qory Apiary's answer is larger than %d bytes", what, max)
@@ -357,15 +374,16 @@ func retryWait(err error) (time.Duration, bool) {
 //   - a 401, unsigned whatever its cause, an access key not yet approved, one revoked,
 //     a clock that is off or a replay, is [Held] and logged once a minute at most,
 //     never taken as the key's revocation;
-//   - an answer whose signature does not verify under the pin is an error, and its
+//   - an answer whose signature does not verify under the pin is an [Outage], and its
 //     body is never read;
-//   - 409 collection_not_linked calls [Apiary.Unlinked] with collection and is
-//     [Permanent], and so are 400, 403, 409 and 413;
+//   - 409 collection_not_linked calls [Apiary.Unlinked] with collection and began,
+//     and is [Permanent], and so are 400, 403, 409 and 413;
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
-//   - any other answer, a 5xx among them, is an error that may pass.
+//   - a 5xx is an [Outage];
+//   - any other answer is an error that may pass.
 //
 // An error names the status and the refusal's code, never the body.
-func (a *Apiary) judge(what string, ans *answer, collection string) error {
+func (a *Apiary) judge(what string, ans *answer, collection string, began uint64) error {
 	if ans.status == http.StatusUnauthorized {
 		a.init()
 		if ok, dropped := a.unauthorized.allow(); ok {
@@ -374,7 +392,7 @@ func (a *Apiary) judge(what string, ans *answer, collection string) error {
 		return Held(fmt.Errorf("%s: Qory Apiary answered 401 unauthorized", what))
 	}
 	if !ans.signed {
-		return fmt.Errorf("%s: Qory Apiary's answer, %d, is not signed under a key of apiary_public_key, so it is not used", what, ans.status)
+		return Outage(fmt.Errorf("%s: Qory Apiary's answer, %d, is not signed under a key of apiary_public_key, so it is not used", what, ans.status))
 	}
 	if ans.status >= 200 && ans.status < 300 {
 		return nil
@@ -390,13 +408,16 @@ func (a *Apiary) judge(what string, ans *answer, collection string) error {
 	switch ans.status {
 	case http.StatusConflict:
 		if refusal.Error == codeCollectionNotLinked && collection != "" && a.Unlinked != nil {
-			a.Unlinked(collection)
+			a.Unlinked(collection, began)
 		}
 		return Permanent(err)
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge:
 		return Permanent(err)
 	case http.StatusTooManyRequests:
 		return &rateLimited{what: what, wait: retryAfter(ans.retryAfter, a.now())}
+	}
+	if ans.status >= 500 {
+		return Outage(err)
 	}
 	return err
 }

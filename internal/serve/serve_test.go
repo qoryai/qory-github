@@ -687,6 +687,72 @@ func TestAHeldErrorIsTriedUntilItPasses(t *testing.T) {
 	}
 }
 
+// TestAnOutageIsTriedForADay has a handler meet Qory Apiary's outage on every attempt,
+// on a clock an hour later at each look, and checks the delivery is tried far past the
+// attempts, with waits that double to five minutes, and failed and logged once a day has
+// passed since its first attempt.
+func TestAnOutageIsTriedForADay(t *testing.T) {
+	var calls atomic.Int32
+	hs := &Handlers{}
+	hs.HandleFunc("issues", func(context.Context, Delivery) error {
+		calls.Add(1)
+		return fmt.Errorf("sending the items: %w", Outage(errors.New("Qory Apiary answered 502")))
+	})
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	log := &syncBuffer{}
+	var mu sync.Mutex
+	now := time.Now()
+	var waits []time.Duration
+	w := &Worker{Store: st, Handlers: hs, Log: slog.New(slog.NewJSONHandler(log, nil)), now: func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(time.Hour)
+		return now
+	}}
+	// The waits are the worker's, recorded, and made short.
+	w.Backoff = func(n int) time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		waits = append(waits, (&Worker{}).backoffTo(n, outageMaxBackoff))
+		return time.Millisecond
+	}
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: w.Log, Stored: w.Notify}
+	w.Start()
+	t.Cleanup(func() { w.Stop(5 * time.Second) })
+	post(rc.Mux(), "issues", guid1, body1, sign(body1))
+	eventually(t, "failed", func() bool { return state(st, guid1) == store.Failed })
+	eventually(t, "logged", func() bool { return strings.Contains(log.String(), `"outcome":"failed","attempts":24,"outage":true`) })
+	if n := calls.Load(); n != 24 {
+		t.Errorf("called %d times, want 24", n)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(waits) != 23 || waits[0] != 2*time.Second || waits[1] != 4*time.Second || waits[8] != outageMaxBackoff || waits[22] != outageMaxBackoff {
+		t.Errorf("waits %v", waits)
+	}
+}
+
+// TestAJoinedErrorIsPermanentOnlyWhenEveryPartIs checks a listing's error joined with
+// the error of its last part is permanent only when both are.
+func TestAJoinedErrorIsPermanentOnlyWhenEveryPartIs(t *testing.T) {
+	transient := errors.New("listing the issues of acme/widgets: GitHub answered 502: Bad Gateway")
+	refused := Permanent(errors.New("sending the items of acme/widgets: Qory Apiary answered 409 collection_not_linked"))
+	for err, want := range map[error]bool{
+		errors.Join(transient, refused):                                      false,
+		errors.Join(refused, transient):                                      false,
+		errors.Join(refused, refused):                                        true,
+		fmt.Errorf("filling: %w", errors.Join(transient, refused)):           false,
+		fmt.Errorf("filling: %w", errors.Join(refused, github.ErrIssueGone)): true,
+		fmt.Errorf("%w and %w", transient, refused):                          false,
+		fmt.Errorf("filling: %w", refused):                                   true,
+		transient:                                                            false,
+	} {
+		if IsPermanent(err) != want {
+			t.Errorf("%v: permanent %v, want %v", err, !want, want)
+		}
+	}
+}
+
 func TestAHandlersPanicFailsItsDeliveryAlone(t *testing.T) {
 	hs := &Handlers{}
 	hs.HandleFunc("issues", func(context.Context, Delivery) error { panic("a bug") })
@@ -891,26 +957,32 @@ func TestReadSettings(t *testing.T) {
 		change map[string]any
 		want   string
 	}{
-		"an unknown field":    {map[string]any{"github_url": "https://api.github.com"}, `unknown fields "github_url"`},
-		"a bad slug":          {map[string]any{"app_slug": "secret value"}, "/app_slug: is not an App's slug"},
-		"another API":         {map[string]any{"api_url": "https://secret.example.com"}, "/api_url: the API is neither"},
-		"Qory Apiary on http": {map[string]any{"apiary_url": "http://secret.example.com"}, "/apiary_url: is neither an https origin"},
-		"Qory Apiary's path":  {map[string]any{"apiary_url": "https://apiary.example.com/secret"}, "/apiary_url: is neither an https origin"},
-		"a user":              {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
-		"a public http URL":   {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
-		"a public query":      {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
-		"a bad key id":        {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
-		"a pin of no list":    {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
-		"a pin of a bad key":  {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
-		"a fixture pin":       {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "rcFAEfgtHFbZVqpPnXPYhYNhpgYEhSXg0Ixjjcdd2Mc"}}}, "/apiary_public_key: lists a published fixture key"},
-		"a secret in the pin": {map[string]any{"apiary_public_key": "qak_secret value"}, "/apiary_public_key: the document contains an access key secret"},
-		"an odd unknown name": {map[string]any{"a\nb": 1}, `unknown fields "a\nb"`},
-		"a null field":        {map[string]any{"state_dir": nil}, "/state_dir: is not a string that is not empty"},
-		"an empty path":       {map[string]any{"private_key_file": ""}, "/private_key_file: is not a string"},
-		"a bad App id":        {map[string]any{"app_id": "secret value"}, "/app_id: is not an App's id"},
-		"a negative App id":   {map[string]any{"app_id": -1}, "/app_id: is neither"},
-		"no port":             {map[string]any{"listen": "127.0.0.1"}, "/listen: is not an address and a port"},
-		"a port too large":    {map[string]any{"listen": ":65536"}, "/listen: has a port"},
+		"an unknown field":     {map[string]any{"github_url": "https://api.github.com"}, `unknown fields "github_url"`},
+		"a bad slug":           {map[string]any{"app_slug": "secret value"}, "/app_slug: is not an App's slug"},
+		"another API":          {map[string]any{"api_url": "https://secret.example.com"}, "/api_url: the API is neither"},
+		"Qory Apiary on http":  {map[string]any{"apiary_url": "http://secret.example.com"}, "/apiary_url: is neither an https origin"},
+		"Qory Apiary's path":   {map[string]any{"apiary_url": "https://apiary.example.com/secret"}, "/apiary_url: is neither an https origin"},
+		"a user":               {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
+		"a public http URL":    {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
+		"a public query":       {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
+		"a bad key id":         {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
+		"a pin of no list":     {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
+		"a pin of a bad key":   {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
+		"a fixture pin":        {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "rcFAEfgtHFbZVqpPnXPYhYNhpgYEhSXg0Ixjjcdd2Mc"}}}, "/apiary_public_key: lists a published fixture key"},
+		"a secret in the pin":  {map[string]any{"apiary_public_key": "qak_secret value"}, "the settings contain an access key secret, which belongs in the file access_key_secret_file names"},
+		"a secret as the path": {map[string]any{"access_key_secret_file": "qak_secret value"}, "the settings contain an access key secret"},
+		"a secret as a name":   {map[string]any{"qak_secret value": "/a"}, "the settings contain an access key secret"},
+		"a run key":            {map[string]any{"state_dir": "QRK_secret value"}, "the settings contain a run key, which belongs nowhere in them"},
+		"a PEM as the path":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY-----\nsecret value\n-----END RSA PRIVATE KEY-----"}, "/private_key_file: holds a control character, so it is not a file's path"},
+		"a PEM on one line":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY----- secret value"}, "/private_key_file: holds a PEM block, which belongs in the file it names"},
+		"a control character":  {map[string]any{"webhook_secret_file": "/s\tsecret value"}, "/webhook_secret_file: holds a control character"},
+		"an odd unknown name":  {map[string]any{"a\nb": 1}, `unknown fields "a\nb"`},
+		"a null field":         {map[string]any{"state_dir": nil}, "/state_dir: is not a string that is not empty"},
+		"an empty path":        {map[string]any{"private_key_file": ""}, "/private_key_file: is not a string"},
+		"a bad App id":         {map[string]any{"app_id": "secret value"}, "/app_id: is not an App's id"},
+		"a negative App id":    {map[string]any{"app_id": -1}, "/app_id: is neither"},
+		"no port":              {map[string]any{"listen": "127.0.0.1"}, "/listen: is not an address and a port"},
+		"a port too large":     {map[string]any{"listen": ":65536"}, "/listen: has a port"},
 	} {
 		doc := map[string]any{}
 		for k, v := range base {
@@ -924,9 +996,17 @@ func TestReadSettings(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err %v, want %q", name, err, tc.want)
 		}
+		if err != nil && strings.Contains(err.Error(), "BEGIN") {
+			t.Errorf("%s: the error says a value: %v", name, err)
+		}
 		if err != nil && strings.Contains(err.Error(), "secret value") {
 			t.Errorf("%s: the error says a value: %v", name, err)
 		}
+	}
+	// A secret hidden from the bytes by an escape is found in the decoded document.
+	escaped := strings.Replace(string(b), `"/a"`, `"\u0071ak_secret value"`, 1)
+	if _, err := parseSettings([]byte(escaped)); err == nil || err.Error() != errSecretInSettings.Error() {
+		t.Errorf("an escaped secret: err %v", err)
 	}
 	delete(base, "listen")
 	delete(base, "access_key_id")

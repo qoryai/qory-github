@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/qory-github"
@@ -75,11 +76,12 @@ const maxSettingsFile = 1 << 20
 var appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 
 // ReadSettings reads the settings file at path, one JSON object with nothing after it
-// but white space. Every field is required, and a field it does not know is refused. An
-// error says where the settings are wrong and what is wrong there, never a value: a
-// field's name is quoted as Go quotes a string.
-//
-// Every field is required but api_url, which is GitHub's API when it is left out.
+// but white space. Every field is required but api_url, which is GitHub's API when it is
+// left out, and a field it does not know is refused. An error says where the settings
+// are wrong and what is wrong there, never a value: a field's name is quoted as Go
+// quotes a string. Settings that hold a secret anywhere, in a value or a member's name,
+// are refused before anything else, with an error that quotes nothing, and so is a
+// file's setting whose value holds a control character or a PEM block.
 func ReadSettings(path string) (Settings, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -96,8 +98,37 @@ func ReadSettings(path string) (Settings, error) {
 	return parseSettings(b)
 }
 
+// errSecretInSettings and errRunKeyInSettings refuse settings that hold a secret, as
+// [accesskey.SecretInDocument] finds one, and quote nothing.
+var (
+	errSecretInSettings = errors.New("the settings contain an access key secret, which belongs in the file access_key_secret_file names and nowhere else")
+	errRunKeyInSettings = errors.New("the settings contain a run key, which belongs nowhere in them")
+)
+
+// secretIn is the error of settings b that hold a secret, as their bytes and, when they
+// decode, their member names and values hold one, or nil.
+func secretIn(b []byte) error {
+	err := accesskey.SecretInDocument(string(b))
+	var doc any
+	if err == nil && json.Unmarshal(b, &doc) == nil {
+		err = accesskey.SecretInDocument(doc)
+	}
+	// A run key's error is also an access key secret's, errors.Is says, so it is told
+	// apart first.
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, accesskey.ErrRunKeyInDocument):
+		return errRunKeyInSettings
+	}
+	return errSecretInSettings
+}
+
 // parseSettings reads the settings document b.
 func parseSettings(b []byte) (Settings, error) {
+	if err := secretIn(b); err != nil {
+		return Settings{}, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	var doc map[string]json.RawMessage
 	err := dec.Decode(&doc)
@@ -142,9 +173,9 @@ func parseSettings(b []byte) (Settings, error) {
 		case "app_id":
 			s.AppID, err = appID(raw)
 		case "private_key_file":
-			s.PrivateKeyFile, err = text(raw)
+			s.PrivateKeyFile, err = filePath(raw)
 		case "webhook_secret_file":
-			s.WebhookSecretFile, err = text(raw)
+			s.WebhookSecretFile, err = filePath(raw)
 		case "listen":
 			if s.Listen, err = text(raw); err == nil {
 				err = checkListen(s.Listen)
@@ -172,7 +203,7 @@ func parseSettings(b []byte) (Settings, error) {
 				err = errors.New("is not ak_ and 16 lower-case Crockford base32 characters")
 			}
 		case "access_key_secret_file":
-			s.AccessKeySecretFile, err = text(raw)
+			s.AccessKeySecretFile, err = filePath(raw)
 		case "apiary_public_key":
 			s.ApiaryPublicKey, err = pin(raw)
 		}
@@ -188,6 +219,22 @@ func text(raw json.RawMessage) (string, error) {
 	var s string
 	if err := json.Unmarshal(raw, &s); err != nil || s == "" {
 		return "", errors.New("is not a string that is not empty")
+	}
+	return s, nil
+}
+
+// filePath is a field that names a file: a string that is not empty, with no control
+// character and no PEM block, so a secret pasted in place of its file is refused and
+// never quoted.
+func filePath(raw json.RawMessage) (string, error) {
+	s, err := text(raw)
+	switch {
+	case err != nil:
+		return "", err
+	case strings.ContainsFunc(s, unicode.IsControl):
+		return "", errors.New("holds a control character, so it is not a file's path")
+	case strings.Contains(s, "-----BEGIN"):
+		return "", errors.New("holds a PEM block, which belongs in the file it names")
 	}
 	return s, nil
 }

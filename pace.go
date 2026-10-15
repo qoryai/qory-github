@@ -211,11 +211,15 @@ func retryAfter(v string, now time.Time) (time.Duration, bool) {
 }
 
 // secondaryLimit is whether a 403 is GitHub's secondary rate limit, which its message
-// says, rather than a refusal of the request. The body is read and put back.
+// says, rather than a refusal of the request. At most 1 MiB of the body is read, and
+// put back before the rest, unread, so the body is whole for its reader, which refuses
+// an answer larger than it takes.
 func secondaryLimit(resp *http.Response) bool {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(b))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(b), resp.Body), resp.Body}
 	var e struct {
 		Message string `json:"message"`
 	}

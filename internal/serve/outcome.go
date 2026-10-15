@@ -25,10 +25,35 @@ func (e *permanentError) Unwrap() error { return e.err }
 
 // IsPermanent is whether err, or an error it wraps, is one asking again would not
 // change: one [Permanent] marked, or a take in's that wraps [github.ErrIssueGone],
-// [github.ErrUnreachable] or [github.ErrInvalidChange].
+// [github.ErrUnreachable] or [github.ErrInvalidChange]. An error that joins several,
+// as [errors.Join] does, is one only when every error it joins is, so a joined error
+// whose cause may pass is tried again.
 func IsPermanent(err error) bool {
-	var p *permanentError
-	return errors.As(err, &p) || errors.Is(err, github.ErrIssueGone) || errors.Is(err, github.ErrUnreachable) || errors.Is(err, github.ErrInvalidChange)
+	for err != nil {
+		if _, ok := err.(*permanentError); ok {
+			return true
+		}
+		for _, target := range []error{github.ErrIssueGone, github.ErrUnreachable, github.ErrInvalidChange} {
+			if is, ok := err.(interface{ Is(error) bool }); err == target || ok && is.Is(target) {
+				return true
+			}
+		}
+		switch u := err.(type) {
+		case interface{ Unwrap() []error }:
+			joined := u.Unwrap()
+			for _, e := range joined {
+				if !IsPermanent(e) {
+					return false
+				}
+			}
+			return len(joined) > 0
+		case interface{ Unwrap() error }:
+			err = u.Unwrap()
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // Held marks err as one that passes only once something outside serve changes, such
@@ -52,4 +77,27 @@ func (e *heldError) Unwrap() error { return e.err }
 func IsHeld(err error) bool {
 	var h *heldError
 	return errors.As(err, &h)
+}
+
+// Outage marks err as Qory Apiary's outage: it could not be reached, its answer could
+// not be read, or it answered a 5xx or an answer not signed under the pin, as a deploy
+// or a proxy in front of it does for a while. The [Worker] tries such a delivery again
+// for longer than another error, see [outageFor]. nil stays nil.
+func Outage(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &outageError{err: err}
+}
+
+// outageError is an error [Outage] marked.
+type outageError struct{ err error }
+
+func (e *outageError) Error() string { return e.err.Error() }
+func (e *outageError) Unwrap() error { return e.err }
+
+// IsOutage is whether err, or an error it wraps, is one [Outage] marked.
+func IsOutage(err error) bool {
+	var o *outageError
+	return errors.As(err, &o)
 }

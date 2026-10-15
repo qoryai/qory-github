@@ -415,6 +415,14 @@ func (e *answerError) Error() string {
 	return fmt.Sprintf("%s: GitHub answered %d: %s", e.what, e.status, e.message)
 }
 
+// Unauthorized is whether err, or an error it wraps, is GitHub's 401 to a request
+// made with a token, as GitHub answers a token it no longer takes, so a caller that
+// keeps tokens drops the one it used.
+func Unauthorized(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.status == http.StatusUnauthorized
+}
+
 // redirect is whether the answer is a redirect, a 3xx.
 func (e *answerError) redirect() bool { return e.status >= 300 && e.status < 400 }
 

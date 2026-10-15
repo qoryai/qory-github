@@ -260,7 +260,8 @@ func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue is
 
 // commented is whether the App's bot, slug[bot] of type Bot, has a comment on the issue
 // that starts with the marker. It reads the comments a page at a time, following the
-// next page [nextPage] reads, on the API alone; a comment anyone else wrote counts for nothing, so pasting the marker does not stop the comment.
+// next page [nextPage] reads, on the API alone; a comment anyone else wrote counts for
+// nothing, so pasting the marker does not stop the comment.
 func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, mark string) (bool, error) {
 	const reading = "reading the issue's comments"
 	bot := slug + "[bot]"
