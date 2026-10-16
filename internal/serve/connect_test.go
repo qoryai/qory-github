@@ -1721,16 +1721,16 @@ func TestALiveAnswerChangesOnlyTheLinkOfItsConnection(t *testing.T) {
 // Save page's line reads the same once its HTML is read.
 func TestThePagesSayTheUsersWords(t *testing.T) {
 	for rf, want := range map[*refusal]string{
-		&refuseQuery:     `This link is not one this server reads. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refusePass:      `This link is not valid. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refuseSignature: `This link is not valid. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refusePayload:   `This link is not valid. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refuseUsed:      `This link was used already. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refuseFailed:    `Something failed on this server. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refuseNoSession: `No installation is under way in this browser, or it took too long. Press "Install the GitHub App" in Qory Apiary again.`,
+		&refuseQuery:     `This link is not one this server reads. Press "Install" in Qory Apiary again.`,
+		&refusePass:      `This link is not valid. Press "Install" in Qory Apiary again.`,
+		&refuseSignature: `This link is not valid. Press "Install" in Qory Apiary again.`,
+		&refusePayload:   `This link is not valid. Press "Install" in Qory Apiary again.`,
+		&refuseUsed:      `This link was used already. Press "Install" in Qory Apiary again.`,
+		&refuseFailed:    `Something failed on this server. Press "Install" in Qory Apiary again.`,
+		&refuseNoSession: `No installation is under way in this browser, or it took too long. Press "Install" in Qory Apiary again.`,
 		&refuseHeld:      "This connection already holds another installation of the App, and it holds only one.",
-		&refuseOlder:     `A newer link for this connection was used already. Press "Install the GitHub App" in Qory Apiary again.`,
-		&refuseAdapter:   "This connect link is for another integration. Press Connect on this integration's page in Qory Apiary.",
+		&refuseOlder:     `A newer link for this connection was used already. Press "Install" in Qory Apiary again.`,
+		&refuseAdapter:   `This connect link is for another integration. Press "Install" on this integration's page in Qory Apiary.`,
 		&refuseMethod:    "This address answers GET requests alone.",
 	} {
 		if rf.page != want {
@@ -1740,7 +1740,7 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 	rig := newConnectRig(t)
 	rec := rig.browser(t).get("/v1/connect/return?installation_id=42&setup_action=install")
 	refused(t, rec, refuseNoSession)
-	if !strings.Contains(rec.Body.String(), `Press "Install the GitHub App" in`) {
+	if !strings.Contains(rec.Body.String(), `Press "Install" in`) {
 		t.Errorf("the page %q", rec.Body)
 	}
 	rec = rig.browser(t).signIn(rig.pass())

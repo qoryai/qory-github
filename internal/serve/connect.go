@@ -28,7 +28,7 @@ import (
 )
 
 // Connect is how a person links an installation of the App to a connection in Qory
-// Apiary. An owner or administrator presses "Install the GitHub App" in Qory Apiary,
+// Apiary. An owner or administrator presses "Install" in Qory Apiary,
 // which makes a connection, pending until the person comes back, unless it ends first,
 // and sends the browser to serve's connect page with a connect pass, which Qory Apiary
 // signed and which names the connection. Then:
@@ -227,14 +227,14 @@ type refusal struct {
 // refuseOlder. Each says one sentence, and nothing the request carries.
 var (
 	refuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers GET requests alone.", why: "the request is not GET"}
-	refuseQuery     = refusal{status: http.StatusBadRequest, page: `This link is not one this server reads. Press "Install the GitHub App" in Qory Apiary again.`, why: "the query is too long, or not one this server reads", name: "query"}
-	refusePass      = refusal{status: http.StatusBadRequest, page: `This link is not valid. Press "Install the GitHub App" in Qory Apiary again.`, why: "the pass is not one: too long, or not two parts in base64url", name: "pass"}
+	refuseQuery     = refusal{status: http.StatusBadRequest, page: `This link is not one this server reads. Press "Install" in Qory Apiary again.`, why: "the query is too long, or not one this server reads", name: "query"}
+	refusePass      = refusal{status: http.StatusBadRequest, page: `This link is not valid. Press "Install" in Qory Apiary again.`, why: "the pass is not one: too long, or not two parts in base64url", name: "pass"}
 	refuseSignature = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's signature does not verify under the pin", name: refusePass.name}
 	refusePayload   = refusal{status: refusePass.status, page: refusePass.page, why: "the pass's payload is not the contract's", name: refusePass.name}
-	refuseAdapter   = refusal{status: http.StatusForbidden, page: "This connect link is for another integration. Press Connect on this integration's page in Qory Apiary.", why: "the pass is for another adapter", name: "adapter"}
-	refuseUsed      = refusal{status: http.StatusBadRequest, page: `This link was used already. Press "Install the GitHub App" in Qory Apiary again.`, why: "the pass's nonce was used already", name: "used"}
-	refuseFailed    = refusal{status: http.StatusInternalServerError, page: `Something failed on this server. Press "Install the GitHub App" in Qory Apiary again.`, why: "the store, or the making of a connect return, failed", name: "failed"}
-	refuseNoSession = refusal{status: http.StatusBadRequest, page: `No installation is under way in this browser, or it took too long. Press "Install the GitHub App" in Qory Apiary again.`, why: "no session", dropCookie: true}
+	refuseAdapter   = refusal{status: http.StatusForbidden, page: `This connect link is for another integration. Press "Install" on this integration's page in Qory Apiary.`, why: "the pass is for another adapter", name: "adapter"}
+	refuseUsed      = refusal{status: http.StatusBadRequest, page: `This link was used already. Press "Install" in Qory Apiary again.`, why: "the pass's nonce was used already", name: "used"}
+	refuseFailed    = refusal{status: http.StatusInternalServerError, page: `Something failed on this server. Press "Install" in Qory Apiary again.`, why: "the store, or the making of a connect return, failed", name: "failed"}
+	refuseNoSession = refusal{status: http.StatusBadRequest, page: `No installation is under way in this browser, or it took too long. Press "Install" in Qory Apiary again.`, why: "no session", dropCookie: true}
 	refuseHeld      = refusal{
 		status:     http.StatusConflict,
 		page:       "This connection already holds another installation of the App, and it holds only one.",
@@ -243,7 +243,7 @@ var (
 	}
 	refuseOlder = refusal{
 		status:     http.StatusConflict,
-		page:       `A newer link for this connection was used already. Press "Install the GitHub App" in Qory Apiary again.`,
+		page:       `A newer link for this connection was used already. Press "Install" in Qory Apiary again.`,
 		why:        "the pass is no newer than one a linked return was made under",
 		endSession: true,
 	}
