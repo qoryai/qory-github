@@ -438,8 +438,8 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 	if source["program"] != "qory-github-server" {
 		t.Errorf("the source role's program is %v, want qory-github-server", source["program"])
 	}
-	if start, _ := source["start"].(string); !strings.HasPrefix(start, "qory-github-server serve ") {
-		t.Errorf("the source role's start is %q, want qory-github-server serve", start)
+	if start, _ := source["start"].(string); !strings.HasPrefix(start, "qory-github-server serve --settings ") {
+		t.Errorf("the source role's start is %q, want qory-github-server serve --settings", start)
 	}
 	if setup, _ := source["setup"].(map[string]any); setup == nil || !strings.HasPrefix(fmt.Sprint(setup["command"]), "qory-github setup ") {
 		t.Errorf("the source role's setup is %v, want the command qory-github setup", source["setup"])
