@@ -2573,6 +2573,48 @@ func TestAFirstListingIsReadOnceAndSentAgainFromThePartNotTaken(t *testing.T) {
 	}
 }
 
+// TestAFirstListing403ConnectionUnknownAfterAPartTakenIsSentAgainFromPart1 lists a
+// pending link of an installation that reaches 101 repositories, two parts, whose part
+// 1 Qory Apiary takes and whose part 2 it answers 403 connection_unknown: the next try
+// sends part 1 again, then part 2, the same listing's parts, id and started_at, and
+// GitHub's repositories are read once.
+func TestAFirstListing403ConnectionUnknownAfterAPartTakenIsSentAgainFromPart1(t *testing.T) {
+	rig := newConnectRig(t)
+	manyRepos(rig, 101)
+	rig.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeCollections && n == 2 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	for deadline := time.Now().Add(time.Minute); rig.adapter.keptFirsts() != 0 || len(rig.apiary.sent(routeCollections)) < 4; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d parts sent, %d listings kept", len(rig.apiary.sent(routeCollections)), rig.adapter.keptFirsts())
+		}
+	}
+	rig.c.stop()
+	sent := rig.apiary.sent(routeCollections)
+	if len(sent) != 4 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	first := listingOf(sent[0])
+	for i, want := range []float64{1, 2, 1, 2} {
+		l := listingOf(sent[i])
+		if l["part"] != want || l["id"] != first["id"] || l["started_at"] != first["started_at"] || l["complete"] != (want == 2) {
+			t.Errorf("sent %d is %v, want part %v of %v", i+1, l, want, first)
+		}
+	}
+	if !reflect.DeepEqual(sent[0].body["collections"], sent[2].body["collections"]) || !reflect.DeepEqual(sent[1].body["collections"], sent[3].body["collections"]) {
+		t.Error("a part sent again changed")
+	}
+	if n := rig.gh.listings(); n != 1 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
+	rig.linked(t, 42, testConnection, linkLive)
+}
+
 // TestAFirstListingGitHubFailsMidwayKeepsNothingAndReadsAgain lists a pending link of
 // an installation whose three repositories GitHub lists one on a page and fails the
 // second page once: the try sends nothing and keeps nothing, and the next, a second
@@ -2834,5 +2876,50 @@ func TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept(t *testing.T) {
 		if n := rig.adapter.keptFirsts(); n != 0 {
 			t.Errorf("%s: %d listings kept", tc.name, n)
 		}
+	}
+}
+
+// TestAPendingLinkDeletedBetweenItsTriesLeavesNothingOfItInMemory lists a pending
+// link, which Qory Apiary answers 403 connection_unknown, and GitHub deletes the
+// installation while the first try's wait holds: the tries stop, forgetting the
+// connection's first listings as they stop, and the adapter's maps hold nothing of the
+// installation.
+func TestAPendingLinkDeletedBetweenItsTriesLeavesNothingOfItInMemory(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeCollections {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	gate, gated := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(gated)
+			select {
+			case <-gate:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	<-gated
+	if !rig.adapter.keptFirst(42, testConnection) {
+		t.Fatal("no listing is kept at the wait")
+	}
+	rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	close(gate)
+	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
+	rig.c.stop()
+	if held := rig.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
 	}
 }
