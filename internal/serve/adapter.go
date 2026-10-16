@@ -606,10 +606,14 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 // ended, see [endedIn], which then forgets the connection's first listings kept, see
 // [Adapter.sendFirst], with its link: those of each installation linked to the
 // connection before it ended, whose generations move on, and any other of the
-// connection.
+// connection. A store that fails to read which installations were linked to it is
+// logged, and the connection's first listings kept are forgotten all the same.
 func (a *Adapter) forgetEnded(ended func(connection string)) func(connection string) {
 	return func(connection string) {
-		linked, _ := linkedTo(a.Store, connection)
+		linked, err := linkedTo(a.Store, connection)
+		if err != nil {
+			a.log().Error("reading the installations linked to an ended connection", slog.String("connection", connection), slog.String("error", err.Error()))
+		}
 		ended(connection)
 		for _, installation := range linked {
 			a.dropFirsts(installation, connection)

@@ -834,6 +834,28 @@ func TestADisconnectOfAConnectionIsSentAgainOn403(t *testing.T) {
 	}
 }
 
+// TestAStoreThatFailsToReadAnEndedConnectionsLinksIsLogged ends a connection while
+// the store, closed, fails every read: the failure is logged, ended runs, and the
+// connection's first listing kept is forgotten all the same.
+func TestAStoreThatFailsToReadAnEndedConnectionsLinksIsLogged(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	log := &syncBuffer{}
+	a := &Adapter{Store: st, Log: slog.New(slog.NewJSONHandler(log, nil))}
+	a.firsts = map[firstKey]*firstListing{{42, testConnection}: {}}
+	st.Close()
+	var ended []string
+	a.forgetEnded(func(connection string) { ended = append(ended, connection) })(testConnection)
+	if !slices.Equal(ended, []string{testConnection}) {
+		t.Errorf("ended %v", ended)
+	}
+	if !strings.Contains(log.String(), `"level":"ERROR","msg":"reading the installations linked to an ended connection","connection":"`+testConnection+`","error":"`) {
+		t.Errorf("the log: %s", log.String())
+	}
+	if a.keptFirst(42, testConnection) {
+		t.Error("the connection's first listing is kept")
+	}
+}
+
 // TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
 // answer a listing, an item and a disconnect 409 connection_ended or
 // connection_suspended: ended drops the link of the installation linked to the
