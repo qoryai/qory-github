@@ -103,6 +103,18 @@
         "github.com",
         "api.github.com"
       ]
+    },
+    "source": {
+      "description": "Brings in the tickets of the repositories an organisation installs the GitHub App on.",
+      "program": "qory-github-server",
+      "setup": {
+        "command": "qory-github setup --public-url https://qory-github.example",
+        "help": "Give the address where that machine is reached from outside. It asks which GitHub account the App is for, an organisation or a user, and opens GitHub with the App filled in, named qory- and that account's handle, which you can change."
+      },
+      "start": "qory-github-server serve --settings /etc/qory-github/serve.json",
+      "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",
+      "access": "These are the repositories GitHub lets this installation reach. To add or remove one, change the installation's repository access on GitHub.",
+      "disconnect": "To uninstall GitHub, remove its installation on GitHub."
     }
   }
 }

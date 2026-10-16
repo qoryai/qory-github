@@ -377,12 +377,15 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 // TestDescribeConformsAndIsPinned checks what describe prints against the integration
 // contract and pins it to testdata/describe.json, so a change to the description is a
 // change to that file too. The contract's fixture fixtures/github.json is the
-// description of 0.1.0, an example of the contract's; this copy is the program's.
+// description of 0.1.0, an example of the contract's; this copy is the program's. The
+// pinned copy is describe's with QORY_FEATURES naming factory, the source role in it;
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins the other.
 func TestDescribeConformsAndIsPinned(t *testing.T) {
 	// The pinned copy is the description of a build with no version, whatever version
 	// the test binary's build info contains.
 	defer func(v string) { version = v }(version)
 	version = "dev"
+	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
 	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
@@ -402,6 +405,129 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	code := run(context.Background(), []string{"describe", "--settings", "{}"}, &out, &errs)
 	if err := conformance.Failure(code, out.Bytes(), errs.Bytes()); err != nil {
 		t.Errorf("describe with settings: %v", err)
+	}
+}
+
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins that describe, where
+// QORY_FEATURES does not name factory, prints testdata/describe.json without its source
+// role and nothing else changed, and that the description still conforms.
+func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
+	defer func(v string) { version = v }(version)
+	version = "dev"
+	pinned, err := os.ReadFile("../../testdata/describe.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d github.Description
+	if err := json.Unmarshal(pinned, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Roles.Source == nil {
+		t.Fatal("testdata/describe.json has no source role")
+	}
+	d.Roles.Source = nil
+	want, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, features := range []string{"", "observability", "all"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+			t.Fatalf("QORY_FEATURES=%q: exit %d: %s", features, code, errs.String())
+		}
+		if err := conformance.Description(out.Bytes()); err != nil {
+			t.Errorf("QORY_FEATURES=%q: %v", features, err)
+		}
+		var doc struct {
+			Roles map[string]json.RawMessage `json:"roles"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := doc.Roles["source"]; ok {
+			t.Errorf("QORY_FEATURES=%q: describe names the source role", features)
+		}
+		if out.String() != string(want)+"\n" {
+			t.Errorf("QORY_FEATURES=%q: describe prints\n%s\nwant testdata/describe.json without its source role:\n%s", features, out.String(), want)
+		}
+	}
+}
+
+// TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
+// names factory, names the source role, qory-github-server, with every member the
+// integration contract requires, and that the contract's schema, as conformance compiles
+// it, checks that role: the description without any one member, or with a member the
+// schema refuses, does not conform.
+func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+	if err := conformance.Description(out.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	roles, _ := doc["roles"].(map[string]any)
+	source, ok := roles["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("describe names no source role: %s", out.String())
+	}
+	members := []string{"description", "program", "setup", "start", "connect", "access", "disconnect"}
+	for _, m := range members {
+		if _, ok := source[m]; !ok {
+			t.Errorf("the source role has no %s", m)
+		}
+	}
+	if len(source) != len(members) {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members), source)
+	}
+	if source["program"] != "qory-github-server" {
+		t.Errorf("the source role's program is %v, want qory-github-server", source["program"])
+	}
+	if start, _ := source["start"].(string); !strings.HasPrefix(start, "qory-github-server serve --settings ") {
+		t.Errorf("the source role's start is %q, want qory-github-server serve --settings", start)
+	}
+	if setup, _ := source["setup"].(map[string]any); setup == nil || !strings.HasPrefix(fmt.Sprint(setup["command"]), "qory-github setup ") {
+		t.Errorf("the source role's setup is %v, want the command qory-github setup", source["setup"])
+	}
+
+	// changed is describe's output with the source role changed by change.
+	changed := func(change func(source map[string]any)) []byte {
+		var d map[string]any
+		if err := json.Unmarshal(out.Bytes(), &d); err != nil {
+			t.Fatal(err)
+		}
+		change(d["roles"].(map[string]any)["source"].(map[string]any))
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	refused := map[string]func(map[string]any){
+		"an unknown member":         func(s map[string]any) { s["extra"] = "x" },
+		"a program with a space":    func(s map[string]any) { s["program"] = "qory github" },
+		"a line with a line break":  func(s map[string]any) { s["connect"] = "one\ntwo" },
+		"a line with a bidi mark":   func(s map[string]any) { s["access"] = "a‏b" },
+		"a line of 301 characters":  func(s map[string]any) { s["disconnect"] = strings.Repeat("a", 301) },
+		"a command not ASCII":       func(s map[string]any) { s["start"] = "qory-github-server serve --settings FILÉ" },
+		"a setup without its help":  func(s map[string]any) { delete(s["setup"].(map[string]any), "help") },
+		"a setup command too long":  func(s map[string]any) { s["setup"].(map[string]any)["command"] = strings.Repeat("a", 201) },
+		"an empty catalogue line":   func(s map[string]any) { s["description"] = "" },
+		"a setup that is a command": func(s map[string]any) { s["setup"] = "qory-github setup" },
+	}
+	for _, m := range members {
+		refused["no "+m] = func(s map[string]any) { delete(s, m) }
+	}
+	for name, change := range refused {
+		if err := conformance.Description(changed(change)); err == nil {
+			t.Errorf("the contract accepts the source role with %s", name)
+		}
 	}
 }
 

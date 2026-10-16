@@ -44,6 +44,7 @@ type Description struct {
 // Roles are the roles the program plays.
 type Roles struct {
 	Credential *CredentialRole `json:"credential,omitempty"`
+	Source     *SourceRole     `json:"source,omitempty"`
 }
 
 // CredentialRole is the gateway's credential adapter: the argument a policy defines, and
@@ -53,7 +54,31 @@ type CredentialRole struct {
 	Hosts    []string `json:"hosts"`
 }
 
-// Describe is the description, with the program's version.
+// SourceRole is the source adapter, qory-github-server: the lines Qory Apiary shows,
+// verbatim and as plain text, to set it up, start it, install it, change which
+// repositories it reaches and uninstall it, as description.json holds them. [Describe]
+// always holds it; qory-github describe prints it only where QORY_FEATURES names
+// factory.
+type SourceRole struct {
+	Description string     `json:"description"`
+	Program     string     `json:"program"`
+	Setup       SourceStep `json:"setup"`
+	Start       string     `json:"start"`
+	Connect     string     `json:"connect"`
+	Access      string     `json:"access"`
+	Disconnect  string     `json:"disconnect"`
+}
+
+// SourceStep is the one step that prepares the source side: the command a person runs,
+// and one line on what it asks and what it does.
+type SourceStep struct {
+	Command string `json:"command"`
+	Help    string `json:"help"`
+}
+
+// Describe is the description, with the program's version: description.json whole, its
+// source role among its roles. qory-github describe leaves the source role out unless
+// QORY_FEATURES names factory.
 func Describe(programVersion string) Description {
 	var d Description
 	if err := json.Unmarshal(description, &d); err != nil {

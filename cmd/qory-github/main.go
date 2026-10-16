@@ -178,12 +178,23 @@ func describe(args []string, stdout, stderr io.Writer) error {
 	if len(args) != 0 {
 		return errors.New("describe takes no arguments")
 	}
-	b, err := json.MarshalIndent(github.Describe(version), "", "  ")
+	b, err := json.MarshalIndent(description(), "", "  ")
 	if err != nil {
 		return err
 	}
 	_, err = fmt.Fprintf(stdout, "%s\n", b)
 	return err
+}
+
+// description is what describe prints: the integration's description, without the
+// source role unless QORY_FEATURES names factory, see [cli.Factory]. description.json
+// holds the role either way.
+func description() github.Description {
+	d := github.Describe(version)
+	if !cli.Factory() {
+		d.Roles.Source = nil
+	}
+	return d
 }
 
 // credential mints a token and prints the gateway's credential document, nothing else

@@ -262,6 +262,63 @@ func TestEnrolRefusesWhatItCannotWriteBeforeAnyRequest(t *testing.T) {
 	}
 }
 
+// TestEnrolTakesTheContractsShape pins the enrol command the integration contract fixes
+// for every source adapter's program, <program> access-key enrol --secret-file FILE
+// <server> <code>, as Qory Apiary shows it: that shape, and the same with -- before the
+// server, enrols; a command without --secret-file, without the server or the code, or
+// with an argument more, is refused before anything is sent; and a secret file that
+// exists is refused before anything is sent, and left as it was.
+func TestEnrolTakesTheContractsShape(t *testing.T) {
+	for _, dashes := range [][]string{nil, {"--"}} {
+		f := newFakeApiary(t, adapterEnrolled)
+		file := filepath.Join(t.TempDir(), "access-key-secret")
+		args := append(append([]string{"--secret-file", file}, dashes...), f.url, code(f.signer))
+		status, out, errs := enrolRun(t, args...)
+		if status != 0 || f.requests.Load() != 1 || out == "" {
+			t.Errorf("access-key enrol %v: exit %d, %d requests, stdout %q, stderr %q", args, status, f.requests.Load(), out, errs)
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Errorf("access-key enrol %v wrote no secret file: %v", args, err)
+		}
+	}
+
+	f := newFakeApiary(t, adapterEnrolled)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "access-key-secret")
+	exists := filepath.Join(dir, "exists")
+	if err := os.WriteFile(exists, []byte("kept\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := code(f.signer)
+	const twoArguments = "want two arguments, the server and the code"
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{f.url, c}, "--secret-file is required"},
+		{[]string{"--secret-file", "", f.url, c}, "--secret-file is required"},
+		{[]string{"--secret-file", file, f.url, c, "extra"}, twoArguments},
+		{[]string{"--secret-file", file, "--", f.url, c, "extra"}, twoArguments},
+		{[]string{"--secret-file", file, f.url}, twoArguments},
+		{[]string{"--secret-file", file}, twoArguments},
+		{[]string{"--secret-file", exists, f.url, c}, "the secret file " + exists + " exists; choose another or move it away"},
+	} {
+		status, out, errs := enrolRun(t, tc.args...)
+		if status != 1 || out != "" || errs != "qory-github-server access-key: "+tc.want+"\n" {
+			t.Errorf("access-key enrol %v: exit %d, stdout %q, stderr %q, want %q", tc.args, status, out, errs, tc.want)
+		}
+	}
+	if n := f.requests.Load(); n != 0 {
+		t.Errorf("%d requests were sent for a refused command", n)
+	}
+	if b, err := os.ReadFile(exists); err != nil || string(b) != "kept\n" {
+		t.Errorf("the secret file that exists holds %q, %v; want it unchanged", b, err)
+	}
+	if _, err := os.Lstat(file); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused command wrote a secret file: %v", err)
+	}
+}
+
 // notACode is the error of a code that is not an enrolment code.
 const notACode = "the code is not an enrolment code: qeci_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it"
 
