@@ -499,16 +499,17 @@ type firstListing struct {
 // that fails, or is stopped, before every page is read keeps and sends nothing, and the
 // next try reads again. A listing read while [Adapter.dropFirsts] forgot the
 // installation's listings, which moves its generation on, is sent, as a listing in
-// flight was before, and not kept, so the next try reads again: a drop that lands while
-// GitHub is read, a change of the installation's repositories among them, never leaves
-// a listing read before it kept. A link live with no listing kept, a re-connect's, is
-// listed as [Adapter.listLocked] lists it. The listing kept is forgotten, see
-// [Adapter.dropFirsts], once the try that makes the link live has sent every part, once
-// the last listing is due, which reads GitHub again, once a connect replaces the link or
-// writes it again, once the link is dropped, by its last listing, a 409
-// connection_ended, a newer pass or GitHub's deletion of the installation, and once the
-// installation's repositories change, as installation_repositories says; and
-// [Connect.listSoon] forgets it as it stops, for any reason, so none outlives its tries.
+// flight was before, and not kept, so the next try reads again: a drop for the
+// installation that lands while GitHub is read, a change of the installation's
+// repositories among them, never leaves a listing read before it kept. A link live with
+// no listing kept, a re-connect's, is listed as [Adapter.listLocked] lists it. The
+// listing kept is forgotten, see [Adapter.dropFirsts], once the try that makes the link
+// live has sent every part, once the last listing is due, which reads GitHub again,
+// once a connect replaces the link or writes it again, once the link is dropped, by its
+// last listing, a 409 connection_ended, a newer pass or GitHub's deletion of the
+// installation, and once the installation's repositories change, as
+// installation_repositories says; and [Connect.listSoon] forgets it as it stops, for any
+// reason, so none outlives its tries.
 func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) error {
 	key := firstKey{installation, l.Connection}
 	a.mu.Lock()
@@ -563,7 +564,8 @@ func (a *Adapter) forgetEnded(ended func(connection string)) func(connection str
 // dropFirsts forgets the first listings kept, see [Adapter.sendFirst]: those of the
 // installation, unless it is 0, and of connection, unless it is "". It moves on the
 // generation of the installation, unless it is 0, and of each installation whose
-// listing it forgets, so a listing of one that is being read is not kept.
+// listing it forgets, so a listing being read for an installation whose generation it
+// moves on is not kept.
 func (a *Adapter) dropFirsts(installation int64, connection string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
