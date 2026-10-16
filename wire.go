@@ -25,10 +25,3 @@ const (
 	KindPerson     = "person"
 	KindAutomation = "automation"
 )
-
-// Reasons a collection is disconnected.
-const (
-	ReasonRemoved = "removed"
-	ReasonEnded   = "ended"
-	ReasonPaused  = "paused"
-)

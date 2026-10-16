@@ -37,6 +37,10 @@ const (
 	// token GitHub exchanges it for.
 	signInCode = "a-code-that-must-not-leak"
 	userToken  = "ghu_a-user-token-that-must-not-leak"
+	// testConnection and otherConnection are connections in Qory Apiary an installation
+	// is linked to.
+	testConnection  = "ac_0123456789abcdef"
+	otherConnection = "ac_fedcba9876543210"
 )
 
 // appKey is one RSA key for the App, made once, since making one is slow.
@@ -108,6 +112,8 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 		routeItems:       "source-items.schema.json",
 		routeComments:    "source-item-comments.schema.json",
 		routeDisconnect:  "sources-disconnect.schema.json",
+
+		routeConnectionsDisconnect: "connections-disconnect.schema.json",
 	} {
 		s, err := contracts.Compile(name)
 		if err != nil {
@@ -179,6 +185,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.t.Errorf("%s: the time is %q", r.URL.Path, tm)
 		}
 		checkBody(f.t, r.URL.Path, b)
+		if r.URL.Path == routeCollections && !strings.Contains(string(b), `"collections":[`) {
+			f.t.Errorf("%s: the collections are not an array: %s", r.URL.Path, b)
+		}
 	} else if req.Timestamp == "" {
 		f.t.Errorf("%s: a GET without X-Qory-Timestamp", r.URL.Path)
 	}
@@ -257,6 +266,13 @@ func (f *fakeApiary) page(after string) string {
 	return string(b)
 }
 
+// count is how many requests the fake received.
+func (f *fakeApiary) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
 // add appends entries to the feed.
 func (f *fakeApiary) add(chs ...contracts.Change) {
 	f.mu.Lock()
@@ -318,18 +334,53 @@ type fakeGitHub struct {
 	gqlFail   string
 	onPage    func(page int, r *http.Request)
 	gqlPages  int
-	// userInstallations and userRepos are what the person signed in with Connect
-	// reaches: the installations, and the repositories of the installation 42, which
-	// GitHub lists one on each page. exchanges are the forms of the sign-in's codes'
-	// exchanges.
-	userInstallations []int64
-	userRepos         []string
+	// person is the person signed in with Connect; userInstallations are the
+	// installations the person reaches, which GitHub lists one on each page; and
+	// memberships are the person's memberships of organisations, by login. userDown
+	// answers every request under /user 502. exchanges are the forms of the sign-in's
+	// codes' exchanges.
+	person            github.Account
+	userInstallations []ghInstallation
+	memberships       map[string]ghMembership
+	userDown          bool
 	exchanges         []url.Values
+}
+
+// ghInstallation is an installation of the App as GET /user/installations lists it.
+type ghInstallation struct {
+	id          int64
+	account     github.Account
+	suspended   bool
+	permissions map[string]string
+}
+
+// ghMembership is a membership of an organisation as GET /user/memberships/orgs/{org}
+// says it.
+type ghMembership struct {
+	state, role string
+	org, person int64
+	refused     bool
+}
+
+// The fake's accounts: the person, alice, and the organisations acme and octo-org.
+var (
+	alice   = github.Account{Login: "alice", ID: 1001, Type: "User"}
+	acme    = github.Account{Login: "acme", ID: 500, Type: "Organization"}
+	octoOrg = github.Account{Login: "octo-org", ID: 600, Type: "Organization"}
+)
+
+// allPermissions are the permissions an installation of the fake grants the App.
+func allPermissions() map[string]string {
+	return map[string]string{"metadata": "read", "issues": "write", "members": "read", "contents": "write"}
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	t.Helper()
-	f := &fakeGitHub{repos: []string{"acme/widgets", "acme/gadgets"}, comments: map[int][]map[string]any{}, userInstallations: []int64{7, 42}, userRepos: []string{"acme/gadgets", "ACME/Widgets"}}
+	f := &fakeGitHub{
+		repos: []string{"acme/widgets", "acme/gadgets"}, comments: map[int][]map[string]any{}, person: alice,
+		userInstallations: []ghInstallation{{id: 7, account: alice, permissions: allPermissions()}, {id: 42, account: acme, permissions: allPermissions()}},
+		memberships:       map[string]ghMembership{"acme": {state: "active", role: "admin", org: acme.ID, person: alice.ID}},
+	}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -359,7 +410,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The installation no longer reaches acme/old.
 		w.WriteHeader(422)
 		io.WriteString(w, `{"message":"There is at least one repository that does not exist or is not accessible to the parent installation."}`)
-	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens":
+	case r.Method == "POST" && (r.URL.Path == "/app/installations/42/access_tokens" || r.URL.Path == "/app/installations/9/access_tokens"):
 		f.mints = append(f.mints, string(b))
 		w.WriteHeader(201)
 		io.WriteString(w, `{"token":"`+ghToken+`","expires_at":"2099-01-01T00:00:00Z"}`)
@@ -416,26 +467,45 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		io.WriteString(w, `{"access_token":"`+userToken+`","token_type":"bearer","scope":""}`)
-	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/user/") && r.Header.Get("Authorization") != "Bearer "+userToken:
+	case r.Method == "GET" && (r.URL.Path == "/user" || strings.HasPrefix(r.URL.Path, "/user/")) && r.Header.Get("Authorization") != "Bearer "+userToken:
 		w.WriteHeader(401)
 		io.WriteString(w, `{"message":"Bad credentials"}`)
+	case r.Method == "GET" && (r.URL.Path == "/user" || strings.HasPrefix(r.URL.Path, "/user/")) && f.userDown:
+		w.WriteHeader(502)
+		io.WriteString(w, `{"message":"Bad Gateway"}`)
+	case r.Method == "GET" && r.URL.Path == "/user":
+		json.NewEncoder(w).Encode(map[string]any{"login": f.person.Login, "id": f.person.ID, "type": "User"})
 	case r.Method == "GET" && r.URL.Path == "/user/installations":
-		var ins []map[string]any
-		for _, id := range f.userInstallations {
-			ins = append(ins, map[string]any{"id": id})
-		}
-		json.NewEncoder(w).Encode(map[string]any{"total_count": len(ins), "installations": ins})
-	case r.Method == "GET" && r.URL.Path == "/user/installations/42/repositories":
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 		page = max(page, 1)
-		var repos []map[string]any
-		if page <= len(f.userRepos) {
-			repos = append(repos, map[string]any{"full_name": f.userRepos[page-1]})
+		var ins []map[string]any
+		if page <= len(f.userInstallations) {
+			in := f.userInstallations[page-1]
+			var suspended any
+			if in.suspended {
+				suspended = "2026-10-01T00:00:00Z"
+			}
+			ins = append(ins, map[string]any{
+				"id": in.id, "account": map[string]any{"login": in.account.Login, "id": in.account.ID, "type": in.account.Type},
+				"suspended_at": suspended, "permissions": in.permissions,
+			})
 		}
-		if page < len(f.userRepos) {
-			w.Header().Set("Link", "<"+f.srv.URL+"/user/installations/42/repositories?per_page=100&page="+strconv.Itoa(page+1)+`>; rel="next"`)
+		if page < len(f.userInstallations) {
+			w.Header().Set("Link", "<"+f.srv.URL+"/user/installations?per_page=100&page="+strconv.Itoa(page+1)+`>; rel="next"`)
 		}
-		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.userRepos), "repositories": repos})
+		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.userInstallations), "installations": append([]map[string]any{}, ins...)})
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/user/memberships/orgs/"):
+		m, ok := f.memberships[strings.TrimPrefix(r.URL.Path, "/user/memberships/orgs/")]
+		switch {
+		case !ok:
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		case m.refused:
+			w.WriteHeader(403)
+			io.WriteString(w, `{"message":"Resource not accessible by integration"}`)
+		default:
+			json.NewEncoder(w).Encode(map[string]any{"state": m.state, "role": m.role, "organization": map[string]any{"login": "x", "id": m.org}, "user": map[string]any{"login": "x", "id": m.person}})
+		}
 	case strings.HasPrefix(r.URL.Path, "/repos/acme/moved/") || r.URL.Path == "/repos/acme/moved":
 		// acme/moved was renamed: GitHub redirects every request for it.
 		w.Header().Set("Location", "https://api.github.com/repositories/1"+strings.TrimPrefix(r.URL.Path, "/repos/acme/moved"))

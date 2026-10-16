@@ -135,7 +135,7 @@ func pulling(t *testing.T) (*wired, *pullGitHub, *puller, *pullClock) {
 	w.adapter.GitHub = github.Client{API: f.srv.URL}
 	clock := &pullClock{t: pullStart}
 	w.adapter.now = clock.now
-	Link(w.st, 42)
+	Link(w.st, 42, testConnection, linkLive)
 	setReach(w.st, "acme/widgets", 42)
 	linkCollection(w.st, "acme/widgets")
 	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}

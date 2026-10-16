@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -52,7 +53,14 @@ func TestUserTokenSaysNoCodeNoSecretAndFollowsNoRedirect(t *testing.T) {
 			t.Errorf("%s: err %v, want %q", name, err, tc.want)
 		case err != nil && (strings.Contains(err.Error(), code) || strings.Contains(err.Error(), secret)):
 			t.Errorf("%s: the error says the code or the secret: %v", name, err)
+		case CodeRefused(err) != (tc.want != ""):
+			t.Errorf("%s: refused %v", name, CodeRefused(err))
 		}
+	}
+	// GitHub out of reach is no refusal of the code.
+	srv.Close()
+	if _, err := c.UserToken(context.Background(), "Iv1.test", []byte(secret), code, "https://qory-github.example.com/v1/connect/authorized"); err == nil || CodeRefused(err) {
+		t.Errorf("err %v", err)
 	}
 }
 
@@ -66,27 +74,47 @@ func TestTheUserListingsReadEveryPageOnce(t *testing.T) {
 		switch r.URL.RequestURI() {
 		case "/user/installations?per_page=100":
 			w.Header().Set("Link", `<`+srv.URL+`/user/installations?per_page=100&page=2>; rel="next"`)
-			io.WriteString(w, `{"installations":[{"id":7}]}`)
+			io.WriteString(w, `{"installations":[{"id":7,"account":{"login":"alice","id":1001,"type":"User"},"suspended_at":null,"permissions":{"issues":"write"}}]}`)
 		case "/user/installations?per_page=100&page=2":
-			io.WriteString(w, `{"installations":[{"id":42}]}`)
-		case "/user/installations/42/repositories?per_page=100":
-			// The next page repeats this one.
-			w.Header().Set("Link", `<`+srv.URL+`/user/installations/42/repositories?per_page=100>; rel="next"`)
-			io.WriteString(w, `{"repositories":[{"full_name":"acme/widgets"}]}`)
+			io.WriteString(w, `{"installations":[{"id":42,"account":{"login":"acme","id":500,"type":"Organization"},"suspended_at":"2026-10-01T00:00:00Z"}]}`)
+		case "/user":
+			io.WriteString(w, `{"login":"alice","id":1001,"type":"User"}`)
+		case "/user/memberships/orgs/acme":
+			io.WriteString(w, `{"state":"active","role":"admin","organization":{"login":"acme","id":500},"user":{"login":"alice","id":1001}}`)
+		case "/user/memberships/orgs/octo-org":
+			w.WriteHeader(403)
+			io.WriteString(w, `{"message":"Resource not accessible by integration"}`)
 		default:
 			w.WriteHeader(404)
 		}
 	}))
 	defer srv.Close()
 	c := Client{API: srv.URL}
-	ids, err := c.UserInstallations(context.Background(), "ghu_a-token")
-	if err != nil || len(ids) != 2 || ids[0] != 7 || ids[1] != 42 {
-		t.Errorf("%v %v", ids, err)
+	ins, err := c.UserInstallations(context.Background(), "ghu_a-token")
+	want := []UserInstallation{
+		{ID: 7, Account: Account{Login: "alice", ID: 1001, Type: "User"}, Permissions: map[string]string{"issues": "write"}},
+		{ID: 42, Account: Account{Login: "acme", ID: 500, Type: "Organization"}, Suspended: true},
 	}
-	if _, err := c.UserRepositories(context.Background(), "ghu_a-token", 42); err == nil || !strings.Contains(err.Error(), "repeats") {
-		t.Errorf("err %v", err)
+	if err != nil || !reflect.DeepEqual(ins, want) {
+		t.Errorf("%+v %v", ins, err)
 	}
 	if _, err := c.UserInstallations(context.Background(), "ghu_another"); err == nil || strings.Contains(err.Error(), "ghu_another") {
+		t.Errorf("err %v", err)
+	}
+	if u, err := c.User(context.Background(), "ghu_a-token"); err != nil || u != (Account{Login: "alice", ID: 1001, Type: "User"}) {
+		t.Errorf("%+v %v", u, err)
+	}
+	if m, err := c.OrgMembership(context.Background(), "ghu_a-token", "acme"); err != nil || m != (Membership{State: "active", Role: "admin", Organization: 500, Person: 1001}) {
+		t.Errorf("%+v %v", m, err)
+	}
+	if _, err := c.OrgMembership(context.Background(), "ghu_a-token", "octo-org"); !Refused(err) || Gone(err) {
+		t.Errorf("err %v", err)
+	}
+	if _, err := c.OrgMembership(context.Background(), "ghu_a-token", "other"); !Gone(err) || Refused(err) {
+		t.Errorf("err %v", err)
+	}
+	// A login that is not one is never put in a path.
+	if _, err := c.OrgMembership(context.Background(), "ghu_a-token", "../user"); err == nil || Gone(err) {
 		t.Errorf("err %v", err)
 	}
 }

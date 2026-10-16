@@ -548,6 +548,9 @@ type Lister struct {
 	Token func(context.Context) (string, error)
 	// Slug is the App's, whose bot writes the work item comment.
 	Slug string
+	// ConnectionID is the connection in Qory Apiary the installation is linked to, which
+	// every part of [Lister.ListRepositories] names.
+	ConnectionID string
 	// Sink is where the requests go.
 	Sink Sink
 	// Logf logs what is skipped; nil is log.Printf.
@@ -653,11 +656,12 @@ func (p *pages) read(path string) error {
 // even when the listing stopped because its context is done.
 const listingEnd = 10 * time.Second
 
-// ListRepositories lists the repositories the installation reaches, as collections, in
-// parts of at most 100 collections and 1 MiB, and reads at most 1,000 pages. When GitHub
+// ListRepositories lists the repositories the installation reaches, as collections of
+// the connection [Lister.ConnectionID], which every part names, in parts of at most 100
+// collections and 1 MiB, and reads at most 1,000 pages. When GitHub
 // answers with one page, up to 100 repositories, nothing can shift, so the last part
-// says the listing is complete, and Qory Apiary disconnects a repository the
-// installation no longer reaches; unless a repository was skipped, which then must not
+// says the listing is complete, and Qory Apiary disconnects a repository of that
+// connection the installation no longer reaches; unless a repository was skipped, which then must not
 // be disconnected, so that listing is not complete. A listing of more than one page never says it is
 // complete, since a repository removed from the installation while it is listed shifts
 // the pages after it: that is a limit, and such a removal reaches Qory Apiary only by
@@ -678,14 +682,14 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	send := func(ctx context.Context, complete bool) error {
 		listing.Part++
 		listing.Complete = complete
-		req := contracts.SourceCollections{Version: contracts.Version, Collections: pending, Listing: listing}
+		req := contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: pending, Listing: listing}
 		if req.Collections == nil {
 			req.Collections = []contracts.Collection{}
 		}
 		pending = nil
 		return l.Sink.Collections(ctx, req)
 	}
-	envelope := sized(contracts.SourceCollections{Version: contracts.Version, Collections: []contracts.Collection{}, Listing: contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	envelope := sized(contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: []contracts.Collection{}, Listing: contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	used := envelope
 	// A part Qory Apiary did not take leaves the listing short, so the listing stops
 	// there, and the part that ends it says it is not complete.

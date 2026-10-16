@@ -2,12 +2,15 @@ package serve
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +27,8 @@ const tokenMargin = 5 * time.Minute
 // Adapter is what serve does with GitHub's deliveries and Qory Apiary's change feed: it
 // sends an installation's repositories, issues and comments to Qory Apiary, and writes
 // on GitHub what the feed says. It serves only an installation the store holds as
-// linked, see [Link], and sends only the items of a collection Qory Apiary linked.
+// linked to a connection, see [Link], and sends only the items of a collection Qory
+// Apiary linked.
 type Adapter struct {
 	// Store keeps the links, the repositories' installations and the feed's cursor.
 	Store *store.Store
@@ -50,6 +54,11 @@ type Adapter struct {
 	// the clock a fill's start is read from; nil is time.Now.
 	turns map[string]chan struct{}
 	now   func() time.Time
+	// installs are the installations' locks, see [Adapter.lockInstallation], by id.
+	// lockWaits, when set, is called each time a lock is held by another and its taker
+	// waits.
+	installs  map[int64]chan struct{}
+	lockWaits func(installation int64)
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most.
@@ -75,9 +84,13 @@ func (a *Adapter) Register(hs *Handlers) {
 }
 
 // linked is h for the deliveries of a linked installation; another's is done and
-// logged.
+// logged. The installation event's deleted is [Adapter.deleted]'s, for any
+// installation.
 func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(context.Context, Delivery) error {
 	return func(ctx context.Context, d Delivery) error {
+		if d.Event == "installation" && d.Action == "deleted" && d.InstallationID > 0 {
+			return a.deleted(ctx, d)
+		}
 		ok, err := Linked(a.Store, d.InstallationID)
 		if err != nil {
 			return err
@@ -87,11 +100,6 @@ func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(con
 			// so the line says what serve knows: the installation is not linked yet.
 			a.log().Info("the installation is not linked to Qory Apiary, so nothing of it is listed until a person connects it", slog.Int64("installation", d.InstallationID))
 			return keepUnlinked(a.Store, d.InstallationID)
-		}
-		if d.Event == "installation" && d.Action == "deleted" && d.InstallationID > 0 {
-			if err := dropUnlinked(a.Store, d.InstallationID); err != nil {
-				return err
-			}
 		}
 		if !ok {
 			a.log().Info("the installation is not linked to Qory Apiary, so the delivery is not handled", deliveryArgs(d)...)
@@ -237,12 +245,15 @@ func (a *Adapter) stopLog() {
 	a.cutLog().stop()
 }
 
-// reachSink is the adapter's sink for a listing of an installation's repositories: it
-// keeps which installation reaches each repository it lists before it sends them.
+// reachSink is the adapter's sink for a listing of an installation's repositories,
+// which names the installation's connection: it keeps which installation reaches each
+// repository it lists before it sends them, and once Qory Apiary takes a part, which it
+// does once the connection is made, it marks the installation's link live.
 type reachSink struct {
 	github.Sink
 	st           *store.Store
 	installation int64
+	connection   string
 }
 
 // Collections keeps each collection's installation and sends them.
@@ -252,52 +263,249 @@ func (s reachSink) Collections(ctx context.Context, req contracts.SourceCollecti
 			return err
 		}
 	}
-	return s.Sink.Collections(ctx, req)
+	if err := s.Sink.Collections(ctx, req); err != nil {
+		return err
+	}
+	return goLive(s.st, s.installation, s.connection)
 }
 
-// listRepositories sends Qory Apiary the repositories the installation reaches.
+// listRepositories sends Qory Apiary the repositories the installation reaches, as
+// collections of the connection it is linked to; an installation not linked sends
+// nothing.
 func (a *Adapter) listRepositories(ctx context.Context, installation int64) error {
+	l, ok, err := linkOf(a.Store, installation)
+	if err != nil || !ok {
+		return err
+	}
+	return a.listConnection(ctx, installation, l.Connection)
+}
+
+// lockInstallation takes the installation's lock, waiting while another holds it until
+// ctx is done, and returns what gives it back, or ctx's error. A listing of the
+// installation and the change of its link that the listing's answer makes, [goLive],
+// hold it, and so does a connect from its first read of the link to its write, see
+// [Connect.link], so no answer to a listing lands between a connect's read and its
+// write. It is held across requests to GitHub and Qory Apiary, one installation's
+// alone.
+func (a *Adapter) lockInstallation(ctx context.Context, installation int64) (func(), error) {
+	a.mu.Lock()
+	if a.installs == nil {
+		a.installs = map[int64]chan struct{}{}
+	}
+	lock, ok := a.installs[installation]
+	if !ok {
+		lock = make(chan struct{}, 1)
+		a.installs[installation] = lock
+	}
+	waits := a.lockWaits
+	a.mu.Unlock()
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	default:
+	}
+	if waits != nil {
+		waits(installation)
+	}
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// listConnection sends Qory Apiary the listing of connection for the installation,
+// holding the installation's lock, see [Adapter.listFor].
+func (a *Adapter) listConnection(ctx context.Context, installation int64, connection string) error {
+	return a.listFor(ctx, installation, connection)
+}
+
+// listFor sends Qory Apiary the listing of connection for the installation, holding
+// the installation's lock:
+//
+//   - while the installation is linked to connection, the repositories it reaches, as
+//     collections of connection, see [reachSink];
+//   - for a connection a connect replaced, see [keepReplaced], a complete listing with
+//     no collections, see [Adapter.listReplaced];
+//   - for any other, nothing.
+//
+// A link pending past its connect return's expiry, which the link keeps, and
+// [returnSkew] more, on the adapter's clock, is settled by the listing, its last: a
+// signed 204 makes it live, as any listing's does; a signed 403 connection_unknown says
+// the connection was not made, and the link is dropped, with its collections' records,
+// see [dropInstallation]; a 409 connection_ended drops it as any does; any other answer
+// keeps it, to be listed again: a 409 connection_suspended, which says the connection
+// was made, and a 403 forbidden among them. Before that a 403 drops nothing, since Qory
+// Apiary answers 403 connection_unknown by design until the browser brings the return,
+// while a 409 connection_ended drops the link at any listing. No caller chooses the
+// moment: a re-connect's later return moves it, and an earlier one never brings it
+// forward.
+func (a *Adapter) listFor(ctx context.Context, installation int64, connection string) error {
+	unlock, err := a.lockInstallation(ctx, installation)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	l, ok, err := linkOf(a.Store, installation)
+	if err != nil {
+		return err
+	}
+	if !ok || l.Connection != connection {
+		return a.listReplaced(ctx, installation, connection)
+	}
+	// A record of the connection as replaced is stale once a link names it again.
+	if err := forgetReplaced(a.Store, connection); err != nil {
+		return err
+	}
+	err = a.listLocked(ctx, installation, connection)
+	last := !a.clock().Before(time.Unix(l.Return, 0).Add(returnSkew))
+	if l.State != linkPending || !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || !last {
+		return err
+	}
+	installMu.Lock()
+	defer installMu.Unlock()
+	now, ok, lerr := linkOf(a.Store, installation)
+	if lerr != nil || !ok || now.Connection != connection || now.State != linkPending {
+		return lerr
+	}
+	if err := dropInstallation(a.Store, installation); err != nil {
+		return err
+	}
+	a.log().Info("the connection was not made in time, so its pending link is dropped", slog.String("connection", connection), slog.Int64("installation", installation))
+	return nil
+}
+
+// listReplaced sends Qory Apiary, for connection, which a connect replaced on the
+// installation, see [keepReplaced], a complete listing with no collections, which
+// never names the installation's repositories, holding the installation's lock: a
+// signed 204, or a 409 connection_suspended, which Qory Apiary answers only for a
+// connection made, says the connection was made meanwhile, and it is ended, see
+// [Adapter.endConnection], so the installation stays linked to one connection; a 409
+// connection_ended, or a 403 connection_unknown to its last listing, past the replaced
+// link's return's expiry, which the record keeps, and [returnSkew] more, on the
+// adapter's clock, says it was not made, and it is forgotten; any other answer keeps
+// it, to be listed again. A connection not replaced on the installation is sent
+// nothing, and so is one an installation's link names again, whose record is stale and
+// is forgotten.
+func (a *Adapter) listReplaced(ctx context.Context, installation int64, connection string) error {
+	r, ok, err := replacedOf(a.Store, connection)
+	if err != nil || !ok || r.Installation != installation {
+		return err
+	}
+	if again, err := linkedTo(a.Store, connection); err != nil || len(again) > 0 {
+		if err != nil {
+			return err
+		}
+		return forgetReplaced(a.Store, connection)
+	}
+	b := make([]byte, 16)
+	rand.Read(b)
+	err = a.Sink.Collections(ctx, contracts.SourceCollections{
+		Version: contracts.Version, ConnectionID: connection, Collections: []contracts.Collection{},
+		Listing: contracts.Listing{ID: hex.EncodeToString(b), Part: 1, Complete: true, StartedAt: contracts.FormatTime(a.clock())},
+	})
+	last := !a.clock().Before(time.Unix(r.Return, 0).Add(returnSkew))
+	switch {
+	case err == nil, refusedAs(err, http.StatusConflict, codeConnectionSuspended):
+		if err := a.endConnection(ctx, connection); err != nil {
+			return err
+		}
+		a.log().Info("the replaced connection was made meanwhile, so it is disconnected", slog.String("connection", connection), slog.Int64("installation", installation))
+	case refusedAs(err, http.StatusConflict, codeConnectionEnded):
+	case last && refusedAs(err, http.StatusForbidden, codeConnectionUnknown):
+		a.log().Info("the replaced connection was not made, so it is forgotten", slog.String("connection", connection), slog.Int64("installation", installation))
+	default:
+		return err
+	}
+	return forgetReplaced(a.Store, connection)
+}
+
+// listLocked is [Adapter.listConnection] for a caller that holds the installation's
+// lock and has read its link.
+func (a *Adapter) listLocked(ctx context.Context, installation int64, connection string) error {
 	l := github.Lister{
-		Client: a.GitHub,
-		Pacer:  a.pacer(installation),
-		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
-		Slug:   a.Slug,
-		Sink:   reachSink{Sink: a.Sink, st: a.Store, installation: installation},
-		Logf:   a.logf,
-		LogCut: a.logCut,
+		Client:       a.GitHub,
+		Pacer:        a.pacer(installation),
+		Token:        func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
+		Slug:         a.Slug,
+		ConnectionID: connection,
+		Sink:         reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: connection},
+		Logf:         a.logf,
+		LogCut:       a.logCut,
 	}
 	return a.forgetOn401(installation, l.ListRepositories(ctx))
 }
 
-// installation handles the installation event: deleted disconnects each repository
-// of the installation the store knows, ended, then forgets them and unlinks it;
-// suspend disconnects each, paused; unsuspend lists the repositories again.
+// connectionSink is a sink that ends a connection, as [Apiary.DisconnectConnection]
+// does.
+type connectionSink interface {
+	DisconnectConnection(ctx context.Context, req contracts.ConnectionsDisconnect) error
+}
+
+// deleted handles the installation event's deleted, for any installation, linked or
+// not, holding the installation's lock, so no connect's link lands between its read
+// and its drop, see [Connect.link]: it keeps that GitHub deleted the installation, see
+// [keepDeleted], which a connect checks before it links, forgets the record of
+// [keepUnlinked], and, for a linked installation, ends its connection, see
+// [Adapter.endConnection], then drops what the store keeps of the installation.
+func (a *Adapter) deleted(ctx context.Context, d Delivery) error {
+	unlock, err := a.lockInstallation(ctx, d.InstallationID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := keepDeleted(a.Store, d.InstallationID); err != nil {
+		return err
+	}
+	if err := dropUnlinked(a.Store, d.InstallationID); err != nil {
+		return err
+	}
+	l, ok, err := linkOf(a.Store, d.InstallationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		a.log().Info("the installation is not linked to Qory Apiary, so the delivery is not handled", deliveryArgs(d)...)
+		return nil
+	}
+	if err := a.endConnection(ctx, l.Connection); err != nil {
+		return err
+	}
+	installMu.Lock()
+	defer installMu.Unlock()
+	return dropInstallation(a.Store, d.InstallationID)
+}
+
+// installation handles the installation event of a linked installation: suspend is
+// logged and changes nothing, since a suspended installation is no disconnect, and the
+// next round lists it again; unsuspend lists the repositories again. deleted is
+// [Adapter.deleted]'s.
 func (a *Adapter) installation(ctx context.Context, d Delivery) error {
 	switch d.Action {
-	case "deleted":
-		refs, err := reachedBy(a.Store, d.InstallationID)
-		if err != nil {
-			return err
-		}
-		if err := a.disconnect(ctx, refs, github.ReasonEnded); err != nil {
-			return err
-		}
-		for _, ref := range refs {
-			if err := a.Store.Delete(nsRepositories, collectionKey(ref)); err != nil {
-				return err
-			}
-		}
-		return Unlink(a.Store, d.InstallationID)
 	case "suspend":
-		refs, err := reachedBy(a.Store, d.InstallationID)
-		if err != nil {
-			return err
-		}
-		return a.disconnect(ctx, refs, github.ReasonPaused)
+		a.log().Info("GitHub suspended the installation, so its link stays and it is read again later", slog.Int64("installation", d.InstallationID))
 	case "unsuspend":
 		return a.listRepositories(ctx, d.InstallationID)
 	}
 	return nil
+}
+
+// endConnection tells Qory Apiary the source no longer grants the connection access,
+// POST /v1/connections/disconnect, which [Apiary.DisconnectConnection] sends again while
+// Qory Apiary answers 403. A 403 that lasts, or another refusal for good, is logged and
+// passed; any other error stops it, to be tried again.
+func (a *Adapter) endConnection(ctx context.Context, connection string) error {
+	cs, ok := a.Sink.(connectionSink)
+	if !ok {
+		return Permanent(errors.New("the sink cannot disconnect a connection"))
+	}
+	err := cs.DisconnectConnection(ctx, contracts.ConnectionsDisconnect{Version: contracts.Version, ConnectionID: connection})
+	if IsPermanent(err) {
+		a.log().Error("the disconnect is refused", slog.String("connection", connection), slog.String("error", err.Error()))
+		return nil
+	}
+	return err
 }
 
 // installationRepositories handles the installation_repositories event: each
@@ -332,7 +540,7 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 			refs = append(refs, r.FullName)
 		}
 	}
-	if err := a.disconnect(ctx, refs, github.ReasonRemoved); err != nil {
+	if err := a.disconnect(ctx, refs); err != nil {
 		return err
 	}
 	for _, ref := range refs {
@@ -343,11 +551,11 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	return a.listRepositories(ctx, d.InstallationID)
 }
 
-// disconnect sends a disconnect for each collection, for reason. One Qory Apiary refuses
-// for good is logged and passed; any other error stops it, to be tried again.
-func (a *Adapter) disconnect(ctx context.Context, refs []string, reason string) error {
+// disconnect sends a disconnect for each collection. One Qory Apiary refuses for good is
+// logged and passed; any other error stops it, to be tried again.
+func (a *Adapter) disconnect(ctx context.Context, refs []string) error {
 	for _, ref := range refs {
-		err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref, Reason: reason})
+		err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref})
 		if IsPermanent(err) {
 			a.log().Error("the disconnect is refused", slog.String("collection", ref), slog.String("error", err.Error()))
 			continue

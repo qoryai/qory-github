@@ -76,12 +76,9 @@ func (c Client) Web() string {
 	return u.Scheme + "://" + u.Host
 }
 
-// The most pages the listings of a person's installations and of the repositories one
-// of them gives the person reads.
-const (
-	maxUserInstallationPages = 100
-	maxUserRepositoryPages   = maxRepositoryPages
-)
+// maxUserInstallationPages is the most pages the listing of a person's installations
+// reads.
+const maxUserInstallationPages = 100
 
 // maxTokenAnswer is the most GitHub's answer to a code's exchange may hold.
 const maxTokenAnswer = 64 << 10
@@ -131,32 +128,66 @@ func (c Client) UserToken(ctx context.Context, clientID string, clientSecret []b
 	json.Unmarshal(b, &got)
 	switch {
 	case resp.StatusCode != http.StatusOK:
-		return "", fmt.Errorf("%s: GitHub answered %d", what, resp.StatusCode)
+		return "", &codeRefused{fmt.Errorf("%s: GitHub answered %d", what, resp.StatusCode)}
 	case got.Error != "" && oauthErrorShape.MatchString(got.Error):
-		return "", fmt.Errorf("%s: GitHub answered %s", what, got.Error)
+		return "", &codeRefused{fmt.Errorf("%s: GitHub answered %s", what, got.Error)}
 	case got.Error != "":
-		return "", fmt.Errorf("%s: GitHub answered an error", what)
+		return "", &codeRefused{fmt.Errorf("%s: GitHub answered an error", what)}
 	case got.AccessToken == "" || strings.ContainsFunc(got.AccessToken, func(r rune) bool { return r <= ' ' || r >= 0x7f }):
-		return "", fmt.Errorf("%s: GitHub answered without a token", what)
+		return "", &codeRefused{fmt.Errorf("%s: GitHub answered without a token", what)}
 	}
 	return got.AccessToken, nil
 }
 
-// UserInstallations are the ids of the App's installations the person whose token
-// token is can reach, GET /user/installations, every page of it, 100 pages at most.
-// An error never says the token.
-func (c Client) UserInstallations(ctx context.Context, token string) ([]int64, error) {
+// codeRefused is GitHub's answer to a code's exchange that gives no token, as opposed
+// to GitHub out of reach or its answer unread.
+type codeRefused struct{ err error }
+
+func (e *codeRefused) Error() string { return e.err.Error() }
+func (e *codeRefused) Unwrap() error { return e.err }
+
+// CodeRefused is whether err, an error of [Client.UserToken], is GitHub's answer that
+// gives no token, rather than GitHub out of reach or its answer unread.
+func CodeRefused(err error) bool {
+	var e *codeRefused
+	return errors.As(err, &e)
+}
+
+// UserInstallation is one of the App's installations a person reaches, as GET
+// /user/installations lists it: its id, the account it is installed on, whether GitHub
+// has suspended it, and the permissions it grants the App.
+type UserInstallation struct {
+	ID          int64
+	Account     Account
+	Suspended   bool
+	Permissions map[string]string
+}
+
+// Account is a GitHub account: its login, its id, and its type, Organization or User.
+type Account struct {
+	Login string `json:"login"`
+	ID    int64  `json:"id"`
+	Type  string `json:"type"`
+}
+
+// UserInstallations are the App's installations the person whose token token is can
+// reach, GET /user/installations, every page of it, 100 pages at most. An error never
+// says the token.
+func (c Client) UserInstallations(ctx context.Context, token string) ([]UserInstallation, error) {
 	const what = "listing the installations the person reaches"
 	read := pages{what: what, max: maxUserInstallationPages}
 	p := &Pacer{}
-	var ids []int64
+	var out []UserInstallation
 	for path := "/user/installations?per_page=100"; path != ""; {
 		if err := read.read(path); err != nil {
 			return nil, err
 		}
 		var page struct {
 			Installations []struct {
-				ID int64 `json:"id"`
+				ID          int64             `json:"id"`
+				Account     *Account          `json:"account"`
+				SuspendedAt *string           `json:"suspended_at"`
+				Permissions map[string]string `json:"permissions"`
 			} `json:"installations"`
 		}
 		next, err := c.get(ctx, p, false, what, path, token, &page)
@@ -164,40 +195,63 @@ func (c Client) UserInstallations(ctx context.Context, token string) ([]int64, e
 			return nil, err
 		}
 		for _, in := range page.Installations {
-			ids = append(ids, in.ID)
+			u := UserInstallation{ID: in.ID, Suspended: in.SuspendedAt != nil, Permissions: in.Permissions}
+			if in.Account != nil {
+				u.Account = *in.Account
+			}
+			out = append(out, u)
 		}
 		path = next
 	}
-	return ids, nil
+	return out, nil
 }
 
-// UserRepositories are the full names, owner/name, of the repositories of the
-// installation the person whose token token is can read, GET
-// /user/installations/{id}/repositories, every page of it, 1,000 pages at most. An
-// error never says the token.
-func (c Client) UserRepositories(ctx context.Context, token string, installation int64) ([]string, error) {
-	const what = "listing the installation's repositories the person reads"
-	if installation <= 0 {
-		return nil, errors.New(what + ": an installation's id is positive")
+// User is the account of the person whose token token is, GET /user. An error never
+// says the token.
+func (c Client) User(ctx context.Context, token string) (Account, error) {
+	const what = "reading the person's account"
+	var a Account
+	if _, err := c.get(ctx, &Pacer{}, false, what, "/user", token, &a); err != nil {
+		return Account{}, err
 	}
-	read := pages{what: what, max: maxUserRepositoryPages}
-	p := &Pacer{}
-	var names []string
-	for path := "/user/installations/" + strconv.FormatInt(installation, 10) + "/repositories?per_page=100"; path != ""; {
-		if err := read.read(path); err != nil {
-			return nil, err
-		}
-		var page struct {
-			Repositories []ghRepo `json:"repositories"`
-		}
-		next, err := c.get(ctx, p, false, what, path, token, &page)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range page.Repositories {
-			names = append(names, r.FullName)
-		}
-		path = next
+	return a, nil
+}
+
+// Membership is a person's membership of an organisation, as GET
+// /user/memberships/orgs/{org} says it: its state, active or pending, its role, admin or
+// member, and the ids of the organisation and of the person.
+type Membership struct {
+	State, Role          string
+	Organization, Person int64
+}
+
+// loginShape is a GitHub login: letters, digits and hyphens, 39 at most.
+var loginShape = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
+
+// OrgMembership is the membership of the organisation org of the person whose token
+// token is, GET /user/memberships/orgs/{org}. GitHub answers 404 when the person is
+// not a member, which [Gone] says, and 403 when the App may not read it. An error never
+// says the token.
+func (c Client) OrgMembership(ctx context.Context, token, org string) (Membership, error) {
+	const what = "reading the person's membership of the organisation"
+	if !loginShape.MatchString(org) {
+		return Membership{}, errors.New(what + ": the organisation's login is not one")
 	}
-	return names, nil
+	var m struct {
+		State        string  `json:"state"`
+		Role         string  `json:"role"`
+		Organization Account `json:"organization"`
+		User         Account `json:"user"`
+	}
+	if _, err := c.get(ctx, &Pacer{}, false, what, "/user/memberships/orgs/"+org, token, &m); err != nil {
+		return Membership{}, err
+	}
+	return Membership{State: m.State, Role: m.Role, Organization: m.Organization.ID, Person: m.User.ID}, nil
+}
+
+// Refused is whether err, or an error it wraps, is GitHub's 403: the token may not do
+// what was asked.
+func Refused(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.status == http.StatusForbidden
 }

@@ -72,6 +72,38 @@ type Options struct {
 	refusalEvery time.Duration
 }
 
+// endedIn is what serve does when Qory Apiary answers that a connection ended: it drops
+// what st keeps of the connection, see [dropConnection], and logs it on log.
+func endedIn(st *store.Store, log *slog.Logger) func(connection string) {
+	return func(connection string) {
+		dropped, err := dropConnection(st, connection)
+		switch {
+		case err != nil:
+			log.Error("dropping an ended connection", slog.String("connection", connection), slog.String("error", err.Error()))
+		case dropped:
+			log.Info("the connection ended in Qory Apiary, so its installation is no longer linked", slog.String("connection", connection))
+		}
+	}
+}
+
+// answeredIn is what serve does with Qory Apiary's signed answer for a connection: it
+// notes it, see [noteAnswer], and drops the connection as [endedIn] does once its 403s
+// have lasted.
+func answeredIn(st *store.Store, log *slog.Logger) func(connection string, status int, code string, at time.Time) {
+	ended := endedIn(st, log)
+	return func(connection string, status int, code string, at time.Time) {
+		end, err := noteAnswer(st, connection, status, code, at)
+		if err != nil {
+			log.Error("could not store when the connection's requests began to be refused", slog.String("connection", connection), slog.String("error", err.Error()))
+			return
+		}
+		if end {
+			log.Info("Qory Apiary answered connection_unknown for a day, so the connection is dropped", slog.String("connection", connection))
+			ended(connection)
+		}
+	}
+}
+
 // Run serves until ctx is done. Before it listens it reads the App's private key, the
 // webhook secret, the access key's secret and the App's client secret, so a wrong file
 // stops it at once, and opens the store. It serves the webhook receiver and, beside it,
@@ -120,21 +152,27 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 				log.Error("marking a collection not linked", slog.String("error", err.Error()))
 			}
 		},
+		Ended:        endedIn(st, log),
+		Answered:     answeredIn(st, log),
+		ConnectionOf: func(ref string) string { c, _ := connectionOf(st, ref); return c },
 	}
 	adapter := &Adapter{Store: st, GitHub: github.Client{API: s.APIURL}, AppID: s.AppID, Key: key, Slug: s.AppSlug, Sink: apiary, Log: log}
-	handlers := opts.Handlers
+	// The adapter's handlers serve only a linked installation, so the receiver keeps no
+	// other's delivery, see [Receiver.Linked].
+	handlers, linked := opts.Handlers, func(int64) (bool, error) { return true, nil }
 	if handlers == nil {
 		handlers = &Handlers{}
 		adapter.Register(handlers)
+		linked = func(id int64) (bool, error) { return Linked(st, id) }
 	}
 	ln, err := net.Listen("tcp", s.Listen)
 	if err != nil {
 		return err
 	}
 	worker := &Worker{Store: st, Handlers: handlers, Log: log}
-	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, Handlers: handlers, refusalEvery: opts.refusalEvery}
+	rc := &Receiver{Secret: secret, Store: st, Log: log, Stored: worker.Notify, Handlers: handlers, Linked: linked, refusalEvery: opts.refusalEvery}
 	connect := &Connect{
-		Store: st, Adapter: adapter, Pin: s.ApiaryPublicKey, AdapterID: s.AdapterID, ClientID: s.ClientID, ClientSecret: clientSecret,
+		Store: st, Adapter: adapter, Pin: s.ApiaryPublicKey, AdapterID: s.AdapterID, Key: accessKey, ClientID: s.ClientID, ClientSecret: clientSecret,
 		PublicURL: s.PublicURL, ApiaryURL: s.ApiaryURL, Log: log,
 	}
 	srv := &http.Server{
