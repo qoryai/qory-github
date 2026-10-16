@@ -2,7 +2,6 @@
   "permissions": {
     "allow": [
       "Skill(harness:explore-an-item)",
-      "Read(//**/in/inputs.json)",
       "WebSearch",
       "WebFetch",
       "mcp__context7"
@@ -11,6 +10,7 @@
       "Edit",
       "Write",
       "NotebookEdit"
-    ]
+    ],
+    "blockReadsOutsideWorkingDirectories": true
   }
 }
