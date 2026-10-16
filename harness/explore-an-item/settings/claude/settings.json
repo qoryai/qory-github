@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//**/in/inputs.json)",
+      "WebSearch",
+      "WebFetch",
+      "mcp__context7"
+    ],
+    "deny": [
+      "Edit",
+      "Write",
+      "NotebookEdit"
+    ]
+  }
+}
