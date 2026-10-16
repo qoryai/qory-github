@@ -2878,3 +2878,48 @@ func TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept(t *testing.T) {
 		}
 	}
 }
+
+// TestAPendingLinkDeletedBetweenItsTriesLeavesNothingOfItInMemory lists a pending
+// link, which Qory Apiary answers 403 connection_unknown, and GitHub deletes the
+// installation while the first try's wait holds: the tries stop, forgetting the
+// connection's first listings as they stop, and the adapter's maps hold nothing of the
+// installation.
+func TestAPendingLinkDeletedBetweenItsTriesLeavesNothingOfItInMemory(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeCollections {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	gate, gated := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		first := false
+		once.Do(func() { first = true })
+		if first {
+			close(gated)
+			select {
+			case <-gate:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	<-gated
+	if !rig.adapter.keptFirst(42, testConnection) {
+		t.Fatal("no listing is kept at the wait")
+	}
+	rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	close(gate)
+	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
+	rig.c.stop()
+	if held := rig.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
+	}
+}

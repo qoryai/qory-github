@@ -565,10 +565,10 @@ func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 	Link(w.st, 42, testConnection, linkLive)
 	Link(w.st, 9, otherConnection, linkLive)
 	for _, id := range []int64{42, 9} {
-		w.adapter.forgetTokens(id)
 		w.adapter.pacer(id)
-		w.adapter.dropFirsts(id, "")
 		w.adapter.mu.Lock()
+		w.adapter.generation(&w.adapter.gens, id)
+		w.adapter.generation(&w.adapter.firstGens, id)
 		if w.adapter.tokens == nil {
 			w.adapter.tokens = map[string]github.InstallationToken{}
 		}
@@ -603,12 +603,42 @@ func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 	}
 }
 
+// TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory deletes a
+// linked installation whose disconnect Qory Apiary answers 409 connection_ended, which
+// forgets the connection's first listings, those of the installation still linked
+// among them, after the installation's are forgotten: the adapter's maps hold nothing
+// of it.
+func TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.adapter.mu.Lock()
+	w.adapter.generation(&w.adapter.gens, 42)
+	w.adapter.generation(&w.adapter.firstGens, 42)
+	w.adapter.mu.Unlock()
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeConnectionsDisconnect {
+			return 409, `{"error":"connection_ended"}`
+		}
+		return 0, ""
+	}
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if s := state(w.st, guid1); s != store.Done {
+		t.Fatalf("the deletion is %s", s)
+	}
+	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
+		t.Errorf("%d disconnects sent", n)
+	}
+	if held := w.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
+	}
+}
+
 // TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept holds a mint of the
 // installation's listing token, and a read of a pending link's first listing, while
-// GitHub deletes the installation, with no move of the generation before, and with one
-// before and one after the deletion, which makes the generation the deletion forgot
-// again: the token is handed to the request that minted it, and the listing is sent,
-// and neither is kept.
+// GitHub deletes the installation, with no move of the generation after the deletion,
+// and with one, which makes no generation again: the token is handed to the request
+// that minted it, and the listing is sent, neither is kept, and the adapter's maps
+// hold nothing of the installation.
 func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 	deleted := map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}}
 	for _, moved := range []bool{false, true} {
@@ -617,9 +647,6 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 			Link(w.st, 42, testConnection, linkLive)
 			h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
 			w.adapter.GitHub.HTTP = &http.Client{Transport: h}
-			if moved {
-				w.adapter.forgetTokens(42)
-			}
 			done := make(chan error, 1)
 			go func() {
 				_, err := w.adapter.token(context.Background(), 42, github.Repository{}, "")
@@ -634,20 +661,13 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 			if err := <-done; err != nil {
 				t.Fatalf("the token minted in flight: %v", err)
 			}
-			want := []string(nil)
-			if moved {
-				want = []string{"gens"}
-			}
-			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
-				t.Errorf("the installation's entries %v, want %v", held, want)
+			if held := w.adapter.heldFor(42); len(held) != 0 {
+				t.Errorf("the installation's entries are kept in %v", held)
 			}
 		})
 		t.Run(fmt.Sprintf("first listing, moved %v", moved), func(t *testing.T) {
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
 			Link(w.st, 42, testConnection, linkPending)
-			if moved {
-				w.adapter.dropFirsts(42, "")
-			}
 			var derr error
 			w.gh.repoAfter = func(*fakeGitHub, int) {
 				// GitHub has answered the page; now GitHub deletes the installation.
@@ -664,12 +684,8 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 			if n := len(w.apiary.sent(routeCollections)); n != 1 {
 				t.Errorf("%d parts sent", n)
 			}
-			want := []string(nil)
-			if moved {
-				want = []string{"firstGens"}
-			}
-			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
-				t.Errorf("the installation's entries %v, want %v", held, want)
+			if held := w.adapter.heldFor(42); len(held) != 0 {
+				t.Errorf("the installation's entries are kept in %v", held)
 			}
 		})
 	}

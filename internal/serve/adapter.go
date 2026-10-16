@@ -190,11 +190,17 @@ func (a *Adapter) forgetOn401(installation int64, err error) error {
 }
 
 // forgetTokens drops the installation's tokens, so the next request mints a new one,
-// and moves its generation on, so a mint in flight does not keep its token.
+// and moves its generation on, see [Adapter.moveGeneration], so a mint in flight does
+// not keep its token.
 func (a *Adapter) forgetTokens(installation int64) {
-	prefix := strconv.FormatInt(installation, 10) + " "
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.forgetTokensLocked(installation)
+}
+
+// forgetTokensLocked is [Adapter.forgetTokens] for a caller that holds mu.
+func (a *Adapter) forgetTokensLocked(installation int64) {
+	prefix := strconv.FormatInt(installation, 10) + " "
 	a.moveGeneration(&a.gens, installation)
 	for key := range a.tokens {
 		if strings.HasPrefix(key, prefix) {
@@ -204,27 +210,34 @@ func (a *Adapter) forgetTokens(installation int64) {
 }
 
 // generation is the installation's generation in gens, for a caller that holds mu: the
-// one gens has, or else a new one. Each generation given, a move's among them, is
-// genSeq moved on, which never goes back, so none is given twice and none is 0: a read
-// that keeps what it read only while the generation it began with stands keeps nothing
-// read across a move, nor across [Adapter.forgetInstallation], after which gens has
-// none for the installation, or a newer one.
+// one gens has, or else a new one, which it keeps in gens. Each generation given, a
+// move's among them, is genSeq moved on, which never goes back, so none is given twice
+// and none is 0: a read that keeps what it read only while the generation it began with
+// stands keeps nothing read across a move, nor across [Adapter.forgetInstallation],
+// after which gens has none for the installation, which reads as 0, or a newer one.
 func (a *Adapter) generation(gens *map[int64]uint64, installation int64) uint64 {
 	if g, ok := (*gens)[installation]; ok {
 		return g
 	}
-	a.moveGeneration(gens, installation)
-	return a.genSeq
-}
-
-// moveGeneration gives the installation a new generation in gens, see
-// [Adapter.generation], for a caller that holds mu.
-func (a *Adapter) moveGeneration(gens *map[int64]uint64, installation int64) {
 	if *gens == nil {
 		*gens = map[int64]uint64{}
 	}
 	a.genSeq++
 	(*gens)[installation] = a.genSeq
+	return a.genSeq
+}
+
+// moveGeneration moves the installation's generation in gens on, see
+// [Adapter.generation], for a caller that holds mu, when gens has one, and makes none
+// when it has none: every read takes its generation through [Adapter.generation] before
+// it reads, which keeps one in gens, so an installation with none has no read in flight
+// but one that began before [Adapter.forgetInstallation] forgot it, which finds 0 and
+// keeps nothing, and an installation GitHub deleted is never made again by a move.
+func (a *Adapter) moveGeneration(gens *map[int64]uint64, installation int64) {
+	if _, ok := (*gens)[installation]; ok {
+		a.genSeq++
+		(*gens)[installation] = a.genSeq
+	}
 }
 
 // String says the adapter's App and how many tokens it keeps, never a token or the
@@ -624,12 +637,17 @@ func (a *Adapter) forgetEnded(ended func(connection string)) func(connection str
 
 // dropFirsts forgets the first listings kept, see [Adapter.sendFirst]: those of the
 // installation, unless it is 0, and of connection, unless it is "". It moves on the
-// generation of the installation, unless it is 0, and of each installation whose
-// listing it forgets, so a listing being read for an installation whose generation it
-// moves on is not kept.
+// generation, see [Adapter.moveGeneration], of the installation, unless it is 0, and of
+// each installation whose listing it forgets, so a listing being read for an
+// installation whose generation it moves on is not kept.
 func (a *Adapter) dropFirsts(installation int64, connection string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.dropFirstsLocked(installation, connection)
+}
+
+// dropFirstsLocked is [Adapter.dropFirsts] for a caller that holds mu.
+func (a *Adapter) dropFirstsLocked(installation int64, connection string) {
 	if installation != 0 {
 		a.moveGeneration(&a.firstGens, installation)
 	}
@@ -645,15 +663,16 @@ func (a *Adapter) dropFirsts(installation int64, connection string) {
 
 // forgetInstallation forgets what the adapter keeps in memory for the installation,
 // for [Adapter.deleted]: its tokens, its first listings kept, its pacer and its
-// generations, so a token minted or a first listing read across it is used, or sent,
-// and not kept, see [Adapter.generation]. Its lock goes once nobody holds it or waits
-// for it, see [installLock]. A request for the installation after it makes what it
-// needs again.
+// generations, at once, under mu, so a token minted or a first listing read across it
+// is used, or sent, and not kept, see [Adapter.generation], and no move after it makes
+// a generation again, see [Adapter.moveGeneration]. Its lock goes once nobody holds it
+// or waits for it, see [installLock]. A request for the installation after it, one
+// that reads GitHub, makes what it needs again.
 func (a *Adapter) forgetInstallation(installation int64) {
-	a.forgetTokens(installation)
-	a.dropFirsts(installation, "")
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.forgetTokensLocked(installation)
+	a.dropFirstsLocked(installation, "")
 	delete(a.gens, installation)
 	delete(a.firstGens, installation)
 	delete(a.pacers, installation)
