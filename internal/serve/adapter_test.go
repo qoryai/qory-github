@@ -1805,6 +1805,20 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 			t.Errorf("after a 409 connection_suspended, answer %d: %v, %v", i, end, err)
 		}
 	}
+	// A 403 forbidden, or a 409 with another code, collection_not_linked, which an items
+	// request may get, neither counts nor starts the day again.
+	st5 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	Link(st5, 42, testConnection, linkLive)
+	for i, a := range []struct {
+		status int
+		code   string
+		d      time.Duration
+		end    bool
+	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
+		if end, err := noteAnswer(st5, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
+			t.Errorf("after a 403 forbidden and a 409 collection_not_linked, answer %d: %v, %v", i, end, err)
+		}
+	}
 	// Another code never counts.
 	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
 	Link(st2, 42, testConnection, linkLive)

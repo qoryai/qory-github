@@ -1957,8 +1957,8 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 
 // TestAPassOneSecondPastFifteenMinutesAheadIsRefused brings, on a clock at a whole
 // second, a pass that expires 15 minutes and one second ahead, which Qory Apiary never
-// issues, as from a clock behind its own: it goes back refused, pass_expired, and its
-// nonce is not kept; one that expires 15 minutes ahead is accepted.
+// issues, as from a clock behind the adapter's: it goes back refused, pass_expired, and
+// its nonce is not kept; one that expires 15 minutes ahead is accepted.
 func TestAPassOneSecondPastFifteenMinutesAheadIsRefused(t *testing.T) {
 	rig := newConnectRig(t)
 	now := time.Now().Truncate(time.Second)
@@ -2292,32 +2292,53 @@ func TestAConnectionLinkedAgainIsNotListedAsReplaced(t *testing.T) {
 	}
 }
 
-// TestTheLastListingsMomentIsTheLinks starts a first listing of a pending link whose
-// return expires later, then has a re-connect move it later still: the tries never
-// reach the last listing before the moment the link keeps, so the link stays pending;
-// and the moment the tries wait for follows the link.
+// TestTheLastListingsMomentIsTheLinks starts, on a clock each wait moves on, a first
+// listing of a pending link whose return expires now, so its last listing is due in
+// returnSkew; during the second wait a re-connect moves the return ten minutes on. The
+// tries then wait for the new moment: no last listing comes at the old one, the waits
+// end exactly at the new one, and the last listing's 403 connection_unknown drops the
+// link there.
 func TestTheLastListingsMomentIsTheLinks(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
-	rig.clock = &pullClock{t: time.Now().Truncate(time.Second)}
-	rig.adapter.now, rig.c.now = rig.clock.now, rig.clock.now
-	rig.budget = 3 * time.Minute
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Unix()})
-	// A re-connect moves the return's expiry ten minutes on before the tries begin.
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Add(10 * time.Minute).Unix()})
-	rig.c.listSoon(42, testConnection, false)
-	eventually(t, "the waits past the budget", func() bool {
-		rig.mu.Lock()
-		defer rig.mu.Unlock()
-		var s time.Duration
-		for _, w := range rig.waits {
-			s += w
+	clock := &pullClock{t: time.Now().Truncate(time.Second)}
+	rig.adapter.now, rig.c.now = clock.now, clock.now
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
+	gate, gated := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var waits []time.Duration
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		waits = append(waits, d)
+		n := len(waits)
+		mu.Unlock()
+		if n == 2 {
+			close(gated)
+			<-gate
 		}
-		return s > rig.budget
-	})
+		return clock.sleep(ctx, d)
+	}
+	rig.c.listSoon(42, testConnection, false)
+	<-gated
+	// The re-connect, as link writes it.
+	moved := clock.now().Add(10 * time.Minute)
+	installMu.Lock()
+	l, _, _ := linkOf(rig.st, 42)
+	l.Return = moved.Unix()
+	putLink(rig.st, 42, l)
+	installMu.Unlock()
+	close(gate)
+	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
 	rig.c.stop()
-	rig.linked(t, 42, testConnection, linkPending)
-	if strings.Contains(rig.log.String(), "not made in time") {
+	if got, want := clock.now(), moved.Add(returnSkew); !got.Equal(want) {
+		t.Errorf("the last listing at %v, want %v", got, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(waits) < 8 || waits[len(waits)-1] > firstListingMaxWait || waits[len(waits)-2] != firstListingMaxWait {
+		t.Errorf("waited %v", waits)
+	}
+	if !strings.Contains(rig.log.String(), `"msg":"the connection was not made in time, so its pending link is dropped","connection":"`+testConnection+`","installation":42`) {
 		t.Errorf("the log %s", rig.log.String())
 	}
 }
@@ -2427,4 +2448,28 @@ func TestTheSetupURLMakesANewState(t *testing.T) {
 		t.Errorf("%+v", r)
 	}
 	rig.linked(t, 42, "", "")
+}
+
+// TestAReConnectForgetsTheConnectionsRecordAsReplaced re-connects acme's 42, pending
+// under C, with a newer pass, while the store holds a record of C as replaced on
+// octo-org's 9, as one a build before this fix could leave: the re-connect forgets it,
+// with no listing run, so no later listing of C for 9 empties it or ends it.
+func TestAReConnectForgetsTheConnectionsRecordAsReplaced(t *testing.T) {
+	rig := newConnectRig(t)
+	var made atomic.Bool
+	twoOrgs(rig, &made)
+	now := time.Now().Truncate(time.Second)
+	if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, now.Add(5*time.Minute)), "42"), testConnection); r.Outcome != outcomeLinked {
+		t.Fatalf("%+v", r)
+	}
+	// No listing runs from here on.
+	rig.c.stop()
+	keepReplaced(rig.st, 9, link{Connection: testConnection, Return: now.Add(returnFor).Unix()})
+	if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, now.Add(10*time.Minute)), "42"), testConnection); r.Outcome != outcomeLinked {
+		t.Fatalf("%+v", r)
+	}
+	rig.linked(t, 42, testConnection, linkPending)
+	if _, ok, _ := replacedOf(rig.st, testConnection); ok {
+		t.Error("the re-connect kept the connection's record as replaced")
+	}
 }
