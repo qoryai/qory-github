@@ -29,9 +29,9 @@ type fakeIssues struct {
 	comments map[int][]map[string]any
 	repos    []map[string]any
 	pageSize int
-	// failComments answers that page of any issue's comments with a 500; zero never
-	// does.
-	failComments int
+	// failComments answers that page of any issue's comments with a 500, and
+	// failRepos that page of the installation's repositories; zero never does.
+	failComments, failRepos int
 	// again makes every page link its next to the first.
 	again bool
 	// goneComments answers the comments of that issue 404, as GitHub answers for an
@@ -76,7 +76,7 @@ func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(m[1])
 		serve(f.comments[n], f.failComments, func(s []map[string]any) any { return s })
 	case r.URL.Path == "/installation/repositories":
-		serve(f.repos, 0, func(s []map[string]any) any { return map[string]any{"total_count": len(f.repos), "repositories": s} })
+		serve(f.repos, f.failRepos, func(s []map[string]any) any { return map[string]any{"total_count": len(f.repos), "repositories": s} })
 	default:
 		w.WriteHeader(404)
 		io.WriteString(w, `{"message":"Not Found"}`)
@@ -571,6 +571,80 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 		}
 		if !tc.fail && total != tc.n {
 			t.Errorf("%s: %d collections", tc.name, total)
+		}
+	}
+}
+
+// TestReadRepositoriesReturnsThePartsAListingSendsAndSendsNone reads the installation's
+// repositories, from one page, from two, and from one page with a skip: the parts are
+// those ListRepositories sends, one listing's, its id and started_at on each, the same
+// collections, part numbers and complete, and none is sent. A read GitHub fails on its
+// second page returns no part, and sends none, not even the part that ends the listing.
+func TestReadRepositoriesReturnsThePartsAListingSendsAndSendsNone(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		n, pageSize   int
+		skip, failure bool
+	}{
+		{"one page", 100, 100, false, false},
+		{"two pages", 250, 125, false, false},
+		{"one page with a skip", 3, 100, true, false},
+		{"two pages GitHub fails on the second", 150, 100, false, true},
+	} {
+		f := &fakeIssues{pageSize: tc.pageSize}
+		for i := range tc.n {
+			n := "repo" + strconv.Itoa(i)
+			f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
+		}
+		if tc.skip {
+			f.repos[1]["html_url"] = "http://github.com/acme/repo1"
+		}
+		if tc.failure {
+			f.failRepos = 2
+		}
+		s := &sink{}
+		var logs []string
+		l := f.lister(t, s, &logs)
+		parts, err := l.ReadRepositories(context.Background())
+		if len(s.reqs) != 0 {
+			t.Errorf("%s: %d parts sent", tc.name, len(s.reqs))
+		}
+		if tc.failure {
+			if err == nil || parts != nil {
+				t.Errorf("%s: err %v, %d parts", tc.name, err, len(parts))
+			}
+			if n := len(f.requested()); n != 2 {
+				t.Errorf("%s: %d pages requested", tc.name, n)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		read := logs
+		logs = nil
+		if err := l.ListRepositories(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if len(parts) != len(s.reqs) || !reflect.DeepEqual(read, logs) {
+			t.Errorf("%s: %d parts read, %d sent; logged %v, then %v", tc.name, len(parts), len(s.reqs), read, logs)
+			continue
+		}
+		if parts[0].Listing.ID == "" || parts[0].Listing.StartedAt == "" {
+			t.Errorf("%s: the listing %+v", tc.name, parts[0].Listing)
+		}
+		for i, p := range parts {
+			sent := s.reqs[i].(contracts.SourceCollections)
+			if p.Listing.ID != parts[0].Listing.ID || p.Listing.StartedAt != parts[0].Listing.StartedAt || p.Listing.ID == sent.Listing.ID {
+				t.Errorf("%s: part %d's listing %+v, the first's %+v, a listing's %+v", tc.name, i+1, p.Listing, parts[0].Listing, sent.Listing)
+			}
+			if p.Listing.Part != sent.Listing.Part || p.Listing.Complete != sent.Listing.Complete || !reflect.DeepEqual(p.Collections, sent.Collections) || p.ConnectionID != testConnection || p.Version != sent.Version {
+				t.Errorf("%s: part %d read %+v, sent %+v", tc.name, i+1, p, sent)
+			}
+			if problem := check(p); problem != "" {
+				t.Errorf("%s: part %d breaks the contract: %s", tc.name, i+1, problem)
+			}
 		}
 	}
 }

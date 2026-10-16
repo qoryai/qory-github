@@ -541,10 +541,11 @@ type Lister struct {
 	Pacer *Pacer
 	// Token returns an installation token for the listing: for
 	// [Lister.ListOpenIssuesComplete] and [Lister.ListChanged] one that reads the
-	// repository's issues, such as [Client.MintInstallationToken]
-	// mints, and for [Lister.ListRepositories] one that reads which repositories the
-	// installation reaches, such as [Client.MintListingToken] mints. It is called before
-	// every request, so it keeps a token until shortly before it expires.
+	// repository's issues, such as [Client.MintInstallationToken] mints, and for
+	// [Lister.ListRepositories] and [Lister.ReadRepositories] one that reads which
+	// repositories the installation reaches, such as [Client.MintListingToken] mints. It
+	// is called before every request, so it keeps a token until shortly before it
+	// expires.
 	Token func(context.Context) (string, error)
 	// Slug is the App's, whose bot writes the work item comment.
 	Slug string
@@ -658,19 +659,57 @@ const listingEnd = 10 * time.Second
 
 // ListRepositories lists the repositories the installation reaches, as collections of
 // the connection [Lister.ConnectionID], which every part names, in parts of at most 100
-// collections and 1 MiB, and reads at most 1,000 pages. When GitHub
-// answers with one page, up to 100 repositories, nothing can shift, so the last part
-// says the listing is complete, and Qory Apiary disconnects a repository of that
-// connection the installation no longer reaches; unless a repository was skipped, which then must not
-// be disconnected, so that listing is not complete. A listing of more than one page never says it is
-// complete, since a repository removed from the installation while it is listed shifts
-// the pages after it: that is a limit, and such a removal reaches Qory Apiary only by
-// the installation_repositories event that says it was removed. A listing stopped
-// early, by an error or its context, still ends with a part, never complete.
+// collections and 1 MiB, and reads at most 1,000 pages. Each part is sent as it fills.
+// When GitHub answers with one page, up to 100 repositories, nothing can shift, so the
+// last part says the listing is complete, and Qory Apiary disconnects a repository of
+// that connection the installation no longer reaches; unless a repository was skipped,
+// which then must not be disconnected, so that listing is not complete. A listing of
+// more than one page never says it is complete, since a repository removed from the
+// installation while it is listed shifts the pages after it: that is a limit, and such a
+// removal reaches Qory Apiary only by the installation_repositories event that says it
+// was removed. A listing stopped early, by an error or its context, still ends with a
+// part, never complete.
 func (l Lister) ListRepositories(ctx context.Context) error {
 	if l.Sink == nil || l.Token == nil {
 		return errors.New("the lister has no sink or no token")
 	}
+	end, err := l.repositoryParts(ctx, l.Sink.Collections)
+	if err == nil {
+		return nil
+	}
+	// A part Qory Apiary did not take leaves the listing short, so the listing stops
+	// there, and the part that ends it says it is not complete.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
+	defer cancel()
+	return errors.Join(err, l.Sink.Collections(ctx, end))
+}
+
+// ReadRepositories reads the listing [Lister.ListRepositories] sends, every page of it,
+// and returns its parts, the same parts under the same rules, in order, and sends none:
+// each part names the one listing's id and started_at, which is taken before the first
+// request to GitHub. A read that fails, or is stopped, before every page is read
+// returns no part. So the caller sends the parts itself, and may send one again,
+// unchanged but for its time, which the sink sets, when Qory Apiary did not take it.
+func (l Lister) ReadRepositories(ctx context.Context) ([]contracts.SourceCollections, error) {
+	if l.Token == nil {
+		return nil, errors.New("the lister has no token")
+	}
+	var parts []contracts.SourceCollections
+	if _, err := l.repositoryParts(ctx, func(_ context.Context, req contracts.SourceCollections) error {
+		parts = append(parts, req)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+// repositoryParts reads the installation's repositories, see [Lister.ListRepositories],
+// and hands each part to emit as it fills, the last once every page is read. On an
+// error, a read's or emit's, it stops and returns the error and the part that would end
+// the listing there: the collections not yet handed on, if any, numbered after the last
+// part handed on, not complete.
+func (l Lister) repositoryParts(ctx context.Context, emit func(context.Context, contracts.SourceCollections) error) (contracts.SourceCollections, error) {
 	p := l.pacerOr()
 	// The listing starts before its first request to GitHub: Qory Apiary disconnects
 	// what a complete listing left out and did not hear of since it started, so a
@@ -679,7 +718,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 	system := l.Client.WebHost()
 	var pending []contracts.Collection
 	skipped := false
-	send := func(ctx context.Context, complete bool) error {
+	part := func(complete bool) contracts.SourceCollections {
 		listing.Part++
 		listing.Complete = complete
 		req := contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: pending, Listing: listing}
@@ -687,16 +726,12 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 			req.Collections = []contracts.Collection{}
 		}
 		pending = nil
-		return l.Sink.Collections(ctx, req)
+		return req
 	}
 	envelope := sized(contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: []contracts.Collection{}, Listing: contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	used := envelope
-	// A part Qory Apiary did not take leaves the listing short, so the listing stops
-	// there, and the part that ends it says it is not complete.
-	stop := func(err error) error {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
-		defer cancel()
-		return errors.Join(err, send(ctx, false))
+	stop := func(err error) (contracts.SourceCollections, error) {
+		return part(false), err
 	}
 	const what = "listing the installation's repositories"
 	read := pages{what: what, max: maxRepositoryPages}
@@ -725,7 +760,7 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 			}
 			l.logCuts(cuts)
 			if len(pending) == contractLimits().collections || used+n+1 > contracts.MaxRequest {
-				if err := send(ctx, false); err != nil {
+				if err := emit(ctx, part(false)); err != nil {
 					return stop(err)
 				}
 				used = envelope
@@ -735,10 +770,10 @@ func (l Lister) ListRepositories(ctx context.Context) error {
 		}
 		path = next
 	}
-	if err := send(ctx, len(read.seen) == 1 && !skipped); err != nil {
+	if err := emit(ctx, part(len(read.seen) == 1 && !skipped)); err != nil {
 		return stop(err)
 	}
-	return nil
+	return contracts.SourceCollections{}, nil
 }
 
 // orTooLarge is why, or, when why is empty, that the collection is larger than a request may be.
