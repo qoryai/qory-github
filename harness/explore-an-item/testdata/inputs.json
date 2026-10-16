@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "work_item": {
+    "number": 12,
+    "url": "https://control.example.com/work-items/wi_example12"
+  },
+  "run": {
+    "attempt": 1,
+    "of": 3
+  },
+  "ticket": {
+    "ref": "12",
+    "url": "https://tracker.example.com/items/12",
+    "title": "The cart accepts a line with quantity 0",
+    "body": "Adding a product with quantity 0 puts an empty line in the cart.\nIt should be refused.",
+    "filed_by": {
+      "name": "Alex Example",
+      "kind": "person"
+    },
+    "filed_at": "2026-10-17T09:12:00Z",
+    "collection": "acme/shop"
+  },
+  "instruction": {
+    "text": "Keep the change in the cart module.",
+    "by": {
+      "name": "Sam Example"
+    },
+    "at": "2026-10-17T09:30:00Z"
+  },
+  "comments": [
+    {
+      "by": {
+        "name": "Alex Example",
+        "kind": "person"
+      },
+      "at": "2026-10-17T09:15:00Z",
+      "body": "Negative quantities are refused already."
+    },
+    {
+      "by": {
+        "name": "Example triage",
+        "kind": "automation"
+      },
+      "at": "2026-10-17T09:16:00Z",
+      "body": "Labelled as a bug."
+    }
+  ],
+  "comments_omitted": 0,
+  "answers": [],
+  "target": {
+    "system": "github.com",
+    "path": "acme/shop"
+  }
+}
