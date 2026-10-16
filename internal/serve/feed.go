@@ -291,7 +291,7 @@ func (f *feed) failedFor(index int) time.Duration {
 }
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for
-// good. A collection's entry whose ref is not owner/name fails for good, before the
+// good. A collection's entry whose ref is not a repository's id fails for good, before the
 // store is written.
 func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	switch ch.Kind {
@@ -301,7 +301,7 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 		}
 		return f.adapter.applyChange(ctx, ch)
 	case contracts.ChangeCollection:
-		if _, err := repository(ch.CollectionRef); err != nil {
+		if _, err := repositoryID(ch.CollectionRef); err != nil {
 			return Permanent(err)
 		}
 		switch ch.Status {

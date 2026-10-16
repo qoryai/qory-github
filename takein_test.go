@@ -46,8 +46,9 @@ type fakeAnswer struct {
 	body   string
 }
 
-// fakeTakeIn is GitHub's API as far as a take in uses it, for the issue acme/widgets#7.
-// It records every request it receives.
+// fakeTakeIn is GitHub's API as far as a take in uses it, for the issue 7 of
+// acme/widgets, through the repository's id, /repositories/1296269, whose item ref is
+// 1296269#7. It records every request it receives.
 type fakeTakeIn struct {
 	srv         *httptest.Server
 	repoLabel   map[string]any // the label created in the repository; nil is none
@@ -78,14 +79,14 @@ func (f *fakeTakeIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, a.body)
 		return
 	}
-	const issue = "/repos/acme/widgets/issues/7"
+	const issue = "/repositories/1296269/issues/7"
 	if f.issueStatus != 0 && strings.HasPrefix(r.URL.Path, issue) {
 		w.WriteHeader(f.issueStatus)
 		io.WriteString(w, `{"message":"`+http.StatusText(f.issueStatus)+`"}`)
 		return
 	}
 	switch {
-	case r.Method == "POST" && r.URL.Path == "/repos/acme/widgets/labels":
+	case r.Method == "POST" && r.URL.Path == "/repositories/1296269/labels":
 		if f.repoLabel != nil {
 			w.WriteHeader(422)
 			io.WriteString(w, `{"message":"Validation Failed","errors":[{"resource":"Label","code":"already_exists","field":"name"}]}`)
@@ -126,8 +127,8 @@ func (f *fakeTakeIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if f.nextHost != "" {
 				host = f.nextHost
 			}
-			// GitHub's next page is under /repositories/{id}, not the path asked for.
-			w.Header().Set("Link", `<`+host+`/repositories/1/issues/7/comments?per_page=100&page=`+strconv.Itoa(page+1)+`>; rel="next", <`+host+`/repositories/1/issues/7/comments?per_page=100&page=9>; rel="last"`)
+			// GitHub names the next page under /repositories/{id}, as the path asked for.
+			w.Header().Set("Link", `<`+host+`/repositories/1296269/issues/7/comments?per_page=100&page=`+strconv.Itoa(page+1)+`>; rel="next", <`+host+`/repositories/1296269/issues/7/comments?per_page=100&page=9>; rel="last"`)
 		}
 		json.NewEncoder(w).Encode(f.comments[from:to])
 	case r.Method == "POST" && r.URL.Path == issue+"/comments":
@@ -145,20 +146,20 @@ func (f *fakeTakeIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveTakeIn starts the fake and returns a client for it and a token function that
-// records the repositories it is asked for.
-func serveTakeIn(t *testing.T, f *fakeTakeIn) (Client, TokenFunc, *[]Repository) {
+// records the ids of the repositories it is asked for.
+func serveTakeIn(t *testing.T, f *fakeTakeIn) (Client, TokenFunc, *[]int64) {
 	t.Helper()
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
-	var asked []Repository
-	token := func(_ context.Context, repo Repository) (string, error) {
-		asked = append(asked, repo)
+	var asked []int64
+	token := func(_ context.Context, repository int64) (string, error) {
+		asked = append(asked, repository)
 		return takeInToken, nil
 	}
 	return Client{API: f.srv.URL}, token, &asked
 }
 
-var takenIn = Change{WorkItemID: "wi_42", Ref: "acme/widgets#7", Status: StatusTakenIn, URL: "https://apiary.example.com/work-items/wi_42"}
+var takenIn = Change{WorkItemID: "wi_42", Ref: "1296269#7", Status: StatusTakenIn, URL: "https://apiary.example.com/work-items/wi_42"}
 
 const takenInComment = "<!-- qory:work-item wi_42 -->\nQory took this into Factory: <https://apiary.example.com/work-items/wi_42>"
 
@@ -166,7 +167,7 @@ const takenInComment = "<!-- qory:work-item wi_42 -->\nQory took this into Facto
 func (f *fakeTakeIn) posts() []string {
 	var out []string
 	for i, r := range f.requests {
-		if r == "POST /repos/acme/widgets/issues/7/comments" {
+		if r == "POST /repositories/1296269/issues/7/comments" {
 			var got struct {
 				Body string `json:"body"`
 			}
@@ -188,10 +189,10 @@ func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"POST /repos/acme/widgets/labels",
-		"POST /repos/acme/widgets/issues/7/labels",
-		"GET /repos/acme/widgets/issues/7/comments?per_page=100",
-		"POST /repos/acme/widgets/issues/7/comments",
+		"POST /repositories/1296269/labels",
+		"POST /repositories/1296269/issues/7/labels",
+		"GET /repositories/1296269/issues/7/comments?per_page=100",
+		"POST /repositories/1296269/issues/7/comments",
 	}
 	if strings.Join(f.requests, "\n") != strings.Join(want, "\n") {
 		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(f.requests, "\n"), strings.Join(want, "\n"))
@@ -211,7 +212,7 @@ func TestATakeInLabelsTheIssueAndCommentsOnce(t *testing.T) {
 			t.Errorf("a request carries %q", a)
 		}
 	}
-	if len(*asked) != 1 || (*asked)[0] != (Repository{Owner: "acme", Name: "widgets"}) {
+	if len(*asked) != 1 || (*asked)[0] != 1296269 {
 		t.Errorf("a token was asked for %v", *asked)
 	}
 
@@ -246,14 +247,14 @@ func TestATakeInWhereTheLabelExistsLabelsTheIssue(t *testing.T) {
 // for another reason than its existence, and checks that nothing more is sent.
 func TestAnotherValidationErrorFailsTheTakeIn(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/acme/widgets/labels" {
+		if r.URL.Path != "/repositories/1296269/labels" {
 			t.Errorf("%s %s was sent", r.Method, r.URL.Path)
 		}
 		w.WriteHeader(422)
 		io.WriteString(w, `{"message":"Validation Failed","errors":[{"resource":"Label","code":"invalid","field":"color"}]}`)
 	}))
 	defer srv.Close()
-	token := func(context.Context, Repository) (string, error) { return takeInToken, nil }
+	token := func(context.Context, int64) (string, error) { return takeInToken, nil }
 	err := Client{API: srv.URL}.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
 	if want := "creating the label qory: GitHub answered 422: Validation Failed"; err == nil || err.Error() != want {
 		t.Errorf("err %v, want %s", err, want)
@@ -295,7 +296,7 @@ func TestTheCommentIsFoundOnALaterPage(t *testing.T) {
 	if got := f.posts(); len(got) != 0 {
 		t.Errorf("a comment was posted again: %q", got)
 	}
-	if !slices.Contains(f.requests, "GET /repositories/1/issues/7/comments?per_page=100&page=2") {
+	if !slices.Contains(f.requests, "GET /repositories/1296269/issues/7/comments?per_page=100&page=2") {
 		t.Errorf("the second page was not read: %v", f.requests)
 	}
 }
@@ -330,7 +331,7 @@ func TestUndoneRemovesTheLabelAlone(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := []string{"DELETE /repos/acme/widgets/issues/7/labels/qory", "DELETE /repos/acme/widgets/issues/7/labels/qory"}
+	want := []string{"DELETE /repositories/1296269/issues/7/labels/qory", "DELETE /repositories/1296269/issues/7/labels/qory"}
 	if strings.Join(f.requests, "\n") != strings.Join(want, "\n") {
 		t.Errorf("requests: %v", f.requests)
 	}
@@ -374,19 +375,17 @@ func TestAnInvalidChangeIsRefusedBeforeAnything(t *testing.T) {
 		edit func(*Change)
 		want string
 	}{
-		{"no number", func(e *Change) { e.Ref = "acme/widgets" }, "ref"},
-		{"empty number", func(e *Change) { e.Ref = "acme/widgets#" }, "ref"},
-		{"zero", func(e *Change) { e.Ref = "acme/widgets#0" }, "ref"},
-		{"negative", func(e *Change) { e.Ref = "acme/widgets#-7" }, "ref"},
-		{"signed", func(e *Change) { e.Ref = "acme/widgets#+7" }, "ref"},
-		{"leading zero", func(e *Change) { e.Ref = "acme/widgets#07" }, "ref"},
-		{"too large", func(e *Change) { e.Ref = "acme/widgets#99999999999999999999" }, "ref"},
-		{"two hashes", func(e *Change) { e.Ref = "acme/widgets#7#8" }, "ref"},
-		{"no owner", func(e *Change) { e.Ref = "widgets#7" }, "ref"},
-		{"bad owner", func(e *Change) { e.Ref = "-acme/widgets#7" }, "ref"},
-		{"dot dot", func(e *Change) { e.Ref = "acme/..#7" }, "ref"},
-		{"path", func(e *Change) { e.Ref = "acme/widgets/issues#7" }, "ref"},
-		{"two repositories", func(e *Change) { e.Ref = "acme/widgets,acme/gadgets#7" }, "ref"},
+		{"no number", func(e *Change) { e.Ref = "1296269" }, "ref"},
+		{"empty number", func(e *Change) { e.Ref = "1296269#" }, "ref"},
+		{"zero", func(e *Change) { e.Ref = "1296269#0" }, "ref"},
+		{"negative", func(e *Change) { e.Ref = "1296269#-7" }, "ref"},
+		{"signed", func(e *Change) { e.Ref = "1296269#+7" }, "ref"},
+		{"leading zero", func(e *Change) { e.Ref = "1296269#07" }, "ref"},
+		{"too large", func(e *Change) { e.Ref = "1296269#99999999999999999999" }, "ref"},
+		{"two hashes", func(e *Change) { e.Ref = "1296269#7#8" }, "ref"},
+		{"a name", func(e *Change) { e.Ref = "acme/widgets#7" }, "ref"},
+		{"a path", func(e *Change) { e.Ref = "1296269/issues#7" }, "ref"},
+		{"two repositories", func(e *Change) { e.Ref = "1296269,1296270#7" }, "ref"},
 		{"empty id", func(e *Change) { e.WorkItemID = "" }, "work_item_id"},
 		{"no prefix", func(e *Change) { e.WorkItemID = "42" }, "work_item_id"},
 		{"marker breaker", func(e *Change) { e.WorkItemID = "wi_42 -->" }, "work_item_id"},
@@ -413,7 +412,7 @@ func TestAnInvalidChangeIsRefusedBeforeAnything(t *testing.T) {
 		for _, status := range []string{StatusTakenIn, StatusUndone} {
 			tr := &sentTransport{}
 			var asked bool
-			token := func(context.Context, Repository) (string, error) { asked = true; return takeInToken, nil }
+			token := func(context.Context, int64) (string, error) { asked = true; return takeInToken, nil }
 			e := takenIn
 			e.Status = status
 			tc.edit(&e)
@@ -441,7 +440,7 @@ func TestAnUnknownStatusIsLeftAlone(t *testing.T) {
 		for _, ref := range []string{takenIn.Ref, "not a ref"} {
 			tr := &sentTransport{}
 			var asked bool
-			token := func(context.Context, Repository) (string, error) { asked = true; return takeInToken, nil }
+			token := func(context.Context, int64) (string, error) { asked = true; return takeInToken, nil }
 			e := takenIn
 			e.Status, e.Ref = status, ref
 			if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, token, takeInSlug, e); err != nil || tr.sent || asked {
@@ -455,16 +454,16 @@ func TestAnUnknownStatusIsLeftAlone(t *testing.T) {
 // nothing is sent and the error says for which repository.
 func TestATokenThatCannotBeHadSendsNothing(t *testing.T) {
 	tr := &sentTransport{}
-	token := func(context.Context, Repository) (string, error) { return "", errors.New("no installation") }
+	token := func(context.Context, int64) (string, error) { return "", errors.New("no installation") }
 	err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
-	if want := "the installation token for acme/widgets: no installation"; err == nil || err.Error() != want || tr.sent {
+	if want := "the installation token for the repository 1296269: no installation"; err == nil || err.Error() != want || tr.sent {
 		t.Errorf("err %v, want %s; sent %v", err, want, tr.sent)
 	}
-	empty := func(context.Context, Repository) (string, error) { return "", nil }
+	empty := func(context.Context, int64) (string, error) { return "", nil }
 	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, empty, takeInSlug, takenIn); err == nil || tr.sent {
 		t.Errorf("an empty token: err %v, sent %v", err, tr.sent)
 	}
-	working := func(context.Context, Repository) (string, error) { return takeInToken, nil }
+	working := func(context.Context, int64) (string, error) { return takeInToken, nil }
 	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, working, takeInSlug+"]", takenIn); err == nil || !strings.HasPrefix(err.Error(), "the App's slug is not one") || tr.sent {
 		t.Errorf("a slug that is not one: err %v, sent %v", err, tr.sent)
 	}
@@ -533,7 +532,7 @@ func TestTheDefaultPortIsTheSameAPI(t *testing.T) {
 		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn); err != nil {
 			t.Errorf("%s, next on %s: %v", tc.api, tc.next, err)
 		}
-		if len(f.posts()) != 0 || !slices.Contains(f.requests, "GET /repositories/1/issues/7/comments?per_page=100&page=2") {
+		if len(f.posts()) != 0 || !slices.Contains(f.requests, "GET /repositories/1296269/issues/7/comments?per_page=100&page=2") {
 			t.Errorf("%s, next on %s: requests %v", tc.api, tc.next, f.requests)
 		}
 	}
@@ -552,11 +551,11 @@ func TestTheDefaultPortIsTheSameAPI(t *testing.T) {
 // which permanent error, if any, each wraps, and that no redirect is followed.
 func TestWhatAskingAgainWouldNotChangeIsPermanent(t *testing.T) {
 	const (
-		labels   = "POST /repos/acme/widgets/labels"
-		add      = "POST /repos/acme/widgets/issues/7/labels"
-		read     = "GET /repos/acme/widgets/issues/7/comments"
-		post     = "POST /repos/acme/widgets/issues/7/comments"
-		remove   = "DELETE /repos/acme/widgets/issues/7/labels/qory"
+		labels   = "POST /repositories/1296269/labels"
+		add      = "POST /repositories/1296269/issues/7/labels"
+		read     = "GET /repositories/1296269/issues/7/comments"
+		post     = "POST /repositories/1296269/issues/7/comments"
+		remove   = "DELETE /repositories/1296269/issues/7/labels/qory"
 		moved    = `{"message":"Moved Permanently","url":"/moved"}`
 		refused  = `{"message":"Resource not accessible by integration"}`
 		limited  = `{"message":"You have exceeded a secondary rate limit."}`
@@ -628,7 +627,7 @@ func TestSendFollowsNoRedirect(t *testing.T) {
 				w.Header().Set("Location", "/moved")
 				w.WriteHeader(status)
 			}))
-			a, err := Client{API: srv.URL, HTTP: hc}.send(context.Background(), nil, false, "reading", http.MethodGet, "/repos/acme/widgets/issues/7/comments", takeInToken, nil)
+			a, err := Client{API: srv.URL, HTTP: hc}.send(context.Background(), nil, false, "reading", http.MethodGet, "/repositories/1296269/issues/7/comments", takeInToken, nil)
 			srv.Close()
 			if err != nil || a.status != status || followed {
 				t.Errorf("%d: err %v, followed %v", status, err, followed)
@@ -641,10 +640,10 @@ func TestSendFollowsNoRedirect(t *testing.T) {
 // that each error wraps ErrInvalidChange, and that an error that is not the change's, a
 // slug that is not one or a token that cannot be had, does not.
 func TestARefusedChangeIsPermanent(t *testing.T) {
-	token := func(context.Context, Repository) (string, error) { return takeInToken, nil }
+	token := func(context.Context, int64) (string, error) { return takeInToken, nil }
 	c := Client{HTTP: &http.Client{Transport: &sentTransport{}}}
 	for _, edit := range []func(*Change){
-		func(e *Change) { e.Ref = "acme/widgets#0" },
+		func(e *Change) { e.Ref = "1296269#0" },
 		func(e *Change) { e.WorkItemID = "42" },
 		func(e *Change) { e.URL = "http://apiary.example.com/work-items/wi_42" },
 	} {
@@ -657,7 +656,7 @@ func TestARefusedChangeIsPermanent(t *testing.T) {
 	if err := c.ApplyChange(context.Background(), nil, token, "qory test", takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
 		t.Errorf("a slug that is not one: err %v", err)
 	}
-	failing := func(context.Context, Repository) (string, error) { return "", errors.New("no installation") }
+	failing := func(context.Context, int64) (string, error) { return "", errors.New("no installation") }
 	if err := c.ApplyChange(context.Background(), nil, failing, takeInSlug, takenIn); err == nil || errors.Is(err, ErrInvalidChange) {
 		t.Errorf("a token that cannot be had: err %v", err)
 	}
@@ -667,7 +666,7 @@ func TestARefusedChangeIsPermanent(t *testing.T) {
 // the label is created, and checks that the take in's next request waits for the reset
 // on the pacer it is handed, the one every caller for the installation shares.
 func TestATakeInGoesThroughTheInstallationsPacer(t *testing.T) {
-	f := &fakeTakeIn{answers: map[string]fakeAnswer{"POST /repos/acme/widgets/labels": {status: 201, header: map[string]string{"X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": unix(600 * time.Second)}, body: `{}`}}}
+	f := &fakeTakeIn{answers: map[string]fakeAnswer{"POST /repositories/1296269/labels": {status: 201, header: map[string]string{"X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": unix(600 * time.Second)}, body: `{}`}}}
 	c, token, _ := serveTakeIn(t, f)
 	clock := &fakeClock{}
 	if err := c.ApplyChange(context.Background(), clock.pacer(), token, takeInSlug, takenIn); err != nil {
@@ -690,6 +689,110 @@ func TestCheckSlug(t *testing.T) {
 		err := CheckSlug(bad)
 		if err == nil || err.Error() != "is not an App's slug, 1 to 100 letters, digits, dots, underscores or hyphens" {
 			t.Errorf("%q: %v", bad, err)
+		}
+	}
+}
+
+// TestATakeInAndAnUndoGoThroughTheRepositorysID applies a taken_in and an undone entry
+// whose ref is "<id>#<n>", and checks every request reaches the repository through its
+// id, /repositories/{id}/..., none by owner/name, and the token is asked for that id.
+func TestATakeInAndAnUndoGoThroughTheRepositorysID(t *testing.T) {
+	for _, status := range []string{StatusTakenIn, StatusUndone} {
+		f := &fakeTakeIn{issueLabels: []string{"qory"}}
+		c, token, asked := serveTakeIn(t, f)
+		e := takenIn
+		e.Status = status
+		if err := c.ApplyChange(context.Background(), nil, token, takeInSlug, e); err != nil {
+			t.Fatalf("%s: %v", status, err)
+		}
+		if len(f.requests) == 0 {
+			t.Errorf("%s: nothing requested", status)
+		}
+		for _, r := range f.requests {
+			_, path, _ := strings.Cut(r, " ")
+			if !strings.HasPrefix(path, "/repositories/1296269/") {
+				t.Errorf("%s: %s is not through the repository's id", status, r)
+			}
+		}
+		if !slices.Equal(*asked, []int64{1296269}) {
+			t.Errorf("%s: a token was asked for %v", status, *asked)
+		}
+	}
+}
+
+// TestAMalformedRefAsksNothing applies a taken_in and an undone entry whose ref is not
+// "<id>#<n>", each id and number decimal digits alone with no sign and no leading zero
+// within an int64, and checks each is refused as an invalid change before the token is
+// asked for and before any request reaches the server, and that the error never says
+// the ref.
+func TestAMalformedRefAsksNothing(t *testing.T) {
+	var requests int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	for _, ref := range []string{
+		"", "1296269", "abc#1", "-1#1", "+1#1", "01296269#1", "1296269#01", "1296269#0", "0#1",
+		"9223372036854775808#1", "1296269#9223372036854775808", "acme/widgets#1", "1296269#1#2",
+		"1296269#1 ", " 1296269#1", "１#1", "../1#1",
+	} {
+		for _, status := range []string{StatusTakenIn, StatusUndone} {
+			var asked bool
+			token := func(context.Context, int64) (string, error) { asked = true; return takeInToken, nil }
+			e := takenIn
+			e.Status, e.Ref = status, ref
+			err := Client{API: srv.URL}.ApplyChange(context.Background(), nil, token, takeInSlug, e)
+			if !errors.Is(err, ErrInvalidChange) || err.Error() != "the change's ref is not a repository's id, #, and an issue's number" {
+				t.Errorf("%q, %s: err %v", ref, status, err)
+			}
+			if asked {
+				t.Errorf("%q, %s: a token was asked for", ref, status)
+			}
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Errorf("%d requests reached GitHub", requests)
+	}
+}
+
+// TestTheRefsParseStrictly checks the refs ParseCollectionRef and ParseItemRef take,
+// decimal digits alone with no sign and no leading zero within an int64, an item's a
+// collection's, #, and a number, and that CollectionRef writes no ref for an id that is
+// not positive, which checkRef refuses.
+func TestTheRefsParseStrictly(t *testing.T) {
+	for ref, want := range map[string]int64{"1": 1, "1296269": 1296269, "9223372036854775807": 9223372036854775807} {
+		if got, ok := ParseCollectionRef(ref); !ok || got != want {
+			t.Errorf("collection %q: %d, %v", ref, got, ok)
+		}
+		if CollectionRef(want) != ref {
+			t.Errorf("CollectionRef(%d) is %q", want, CollectionRef(want))
+		}
+	}
+	for _, ref := range []string{"", "0", "01296269", "-1", "+1", "9223372036854775808", "99999999999999999999", "12a", "abc", "acme/widgets", "1296269#42", " 1", "1 ", "１"} {
+		if got, ok := ParseCollectionRef(ref); ok {
+			t.Errorf("collection %q is taken, as %d", ref, got)
+		}
+	}
+	if id, n, ok := ParseItemRef("1296269#42"); !ok || id != 1296269 || n != 42 {
+		t.Errorf("item 1296269#42: %d %d %v", id, n, ok)
+	}
+	if id, n, ok := ParseItemRef("9223372036854775807#9223372036854775807"); !ok || id != 9223372036854775807 || n != 9223372036854775807 {
+		t.Errorf("the largest item: %d %d %v", id, n, ok)
+	}
+	for _, ref := range []string{"", "#", "1296269", "1296269#", "#42", "01296269#42", "1296269#042", "-1#42", "1296269#+42", "0#42", "1296269#0", "9223372036854775808#1", "1#9223372036854775808", "acme/widgets#42", "1296269#42#1", "1296269##42", "1296269 #42", "1296269#4a"} {
+		if id, n, ok := ParseItemRef(ref); ok {
+			t.Errorf("item %q is taken, as %d %d", ref, id, n)
+		}
+	}
+	for _, id := range []int64{0, -1} {
+		if ref := CollectionRef(id); ref != "" || checkRef(ref) == "" {
+			t.Errorf("CollectionRef(%d) is %q", id, ref)
 		}
 	}
 }

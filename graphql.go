@@ -31,9 +31,11 @@ const openIssuesPerPage = 100
 
 // openIssuesQuery reads one page of a repository's open issues, oldest first, the page
 // after the cursor $after, or the first page when it is null. It names the repository
-// too, as GitHub has it, so a renamed or transferred one is known.
+// too, as GitHub has it, so a renamed or transferred one is known, and its id, which
+// the refs of its collection and its items are.
 const openIssuesQuery = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
+    databaseId
     nameWithOwner
     url
     issues(states: OPEN, first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -79,6 +81,7 @@ type (
 	gqlOpenIssues struct {
 		Data struct {
 			Repository *struct {
+				DatabaseID    int64  `json:"databaseId"`
 				NameWithOwner string `json:"nameWithOwner"`
 				URL           string `json:"url"`
 				Issues        struct {
@@ -195,7 +198,7 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 		return g.r, nil, false, err
 	}
 	repo := got.Data.Repository
-	r := ghRepo{FullName: repo.NameWithOwner, HTMLURL: repo.URL}
+	r := ghRepo{ID: repo.DatabaseID, FullName: repo.NameWithOwner, HTMLURL: repo.URL}
 	switch {
 	case !strings.EqualFold(r.FullName, g.repo.String()):
 		return g.r, nil, false, fmt.Errorf("%w: %s: GitHub names the repository %s", ErrRepositoryGone, g.what, r.FullName)
@@ -270,10 +273,12 @@ func rateLimited(errs []gqlError) bool {
 
 // ListOpenIssuesComplete lists the repository's open issues by GraphQL's cursor, oldest
 // first, and their comments, and sends them to Qory Apiary; the fill and the daily
-// listing of open issues use it. Items go in parts of at most 100 items and 1 MiB, and
-// after each part the comments of its items, for an issue that has any, read by REST in
-// requests of at most 100 comments and 1 MiB, the App's work item comment left out. It
-// reads at most 2,000 pages of 100 issues, and 100 pages of an issue's comments.
+// listing of open issues use it. GraphQL names a repository by owner/name, repo, and
+// answers its id, which the refs of its collection and its items are. Items go in parts
+// of at most 100 items and 1 MiB, and after each part the comments of its items, for an
+// issue that has any, read by REST through the repository's id in requests of at most
+// 100 comments and 1 MiB, the App's work item comment left out. It reads at most 2,000
+// pages of 100 issues, and 100 pages of an issue's comments.
 //
 // The last part says the listing is complete, since paging by cursor does not skip an
 // issue, so Qory Apiary closes every item of the collection the listing left out and
@@ -328,7 +333,7 @@ func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int
 			if why := checkCollection(coll); why != "" {
 				return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
 			}
-			o = l.openParts(p, repo, listing, coll)
+			o = l.openParts(p, listing, coll)
 		}
 		for _, is := range page {
 			// An issue the listing returns as not open, one closed during the read say, is

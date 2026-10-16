@@ -27,12 +27,13 @@ type ghRepoComment struct {
 	IssueURL string `json:"issue_url"`
 }
 
-// ListChanged sends Qory Apiary what changed in the repository at or after since, which
-// is how the adapter catches what the webhooks missed: the issues GitHub says changed,
-// in every state, pull requests left out, and then the comments on the repository's
-// issues that changed. Unlike [Lister.ListOpenIssuesComplete], it sends a closed issue
-// too, with its state and its reason, so Qory Apiary learns of a close whose webhook it
-// missed.
+// ListChanged sends Qory Apiary what changed in the repository whose id is repository at
+// or after since, which is how the adapter catches what the webhooks missed: the issues
+// GitHub says changed, in every state, pull requests left out, and then the comments on
+// the repository's issues that changed. Unlike [Lister.ListOpenIssuesComplete], it sends
+// a closed issue too, with its state and its reason, so Qory Apiary learns of a close
+// whose webhook it missed. Each request reaches the repository through its id,
+// /repositories/{id}, so the collection's ref, which is that id, is all it needs.
 //
 // Every request is an event's, an upsert: none is a listing's part and none says it is
 // complete, so Qory Apiary closes and drops nothing for it. Items go in requests of at
@@ -59,26 +60,29 @@ type ghRepoComment struct {
 // would read more fails, and so does one GitHub answers that the repository is gone or
 // moved, with an error that wraps [ErrRepositoryGone]. It stops at the first error, and
 // sends nothing more.
-func (l Lister) ListChanged(ctx context.Context, repo Repository, since time.Time) error {
-	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
-		return fmt.Errorf("%q is not owner/name", repo.String())
+func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Time) error {
+	if repository <= 0 {
+		return errors.New("the repository's id is not one")
 	}
 	if l.Sink == nil || l.Token == nil || l.Slug == "" {
 		return errors.New("the lister has no sink, no token or no App slug")
 	}
 	p := l.pacerOr()
+	repo := CollectionRef(repository)
 	var r ghRepo
-	if _, err := l.get(ctx, p, "reading the repository "+repo.String(), "/repos/"+repo.String(), &r); err != nil {
+	if _, err := l.get(ctx, p, "reading the repository "+repo, "/repositories/"+repo, &r); err != nil {
 		return repositoryGone(err)
 	}
+	// The repository GitHub answers for /repositories/{id} is the one whose id it is.
+	r.ID = repository
 	coll := collectionOf(r)
 	if why := checkCollection(coll); why != "" {
 		return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
 	}
-	if err := l.changedIssues(ctx, p, repo, r, since); err != nil {
+	if err := l.changedIssues(ctx, p, r, since); err != nil {
 		return err
 	}
-	return l.changedComments(ctx, p, repo, coll, since)
+	return l.changedComments(ctx, p, coll, since)
 }
 
 // changedPages reads, oldest change first, what the listing at base, a path and a query
@@ -145,9 +149,9 @@ func changedPages[T any](ctx context.Context, l Lister, p *Pacer, what, base str
 
 // changedIssues sends the issues of the repository r that changed at or after since,
 // every state's.
-func (l Lister) changedIssues(ctx context.Context, p *Pacer, repo Repository, r ghRepo, since time.Time) error {
+func (l Lister) changedIssues(ctx context.Context, p *Pacer, r ghRepo, since time.Time) error {
 	system := l.Client.WebHost()
-	ref := r.FullName
+	ref := CollectionRef(r.ID)
 	req := contracts.SourceItems{Version: contracts.Version, CollectionRef: ref, Items: []contracts.Item{}}
 	envelope := sized(req)
 	used := envelope
@@ -159,8 +163,8 @@ func (l Lister) changedIssues(ctx context.Context, p *Pacer, repo Repository, r 
 		req.Items, used = []contracts.Item{}, envelope
 		return err
 	}
-	what := "listing the issues of " + repo.String() + " that changed"
-	base := "/repos/" + repo.String() + "/issues?state=all&sort=updated&direction=asc"
+	what := "listing the issues of " + ref + " that changed"
+	base := "/repositories/" + ref + "/issues?state=all&sort=updated&direction=asc"
 	err := changedPages(ctx, l, p, what, base, since,
 		func(is ghIssue) string { return strconv.FormatInt(is.Number, 10) },
 		func(is ghIssue) string { return is.UpdatedAt },
@@ -196,10 +200,11 @@ func (l Lister) changedIssues(ctx context.Context, p *Pacer, repo Repository, r 
 }
 
 // changedComments sends the comments on the issues of the repository, the collection
-// coll, that changed at or after since, grouped by their item on each page.
-func (l Lister) changedComments(ctx context.Context, p *Pacer, repo Repository, coll contracts.Collection, since time.Time) error {
-	what := "listing the comments of " + repo.String() + " that changed"
-	base := "/repos/" + repo.String() + "/issues/comments?sort=updated&direction=asc"
+// coll, whose ref is the repository's id, that changed at or after since, grouped by
+// their item on each page.
+func (l Lister) changedComments(ctx context.Context, p *Pacer, coll contracts.Collection, since time.Time) error {
+	what := "listing the comments of " + coll.Ref + " that changed"
+	base := "/repositories/" + coll.Ref + "/issues/comments?sort=updated&direction=asc"
 	return changedPages(ctx, l, p, what, base, since,
 		func(c ghRepoComment) string { return strconv.FormatInt(c.ID, 10) },
 		func(c ghRepoComment) string { return c.UpdatedAt },

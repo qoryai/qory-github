@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,6 +81,7 @@ type (
 		Name string `json:"name"`
 	}
 	ghRepo struct {
+		ID       int64  `json:"id"`
 		FullName string `json:"full_name"`
 		HTMLURL  string `json:"html_url"`
 	}
@@ -198,10 +200,71 @@ func authorOf(u *ghUser, cuts *[]Cut, ref, field string) contracts.Person {
 	return p
 }
 
+// A collection's ref is its repository's id on GitHub, in decimal, and an item's ref is
+// the repository's id, #, and the issue's number, such as 1296269#42: GitHub gives
+// neither again, and a repository renamed or transferred keeps its id, where its
+// owner/name changes. A comment's ref is the comment's id. The collection's title, its
+// URL and its target's path, and an item's URL, still name the repository as GitHub
+// does, owner/name.
+
+// idShape is a repository's id, or an issue's number, in a ref: decimal digits alone,
+// with no sign and no leading zero, which [parseID] holds to the range of an int64.
+var idShape = regexp.MustCompile(`^[1-9][0-9]{0,18}$`)
+
+// parseID is the positive id s writes, by [idShape], or false.
+func parseID(s string) (int64, bool) {
+	if !idShape.MatchString(s) {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+// CollectionRef is the ref of the collection of the repository whose id is id, or ""
+// for an id that is not positive, which [checkRef] refuses.
+func CollectionRef(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
+}
+
+// itemRef is the ref of the item of the issue number of the repository whose id is id,
+// or "" when either is not positive, which [checkRef] refuses.
+func itemRef(id, number int64) string {
+	if id <= 0 || number <= 0 {
+		return ""
+	}
+	return CollectionRef(id) + "#" + strconv.FormatInt(number, 10)
+}
+
+// ParseCollectionRef is the id of the repository the collection ref names, or false
+// when ref is not one: decimal digits alone, with no sign and no leading zero, within an
+// int64.
+func ParseCollectionRef(ref string) (int64, bool) {
+	return parseID(ref)
+}
+
+// ParseItemRef is the id of the repository and the issue's number the item ref names,
+// or false when ref is not one: a collection's ref, #, and the number, each decimal
+// digits alone, with no sign and no leading zero, within an int64.
+func ParseItemRef(ref string) (id, number int64, ok bool) {
+	repo, num, found := strings.Cut(ref, "#")
+	if !found {
+		return 0, 0, false
+	}
+	id, ok1 := parseID(repo)
+	number, ok2 := parseID(num)
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	return id, number, true
+}
+
 // collectionOf is a repository's issues as a collection, without a target. A listing
 // fits its title to the contract's limit; an event sends only its ref.
 func collectionOf(r ghRepo) contracts.Collection {
-	return contracts.Collection{Ref: r.FullName, URL: r.HTMLURL, Title: r.FullName}
+	return contracts.Collection{Ref: CollectionRef(r.ID), URL: r.HTMLURL, Title: r.FullName}
 }
 
 // labelsOf are the labels of the issue ref as the contract takes them: each fitted to
@@ -258,7 +321,7 @@ func utc(s string) (string, bool) {
 func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut) {
 	lim := contractLimits()
 	var cuts []Cut
-	ref := r.FullName + "#" + strconv.FormatInt(is.Number, 10)
+	ref := itemRef(r.ID, is.Number)
 	state := StateOpen
 	if is.State == StateClosed {
 		state = StateClosed
@@ -430,9 +493,10 @@ func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, 
 // target's system, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
 // unlabeled send the issue as it is now, and deleted sends it closed. Transferred sends
 // the issue closed in the repository it left and, when active says the repository it
-// went to is one Qory Apiary reads, the issue it became there. Every other action, and
-// an event for a pull request, sends nothing. It does no I/O.
-func IssuesWebhook(payload []byte, system string, active func(Repository) bool) (ToSend, error) {
+// went to is one Qory Apiary reads, by the ref of its collection, the issue it became
+// there. Every other action, and an event for a pull request, sends nothing. It does no
+// I/O.
+func IssuesWebhook(payload []byte, system string, active func(collectionRef string) bool) (ToSend, error) {
 	var ev struct {
 		Action     string  `json:"action"`
 		Issue      ghIssue `json:"issue"`
@@ -461,12 +525,12 @@ func IssuesWebhook(payload []byte, system string, active func(Repository) bool) 
 	if ev.Action != "transferred" || ev.Changes.NewIssue == nil || ev.Changes.NewRepository == nil {
 		return t, nil
 	}
-	owner, name, ok := strings.Cut(ev.Changes.NewRepository.FullName, "/")
-	if !ok || active == nil || !active(Repository{Owner: owner, Name: name}) {
+	coll := collectionOf(*ev.Changes.NewRepository)
+	if coll.Ref == "" || active == nil || !active(coll.Ref) {
 		return t, nil
 	}
 	it, why, cuts = itemOf(system, *ev.Changes.NewRepository, *ev.Changes.NewIssue)
-	t.addItem(collectionOf(*ev.Changes.NewRepository), it, why, cuts)
+	t.addItem(coll, it, why, cuts)
 	return t, nil
 }
 
@@ -503,7 +567,7 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	coll := collectionOf(ev.Repository)
 	req := contracts.SourceItemComments{
 		Version:  contracts.Version,
-		ItemRef:  ev.Repository.FullName + "#" + strconv.FormatInt(ev.Issue.Number, 10),
+		ItemRef:  itemRef(ev.Repository.ID, ev.Issue.Number),
 		Comments: []contracts.Comment{c},
 	}
 	if cw := checkCollection(coll); why == "" && cw != "" {
@@ -804,7 +868,6 @@ type listed struct {
 type openParts struct {
 	l       Lister
 	p       *Pacer
-	repo    Repository
 	system  string
 	listing contracts.Listing
 	coll    contracts.Collection
@@ -819,10 +882,9 @@ type openParts struct {
 	skipped bool
 }
 
-// openParts starts sending the parts of listing, the open issues of repo, the
-// collection coll.
-func (l Lister) openParts(p *Pacer, repo Repository, listing contracts.Listing, coll contracts.Collection) *openParts {
-	o := &openParts{l: l, p: p, repo: repo, system: l.Client.WebHost(), listing: listing, coll: coll}
+// openParts starts sending the parts of listing, the open issues of the collection coll.
+func (l Lister) openParts(p *Pacer, listing contracts.Listing, coll contracts.Collection) *openParts {
+	o := &openParts{l: l, p: p, system: l.Client.WebHost(), listing: listing, coll: coll}
 	o.envelope = sized(contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: []contracts.Item{}, Listing: &contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
 	o.used = o.envelope
 	return o
@@ -847,7 +909,7 @@ func (o *openParts) add(ctx context.Context, r ghRepo, is ghIssue) error {
 		if err != nil {
 			return err
 		}
-		if err := o.l.listComments(ctx, o.p, o.repo, sent); err != nil {
+		if err := o.l.listComments(ctx, o.p, o.coll.Ref, sent); err != nil {
 			return err
 		}
 	}
@@ -889,7 +951,7 @@ func (o *openParts) end(ctx context.Context, complete bool) error {
 	if err != nil {
 		return o.stop(ctx, err)
 	}
-	return o.l.listComments(ctx, o.p, o.repo, sent)
+	return o.l.listComments(ctx, o.p, o.coll.Ref, sent)
 }
 
 // stop ends a listing stopped early by err: the items read and not sent go as its last
@@ -904,11 +966,12 @@ func (o *openParts) stop(ctx context.Context, err error) error {
 	return errors.Join(err, end)
 }
 
-// listComments reads and sends the comments of the items that have any. An item's
-// comments are read oldest first, by REST's pages, which GitHub documents by number, and
-// a comment deleted while they are read can shift the pages after it, so no request
-// says they are complete.
-func (l Lister) listComments(ctx context.Context, p *Pacer, repo Repository, items []listed) error {
+// listComments reads and sends the comments of the items of the collection collRef, a
+// repository's id, that have any; GitHub's API reaches the repository by that id,
+// /repositories/{id}. An item's comments are read oldest first, by REST's pages, which
+// GitHub documents by number, and a comment deleted while they are read can shift the
+// pages after it, so no request says they are complete.
+func (l Lister) listComments(ctx context.Context, p *Pacer, collRef string, items []listed) error {
 items:
 	for _, x := range items {
 		if x.comments <= 0 {
@@ -919,7 +982,7 @@ items:
 		used := envelope
 		what := "listing the comments on " + x.item.Ref
 		read := pages{what: what, max: maxCommentPages}
-		path := "/repos/" + repo.String() + "/issues/" + strconv.FormatInt(x.number, 10) + "/comments?per_page=100"
+		path := "/repositories/" + collRef + "/issues/" + strconv.FormatInt(x.number, 10) + "/comments?per_page=100"
 		for path != "" {
 			if err := read.read(path); err != nil {
 				return err

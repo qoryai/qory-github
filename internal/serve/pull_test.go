@@ -47,7 +47,7 @@ func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
-	case "/repos/acme/widgets/issues", "/graphql":
+	case "/repositories/" + widgetsRef + "/issues", "/graphql":
 		if hold != nil {
 			held <- struct{}{}
 			select {
@@ -56,21 +56,21 @@ func (f *pullGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if f.unchanged && r.URL.Path == "/repos/acme/widgets/issues" {
+		if f.unchanged && r.URL.Path == "/repositories/"+widgetsRef+"/issues" {
 			io.WriteString(w, `[]`)
 			return
 		}
 		f.gh.ServeHTTP(w, r)
-	case "/repos/acme/widgets/issues/comments":
+	case "/repositories/" + widgetsRef + "/issues/comments":
 		if onComments != nil {
 			onComments()
 		}
 		json.NewEncoder(w).Encode(append([]map[string]any{}, comments...))
-	case "/repos/acme/gadgets":
-		io.WriteString(w, `{"full_name":"acme/gadgets","html_url":"https://github.com/acme/gadgets"}`)
-	case "/repos/acme/gadgets/issues":
+	case "/repositories/" + gadgetsRef:
+		io.WriteString(w, `{"id":`+gadgetsRef+`,"full_name":"acme/gadgets","html_url":"https://github.com/acme/gadgets"}`)
+	case "/repositories/" + gadgetsRef + "/issues":
 		json.NewEncoder(w).Encode(append([]map[string]any{}, gadgets...))
-	case "/repos/acme/gadgets/issues/comments":
+	case "/repositories/" + gadgetsRef + "/issues/comments":
 		io.WriteString(w, `[]`)
 	default:
 		f.gh.ServeHTTP(w, r)
@@ -136,8 +136,8 @@ func pulling(t *testing.T) (*wired, *pullGitHub, *puller, *pullClock) {
 	clock := &pullClock{t: pullStart}
 	w.adapter.now = clock.now
 	Link(w.st, 42, testConnection, linkLive)
-	setReach(w.st, "acme/widgets", 42)
-	linkCollection(w.st, "acme/widgets")
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
 	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}
 	return w, f, p, clock
 }
@@ -175,7 +175,7 @@ func sinceOf(t *testing.T, request string) time.Time {
 
 func markOf(t *testing.T, w *wired) pullMark {
 	t.Helper()
-	m, err := pulledOf(w.st, "acme/widgets")
+	m, err := pulledOf(w.st, refOf("acme/widgets"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,18 +190,18 @@ func markOf(t *testing.T, w *wired) pullMark {
 func TestAPullSendsWhatChangedSinceTheLastGoodPull(t *testing.T) {
 	w, f, p, clock := pulling(t)
 	last := pullStart.Add(-time.Hour)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: last, Listed: last})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: last, Listed: last})
 	w.gh.issues = []map[string]any{ghIssue(1, 1), closedIssue(2)}
 	f.comments = []map[string]any{repoComment(11, 1)}
 	clock.t = pullStart
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
-	asked := f.asked("/repos/acme/widgets/issues")
+	asked := f.asked("/repositories/" + widgetsRef + "/issues")
 	if len(asked) != 1 || !strings.Contains(asked[0], "state=all") || !strings.Contains(asked[0], "sort=updated") || !sinceOf(t, asked[0]).Equal(last.Add(-5*time.Minute)) {
 		t.Errorf("asked for issues %v", asked)
 	}
-	if c := f.asked("/repos/acme/widgets/issues/comments"); len(c) != 1 || !sinceOf(t, c[0]).Equal(last.Add(-5*time.Minute)) {
+	if c := f.asked("/repositories/" + widgetsRef + "/issues/comments"); len(c) != 1 || !sinceOf(t, c[0]).Equal(last.Add(-5*time.Minute)) {
 		t.Errorf("asked for comments %v", c)
 	}
 	items := w.apiary.sent(routeItems)
@@ -214,7 +214,7 @@ func TestAPullSendsWhatChangedSinceTheLastGoodPull(t *testing.T) {
 		t.Errorf("sent %s", items[0].raw)
 	}
 	comments := w.apiary.sent(routeComments)
-	if len(comments) != 1 || comments[0].body["item_ref"] != "acme/widgets#1" || comments[0].body["complete"] != nil {
+	if len(comments) != 1 || comments[0].body["item_ref"] != itemOf("acme/widgets", 1) || comments[0].body["complete"] != nil {
 		t.Errorf("sent comments %v", comments)
 	}
 	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(last) {
@@ -228,10 +228,10 @@ func TestAPullSendsWhatChangedSinceTheLastGoodPull(t *testing.T) {
 func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 	w, f, p, clock := pulling(t)
 	last := pullStart.Add(-time.Hour)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: last, Listed: last})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: last, Listed: last})
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
 	w.apiary.refuse = func(string, int) (int, string) { return 502, `{"error":"bad_gateway"}` }
-	if err := p.pull(context.Background(), "acme/widgets", 42); !IsOutage(err) {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); !IsOutage(err) {
 		t.Errorf("err %v", err)
 	}
 	if m := markOf(t, w); !m.Since.Equal(last) {
@@ -242,7 +242,7 @@ func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 	w.gh.issuesDown = true
 	w.gh.mu.Unlock()
 	clock.t = pullStart.Add(time.Hour)
-	if err := p.pull(context.Background(), "acme/widgets", 42); err == nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err == nil {
 		t.Error("a pull GitHub answered 502 passed")
 	}
 	if m := markOf(t, w); !m.Since.Equal(last) {
@@ -252,16 +252,59 @@ func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 	w.gh.issuesDown = false
 	w.gh.mu.Unlock()
 	clock.t = pullStart.Add(2 * time.Hour)
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range f.asked("/repos/acme/widgets/issues") {
+	for _, r := range f.asked("/repositories/" + widgetsRef + "/issues") {
 		if !sinceOf(t, r).Equal(last.Add(-5 * time.Minute)) {
 			t.Errorf("asked %s", r)
 		}
 	}
 	if m := markOf(t, w); !m.Since.Equal(pullStart.Add(2 * time.Hour)) {
 		t.Errorf("kept %+v", m)
+	}
+}
+
+// TestAPullReadsWhatChangedByIDAndListsNothingWithoutAName pulls a collection with no
+// way to name its repository for GraphQL's listing, as serve has it: what changed is
+// read through the repository's id alone, and sent; a listing of open issues that is
+// due fails, errOpenByID, before GitHub is asked for it, and keeps no time, whether
+// what changed was read before it or the collection has no pull kept.
+func TestAPullReadsWhatChangedByIDAndListsNothingWithoutAName(t *testing.T) {
+	w, f, p, _ := pulling(t)
+	w.adapter.openRepository = nil
+	last := pullStart.Add(-time.Hour)
+	keepPulled(w.st, widgetsRef, pullMark{Since: last, Listed: last})
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	if err := p.pull(context.Background(), widgetsRef, 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.asked("/repositories/"+widgetsRef+"/issues")) != 1 || len(f.asked("/graphql")) != 0 || len(w.apiary.sent(routeItems)) != 1 {
+		t.Errorf("asked %v; %d items requests", f.requests, len(w.apiary.sent(routeItems)))
+	}
+	for _, r := range f.requests {
+		if strings.Contains(r, "/repos/") {
+			t.Errorf("asked by owner/name: %s", r)
+		}
+	}
+	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(last) {
+		t.Errorf("kept %+v", m)
+	}
+
+	for _, mark := range []pullMark{{Since: pullStart, Listed: pullStart.Add(-25 * time.Hour)}, {}} {
+		keepPulled(w.st, widgetsRef, mark)
+		if mark == (pullMark{}) {
+			w.st.Delete(nsPulls, widgetsRef)
+		}
+		if err := p.pull(context.Background(), widgetsRef, 42); !errors.Is(err, errOpenByID) {
+			t.Errorf("%+v: err %v", mark, err)
+		}
+		if len(f.asked("/graphql")) != 0 {
+			t.Errorf("%+v: GraphQL asked", mark)
+		}
+		if m := markOf(t, w); m != mark {
+			t.Errorf("%+v: kept %+v", mark, m)
+		}
 	}
 }
 
@@ -272,9 +315,9 @@ func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 func TestTheDailyListingIsSentAndIsComplete(t *testing.T) {
 	w, f, p, _ := pulling(t)
 	last := pullStart.Add(-time.Hour)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: last, Listed: pullStart.Add(-25 * time.Hour)})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: last, Listed: pullStart.Add(-25 * time.Hour)})
 	w.gh.issues = []map[string]any{ghIssue(1, 0), closedIssue(2), ghIssue(3, 0)}
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
 	listings := listingParts(w)
@@ -288,12 +331,12 @@ func TestTheDailyListingIsSentAndIsComplete(t *testing.T) {
 		t.Errorf("kept %+v", m)
 	}
 
-	w.st.Delete(nsPulls, "acme/widgets")
-	before, rest := len(f.asked("/graphql")), len(f.asked("/repos/acme/widgets/issues"))
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	w.st.Delete(nsPulls, widgetsRef)
+	before, rest := len(f.asked("/graphql")), len(f.asked("/repositories/"+widgetsRef+"/issues"))
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.asked("/graphql")) != before+1 || len(f.asked("/repos/acme/widgets/issues")) != rest || len(f.asked("/repos/acme/widgets/issues/comments")) != 1 {
+	if len(f.asked("/graphql")) != before+1 || len(f.asked("/repositories/"+widgetsRef+"/issues")) != rest || len(f.asked("/repositories/"+widgetsRef+"/issues/comments")) != 1 {
 		t.Errorf("a collection with no pull kept asked %v", f.requests)
 	}
 	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(pullStart) {
@@ -319,9 +362,9 @@ func listingParts(w *wired) []contracts.SourceItems {
 // fill began, and does not list again.
 func TestTheFirstPullAfterAFillStartsFromTheFill(t *testing.T) {
 	w, f, p, clock := pulling(t)
-	unlinkCollection(w.st, "acme/widgets")
+	unlinkCollection(w.st, refOf("acme/widgets"))
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
-	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme/widgets", Status: "linked"})
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
 	if err := w.feed.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -329,10 +372,10 @@ func TestTheFirstPullAfterAFillStartsFromTheFill(t *testing.T) {
 		t.Errorf("the fill kept %+v", m)
 	}
 	clock.t = pullStart.Add(time.Hour)
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
-	asked := f.asked("/repos/acme/widgets/issues")
+	asked := f.asked("/repositories/" + widgetsRef + "/issues")
 	if len(asked) != 1 || !sinceOf(t, asked[0]).Equal(pullStart.Add(-5*time.Minute)) || len(f.asked("/graphql")) != 1 {
 		t.Errorf("asked %v", f.requests)
 	}
@@ -343,7 +386,7 @@ func TestTheFirstPullAfterAFillStartsFromTheFill(t *testing.T) {
 // waits for it before it reaches GitHub.
 func TestAPullAndAFillNeverOverlap(t *testing.T) {
 	w, f, p, _ := pulling(t)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
 	hold := func() chan struct{} {
 		f.mu.Lock()
@@ -360,10 +403,10 @@ func TestAPullAndAFillNeverOverlap(t *testing.T) {
 
 	c := hold()
 	filled := make(chan error, 1)
-	go func() { filled <- w.adapter.fill(context.Background(), "acme/widgets") }()
+	go func() { filled <- w.adapter.fill(context.Background(), refOf("acme/widgets")) }()
 	<-f.held
 	n := f.count()
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
 	if f.count() != n || !strings.Contains(w.log.String(), "a fill or another pull of the collection runs, so it is not pulled this round") {
@@ -376,10 +419,10 @@ func TestAPullAndAFillNeverOverlap(t *testing.T) {
 
 	c = hold()
 	pulled := make(chan error, 1)
-	go func() { pulled <- p.pull(context.Background(), "acme/widgets", 42) }()
+	go func() { pulled <- p.pull(context.Background(), refOf("acme/widgets"), 42) }()
 	<-f.held
 	n = f.count()
-	go func() { filled <- w.adapter.fill(context.Background(), "acme/widgets") }()
+	go func() { filled <- w.adapter.fill(context.Background(), refOf("acme/widgets")) }()
 	time.Sleep(100 * time.Millisecond)
 	if f.count() != n {
 		t.Errorf("a fill reached GitHub during a pull: %d requests after %d", f.count(), n)
@@ -403,35 +446,35 @@ func TestAPullAndAFillNeverOverlap(t *testing.T) {
 func TestAnUnlinkedCollectionSendsNothing(t *testing.T) {
 	w, f, p, _ := pulling(t)
 	last := pullStart.Add(-time.Hour)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: last, Listed: last})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: last, Listed: last})
 	w.gh.issues = []map[string]any{ghIssue(1, 1)}
 	f.comments = []map[string]any{repoComment(11, 1)}
-	unlinkCollection(w.st, "acme/widgets")
-	if err := p.pull(context.Background(), "acme/widgets", 42); err != nil {
+	unlinkCollection(w.st, refOf("acme/widgets"))
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err != nil {
 		t.Fatal(err)
 	}
 	if f.count() != 0 || len(w.apiary.sent(routeItems)) != 0 {
 		t.Errorf("a collection not linked was pulled: %d requests", f.count())
 	}
 
-	linkCollection(w.st, "acme/widgets")
-	f.onComments = func() { unlinkCollection(w.st, "acme/widgets") }
-	err := p.pull(context.Background(), "acme/widgets", 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	f.onComments = func() { unlinkCollection(w.st, refOf("acme/widgets")) }
+	err := p.pull(context.Background(), refOf("acme/widgets"), 42)
 	if len(w.apiary.sent(routeItems)) != 1 || len(w.apiary.sent(routeComments)) != 0 {
 		t.Errorf("sent %d items and %d comments requests", len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)))
 	}
-	p.report(context.Background(), slog.String("collection", "acme/widgets"), "pulling the collection", err)
+	p.report(context.Background(), slog.String("collection", widgetsRef), "pulling the collection", err)
 	if !strings.Contains(w.log.String(), "the collection is not linked, so its pull stops") {
 		t.Errorf("err %v; the log %s", err, w.log.String())
 	}
 
 	f.onComments = nil
-	linkCollection(w.st, "acme/widgets")
+	linkCollection(w.st, refOf("acme/widgets"))
 	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
-	if err := p.pull(context.Background(), "acme/widgets", 42); err == nil {
+	if err := p.pull(context.Background(), refOf("acme/widgets"), 42); err == nil {
 		t.Error("a pull refused 409 passed")
 	}
-	if ok, _ := collectionLinked(w.st, "acme/widgets"); ok {
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
 		t.Error("the collection is still linked")
 	}
 	if len(w.apiary.sent(routeComments)) != 0 {
@@ -448,11 +491,11 @@ func TestAnUnlinkedCollectionSendsNothing(t *testing.T) {
 // logs the first's failure and the second's absence, and keeps the third's time alone.
 func TestAFailingCollectionDoesNotHoldAnother(t *testing.T) {
 	w, _, p, _ := pulling(t)
-	for _, ref := range []string{"acme/gone", "acme/gadgets"} {
+	for _, ref := range refsOf("acme/gone", "acme/gadgets") {
 		setReach(w.st, ref, 42)
 		linkCollection(w.st, ref)
 	}
-	for _, ref := range []string{"acme/widgets", "acme/gone", "acme/gadgets"} {
+	for _, ref := range refsOf("acme/widgets", "acme/gone", "acme/gadgets") {
 		keepPulled(w.st, ref, pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
 	}
 	w.gh.issuesDown = true
@@ -461,15 +504,15 @@ func TestAFailingCollectionDoesNotHoldAnother(t *testing.T) {
 	if len(w.apiary.sent(routeCollections)) != 1 {
 		t.Errorf("%d collections requests", len(w.apiary.sent(routeCollections)))
 	}
-	if m, _ := pulledOf(w.st, "acme/gadgets"); !m.Since.Equal(pullStart) {
+	if m, _ := pulledOf(w.st, refOf("acme/gadgets")); !m.Since.Equal(pullStart) {
 		t.Errorf("acme/gadgets kept %+v", m)
 	}
-	if m, _ := pulledOf(w.st, "acme/widgets"); !m.Since.Equal(pullStart.Add(-time.Hour)) {
+	if m, _ := pulledOf(w.st, refOf("acme/widgets")); !m.Since.Equal(pullStart.Add(-time.Hour)) {
 		t.Errorf("acme/widgets kept %+v", m)
 	}
 	log := w.log.String()
-	if !strings.Contains(log, `"msg":"pulling the collection failed","collection":"acme/widgets"`) ||
-		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again","collection":"acme/gone"`) {
+	if !strings.Contains(log, `"msg":"pulling the collection failed","collection":"`+widgetsRef+`"`) ||
+		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again","collection":"`+refOf("acme/gone")+`"`) {
 		t.Errorf("the log %s", log)
 	}
 	if strings.Contains(log, ghToken) {
@@ -482,10 +525,10 @@ func TestAFailingCollectionDoesNotHoldAnother(t *testing.T) {
 // it was given.
 func TestARoundSpreadsItsCollections(t *testing.T) {
 	w, _, p, clock := pulling(t)
-	setReach(w.st, "acme/gadgets", 42)
-	linkCollection(w.st, "acme/gadgets")
-	// The collections are read in their keys' order, gadgets first, then the
-	// installation.
+	setReach(w.st, refOf("acme/gadgets"), 42)
+	linkCollection(w.st, refOf("acme/gadgets"))
+	// The collections are read in their keys' order, their ids', widgets first, then
+	// gadgets, then the installation.
 	moments := []time.Duration{20 * time.Minute, 10 * time.Minute, 5 * time.Minute}
 	var spreads []time.Duration
 	p.jitter = func(d time.Duration) time.Duration {
@@ -507,7 +550,7 @@ func TestARoundSpreadsItsCollections(t *testing.T) {
 	if len(spreads) != 3 || spreads[0] != 30*time.Minute {
 		t.Errorf("spread over %v", spreads)
 	}
-	// The installation at 5 minutes, widgets at 10 and gadgets at 20.
+	// The installation at 5 minutes, gadgets at 10 and widgets at 20.
 	if len(waits) != 3 || waits[0] != 5*time.Minute || waits[1] != 5*time.Minute || waits[2] != 10*time.Minute {
 		t.Errorf("waited %v", waits)
 	}
@@ -602,7 +645,7 @@ func TestAStopStopsThePuller(t *testing.T) {
 // again.
 func TestAPullThatKeepsFailingIsLoggedOnceAndOnceMoreAfterADay(t *testing.T) {
 	w, _, p, clock := pulling(t)
-	keepPulled(w.st, "acme/widgets", pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
 	down := func(on bool) {
 		w.gh.mu.Lock()
 		w.gh.issuesDown = on
@@ -612,11 +655,11 @@ func TestAPullThatKeepsFailingIsLoggedOnceAndOnceMoreAfterADay(t *testing.T) {
 		clock.mu.Lock()
 		clock.t = pullStart.Add(at)
 		clock.mu.Unlock()
-		p.installationRound(context.Background(), 42, []pullTarget{{ref: "acme/widgets"}}, clock.now(), 0)
+		p.installationRound(context.Background(), 42, []pullTarget{{ref: widgetsRef}}, clock.now(), 0)
 	}
 	lines := func(want string) int { return strings.Count(w.log.String(), want) }
-	const failed = `"msg":"pulling the collection failed","collection":"acme/widgets"`
-	const day = `"msg":"pulling the collection has failed for a day, and the next round tries again","collection":"acme/widgets"`
+	const failed = `"msg":"pulling the collection failed","collection":"` + widgetsRef + `"`
+	const day = `"msg":"pulling the collection has failed for a day, and the next round tries again","collection":"` + widgetsRef + `"`
 	down(true)
 	for _, at := range []time.Duration{0, time.Hour, 23 * time.Hour} {
 		round(at)
@@ -648,7 +691,7 @@ func TestAPullThatKeepsFailingIsLoggedOnceAndOnceMoreAfterADay(t *testing.T) {
 func TestTheDroppedLinesAreCountedAsThePullRoundsFailures(t *testing.T) {
 	w, _, p, _ := pulling(t)
 	p.failed("reading the linked collections", errors.New("the store failed"))
-	p.failed("pulling the collection failed", errors.New("GitHub answered 502"), slog.String("collection", "acme/widgets"))
+	p.failed("pulling the collection failed", errors.New("GitHub answered 502"), slog.String("collection", widgetsRef))
 	p.failLog().stop()
 	log := w.log.String()
 	if strings.Contains(log, "GitHub answered 502") || !strings.Contains(log, `"msg":"failures of the pull rounds dropped","failed_dropped":1`) {
@@ -686,11 +729,11 @@ var listingCallers = []struct {
 	run  func(ctx context.Context, w *wired, p *puller) error
 }{
 	{"the fill", func(ctx context.Context, w *wired, _ *puller) error {
-		return w.adapter.fill(ctx, "acme/widgets")
+		return w.adapter.fill(ctx, refOf("acme/widgets"))
 	}},
 	{"the daily listing", func(ctx context.Context, w *wired, p *puller) error {
-		keepPulled(w.st, "acme/widgets", pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)})
-		return p.pull(ctx, "acme/widgets", 42)
+		keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)})
+		return p.pull(ctx, refOf("acme/widgets"), 42)
 	}},
 }
 

@@ -541,10 +541,14 @@ func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarge
 // complete; one that fails on the comments of its last part's items has sent that part
 // already, complete, since comments are no part of complete. Either way its start is
 // not kept, so the next pull lists again. A repository with no open issue sends one
-// part without items that says the listing is complete.
+// part without items that says the listing is complete. The listing names the
+// repository by owner/name, which the collection's ref, the repository's id, does not
+// carry, so a listing whose repository [Adapter.openRepository] does not name fails,
+// [errOpenByID], before it asks GitHub, and the pull's start is not kept. What changed
+// is read through the repository's id, which needs no name.
 func (p *puller) pull(ctx context.Context, ref string, installation int64) error {
 	a := p.adapter
-	repo, err := repository(ref)
+	id, err := repositoryID(ref)
 	if err != nil {
 		return err
 	}
@@ -565,7 +569,7 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 	l := github.Lister{
 		Client: a.GitHub,
 		Pacer:  a.pacer(installation),
-		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, repo, "read") },
+		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, id, "read") },
 		Slug:   a.Slug,
 		Sink:   linkedSink{Sink: a.Sink, adapter: a, ref: ref},
 		Logf:   a.logf,
@@ -573,11 +577,15 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 	}
 	next := pullMark{Since: start, Listed: mark.Listed}
 	if !mark.Since.IsZero() {
-		if err := a.forgetOn401(installation, l.ListChanged(ctx, repo, mark.Since.Add(-pullOverlap))); err != nil {
+		if err := a.forgetOn401(installation, l.ListChanged(ctx, id, mark.Since.Add(-pullOverlap))); err != nil {
 			return err
 		}
 	}
 	if mark.Since.IsZero() || mark.Listed.IsZero() || start.Sub(mark.Listed) >= listEvery {
+		repo, err := a.openRepo(ref)
+		if err != nil {
+			return err
+		}
 		if err := a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, repo)); err != nil {
 			return err
 		}

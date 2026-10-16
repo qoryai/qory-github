@@ -138,8 +138,17 @@ func TestLiveCursorListingSkipsNoIssue(t *testing.T) {
 			t.Fatal(err)
 		}
 		refs, parts := sentParts(s)
+		// The items' refs are the repository's id, which the collection's ref is, # and
+		// the issue's number.
+		coll := ""
+		if items := s.items(); len(items) > 0 {
+			coll = items[0].CollectionRef
+		}
+		if _, ok := ParseCollectionRef(coll); !ok {
+			t.Errorf("the collection's ref %q is not a repository's id", coll)
+		}
 		for _, is := range lv.issues() {
-			ref := lv.repo.String() + "#" + strconv.FormatInt(is.Number, 10)
+			ref := coll + "#" + strconv.FormatInt(is.Number, 10)
 			if got := slices.Contains(refs, ref); got != (is.State == "open") {
 				t.Errorf("%s, %s: sent %v", ref, is.State, got)
 			}

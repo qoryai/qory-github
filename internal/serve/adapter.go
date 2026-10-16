@@ -44,6 +44,14 @@ type Adapter struct {
 	// Log takes what is skipped or failed; nil logs nothing.
 	Log *slog.Logger
 
+	// openRepository is the repository, owner/name, whose open issues a fill or the
+	// daily listing of the collection ref reads, or false. That listing is GraphQL's,
+	// [github.Lister.ListOpenIssuesComplete], which names a repository by owner/name or
+	// by its node id and never by the id a collection's ref is, and how serve learns
+	// either for a ref is not decided yet: nil, as serve has it, fails the fill and the
+	// listing for good before any request to GitHub, [errOpenByID]. A test sets it.
+	openRepository func(ref string) (github.Repository, bool)
+
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
@@ -146,12 +154,13 @@ func (a *Adapter) pacer(installation int64) *github.Pacer {
 	return p
 }
 
-// token is an installation token for installation, limited to repo, or, when repo is
-// empty, the listing token that reads which repositories it reaches; permission is the
-// one it grants on issues. A token is kept until shortly before it expires, unless the
+// token is an installation token for installation, limited to the repository whose id
+// is repository, which GitHub's mint takes as repository_ids, or, when repository is 0,
+// the listing token that reads which repositories it reaches; permission is the one it
+// grants on issues. A token is kept until shortly before it expires, unless the
 // installation's tokens were dropped while it was minted.
-func (a *Adapter) token(ctx context.Context, installation int64, repo github.Repository, permission string) (string, error) {
-	key := strconv.FormatInt(installation, 10) + " " + strings.ToLower(repo.String()) + " " + permission
+func (a *Adapter) token(ctx context.Context, installation, repository int64, permission string) (string, error) {
+	key := strconv.FormatInt(installation, 10) + " " + strconv.FormatInt(repository, 10) + " " + permission
 	a.mu.Lock()
 	t, ok := a.tokens[key]
 	gen := a.generation(&a.gens, installation)
@@ -160,10 +169,10 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 		return t.Token, nil
 	}
 	var err error
-	if repo == (github.Repository{}) {
+	if repository == 0 {
 		t, err = a.GitHub.MintListingToken(ctx, a.AppID, a.Key, installation)
 	} else {
-		t, err = a.GitHub.MintInstallationToken(ctx, github.Request{AppID: a.AppID, Key: a.Key, InstallationID: installation, Repositories: []github.Repository{repo}, Permissions: map[string]string{"issues": permission}})
+		t, err = a.GitHub.MintInstallationToken(ctx, github.Request{AppID: a.AppID, Key: a.Key, InstallationID: installation, RepositoryIDs: []int64{repository}, Permissions: map[string]string{"issues": permission}})
 	}
 	if err != nil {
 		return "", err
@@ -526,7 +535,7 @@ func (a *Adapter) lister(installation int64, connection string) github.Lister {
 	return github.Lister{
 		Client:       a.GitHub,
 		Pacer:        a.pacer(installation),
-		Token:        func(ctx context.Context) (string, error) { return a.token(ctx, installation, github.Repository{}, "") },
+		Token:        func(ctx context.Context) (string, error) { return a.token(ctx, installation, 0, "") },
 		Slug:         a.Slug,
 		ConnectionID: connection,
 		Sink:         reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: connection},
@@ -753,13 +762,14 @@ func (a *Adapter) endConnection(ctx context.Context, connection string) error {
 }
 
 // installationRepositories handles the installation_repositories event: each
-// repository removed that the store holds as the installation's is disconnected,
-// removed, and forgotten, one it does not hold is passed, and the installation's
-// repositories are listed again, which a listing of more than one page needs, since it
-// never says it is complete. The installation's tokens are dropped first, so the
-// listing never reads with a token minted before the change, and so are its first
-// listings kept, see [Adapter.sendFirst], which the change makes stale: one being read
-// as they are dropped is sent and not kept, so the next try reads GitHub again.
+// repository removed, by its id, which is its collection's ref, that the store holds as
+// the installation's is disconnected, removed, and forgotten, one it does not hold is
+// passed, and the installation's repositories are listed again, which a listing of
+// more than one page needs, since it never says it is complete. The installation's
+// tokens are dropped first, so the listing never reads with a token minted before the
+// change, and so are its first listings kept, see [Adapter.sendFirst], which the change
+// makes stale: one being read as they are dropped is sent and not kept, so the next try
+// reads GitHub again.
 func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) error {
 	if d.Action != "added" && d.Action != "removed" {
 		return nil
@@ -768,7 +778,7 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	a.dropFirsts(d.InstallationID, "")
 	var ev struct {
 		Removed []struct {
-			FullName string `json:"full_name"`
+			ID int64 `json:"id"`
 		} `json:"repositories_removed"`
 	}
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
@@ -776,15 +786,16 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	}
 	var refs []string
 	for _, r := range ev.Removed {
-		if r.FullName == "" {
+		ref := github.CollectionRef(r.ID)
+		if ref == "" {
 			continue
 		}
-		installation, ok, err := reachOf(a.Store, r.FullName)
+		installation, ok, err := reachOf(a.Store, ref)
 		if err != nil {
 			return err
 		}
 		if ok && installation == d.InstallationID {
-			refs = append(refs, r.FullName)
+			refs = append(refs, ref)
 		}
 	}
 	if err := a.disconnect(ctx, refs); err != nil {
@@ -817,8 +828,8 @@ func (a *Adapter) disconnect(ctx context.Context, refs []string) error {
 // issues handles the issues event: the issue, as [github.IssuesWebhook] makes it, goes
 // to Qory Apiary when its collection is linked.
 func (a *Adapter) issues(ctx context.Context, d Delivery) error {
-	active := func(r github.Repository) bool {
-		ok, _ := collectionLinked(a.Store, r.String())
+	active := func(ref string) bool {
+		ok, _ := collectionLinked(a.Store, ref)
 		return ok
 	}
 	t, err := github.IssuesWebhook(d.Body, a.GitHub.WebHost(), active)
@@ -897,9 +908,16 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // answers is gone or moved, [github.ErrRepositoryGone], or for which GitHub refuses to
 // mint a token for good, [github.ErrMintRefused], fails for good, so the change feed
 // passes it. It waits for a pull of the collection that runs, and once it has sent
-// everything, the next pull reads what changed from when it began.
+// everything, the next pull reads what changed from when it began. The listing names the
+// repository by owner/name, which the collection's ref, the repository's id, does not
+// carry, so a fill whose repository [Adapter.openRepository] does not name fails for
+// good, [errOpenByID], before the store is read or GitHub is asked.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
-	repo, err := repository(ref)
+	id, err := repositoryID(ref)
+	if err != nil {
+		return Permanent(err)
+	}
+	repo, err := a.openRepo(ref)
 	if err != nil {
 		return Permanent(err)
 	}
@@ -919,7 +937,7 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 	l := github.Lister{
 		Client: a.GitHub,
 		Pacer:  a.pacer(installation),
-		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, repo, "read") },
+		Token:  func(ctx context.Context) (string, error) { return a.token(ctx, installation, id, "read") },
 		Slug:   a.Slug,
 		Sink:   a.Sink,
 		Logf:   a.logf,
@@ -937,18 +955,24 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 
 // applyChange writes on GitHub what a work_item entry of the feed says, with a token
 // that writes the issues of that one repository, from the installation that reaches it.
-// A token GitHub refuses to mint for good, [github.ErrMintRefused], fails it for good.
+// A ref that is not an item's, the repository's id, #, and the issue's number, see
+// [github.ParseItemRef], fails for good before the store is read or GitHub is asked,
+// as [github.Client.ApplyChange] refuses it. A token GitHub refuses to mint for good,
+// [github.ErrMintRefused], fails it for good.
 func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
-	collection, _, _ := strings.Cut(ch.Ref, "#")
-	installation, ok, err := reachOf(a.Store, collection)
+	id, _, ok := github.ParseItemRef(ch.Ref)
+	if !ok {
+		return Permanent(fmt.Errorf("applying a change: %w", errNotItemRef))
+	}
+	installation, ok, err := reachOf(a.Store, github.CollectionRef(id))
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return Permanent(fmt.Errorf("applying a change: %w", errNoInstallation))
 	}
-	token := func(ctx context.Context, repo github.Repository) (string, error) {
-		return a.token(ctx, installation, repo, "write")
+	token := func(ctx context.Context, repository int64) (string, error) {
+		return a.token(ctx, installation, repository, "write")
 	}
 	err = a.forgetOn401(installation, a.GitHub.ApplyChange(ctx, a.pacer(installation), token, a.Slug, github.Change{WorkItemID: ch.WorkItemID, Ref: ch.Ref, Status: ch.Status, URL: ch.URL}))
 	if errors.Is(err, github.ErrMintRefused) {
@@ -957,11 +981,32 @@ func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 	return err
 }
 
-// repository is a collection's ref as a repository, owner/name.
-func repository(ref string) (github.Repository, error) {
-	repos, err := github.ParseRepositories(ref)
-	if err != nil || len(repos) != 1 {
-		return github.Repository{}, errors.New("the collection's ref is not owner/name")
+// errNotItemRef refuses a change's ref that is not an item's, see [github.ParseItemRef].
+var errNotItemRef = errors.New("the change's ref is not a repository's id, #, and an issue's number")
+
+// repositoryID is the id of the repository a collection's ref names, see
+// [github.ParseCollectionRef].
+func repositoryID(ref string) (int64, error) {
+	id, ok := github.ParseCollectionRef(ref)
+	if !ok {
+		return 0, errors.New("the collection's ref is not a repository's id")
 	}
-	return repos[0], nil
+	return id, nil
+}
+
+// errOpenByID fails a fill, and the daily listing of a collection's open issues, whose
+// repository the adapter knows by its id alone, see [Adapter.openRepository].
+var errOpenByID = errors.New("listing a repository's open issues by its id is not built: GraphQL names a repository by owner/name or by its node id")
+
+// openRepo is the repository, owner/name, whose open issues are listed for the
+// collection ref, see [Adapter.openRepository], or [errOpenByID].
+func (a *Adapter) openRepo(ref string) (github.Repository, error) {
+	if a.openRepository == nil {
+		return github.Repository{}, errOpenByID
+	}
+	repo, ok := a.openRepository(ref)
+	if !ok {
+		return github.Repository{}, errOpenByID
+	}
+	return repo, nil
 }

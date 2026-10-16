@@ -22,7 +22,7 @@ import (
 )
 
 // fakeIssues is GitHub's API as a listing reads it by REST: the comments of
-// acme/widgets's issues, and the installation's repositories, each pageSize to a page
+// acme/widgets's issues, through its id, /repositories/1296269, and the installation's repositories, each pageSize to a page
 // with a Link header to the next. It records the paths it is asked for.
 type fakeIssues struct {
 	srv      *httptest.Server
@@ -42,7 +42,7 @@ type fakeIssues struct {
 	auth         []string
 }
 
-var commentsPath = regexp.MustCompile(`^/repos/acme/widgets/issues/(\d+)/comments$`)
+var commentsPath = regexp.MustCompile(`^/repositories/1296269/issues/(\d+)/comments$`)
 
 func (f *fakeIssues) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
@@ -244,14 +244,26 @@ func (f *fakeIssues) lister(t *testing.T, s Sink, logs *[]string) Lister {
 // testConnection is the connection a test's listings name.
 const testConnection = "ac_0123456789abcdef"
 
+// widgets is the repository the listings' tests read, and widgetsID and widgetsRef its id
+// on GitHub and the ref of its collection, which that id is. gadgetsID is another's.
 var widgets = Repository{Owner: "acme", Name: "widgets"}
+
+const (
+	widgetsID  = 1296269
+	widgetsRef = "1296269"
+	gadgetsID  = 1296270
+)
+
+// repoJSON is a repository as GitHub's REST answers it, with its id.
+func repoJSON(id int, fullName, htmlURL string) map[string]any {
+	return map[string]any{"id": id, "full_name": fullName, "html_url": htmlURL}
+}
 
 func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	f := &fakeIssues{pageSize: 1}
-	for _, n := range []string{"widgets", "gadgets"} {
-		f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
-	}
-	f.repos = append(f.repos, map[string]any{"full_name": "acme/broken", "html_url": "ftp://github.com/acme/broken"})
+	f.repos = append(f.repos, repoJSON(widgetsID, "acme/widgets", "https://github.com/acme/widgets"))
+	f.repos = append(f.repos, repoJSON(gadgetsID, "acme/gadgets", "https://github.com/acme/gadgets"))
+	f.repos = append(f.repos, repoJSON(1296271, "acme/broken", "ftp://github.com/acme/broken"))
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
@@ -264,13 +276,13 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	}
 	got := s.reqs[0].(contracts.SourceCollections)
 	want := []contracts.Collection{
-		{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &contracts.Target{System: host, Path: "acme/widgets"}},
-		{Ref: "acme/gadgets", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
+		{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &contracts.Target{System: host, Path: "acme/widgets"}},
+		{Ref: "1296270", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
 	}
 	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 || got.ConnectionID != testConnection {
 		t.Errorf("collections %+v", got)
 	}
-	if !reflect.DeepEqual(logs, []string{"skipped the collection acme/broken: its URL is not https or is longer than 2048 characters"}) {
+	if !reflect.DeepEqual(logs, []string{"skipped the collection 1296271: its URL is not https or is longer than 2048 characters"}) {
 		t.Errorf("logged %v", logs)
 	}
 	if strings.Join(f.requested(), " ") != "/installation/repositories?per_page=100 /installation/repositories?page=2&per_page=100 /installation/repositories?page=3&per_page=100" {
@@ -290,7 +302,7 @@ func str(s string) *string { return &s }
 
 // TestAnIssueMapsToAnItem checks every row of the mapping.
 func TestAnIssueMapsToAnItem(t *testing.T) {
-	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	r := ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
 	base := ghIssue{
 		Number: 42, Title: "Widgets spin backwards", Body: str("They should not."), State: "open",
 		HTMLURL: "https://github.com/acme/widgets/issues/42", Labels: []ghLabel{{"bug"}, {"good first issue"}},
@@ -299,7 +311,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	}
 	it, why, _ := itemOf("github.com", r, base)
 	want := contracts.Item{
-		Ref: "acme/widgets#42", URL: "https://github.com/acme/widgets/issues/42", Title: "Widgets spin backwards", Body: "They should not.",
+		Ref: "1296269#42", URL: "https://github.com/acme/widgets/issues/42", Title: "Widgets spin backwards", Body: "They should not.",
 		BodyFormat: "markdown", Type: "issue", State: "open", Labels: []string{"bug", "good first issue"},
 		FiledBy: contracts.Person{Name: "alice", Kind: "person"}, CommentCount: 3, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
 		Target: &contracts.Target{System: "github.com", Path: "acme/widgets"},
@@ -307,7 +319,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	if why != "" || !reflect.DeepEqual(it, want) {
 		t.Errorf("item %+v, %s\nwant %+v", it, why, want)
 	}
-	if c := collectionOf(r); c != (contracts.Collection{Ref: "acme/widgets", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
+	if c := collectionOf(r); c != (contracts.Collection{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}) {
 		t.Errorf("collection %+v", c)
 	}
 	for _, tc := range []struct {
@@ -346,9 +358,9 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 // TestTheWireIsTheContractsJSON checks the JSON an item and a comment of the adapter's
 // become: the names, the nulls the contract wants and the fields it leaves out.
 func TestTheWireIsTheContractsJSON(t *testing.T) {
-	it, _, _ := itemOf("github.com", ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
-	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: "acme/widgets", Items: []contracts.Item{it}})
-	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"acme/widgets","items":[{"ref":"acme/widgets#1","url":"https://github.com/acme/widgets/issues/1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
+	it, _, _ := itemOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
+	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: widgetsRef, Items: []contracts.Item{it}})
+	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"1296269","items":[{"ref":"1296269#1","url":"https://github.com/acme/widgets/issues/1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
 	if string(b) != want {
 		t.Errorf("items\n%s\nwant\n%s", b, want)
 	}
@@ -356,17 +368,18 @@ func TestTheWireIsTheContractsJSON(t *testing.T) {
 	req := got.Comments[0]
 	req.Time = "2026-01-02T03:04:05Z"
 	b, _ = json.Marshal(req)
-	if string(b) != `{"version":1,"time":"2026-01-02T03:04:05Z","item_ref":"acme/widgets#1","comments":[{"ref":"9","url":"https://github.com/acme/widgets/issues/1#issuecomment-9","author":{"name":"bob","kind":"person"},"body":"","body_format":"markdown","created_at":"2026-01-04T00:00:00Z","updated_at":"2026-01-05T00:00:00Z","deleted":true}]}` {
+	if string(b) != `{"version":1,"time":"2026-01-02T03:04:05Z","item_ref":"1296269#1","comments":[{"ref":"9","url":"https://github.com/acme/widgets/issues/1#issuecomment-9","author":{"name":"bob","kind":"person"},"body":"","body_format":"markdown","created_at":"2026-01-04T00:00:00Z","updated_at":"2026-01-05T00:00:00Z","deleted":true}]}` {
 		t.Errorf("comments %s", b)
 	}
 }
 
-// event is a webhook payload: action on issue in acme/widgets, with extra fields.
+// event is a webhook payload: action on issue in acme/widgets, whose id is widgetsID,
+// with extra fields.
 func event(action string, issue map[string]any, extra map[string]any) []byte {
 	ev := map[string]any{
 		"action":       action,
 		"issue":        issue,
-		"repository":   map[string]any{"full_name": "acme/widgets", "html_url": "https://github.com/acme/widgets", "id": 1},
+		"repository":   repoJSON(widgetsID, "acme/widgets", "https://github.com/acme/widgets"),
 		"sender":       map[string]any{"login": "alice"},
 		"installation": map[string]any{"id": 7},
 	}
@@ -382,28 +395,33 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 	closed["state"], closed["state_reason"] = "closed", "not_planned"
 	pr := issue(1, 0)
 	pr["pull_request"] = map[string]any{}
-	gadgets := map[string]any{"full_name": "acme/gadgets", "html_url": "https://github.com/acme/gadgets"}
+	gadgets := repoJSON(gadgetsID, "acme/gadgets", "https://github.com/acme/gadgets")
 	transfer := map[string]any{"changes": map[string]any{"new_issue": issue(9, 0), "new_repository": gadgets}}
-	active := func(r Repository) bool { return r == Repository{Owner: "acme", Name: "gadgets"} }
-	inactive := func(Repository) bool { return false }
+	// A repository a transfer names without an id has no collection, so active is not
+	// asked about it, and only the issue it left is sent.
+	noID := map[string]any{"changes": map[string]any{"new_issue": issue(9, 0), "new_repository": map[string]any{"full_name": "acme/gadgets", "html_url": "https://github.com/acme/gadgets"}}}
+	var asked []string
+	active := func(ref string) bool { asked = append(asked, ref); return ref == "1296270" }
+	inactive := func(string) bool { return false }
 	for _, tc := range []struct {
 		action string
 		issue  map[string]any
 		extra  map[string]any
-		active func(Repository) bool
-		want   []string // collection item state reason, one per items request
+		active func(string) bool
+		want   []string // collection item path state reason, one per items request
 	}{
-		{"opened", issue(1, 0), nil, nil, []string{"acme/widgets acme/widgets#1 open <nil>"}},
-		{"reopened", issue(1, 0), nil, nil, []string{"acme/widgets acme/widgets#1 open <nil>"}},
-		{"edited", issue(1, 0), map[string]any{"changes": map[string]any{"title": map[string]any{"from": "old"}}}, nil, []string{"acme/widgets acme/widgets#1 open <nil>"}},
-		{"closed", closed, nil, nil, []string{"acme/widgets acme/widgets#1 closed Not planned"}},
-		{"labeled", issue(1, 0), map[string]any{"label": map[string]any{"name": "bug"}}, nil, []string{"acme/widgets acme/widgets#1 open <nil>"}},
-		{"unlabeled", issue(1, 0), nil, nil, []string{"acme/widgets acme/widgets#1 open <nil>"}},
-		{"deleted", issue(1, 0), nil, nil, []string{"acme/widgets acme/widgets#1 closed <nil>"}},
-		{"deleted", closed, nil, nil, []string{"acme/widgets acme/widgets#1 closed <nil>"}},
-		{"transferred", issue(1, 0), transfer, active, []string{"acme/widgets acme/widgets#1 closed <nil>", "acme/gadgets acme/gadgets#9 open <nil>"}},
-		{"transferred", issue(1, 0), transfer, inactive, []string{"acme/widgets acme/widgets#1 closed <nil>"}},
-		{"transferred", issue(1, 0), transfer, nil, []string{"acme/widgets acme/widgets#1 closed <nil>"}},
+		{"opened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
+		{"reopened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
+		{"edited", issue(1, 0), map[string]any{"changes": map[string]any{"title": map[string]any{"from": "old"}}}, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
+		{"closed", closed, nil, nil, []string{"1296269 1296269#1 acme/widgets closed Not planned"}},
+		{"labeled", issue(1, 0), map[string]any{"label": map[string]any{"name": "bug"}}, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
+		{"unlabeled", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
+		{"deleted", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
+		{"deleted", closed, nil, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), transfer, active, []string{"1296269 1296269#1 acme/widgets closed <nil>", "1296270 1296270#9 acme/gadgets open <nil>"}},
+		{"transferred", issue(1, 0), transfer, inactive, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), transfer, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), noID, active, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
 		{"assigned", issue(1, 0), nil, nil, nil},
 		{"pinned", issue(1, 0), nil, nil, nil},
 		{"milestoned", issue(1, 0), nil, nil, nil},
@@ -424,8 +442,8 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 			if it.StateReason != nil {
 				reason = *it.StateReason
 			}
-			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.State+" "+reason)
-			if it.Target.Path != req.CollectionRef || it.Target.System != "github.com" {
+			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.Target.Path+" "+it.State+" "+reason)
+			if it.Target.System != "github.com" {
 				t.Errorf("%s: target %+v", tc.action, it.Target)
 			}
 		}
@@ -436,11 +454,14 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 	long := issue(1, 0)
 	long["body"] = strings.Repeat("a", 70_000)
 	got, _ := IssuesWebhook(event("edited", long, nil), "github.com", nil)
-	if len(got.Items) != 1 || len(got.Skipped) != 0 || got.Items[0].Items[0].Body != strings.Repeat("a", 65_536) || !reflect.DeepEqual(got.Cut, []Cut{{Ref: "acme/widgets#1", Field: "body", Length: 70_000}}) {
+	if len(got.Items) != 1 || len(got.Skipped) != 0 || got.Items[0].Items[0].Body != strings.Repeat("a", 65_536) || !reflect.DeepEqual(got.Cut, []Cut{{Ref: "1296269#1", Field: "body", Length: 70_000}}) {
 		t.Errorf("long body: %d requests, skipped %+v", len(got.Items), got.Skipped)
 	}
 	if _, err := IssuesWebhook([]byte("{"), "github.com", nil); err == nil {
 		t.Error("a payload that is not JSON is taken")
+	}
+	if !reflect.DeepEqual(asked, []string{"1296270"}) {
+		t.Errorf("active was asked about %q, want the collection ref of the repository a transfer names", asked)
 	}
 }
 
@@ -481,7 +502,7 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 			req := got.Comments[0]
 			c := req.Comments[0]
 			line = fmt.Sprintf("%s %s %s %v", c.Ref, c.Author.Name, c.Author.Kind, c.Deleted)
-			if req.ItemRef != "acme/widgets#1" || req.Complete != nil || req.Version != 1 || c.BodyFormat != "markdown" {
+			if req.ItemRef != "1296269#1" || req.Complete != nil || req.Version != 1 || c.BodyFormat != "markdown" {
 				t.Errorf("%s: request %+v", tc.action, req)
 			}
 		}
@@ -502,9 +523,9 @@ func TestTheStartTimeIsTheClocks(t *testing.T) {
 // would refuse as a collection, and a comment whose body is too long, which is cut, and
 // deleted, which is sent without it.
 func TestAWebhooksEventHasTheListingsChecks(t *testing.T) {
-	bad := map[string]any{"repository": map[string]any{"full_name": "acme/widgets", "html_url": "http://github.com/acme/widgets"}}
+	bad := map[string]any{"repository": repoJSON(widgetsID, "acme/widgets", "http://github.com/acme/widgets")}
 	got, _ := IssuesWebhook(event("opened", issue(1, 0), bad), "github.com", nil)
-	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "acme/widgets#1", Why: "its collection: its URL is not https or is longer than 2048 characters"}}) {
+	if len(got.Items) != 0 || !reflect.DeepEqual(got.Skipped, []Skipped{{Ref: "1296269#1", Why: "its collection: its URL is not https or is longer than 2048 characters"}}) {
 		t.Errorf("issues: %+v", got)
 	}
 	bad["comment"] = comment(5, "bob", "User", "c")
@@ -544,7 +565,7 @@ func TestARepositoriesListingOfOnePageIsComplete(t *testing.T) {
 		f := &fakeIssues{pageSize: tc.pageSize}
 		for i := range tc.n {
 			n := "repo" + strconv.Itoa(i)
-			f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
+			f.repos = append(f.repos, repoJSON(1000+i, "acme/"+n, "https://github.com/acme/"+n))
 		}
 		total := 0
 		if tc.name == "one page with a skip" {
@@ -594,7 +615,7 @@ func TestReadRepositoriesReturnsThePartsAListingSendsAndSendsNone(t *testing.T) 
 		f := &fakeIssues{pageSize: tc.pageSize}
 		for i := range tc.n {
 			n := "repo" + strconv.Itoa(i)
-			f.repos = append(f.repos, map[string]any{"full_name": "acme/" + n, "html_url": "https://github.com/acme/" + n})
+			f.repos = append(f.repos, repoJSON(1000+i, "acme/"+n, "https://github.com/acme/"+n))
 		}
 		if tc.skip {
 			f.repos[1]["html_url"] = "http://github.com/acme/repo1"
@@ -689,7 +710,7 @@ func truncatedMember(t *testing.T, v any) ([]string, bool) {
 // and two labels equal once cut are sent once. An uncut item or comment has no
 // truncated member.
 func TestACutFieldIsNamedInTruncated(t *testing.T) {
-	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	r := ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
 	long := func(n int) string { return strings.Repeat("ü", n) }
 	past := func(is *ghIssue) {
 		for i := range 101 {
@@ -736,7 +757,7 @@ func TestACutFieldIsNamedInTruncated(t *testing.T) {
 		if len(it.Labels) != tc.labels {
 			t.Errorf("item, %s: %d labels %q", tc.name, len(it.Labels), it.Labels)
 		}
-		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{it}}); bad != "" {
+		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: widgetsRef, Items: []contracts.Item{it}}); bad != "" {
 			t.Errorf("item, %s: %s", tc.name, bad)
 		}
 	}
@@ -757,7 +778,7 @@ func TestACutFieldIsNamedInTruncated(t *testing.T) {
 		if why != "" || !reflect.DeepEqual(sc.Truncated, tc.want) || ok != (tc.want != nil) || !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("comment, %s: truncated %q, member %v %q, %s", tc.name, sc.Truncated, ok, got, why)
 		}
-		if bad := check(contracts.SourceItemComments{Version: contracts.Version, ItemRef: "acme/widgets#1", Comments: []contracts.Comment{sc}}); bad != "" {
+		if bad := check(contracts.SourceItemComments{Version: contracts.Version, ItemRef: "1296269#1", Comments: []contracts.Comment{sc}}); bad != "" {
 			t.Errorf("comment, %s: %s", tc.name, bad)
 		}
 	}
@@ -814,7 +835,7 @@ func TestAWebhooksCutIsNamedInTruncated(t *testing.T) {
 // null state_reason, records no cut, and is an item the contract's schema takes; a
 // reason within the limit is sent as it is worded.
 func TestAStateReasonPastItsLimitIsDropped(t *testing.T) {
-	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	r := ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
 	was := stateReasons["duplicate"]
 	t.Cleanup(func() { stateReasons["duplicate"] = was })
 	is := ghIssue{
@@ -834,7 +855,7 @@ func TestAStateReasonPastItsLimitIsDropped(t *testing.T) {
 		if why != "" || len(cuts) != 0 || it.Truncated != nil || !reflect.DeepEqual(it.StateReason, tc.want) {
 			t.Errorf("%d characters: reason %v, cuts %+v, truncated %q, %s", len(tc.words), it.StateReason, cuts, it.Truncated, why)
 		}
-		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{it}}); bad != "" {
+		if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: widgetsRef, Items: []contracts.Item{it}}); bad != "" {
 			t.Errorf("%d characters: %s", len(tc.words), bad)
 		}
 	}
