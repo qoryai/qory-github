@@ -524,6 +524,157 @@ func TestATokenMintedAcrossAForgetIsNotKept(t *testing.T) {
 	}
 }
 
+// heldFor names the adapter's maps that hold an entry for the installation.
+func (a *Adapter) heldFor(installation int64) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var held []string
+	for key := range a.tokens {
+		if strings.HasPrefix(key, strconv.FormatInt(installation, 10)+" ") {
+			held = append(held, "tokens")
+			break
+		}
+	}
+	for k := range a.firsts {
+		if k.installation == installation {
+			held = append(held, "firsts")
+			break
+		}
+	}
+	if _, ok := a.gens[installation]; ok {
+		held = append(held, "gens")
+	}
+	if _, ok := a.firstGens[installation]; ok {
+		held = append(held, "firstGens")
+	}
+	if _, ok := a.pacers[installation]; ok {
+		held = append(held, "pacers")
+	}
+	if _, ok := a.installs[installation]; ok {
+		held = append(held, "installs")
+	}
+	return held
+}
+
+// TestAnInstallationDeletedLeavesNothingOfItInMemory has the adapter keep, for two
+// installations, a token, a first listing, a pacer and their generations, and hold the
+// other's lock, then GitHub deletes one: the adapter's maps hold nothing of it, and the
+// other's entries stay; the other's lock goes once it is given back.
+func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	Link(w.st, 9, otherConnection, linkLive)
+	for _, id := range []int64{42, 9} {
+		w.adapter.forgetTokens(id)
+		w.adapter.pacer(id)
+		w.adapter.dropFirsts(id, "")
+		w.adapter.mu.Lock()
+		if w.adapter.tokens == nil {
+			w.adapter.tokens = map[string]github.InstallationToken{}
+		}
+		w.adapter.tokens[strconv.FormatInt(id, 10)+" acme/widgets read"] = github.InstallationToken{Token: ghToken, ExpiresAt: time.Now().Add(time.Hour)}
+		if w.adapter.firsts == nil {
+			w.adapter.firsts = map[firstKey]*firstListing{}
+		}
+		w.adapter.firsts[firstKey{id, testConnection}] = &firstListing{}
+		w.adapter.mu.Unlock()
+	}
+	unlock, err := w.adapter.lockInstallation(context.Background(), 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := []string{"tokens", "firsts", "gens", "firstGens", "pacers", "installs"}
+	if held := w.adapter.heldFor(9); !slices.Equal(held, all) {
+		t.Fatalf("the other installation's entries %v, want %v", held, all)
+	}
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if s := state(w.st, guid1); s != store.Done {
+		t.Fatalf("the deletion is %s", s)
+	}
+	if held := w.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
+	}
+	if held := w.adapter.heldFor(9); !slices.Equal(held, all) {
+		t.Errorf("the other installation's entries %v, want %v", held, all)
+	}
+	unlock()
+	if held := w.adapter.heldFor(9); slices.Contains(held, "installs") {
+		t.Errorf("the other installation's lock is kept once it is given back: %v", held)
+	}
+}
+
+// TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept holds a mint of the
+// installation's listing token, and a read of a pending link's first listing, while
+// GitHub deletes the installation, with no move of the generation before, and with one
+// before and one after the deletion, which makes the generation the deletion forgot
+// again: the token is handed to the request that minted it, and the listing is sent,
+// and neither is kept.
+func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
+	deleted := map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}}
+	for _, moved := range []bool{false, true} {
+		t.Run(fmt.Sprintf("token, moved %v", moved), func(t *testing.T) {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			Link(w.st, 42, testConnection, linkLive)
+			h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
+			w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+			if moved {
+				w.adapter.forgetTokens(42)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := w.adapter.token(context.Background(), 42, github.Repository{}, "")
+				done <- err
+			}()
+			<-h.minting
+			w.deliver(t, "installation", guid1, deleted)
+			if moved {
+				w.adapter.forgetTokens(42)
+			}
+			close(h.release)
+			if err := <-done; err != nil {
+				t.Fatalf("the token minted in flight: %v", err)
+			}
+			want := []string(nil)
+			if moved {
+				want = []string{"gens"}
+			}
+			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
+				t.Errorf("the installation's entries %v, want %v", held, want)
+			}
+		})
+		t.Run(fmt.Sprintf("first listing, moved %v", moved), func(t *testing.T) {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			Link(w.st, 42, testConnection, linkPending)
+			if moved {
+				w.adapter.dropFirsts(42, "")
+			}
+			var derr error
+			w.gh.repoAfter = func(*fakeGitHub, int) {
+				// GitHub has answered the page; now GitHub deletes the installation.
+				derr = w.adapter.deleted(context.Background(), Delivery{Event: "installation", Action: "deleted", InstallationID: 42})
+				if moved {
+					w.adapter.dropFirsts(42, "")
+				}
+			}
+			// The read runs without the installation's lock, which a try of the listing
+			// holds, so the deletion lands while GitHub is read.
+			if err := w.adapter.sendFirst(context.Background(), 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()}); err != nil || derr != nil {
+				t.Fatalf("the listing: %v; the deletion: %v", err, derr)
+			}
+			if n := len(w.apiary.sent(routeCollections)); n != 1 {
+				t.Errorf("%d parts sent", n)
+			}
+			want := []string(nil)
+			if moved {
+				want = []string{"firstGens"}
+			}
+			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
+				t.Errorf("the installation's entries %v, want %v", held, want)
+			}
+		})
+	}
+}
+
 // TestDeliveriesOfAnEventWithoutAHandlerAreNotKept posts many deliveries of push and
 // pull_request, and one each of workflow_run and an event GitHub may add, which no
 // handler takes: each is answered 202, as a delivery kept is, and logged unhandled,

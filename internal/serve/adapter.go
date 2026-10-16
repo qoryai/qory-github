@@ -47,22 +47,26 @@ type Adapter struct {
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
-	// gens are the installations' token generations, which [Adapter.forgetTokens]
-	// moves on: a token minted across a move is used and not kept.
-	gens map[int64]uint64
+	// gens are the installations' token generations, see [Adapter.generation], which
+	// [Adapter.forgetTokens] moves on and [Adapter.forgetInstallation] forgets: a token
+	// minted across either is used and not kept. genSeq is the last generation given,
+	// of gens or of firstGens.
+	gens   map[int64]uint64
+	genSeq uint64
 	// turns are the collections' turns, see [Adapter.collectionTurn], by key. now is
 	// the clock a fill's start is read from; nil is time.Now.
 	turns map[string]chan struct{}
 	now   func() time.Time
-	// installs are the installations' locks, see [Adapter.lockInstallation], by id.
-	// lockWaits, when set, is called each time a lock is held by another and its taker
-	// waits.
-	installs  map[int64]chan struct{}
+	// installs are the installations' locks, see [Adapter.lockInstallation], by id,
+	// each while one holds it or waits for it. lockWaits, when set, is called each time
+	// a lock is held by another and its taker waits.
+	installs  map[int64]*installLock
 	lockWaits func(installation int64)
 	// firsts are the links' first listings kept, see [Adapter.sendFirst], in memory
 	// alone, by installation and connection. firstGens are the installations'
-	// generations of them, which [Adapter.dropFirsts] moves on: a listing read across a
-	// move is sent and not kept.
+	// generations of them, see [Adapter.generation], which [Adapter.dropFirsts] moves on
+	// and [Adapter.forgetInstallation] forgets: a listing read across either is sent and
+	// not kept.
 	firsts    map[firstKey]*firstListing
 	firstGens map[int64]uint64
 
@@ -126,7 +130,8 @@ func deliveryArgs(d Delivery) []any {
 	return args
 }
 
-// pacer is the installation's Pacer, one for everything that reaches GitHub for it.
+// pacer is the installation's Pacer, one for everything that reaches GitHub for it
+// until GitHub deletes the installation, see [Adapter.forgetInstallation].
 func (a *Adapter) pacer(installation int64) *github.Pacer {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -149,7 +154,7 @@ func (a *Adapter) token(ctx context.Context, installation int64, repo github.Rep
 	key := strconv.FormatInt(installation, 10) + " " + strings.ToLower(repo.String()) + " " + permission
 	a.mu.Lock()
 	t, ok := a.tokens[key]
-	gen := a.gens[installation]
+	gen := a.generation(&a.gens, installation)
 	a.mu.Unlock()
 	if ok && time.Until(t.ExpiresAt) > tokenMargin {
 		return t.Token, nil
@@ -190,15 +195,36 @@ func (a *Adapter) forgetTokens(installation int64) {
 	prefix := strconv.FormatInt(installation, 10) + " "
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.gens == nil {
-		a.gens = map[int64]uint64{}
-	}
-	a.gens[installation]++
+	a.moveGeneration(&a.gens, installation)
 	for key := range a.tokens {
 		if strings.HasPrefix(key, prefix) {
 			delete(a.tokens, key)
 		}
 	}
+}
+
+// generation is the installation's generation in gens, for a caller that holds mu: the
+// one gens has, or else a new one. Each generation given, a move's among them, is
+// genSeq moved on, which never goes back, so none is given twice and none is 0: a read
+// that keeps what it read only while the generation it began with stands keeps nothing
+// read across a move, nor across [Adapter.forgetInstallation], after which gens has
+// none for the installation, or a newer one.
+func (a *Adapter) generation(gens *map[int64]uint64, installation int64) uint64 {
+	if g, ok := (*gens)[installation]; ok {
+		return g
+	}
+	a.moveGeneration(gens, installation)
+	return a.genSeq
+}
+
+// moveGeneration gives the installation a new generation in gens, see
+// [Adapter.generation], for a caller that holds mu.
+func (a *Adapter) moveGeneration(gens *map[int64]uint64, installation int64) {
+	if *gens == nil {
+		*gens = map[int64]uint64{}
+	}
+	a.genSeq++
+	(*gens)[installation] = a.genSeq
 }
 
 // String says the adapter's App and how many tokens it keeps, never a token or the
@@ -292,32 +318,59 @@ func (a *Adapter) listRepositories(ctx context.Context, installation int64) erro
 // hold it, and so does a connect from its first read of the link to its write, see
 // [Connect.link], so no answer to a listing lands between a connect's read and its
 // write. It is held across requests to GitHub and Qory Apiary, one installation's
-// alone.
+// alone. The lock is forgotten once nobody holds it or waits for it, see
+// [installLock], so an installation GitHub deleted keeps none.
 func (a *Adapter) lockInstallation(ctx context.Context, installation int64) (func(), error) {
 	a.mu.Lock()
 	if a.installs == nil {
-		a.installs = map[int64]chan struct{}{}
+		a.installs = map[int64]*installLock{}
 	}
 	lock, ok := a.installs[installation]
 	if !ok {
-		lock = make(chan struct{}, 1)
+		lock = &installLock{ch: make(chan struct{}, 1)}
 		a.installs[installation] = lock
 	}
+	lock.users++
 	waits := a.lockWaits
 	a.mu.Unlock()
+	unlock := func() {
+		<-lock.ch
+		a.leaveLock(installation, lock)
+	}
 	select {
-	case lock <- struct{}{}:
-		return func() { <-lock }, nil
+	case lock.ch <- struct{}{}:
+		return unlock, nil
 	default:
 	}
 	if waits != nil {
 		waits(installation)
 	}
 	select {
-	case lock <- struct{}{}:
-		return func() { <-lock }, nil
+	case lock.ch <- struct{}{}:
+		return unlock, nil
 	case <-ctx.Done():
+		a.leaveLock(installation, lock)
 		return nil, ctx.Err()
+	}
+}
+
+// installLock is an installation's lock: ch holds one value while one holds the lock,
+// and users counts its holder and its takers waiting, under mu. The lock stays in
+// installs while users is above 0 and goes when it falls to 0, so every taker of the
+// installation's lock takes one lock, and no two hold it at once.
+type installLock struct {
+	ch    chan struct{}
+	users int
+}
+
+// leaveLock counts off a holder of the installation's lock who gave it back, or a taker
+// who stopped waiting, and forgets the lock once it has no holder and no taker waiting.
+func (a *Adapter) leaveLock(installation int64, lock *installLock) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lock.users--
+	if lock.users == 0 {
+		delete(a.installs, installation)
 	}
 }
 
@@ -521,7 +574,7 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 			return a.listLocked(ctx, installation, l.Connection)
 		}
 		a.mu.Lock()
-		gen := a.firstGens[installation]
+		gen := a.generation(&a.firstGens, installation)
 		a.mu.Unlock()
 		parts, err := a.lister(installation, l.Connection).ReadRepositories(ctx)
 		if err != nil {
@@ -573,20 +626,33 @@ func (a *Adapter) forgetEnded(ended func(connection string)) func(connection str
 func (a *Adapter) dropFirsts(installation int64, connection string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.firstGens == nil {
-		a.firstGens = map[int64]uint64{}
-	}
 	if installation != 0 {
-		a.firstGens[installation]++
+		a.moveGeneration(&a.firstGens, installation)
 	}
 	for k := range a.firsts {
 		if (installation == 0 || k.installation == installation) && (connection == "" || k.connection == connection) {
 			delete(a.firsts, k)
 			if k.installation != installation {
-				a.firstGens[k.installation]++
+				a.moveGeneration(&a.firstGens, k.installation)
 			}
 		}
 	}
+}
+
+// forgetInstallation forgets what the adapter keeps in memory for the installation,
+// for [Adapter.deleted]: its tokens, its first listings kept, its pacer and its
+// generations, so a token minted or a first listing read across it is used, or sent,
+// and not kept, see [Adapter.generation]. Its lock goes once nobody holds it or waits
+// for it, see [installLock]. A request for the installation after it makes what it
+// needs again.
+func (a *Adapter) forgetInstallation(installation int64) {
+	a.forgetTokens(installation)
+	a.dropFirsts(installation, "")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.gens, installation)
+	delete(a.firstGens, installation)
+	delete(a.pacers, installation)
 }
 
 // connectionSink is a sink that ends a connection, as [Apiary.DisconnectConnection]
@@ -598,9 +664,10 @@ type connectionSink interface {
 // deleted handles the installation event's deleted, for any installation, linked or
 // not, holding the installation's lock, so no connect's link lands between its read
 // and its drop, see [Connect.link]: it keeps that GitHub deleted the installation, see
-// [keepDeleted], which a connect checks before it links, forgets the record of
-// [keepUnlinked] and the installation's first listings kept, see [Adapter.sendFirst],
-// and, for a linked installation, ends its connection, see [Adapter.endConnection], then
+// [keepDeleted], which a connect checks before it links, forgets what the adapter keeps
+// in memory for the installation, see [Adapter.forgetInstallation], its first listings
+// kept, see [Adapter.sendFirst], among them, and the record of [keepUnlinked], and, for
+// a linked installation, ends its connection, see [Adapter.endConnection], then
 // drops what the store keeps of the installation.
 func (a *Adapter) deleted(ctx context.Context, d Delivery) error {
 	unlock, err := a.lockInstallation(ctx, d.InstallationID)
@@ -611,7 +678,7 @@ func (a *Adapter) deleted(ctx context.Context, d Delivery) error {
 	if err := keepDeleted(a.Store, d.InstallationID); err != nil {
 		return err
 	}
-	a.dropFirsts(d.InstallationID, "")
+	a.forgetInstallation(d.InstallationID)
 	if err := dropUnlinked(a.Store, d.InstallationID); err != nil {
 		return err
 	}
