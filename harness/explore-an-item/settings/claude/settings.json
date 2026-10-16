@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Skill(harness:explore-an-item)",
       "Read(//**/in/inputs.json)",
       "WebSearch",
       "WebFetch",
