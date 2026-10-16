@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,6 +45,9 @@ type connectRig struct {
 	// budget is how much of the waits pass at once; a wait past it holds until its
 	// context is done, as time that has not passed yet.
 	budget time.Duration
+	// clock, when set, is the adapter's and the Connect's clock, which each wait that
+	// passes moves on.
+	clock *pullClock
 }
 
 func newConnectRig(t *testing.T) *connectRig {
@@ -73,7 +77,7 @@ func (rig *connectRig) connect(st *store.Store) *Connect {
 			for _, w := range rig.waits {
 				sum += w
 			}
-			budget := rig.budget
+			budget, clock := rig.budget, rig.clock
 			rig.mu.Unlock()
 			if budget == 0 {
 				budget = 2 * time.Minute
@@ -81,6 +85,9 @@ func (rig *connectRig) connect(st *store.Store) *Connect {
 			if sum > budget {
 				<-ctx.Done()
 				return ctx.Err()
+			}
+			if clock != nil {
+				return clock.sleep(ctx, d)
 			}
 			return nil
 		},
@@ -1289,7 +1296,7 @@ func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 	}
 	rig.c.stop()
 	rig.c.refill(42)
-	rig.c.listSoon(42, testConnection, true, time.Now().Add(returnFor))
+	rig.c.listSoon(42, testConnection, true)
 	rig.c.fillMu.Lock()
 	n = len(rig.c.refilling)
 	rig.c.fillMu.Unlock()
@@ -1485,9 +1492,7 @@ func TestTwoPassesForOneConnectionLinkOneInstallation(t *testing.T) {
 // for the connection it is linked to, pending, at Qory Apiary, while a connect for
 // another connection reaches its link: the connect waits for the listing, whose 204
 // makes the link live, and goes back refused, grant_taken; the installation is never
-// linked to the new connection while Qory Apiary took the other's listing. Then, once
-// a connect has replaced a pending link, a listing for the replaced connection sends
-// nothing.
+// linked to the new connection while Qory Apiary took the other's listing.
 func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 	rig := newConnectRig(t)
 	Link(rig.st, 42, otherConnection, linkPending)
@@ -1572,7 +1577,7 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 			n++
 			var req contracts.SourceCollections
 			json.Unmarshal(s.raw, &req)
-			if len(req.Collections) != 0 || !req.Listing.Complete || req.Listing.Part != 1 {
+			if !strings.Contains(string(s.raw), `"collections":[]`) || len(req.Collections) != 0 || !req.Listing.Complete || req.Listing.Part != 1 {
 				t.Errorf("a listing of the replaced connection names collections: %s", s.raw)
 			}
 		}
@@ -1583,7 +1588,7 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 	before := len(rig.apiary.sent(routeCollections))
 	// A first listing's tries still running for the replaced connection.
 	rig.c = rig.connect(rig.st)
-	rig.c.listSoon(42, otherConnection, false, time.Now().Add(returnFor))
+	rig.c.listSoon(42, otherConnection, false)
 	eventually(t, "the first listing's tries", func() bool {
 		n := 0
 		for _, s := range rig.apiary.sent(routeCollections)[before:] {
@@ -1604,9 +1609,11 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 		t.Error("a 403 before the last listing forgot the replaced connection")
 	}
 	rig.linked(t, 42, testConnection, linkPending)
-	// The last listing: a 403 forgets it.
+	// The last listing, once the adapter's clock is past the replaced link's return
+	// and returnSkew more: a 403 forgets it.
 	before = len(rig.apiary.sent(routeCollections))
-	if err := rig.adapter.listFor(context.Background(), 42, otherConnection, true); err != nil {
+	rig.adapter.now = func() time.Time { return time.Now().Add(returnFor + returnSkew + time.Second) }
+	if err := rig.adapter.listFor(context.Background(), 42, otherConnection); err != nil {
 		t.Errorf("err %v", err)
 	}
 	if n := empty(t, rig, before); n != 1 {
@@ -1884,11 +1891,11 @@ func TestAWaitForTheInstallationsLockPastTheDeadlineGoesBack(t *testing.T) {
 	}
 }
 
-// TestAFirstListingEndsWithTheLastListing lists a pending link whose connect return
-// expired now: the tries wait 8 seconds, doubling, up to 64, and the last wait ends at
-// the expiry and returnSkew more, where the last listing is sent. Its 403
-// connection_unknown drops the link; a 500 keeps it, and its tries go on, the waits
-// doubling up to an hour.
+// TestAFirstListingEndsWithTheLastListing lists, on a clock each wait moves on, a
+// pending link whose connect return expired now: the tries wait 8 seconds, doubling,
+// up to 64, and the last wait ends at the expiry and returnSkew more, where the last
+// listing is sent. Its 403 connection_unknown drops the link; a 500 keeps it, and its
+// tries go on, the waits doubling up to an hour.
 func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 	before := []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second, 64 * time.Second, 64 * time.Second}
 	for _, status := range []int{403, 500} {
@@ -1900,9 +1907,10 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 			}
 			return 500, `{"error":"internal"}`
 		}
-		expires := time.Now()
-		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: expires.Unix()})
-		rig.c.listSoon(42, testConnection, false, expires)
+		rig.clock = &pullClock{t: time.Now().Truncate(time.Second)}
+		rig.adapter.now, rig.c.now = rig.clock.now, rig.clock.now
+		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Unix()})
+		rig.c.listSoon(42, testConnection, false)
 		sum := func() (s time.Duration) {
 			rig.mu.Lock()
 			defer rig.mu.Unlock()
@@ -1925,13 +1933,12 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 		if len(waits) < 7 || !slices.Equal(waits[:6], before) {
 			t.Fatalf("%d: waited %v", status, waits)
 		}
-		// The seventh wait ends at the expiry and returnSkew more, to within the second
-		// the test took to begin.
+		// The seventh wait ends at the expiry and returnSkew more.
 		var upTo time.Duration
 		for _, w := range waits[:7] {
 			upTo += w
 		}
-		if upTo < returnSkew-5*time.Second || upTo > returnSkew {
+		if upTo != returnSkew {
 			t.Errorf("%d: the last listing after %v", status, upTo)
 		}
 		if status == 403 {
@@ -1949,10 +1956,9 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 }
 
 // TestAPassOneSecondPastFifteenMinutesAheadIsRefused brings, on a clock at a whole
-// second, a pass that expires 15 minutes and one second ahead, as Qory Apiary issues
-// one a second after the connection's previous pass after quick presses: it goes back
-// refused, pass_expired, and its nonce is not kept; one that expires 15 minutes ahead
-// is accepted.
+// second, a pass that expires 15 minutes and one second ahead, which Qory Apiary never
+// issues, as from a clock behind its own: it goes back refused, pass_expired, and its
+// nonce is not kept; one that expires 15 minutes ahead is accepted.
 func TestAPassOneSecondPastFifteenMinutesAheadIsRefused(t *testing.T) {
 	rig := newConnectRig(t)
 	now := time.Now().Truncate(time.Second)
@@ -2190,7 +2196,7 @@ func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
 	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
-	rig.c.listSoon(42, testConnection, false, time.Now().Add(returnFor))
+	rig.c.listSoon(42, testConnection, false)
 	eventually(t, "three waits", func() bool { rig.mu.Lock(); defer rig.mu.Unlock(); return len(rig.waits) >= 3 })
 	rig.c.stop()
 	rig.mu.Lock()
@@ -2203,4 +2209,222 @@ func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
 	if !strings.Contains(rig.log.String(), `"msg":"Qory Apiary answered a listing 403 forbidden, so it is sent again later","connection":"`+testConnection+`","installation":42`) {
 		t.Errorf("the log %s", rig.log.String())
 	}
+}
+
+// TestAConnectionLinkedAgainIsNotListedAsReplaced has a connect replace the installation
+// 42's pending link to C, then a newer pass for C link octo-org's 9, and C made: C's
+// record as replaced is forgotten as C is linked again, so no listing of C, the first
+// listing's tries for 42 or the round's among them, empties it or ends it. And a
+// record found stale, naming a connection an installation's link names, is forgotten,
+// and nothing is sent.
+func TestAConnectionLinkedAgainIsNotListedAsReplaced(t *testing.T) {
+	for _, order := range []string{"42 then 9", "9 then 42"} {
+		first, again := "42", "9"
+		if order == "9 then 42" {
+			first, again = "9", "42"
+		}
+		rig := newConnectRig(t)
+		var made atomic.Bool
+		twoOrgs(rig, &made)
+		now := time.Now().Truncate(time.Second)
+		if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(otherConnection, now.Add(5*time.Minute)), first), otherConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
+		}
+		if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, now.Add(5*time.Minute)), first), testConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
+		}
+		if _, ok, _ := replacedOf(rig.st, otherConnection); !ok {
+			t.Fatalf("%s: C is not kept as replaced", order)
+		}
+		// No listing runs from here on, so the link itself forgets the record.
+		rig.c.stop()
+		if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(otherConnection, now.Add(10*time.Minute)), again), otherConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
+		}
+		if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+			t.Errorf("%s: C linked again is kept as replaced", order)
+		}
+		made.Store(true)
+		id, _ := strconv.ParseInt(first, 10, 64)
+		before := len(rig.apiary.sent(routeCollections))
+		if err := rig.adapter.listFor(context.Background(), id, otherConnection); err != nil {
+			t.Errorf("%s: err %v", order, err)
+		}
+		if n := len(rig.apiary.sent(routeCollections)); n != before {
+			t.Errorf("%s: %d listings of C for %s", order, n-before, first)
+		}
+		if sent := rig.apiary.sent(routeConnectionsDisconnect); len(sent) != 0 {
+			t.Errorf("%s: C, linked again, was disconnected: %v", order, sent)
+		}
+		rig.linked(t, id, testConnection, linkPending)
+	}
+
+	// A stale record, naming the connection the installation is linked to again: the
+	// round lists the link, never the replaced connection, forgets the record, and the
+	// link stays.
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	now := time.Now()
+	putLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Pass: now.Add(10 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
+	keepReplaced(rig.st, 42, link{Connection: otherConnection, Return: now.Add(-returnFor - returnSkew - time.Minute).Unix()})
+	p := &puller{adapter: rig.adapter, store: rig.st, log: rig.adapter.Log, sleep: func(context.Context, time.Duration) error { return nil }, jitter: func(time.Duration) time.Duration { return 0 }}
+	p.listReplaced(context.Background())
+	p.rounds.Wait()
+	rig.linked(t, 42, otherConnection, linkPending)
+	if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+		t.Error("the stale record is kept")
+	}
+	if sent := rig.apiary.sent(routeConnectionsDisconnect); len(sent) != 0 {
+		t.Errorf("disconnects %v", sent)
+	}
+	// And listed for an installation that is not the link's, a stale record is
+	// forgotten, and nothing is sent.
+	keepReplaced(rig.st, 9, link{Connection: otherConnection, Return: now.Add(-returnFor - returnSkew - time.Minute).Unix()})
+	before := len(rig.apiary.sent(routeCollections))
+	if err := rig.adapter.listFor(context.Background(), 9, otherConnection); err != nil {
+		t.Errorf("err %v", err)
+	}
+	if n := len(rig.apiary.sent(routeCollections)); n != before {
+		t.Errorf("%d listings", n-before)
+	}
+	if _, ok, _ := replacedOf(rig.st, otherConnection); ok {
+		t.Error("the stale record is kept")
+	}
+}
+
+// TestTheLastListingsMomentIsTheLinks starts a first listing of a pending link whose
+// return expires later, then has a re-connect move it later still: the tries never
+// reach the last listing before the moment the link keeps, so the link stays pending;
+// and the moment the tries wait for follows the link.
+func TestTheLastListingsMomentIsTheLinks(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	rig.clock = &pullClock{t: time.Now().Truncate(time.Second)}
+	rig.adapter.now, rig.c.now = rig.clock.now, rig.clock.now
+	rig.budget = 3 * time.Minute
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Unix()})
+	// A re-connect moves the return's expiry ten minutes on before the tries begin.
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Add(10 * time.Minute).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	eventually(t, "the waits past the budget", func() bool {
+		rig.mu.Lock()
+		defer rig.mu.Unlock()
+		var s time.Duration
+		for _, w := range rig.waits {
+			s += w
+		}
+		return s > rig.budget
+	})
+	rig.c.stop()
+	rig.linked(t, 42, testConnection, linkPending)
+	if strings.Contains(rig.log.String(), "not made in time") {
+		t.Errorf("the log %s", rig.log.String())
+	}
+}
+
+// TestA409ConnectionEndedToAFirstListingDropsTheLink has Qory Apiary answer a pending
+// link's first listing 409 connection_ended: the link is dropped at once, with no wait
+// and no other try; the parts sent are the one listing's.
+func TestA409ConnectionEndedToAFirstListingDropsTheLink(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"connection_ended"}` }
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
+	rig.c.stop()
+	rig.mu.Lock()
+	defer rig.mu.Unlock()
+	ids := map[any]bool{}
+	for _, s := range rig.apiary.sent(routeCollections) {
+		ids[s.body["listing"].(map[string]any)["id"]] = true
+	}
+	if len(rig.waits) != 0 || len(ids) != 1 {
+		t.Errorf("waited %v, %d listings", rig.waits, len(ids))
+	}
+}
+
+// TestTheNewestPassOutlivesTheOlderSession runs, on one clock for the store and the
+// Connect, a connect of octo-org's 9 under a newer pass while a session under an older
+// pass for the same connection waits; then GitHub deletes 9, serve restarts, and the
+// clock moves to just before the older session ends: the older pass still gets
+// refuseOlder, and acme's 42 never goes live under the connection. A record kept too
+// short a time, or not kept in the store, fails it.
+func TestTheNewestPassOutlivesTheOlderSession(t *testing.T) {
+	for _, later := range []time.Duration{2 * time.Minute, sessionFor - 10*time.Second} {
+		rig := newConnectRig(t)
+		rig.c.stop()
+		clock := &pullClock{t: time.Now().Truncate(time.Second)}
+		dir := filepath.Join(t.TempDir(), "s")
+		open := func() *store.Store {
+			st, err := store.Open(dir, store.Options{Now: clock.now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rig.st = st
+			rig.c = rig.connect(st)
+			rig.c.now = clock.now
+			rig.adapter.now = clock.now
+			rig.h = rig.c.Route(rig.mux)
+			return st
+		}
+		st := open()
+		var made atomic.Bool
+		twoOrgs(rig, &made)
+		t0 := clock.now()
+		victim := rig.browser(t)
+		victim.signIn(rig.passAt(testConnection, t0.Add(time.Second)))
+		if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, t0.Add(2*time.Second)), "9"), testConnection); r.Outcome != outcomeLinked {
+			t.Fatalf("%+v", r)
+		}
+		if err := rig.adapter.deleted(context.Background(), Delivery{Event: "installation", Action: "deleted", InstallationID: 9}); err != nil {
+			t.Fatal(err)
+		}
+		rig.c.stop()
+		st.Close()
+		clock.sleep(context.Background(), later)
+		st = open()
+		victim.h = rig.h
+		refused(t, victim.finish("installation_id=42&setup_action=install"), refuseOlder)
+		made.Store(true)
+		rig.c.stop()
+		rig.adapter.listRepositories(context.Background(), 42)
+		rig.linked(t, 42, "", "")
+		st.Close()
+	}
+}
+
+// TestNoValueInTheAddressChoosesThePage brings /v1/connect/refused with no page cookie
+// and a query that names another page: the page is the default, never the one the
+// query names.
+func TestNoValueInTheAddressChoosesThePage(t *testing.T) {
+	rig := newConnectRig(t)
+	rec := rig.browser(t).get("/v1/connect/refused?" + pageCookie + "=used&page=used&name=used")
+	if strings.Contains(rec.Body.String(), refuseUsed.page) || (rec.Body.String() != refusePass.page+"\n" && rec.Body.String() != refuseQuery.page+"\n") {
+		t.Errorf("%d %q", rec.Code, rec.Body)
+	}
+}
+
+// TestTheSetupURLMakesANewState checks each step's state is new: the install's, after
+// the first sign-in, is not the first sign-in's, and the second sign-in's, after the
+// Setup URL, is neither; the install's state brought to the callback is refused.
+func TestTheSetupURLMakesANewState(t *testing.T) {
+	rig := newConnectRig(t)
+	b := rig.browser(t)
+	first := b.start(rig.pass())
+	rec := b.get("/v1/connect/authorized?code=" + signInCode + "&state=" + first)
+	m := regexp.MustCompile(`state=([A-Za-z0-9_-]{43})`).FindStringSubmatch(rec.Header().Get("Location") + rec.Body.String())
+	if m == nil {
+		t.Fatalf("no install state: %v %s", rec.Header(), rec.Body)
+	}
+	install := m[1]
+	rec = b.get("/v1/connect/return?installation_id=42&setup_action=install&state=" + install)
+	u, _ := url.Parse(rec.Header().Get("Location"))
+	second := u.Query().Get("state")
+	if second == "" || second == install || second == first || install == first {
+		t.Errorf("the states %q %q %q", first, install, second)
+	}
+	if r := rig.backTo(t, b.get("/v1/connect/authorized?code="+signInCode+"&state="+install), testConnection); r.Outcome != outcomeRefused || r.Reason != reasonGrantNotConfirmed {
+		t.Errorf("%+v", r)
+	}
+	rig.linked(t, 42, "", "")
 }

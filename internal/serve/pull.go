@@ -199,6 +199,9 @@ type puller struct {
 	mu     sync.Mutex
 	busy   map[int64]bool
 	rounds sync.WaitGroup
+	// replacing is the replaced connections whose listing a round has under way, see
+	// [puller.listReplaced]; mu guards it.
+	replacing map[string]bool
 
 	once  sync.Once
 	fails *throttle
@@ -378,7 +381,9 @@ func (p *puller) round(ctx context.Context, start time.Time, interval time.Durat
 
 // listReplaced sends, without waiting for it, the last listing of each connection a
 // connect replaced whose moment has come, see [Adapter.listReplaced], which [Connect]
-// sends too, unless serve stopped meanwhile: so a restart settles it as well.
+// sends too, unless serve stopped meanwhile: so a restart settles it as well. One
+// listing of a connection is under way at a time: a round that finds one under way
+// leaves it.
 func (p *puller) listReplaced(ctx context.Context) {
 	var connections []string
 	if err := p.store.Each(nsReplaced, func(key string, _ []byte) error {
@@ -393,10 +398,25 @@ func (p *puller) listReplaced(ctx context.Context) {
 		if err != nil || !ok || p.clock().Before(time.Unix(r.Return, 0).Add(returnSkew)) {
 			continue
 		}
+		p.mu.Lock()
+		if p.replacing[connection] {
+			p.mu.Unlock()
+			continue
+		}
+		if p.replacing == nil {
+			p.replacing = map[string]bool{}
+		}
+		p.replacing[connection] = true
+		p.mu.Unlock()
 		p.rounds.Add(1)
 		go func() {
 			defer p.rounds.Done()
-			if err := p.adapter.listFor(ctx, r.Installation, connection, true); err != nil {
+			defer func() {
+				p.mu.Lock()
+				delete(p.replacing, connection)
+				p.mu.Unlock()
+			}()
+			if err := p.adapter.listFor(ctx, r.Installation, connection); err != nil {
 				p.report(ctx, slog.String("connection", connection), "listing a replaced connection", err)
 			}
 		}()

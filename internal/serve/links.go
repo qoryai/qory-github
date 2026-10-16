@@ -58,7 +58,8 @@ const (
 
 // The states of an installation's link: pending from the linked connect return, and live
 // once Qory Apiary answers a listing that names the connection with a signed 204, which
-// it does once the connection is made.
+// it does once the connection is made. A connection may end while it is pending, and a
+// 409 connection_ended to any listing drops the link.
 const (
 	linkPending = "pending"
 	linkLive    = "live"
@@ -231,7 +232,8 @@ func lasting(code string) bool { return code == codeConnectionUnknown }
 
 // noteAnswer notes Qory Apiary's signed answer, status and refusal code, at at, to a
 // request for connection, and says whether the connection is to be taken as ended, as
-// on 409 connection_ended: a 2xx forgets the connection's first 403; a 403 that
+// on 409 connection_ended: a 2xx, or a 409 connection_suspended, which Qory Apiary
+// answers only for a connection it holds, forgets the connection's first 403; a 403 that
 // [lasting] counts, for a connection an installation is linked to live, is kept as the
 // first, unless one is kept already, and then ends the connection once [forbiddenFor]
 // has passed since it. A pending link is never ended by 403s: Qory Apiary answers its
@@ -239,7 +241,8 @@ func lasting(code string) bool { return code == codeConnectionUnknown }
 func noteAnswer(st *store.Store, connection string, status int, code string, at time.Time) (bool, error) {
 	forbiddenMu.Lock()
 	defer forbiddenMu.Unlock()
-	if status >= 200 && status < 300 {
+	// A 2xx, or a 409 connection_suspended, says Qory Apiary holds the connection.
+	if (status >= 200 && status < 300) || (status == http.StatusConflict && code == codeConnectionSuspended) {
 		return false, forgetForbidden(st, connection)
 	}
 	if status != http.StatusForbidden || !lasting(code) {

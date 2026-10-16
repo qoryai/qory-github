@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1790,6 +1791,20 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	if !note(403, codeConnectionUnknown, 2*forbiddenFor+time.Hour) {
 		t.Error("403s for a day after the 2xx do not end the connection")
 	}
+	// A 409 connection_suspended starts the day again too: Qory Apiary holds the
+	// connection.
+	st4 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	Link(st4, 42, testConnection, linkLive)
+	for i, a := range []struct {
+		status int
+		code   string
+		d      time.Duration
+		end    bool
+	}{{403, codeConnectionUnknown, 0, false}, {409, codeConnectionSuspended, forbiddenFor - time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor + time.Hour, false}, {403, codeConnectionUnknown, 2*forbiddenFor + time.Hour, true}} {
+		if end, err := noteAnswer(st4, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
+			t.Errorf("after a 409 connection_suspended, answer %d: %v, %v", i, end, err)
+		}
+	}
 	// Another code never counts.
 	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
 	Link(st2, 42, testConnection, linkLive)
@@ -1871,7 +1886,7 @@ func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 		if tc.unsigned {
 			w.apiary.signer = newKey(t)
 		}
-		err := w.adapter.listFor(context.Background(), 42, testConnection, false)
+		err := w.adapter.listFor(context.Background(), 42, testConnection)
 		l, ok, _ := linkOf(w.st, 42)
 		if got := map[bool]string{true: l.State}[ok]; got != tc.want {
 			t.Errorf("%s: the link %q, err %v", name, got, err)
@@ -1901,7 +1916,7 @@ func TestAReplacedConnectionAnsweredSuspendedIsEnded(t *testing.T) {
 		}
 		return 0, ""
 	}
-	if err := w.adapter.listFor(context.Background(), 42, otherConnection, false); err != nil {
+	if err := w.adapter.listFor(context.Background(), 42, otherConnection); err != nil {
 		t.Errorf("err %v", err)
 	}
 	if sent := w.apiary.sent(routeConnectionsDisconnect); len(sent) != 1 || sent[0].body["connection_id"] != otherConnection {
@@ -1918,10 +1933,10 @@ func TestAReplacedConnectionAnsweredSuspendedIsEnded(t *testing.T) {
 	}
 }
 
-// TestTheContractsRefusalFixturesAreRead has Qory Apiary answer a listing with each of
-// the contract's refusal fixtures that serve reads, signed, and checks serve reads its
-// status and code. A fixture the contract's revision does not hold is skipped:
-// connection-unknown.json came after 6f182ad.
+// TestTheContractsRefusalFixturesAreRead has Qory Apiary answer an items request with
+// each of the contract's refusal fixtures that serve reads, signed, and checks serve
+// reads its status and code. A fixture the contract's revision does not hold is
+// skipped: connection-unknown.json came after 6f182ad.
 func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status int
@@ -1947,5 +1962,79 @@ func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
 				t.Errorf("err %v", err)
 			}
 		})
+	}
+}
+
+// TestAnUnsigned403KeepsNothing has Qory Apiary answer a request for a live connection
+// 403 connection_unknown under a key the pin does not list: serve acts on no unsigned
+// answer, so no first 403 is kept.
+func TestAnUnsigned403KeepsNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	w.apiary.signer = newKey(t)
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	if err := w.adapter.listRepositories(context.Background(), 42); err == nil {
+		t.Error("an unsigned 403 passed")
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("an unsigned 403 is kept as the first")
+	}
+}
+
+// TestTheRoundSettlesAReplacedConnection runs a round, as after a restart, with a
+// connection a connect replaced on the installation 42 whose last listing is due: the
+// round sends that listing, empty, and its 403 connection_unknown forgets the
+// connection.
+func TestTheRoundSettlesAReplacedConnection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	clock := &pullClock{t: time.Now()}
+	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}
+	p.round(context.Background(), clock.now(), time.Hour)
+	p.rounds.Wait()
+	n := 0
+	for _, s := range w.apiary.sent(routeCollections) {
+		if s.body["connection_id"] == otherConnection {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d listings of the replaced connection", n)
+	}
+	if _, ok, _ := replacedOf(w.st, otherConnection); ok {
+		t.Error("the replaced connection is kept")
+	}
+}
+
+// TestOneListingOfAReplacedConnectionAtATime has two rounds find the same replaced
+// connection due while the first round's listing of it waits for the installation's
+// lock: the second round leaves it, and one listing is sent.
+func TestOneListingOfAReplacedConnectionAtATime(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	unlock, err := w.adapter.lockInstallation(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waits atomic.Int32
+	w.adapter.lockWaits = func(int64) { waits.Add(1) }
+	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log}
+	p.listReplaced(context.Background())
+	eventually(t, "the first listing waits", func() bool { return waits.Load() == 1 })
+	p.listReplaced(context.Background())
+	unlock()
+	p.rounds.Wait()
+	n := 0
+	for _, s := range w.apiary.sent(routeCollections) {
+		if s.body["connection_id"] == otherConnection {
+			n++
+		}
+	}
+	if n != 1 || waits.Load() != 1 {
+		t.Errorf("%d listings, %d waits", n, waits.Load())
 	}
 }

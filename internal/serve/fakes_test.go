@@ -185,6 +185,9 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.t.Errorf("%s: the time is %q", r.URL.Path, tm)
 		}
 		checkBody(f.t, r.URL.Path, b)
+		if r.URL.Path == routeCollections && !strings.Contains(string(b), `"collections":[`) {
+			f.t.Errorf("%s: the collections are not an array: %s", r.URL.Path, b)
+		}
 	} else if req.Timestamp == "" {
 		f.t.Errorf("%s: a GET without X-Qory-Timestamp", r.URL.Path)
 	}

@@ -29,9 +29,9 @@ import (
 
 // Connect is how a person links an installation of the App to a connection in Qory
 // Apiary. An owner or administrator presses "Install the GitHub App" in Qory Apiary,
-// which makes a connection, pending until the person comes back, and sends the browser
-// to serve's connect page with a connect pass, which Qory Apiary signed and which names
-// the connection. Then:
+// which makes a connection, pending until the person comes back, unless it ends first,
+// and sends the browser to serve's connect page with a connect pass, which Qory Apiary
+// signed and which names the connection. Then:
 //
 //  1. GET <public_url>/v1/connect?state=<pass> checks the pass, see
 //     [Connect.checkPass]: its expiry first, then its nonce, which it keeps until the
@@ -78,12 +78,12 @@ import (
 // An installation is linked to one connection at a time, and a connection holds one
 // installation, pending from the linked connect return, live once Qory Apiary takes a
 // listing that names the connection, see [Connect.link]. A session lives in the store
-// under the SHA-256 of a random id, which a cookie for /v1/connect alone carries, for
-// 15 minutes at most, see [sessionFor]. It ends with each connect return, and with each refusal that
-// ends it once it is read; a refusal of the method, of the query's size or of its form
-// comes before the session is read, so it keeps the session. Every redirect's target is
-// built from the settings and the session, never from what the request carries, and a
-// page says nothing the request carries.
+// under the SHA-256 of a random id, which a cookie for /v1/connect alone carries, for 15
+// minutes at most, see [sessionFor]. It ends with each connect return, and with each
+// refusal that ends it once it is read; a refusal of the method, of the query's size or
+// of its form comes before the session is read, so it keeps the session. Every
+// redirect's target is built from the settings and the session, never from what the
+// request carries, and a page says nothing the request carries.
 //
 // The pages count no requests by address: behind the operator's TLS proxy every request
 // comes from the proxy's address, so such a count would bound every person at once.
@@ -166,7 +166,7 @@ const (
 	// it took too long.
 	sessionFor = 900 * time.Second
 	// passAhead is how far ahead of serve's clock a pass's expiry may be: Qory Apiary
-	// makes a pass that expires 15 minutes after it is made.
+	// makes a pass that expires at most 15 minutes after it is made.
 	passAhead = 15 * time.Minute
 	// returnFor is how long a connect return lives at most.
 	returnFor = 300 * time.Second
@@ -221,9 +221,10 @@ type refusal struct {
 }
 
 // The pages that refuse, by what went wrong: a request that is not one; a pass that is
-// forged or malformed, taken already, or another adapter's; a store that fails; no
-// session; or a connection that holds another installation. Each says one sentence,
-// and nothing the request carries.
+// forged or malformed, taken already, or another adapter's; a store that fails, or a
+// connect return that fails to be made; no session; a connection that holds another
+// installation; or a pass no newer than one a linked return was made under,
+// refuseOlder. Each says one sentence, and nothing the request carries.
 var (
 	refuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers GET requests alone.", why: "the request is not GET"}
 	refuseQuery     = refusal{status: http.StatusBadRequest, page: `This link is not one this server reads. Press "Install the GitHub App" in Qory Apiary again.`, why: "the query is too long, or not one this server reads", name: "query"}
@@ -775,7 +776,7 @@ func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		c.failed(w, r, id, "making the connect return", err)
 		return
 	}
-	c.listSoon(installation, s.Connection, again, expires)
+	c.listSoon(installation, s.Connection, again)
 	c.end(w, id)
 	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again))...)
 	c.toApiary(w, s.Connection, ret)
@@ -846,12 +847,14 @@ func (c *Connect) administers(ctx context.Context, token string, account github.
 //
 // And a connection holds one installation: when another installation is linked to the
 // connection, see [Connect.heldBy], the page [refuseHeld] answers, and nothing is
-// linked, unless that link is pending and gives way to a newer pass. Before all of
-// that, a pass that expires no later than the newest pass a linked return was minted
-// under for the connection, see [keepPass], gets [refuseOlder], whatever is linked to
-// the connection now, so where both apply [refuseOlder] answers: Qory Apiary takes a return only for the connection's newest pass,
-// which may be that return, still unspent. Each linked return it allows keeps its pass
-// as that newest, with the link.
+// linked, unless that link is pending and gives way to a newer pass. Before all of that,
+// a pass that expires no later than the newest pass a linked return was minted under for
+// the connection, see [keepPass], gets [refuseOlder], whatever is linked to the
+// connection now, so where both apply [refuseOlder] answers: Qory Apiary takes a return
+// only for the connection's newest pass, which may be that return, still unspent. Each
+// linked return it allows keeps its pass as that newest, with the link.
+// A link it writes to the session's connection forgets the connection's record as
+// replaced, see [keepReplaced], which is stale from then on.
 //
 // An installation GitHub deleted meanwhile, see [keepDeleted], is refused,
 // grant_not_confirmed, and nothing is linked.
@@ -904,6 +907,9 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		installMu.Lock()
 		defer installMu.Unlock()
 		if err := putLink(c.Store, installation, l); err != nil {
+			return false, nil, nil, err
+		}
+		if err := forgetReplaced(c.Store, s.Connection); err != nil {
 			return false, nil, nil, err
 		}
 		return l.State == linkLive, nil, nil, keepPass(c.Store, s.Connection, s.Pass, c.clock())
@@ -974,6 +980,11 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 	if err := putLink(c.Store, installation, link{Connection: s.Connection, State: linkPending, Pass: s.Pass, Return: returnExpires}); err != nil {
 		return false, nil, nil, err
 	}
+	// A record of the connection replaced before is stale once the connection is
+	// linked again: its listings would end or empty it.
+	if err := forgetReplaced(c.Store, s.Connection); err != nil {
+		return false, nil, nil, err
+	}
 	if err := keepPass(c.Store, s.Connection, s.Pass, c.clock()); err != nil {
 		return false, nil, nil, err
 	}
@@ -1015,18 +1026,20 @@ func (c *Connect) listFailed(installation int64, connection string, err error) {
 // installation, while the browser carries the linked connect return to Qory Apiary,
 // which answers the listing 403 connection_unknown until it has taken the return. That
 // 403, and a failure that passes, no answer, a 429, a 5xx, an answer not signed or a
-// 403 forbidden, which is logged, is sent again, the waits doubling from [firstListingWait] up to [firstListingMaxWait],
-// until the return, which expires at returnExpires, has expired and [returnSkew] more
-// has passed: then the link's last listing settles it, see [Adapter.listFor], sent
-// again past failures that pass, the waits doubling up to [lastListingMaxWait]. A signed
-// 204 makes the link live. Once a connect for another connection has replaced the link,
-// each listing is the replaced connection's, empty, see [Adapter.listReplaced]. It stops
-// once the link is live or settled, once Qory Apiary refuses otherwise, a 409
+// 403 forbidden, which is logged, is sent again, the waits doubling from
+// [firstListingWait] up to [firstListingMaxWait], until the moment of the last listing:
+// the expiry of the return the link keeps, or the replaced record keeps, and
+// [returnSkew] more, on the adapter's clock. Then the link's last listing settles it,
+// see [Adapter.listFor], sent again past failures that pass, the waits doubling up to
+// [lastListingMaxWait]. A signed 204 makes the link live, and a 409 connection_ended to
+// any try drops it at once. Once a connect for another connection has replaced the
+// link, each listing is the replaced connection's, empty, see [Adapter.listReplaced].
+// It stops once the link is live or settled, once Qory Apiary refuses otherwise, a 409
 // connection_suspended among them, which keeps the link, which is logged and which the
-// round's listing takes up again, and once [Connect.stop] has run. again,
-// a re-connect, fills the linked collections again once the listing is taken, see
+// round's listing takes up again, and once [Connect.stop] has run. again, a
+// re-connect, fills the linked collections again once the listing is taken, see
 // [Connect.refill].
-func (c *Connect) listSoon(installation int64, connection string, again bool, returnExpires time.Time) {
+func (c *Connect) listSoon(installation int64, connection string, again bool) {
 	c.init()
 	c.fillMu.Lock()
 	defer c.fillMu.Unlock()
@@ -1036,14 +1049,14 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 	c.fills.Add(1)
 	go func() {
 		defer c.fills.Done()
-		lastIn := returnExpires.Add(returnSkew).Sub(c.clock())
-		wait, waited := firstListingWait, time.Duration(0)
+		wait := firstListingWait
 		for {
-			if !c.listed(installation, connection) {
+			moment, ok := c.lastListing(installation, connection)
+			if !ok {
 				return
 			}
-			last := waited >= lastIn
-			err := c.Adapter.listFor(c.fillCtx, installation, connection, last)
+			last := !c.Adapter.clock().Before(moment)
+			err := c.Adapter.listFor(c.fillCtx, installation, connection)
 			if c.fillCtx.Err() != nil {
 				return
 			}
@@ -1053,7 +1066,7 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 				}
 				return
 			}
-			if !c.listed(installation, connection) {
+			if moment, ok = c.lastListing(installation, connection); !ok {
 				return
 			}
 			var refused *refusedError
@@ -1068,13 +1081,12 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 				return
 			}
 			d := wait
-			if !last {
-				d = max(min(wait, lastIn-waited), 0)
+			if now := c.Adapter.clock(); now.Before(moment) {
+				d = min(wait, moment.Sub(now))
 			}
 			if c.wait(c.fillCtx, d) != nil {
 				return
 			}
-			waited += d
 			if last {
 				wait = min(2*wait, lastListingMaxWait)
 			} else {
@@ -1084,15 +1096,20 @@ func (c *Connect) listSoon(installation int64, connection string, again bool, re
 	}()
 }
 
-// listed is whether connection is still to be listed for the installation: the
-// installation is linked to it, pending, or it is a connection a connect replaced on
-// the installation, see [keepReplaced].
-func (c *Connect) listed(installation int64, connection string) bool {
+// lastListing is the moment of the last listing of connection for the installation,
+// and whether it is still to be listed: the installation is linked to it, and the
+// moment is the expiry of the return its link keeps and [returnSkew] more; or it is a
+// connection a connect replaced on the installation, see [keepReplaced], and the
+// moment is that of the replaced link.
+func (c *Connect) lastListing(installation int64, connection string) (time.Time, bool) {
 	if l, ok, err := linkOf(c.Store, installation); err == nil && ok && l.Connection == connection {
-		return true
+		return time.Unix(l.Return, 0).Add(returnSkew), true
 	}
 	r, ok, err := replacedOf(c.Store, connection)
-	return err == nil && ok && r.Installation == installation
+	if err != nil || !ok || r.Installation != installation {
+		return time.Time{}, false
+	}
+	return time.Unix(r.Return, 0).Add(returnSkew), true
 }
 
 // refill fills again, after the answer, each collection Qory Apiary linked that the

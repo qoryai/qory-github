@@ -316,10 +316,9 @@ func (a *Adapter) lockInstallation(ctx context.Context, installation int64) (fun
 }
 
 // listConnection sends Qory Apiary the listing of connection for the installation,
-// holding the installation's lock, see [Adapter.listFor], as the round does: the last
-// listing of a pending link is the first one past its moment.
+// holding the installation's lock, see [Adapter.listFor].
 func (a *Adapter) listConnection(ctx context.Context, installation int64, connection string) error {
-	return a.listFor(ctx, installation, connection, false)
+	return a.listFor(ctx, installation, connection)
 }
 
 // listFor sends Qory Apiary the listing of connection for the installation, holding
@@ -331,16 +330,18 @@ func (a *Adapter) listConnection(ctx context.Context, installation int64, connec
 //     no collections, see [Adapter.listReplaced];
 //   - for any other, nothing.
 //
-// A link pending past its connect return's expiry and [returnSkew] more, or whose last
-// listing this is, last, is settled by the listing: a signed 204 makes it live, as any
-// listing's does; a signed 403 connection_unknown says the connection was not made, and
-// the link is dropped, with its collections' records, see [dropInstallation]; a 409
-// connection_ended drops it as any does; any other answer keeps it, to be listed again:
-// a 409 connection_suspended, which says the connection was made, and a 403 forbidden
-// among them.
-// Before that a 403 drops nothing, since Qory Apiary answers 403 connection_unknown by
-// design until the browser brings the return.
-func (a *Adapter) listFor(ctx context.Context, installation int64, connection string, last bool) error {
+// A link pending past its connect return's expiry, which the link keeps, and
+// [returnSkew] more, on the adapter's clock, is settled by the listing, its last: a
+// signed 204 makes it live, as any listing's does; a signed 403 connection_unknown says
+// the connection was not made, and the link is dropped, with its collections' records,
+// see [dropInstallation]; a 409 connection_ended drops it as any does; any other answer
+// keeps it, to be listed again: a 409 connection_suspended, which says the connection
+// was made, and a 403 forbidden among them. Before that a 403 drops nothing, since Qory
+// Apiary answers 403 connection_unknown by design until the browser brings the return,
+// while a 409 connection_ended drops the link at any listing. No caller chooses the
+// moment: a re-connect's later return moves it, and an earlier one never brings it
+// forward.
+func (a *Adapter) listFor(ctx context.Context, installation int64, connection string) error {
 	unlock, err := a.lockInstallation(ctx, installation)
 	if err != nil {
 		return err
@@ -351,10 +352,14 @@ func (a *Adapter) listFor(ctx context.Context, installation int64, connection st
 		return err
 	}
 	if !ok || l.Connection != connection {
-		return a.listReplaced(ctx, installation, connection, last)
+		return a.listReplaced(ctx, installation, connection)
+	}
+	// A record of the connection as replaced is stale once a link names it again.
+	if err := forgetReplaced(a.Store, connection); err != nil {
+		return err
 	}
 	err = a.listLocked(ctx, installation, connection)
-	last = last || !a.clock().Before(time.Unix(l.Return, 0).Add(returnSkew))
+	last := !a.clock().Before(time.Unix(l.Return, 0).Add(returnSkew))
 	if l.State != linkPending || !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || !last {
 		return err
 	}
@@ -378,13 +383,21 @@ func (a *Adapter) listFor(ctx context.Context, installation int64, connection st
 // connection made, says the connection was made meanwhile, and it is ended, see
 // [Adapter.endConnection], so the installation stays linked to one connection; a 409
 // connection_ended, or a 403 connection_unknown to its last listing, past the replaced
-// link's return's expiry and [returnSkew] more, or last, says it was not made, and it is
-// forgotten; any other answer keeps it, to be listed again. A connection not replaced
-// on the installation is sent nothing.
-func (a *Adapter) listReplaced(ctx context.Context, installation int64, connection string, last bool) error {
+// link's return's expiry, which the record keeps, and [returnSkew] more, on the
+// adapter's clock, says it was not made, and it is forgotten; any other answer keeps
+// it, to be listed again. A connection not replaced on the installation is sent
+// nothing, and so is one an installation's link names again, whose record is stale and
+// is forgotten.
+func (a *Adapter) listReplaced(ctx context.Context, installation int64, connection string) error {
 	r, ok, err := replacedOf(a.Store, connection)
 	if err != nil || !ok || r.Installation != installation {
 		return err
+	}
+	if again, err := linkedTo(a.Store, connection); err != nil || len(again) > 0 {
+		if err != nil {
+			return err
+		}
+		return forgetReplaced(a.Store, connection)
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -392,7 +405,7 @@ func (a *Adapter) listReplaced(ctx context.Context, installation int64, connecti
 		Version: contracts.Version, ConnectionID: connection, Collections: []contracts.Collection{},
 		Listing: contracts.Listing{ID: hex.EncodeToString(b), Part: 1, Complete: true, StartedAt: contracts.FormatTime(a.clock())},
 	})
-	last = last || !a.clock().Before(time.Unix(r.Return, 0).Add(returnSkew))
+	last := !a.clock().Before(time.Unix(r.Return, 0).Add(returnSkew))
 	switch {
 	case err == nil, refusedAs(err, http.StatusConflict, codeConnectionSuspended):
 		if err := a.endConnection(ctx, connection); err != nil {
