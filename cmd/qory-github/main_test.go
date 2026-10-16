@@ -377,12 +377,15 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 // TestDescribeConformsAndIsPinned checks what describe prints against the integration
 // contract and pins it to testdata/describe.json, so a change to the description is a
 // change to that file too. The contract's fixture fixtures/github.json is the
-// description of 0.1.0, an example of the contract's; this copy is the program's.
+// description of 0.1.0, an example of the contract's; this copy is the program's. The
+// pinned copy is describe's with QORY_FEATURES naming factory, the source role in it;
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins the other.
 func TestDescribeConformsAndIsPinned(t *testing.T) {
 	// The pinned copy is the description of a build with no version, whatever version
 	// the test binary's build info contains.
 	defer func(v string) { version = v }(version)
 	version = "dev"
+	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
 	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
@@ -405,11 +408,59 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	}
 }
 
-// TestDescribeHasASourceRoleTheContractAccepts pins that describe names the source role,
-// qory-github-server, with every member the integration contract requires, and that the
-// contract's schema, as conformance compiles it, checks that role: the description
-// without any one member, or with a member the schema refuses, does not conform.
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins that describe, where
+// QORY_FEATURES does not name factory, prints testdata/describe.json without its source
+// role and nothing else changed, and that the description still conforms.
+func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
+	defer func(v string) { version = v }(version)
+	version = "dev"
+	pinned, err := os.ReadFile("../../testdata/describe.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d github.Description
+	if err := json.Unmarshal(pinned, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Roles.Source == nil {
+		t.Fatal("testdata/describe.json has no source role")
+	}
+	d.Roles.Source = nil
+	want, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, features := range []string{"", "observability", "all"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+			t.Fatalf("QORY_FEATURES=%q: exit %d: %s", features, code, errs.String())
+		}
+		if err := conformance.Description(out.Bytes()); err != nil {
+			t.Errorf("QORY_FEATURES=%q: %v", features, err)
+		}
+		var doc struct {
+			Roles map[string]json.RawMessage `json:"roles"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := doc.Roles["source"]; ok {
+			t.Errorf("QORY_FEATURES=%q: describe names the source role", features)
+		}
+		if out.String() != string(want)+"\n" {
+			t.Errorf("QORY_FEATURES=%q: describe prints\n%s\nwant testdata/describe.json without its source role:\n%s", features, out.String(), want)
+		}
+	}
+}
+
+// TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
+// names factory, names the source role, qory-github-server, with every member the
+// integration contract requires, and that the contract's schema, as conformance compiles
+// it, checks that role: the description without any one member, or with a member the
+// schema refuses, does not conform.
 func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
 	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())

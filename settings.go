@@ -56,7 +56,9 @@ type CredentialRole struct {
 
 // SourceRole is the source adapter, qory-github-server: the lines Qory Apiary shows,
 // verbatim and as plain text, to set it up, start it, install it, change which
-// repositories it reaches and uninstall it, as description.json holds them.
+// repositories it reaches and uninstall it, as description.json holds them. [Describe]
+// always holds it; qory-github describe prints it only where QORY_FEATURES names
+// factory.
 type SourceRole struct {
 	Description string     `json:"description"`
 	Program     string     `json:"program"`
@@ -74,7 +76,9 @@ type SourceStep struct {
 	Help    string `json:"help"`
 }
 
-// Describe is the description, with the program's version.
+// Describe is the description, with the program's version: description.json whole, its
+// source role among its roles. qory-github describe leaves the source role out unless
+// QORY_FEATURES names factory.
 func Describe(programVersion string) Description {
 	var d Description
 	if err := json.Unmarshal(description, &d); err != nil {
