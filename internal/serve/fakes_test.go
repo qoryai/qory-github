@@ -325,6 +325,12 @@ type fakeGitHub struct {
 	// 502.
 	unauthorized, issuesDown, reposDown bool
 	goneComments                        int
+	// repoPageSize, when set, lists the installation's repositories that many on a
+	// page, each page's Link header naming the next; repoPageDown answers that page,
+	// counted from 1, 502. repoAfter, when set, is called with each page's number once
+	// the page is answered, with f.mu held.
+	repoPageSize, repoPageDown int
+	repoAfter                  func(f *fakeGitHub, page int)
 	// gqlFailOn answers that page of GraphQL's listing, counted from 1, as gqlFail
 	// says: "errors", a 200 whose errors say the query failed; "limited", a 200 that
 	// says GraphQL's rate limit, for that page and every try after it; or "502".
@@ -415,11 +421,31 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 		io.WriteString(w, `{"token":"`+ghToken+`","expires_at":"2099-01-01T00:00:00Z"}`)
 	case r.Method == "GET" && r.URL.Path == "/installation/repositories":
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		page = max(page, 1)
+		if page == f.repoPageDown {
+			w.WriteHeader(502)
+			io.WriteString(w, `{"message":"Bad Gateway"}`)
+			return
+		}
+		names := f.repos
+		if f.repoPageSize > 0 {
+			from := min((page-1)*f.repoPageSize, len(names))
+			if to := from + f.repoPageSize; to < len(names) {
+				names = names[from:to]
+				w.Header().Set("Link", "<"+f.srv.URL+"/installation/repositories?per_page=100&page="+strconv.Itoa(page+1)+`>; rel="next"`)
+			} else {
+				names = names[from:]
+			}
+		}
 		var repos []map[string]any
-		for _, name := range f.repos {
+		for _, name := range names {
 			repos = append(repos, map[string]any{"full_name": name, "html_url": "https://github.com/" + name})
 		}
-		json.NewEncoder(w).Encode(map[string]any{"total_count": len(repos), "repositories": repos})
+		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.repos), "repositories": repos})
+		if f.repoAfter != nil {
+			f.repoAfter(f, page)
+		}
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":
@@ -649,4 +675,33 @@ func settingsFiles(t *testing.T, dir string, access *accesskey.Key, apiaryURL st
 		AccessKeyID: testKeyID, AccessKeySecretFile: accessFile, ApiaryPublicKey: pin,
 		AdapterID: testAdapterID, ClientID: testClientID, ClientSecretFile: clientFile,
 	}
+}
+
+// listings is how many listings of the installation's repositories the fake answered:
+// the requests for their first page.
+func (f *fakeGitHub) listings() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if r == "GET /installation/repositories?per_page=100" {
+			n++
+		}
+	}
+	return n
+}
+
+// keptFirsts is how many first listings the adapter keeps, see [Adapter.sendFirst].
+func (a *Adapter) keptFirsts() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.firsts)
+}
+
+// keptFirst is whether the adapter keeps a first listing for the installation and
+// connection, see [Adapter.sendFirst].
+func (a *Adapter) keptFirst(installation int64, connection string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.firsts[firstKey{installation, connection}] != nil
 }
