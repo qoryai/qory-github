@@ -327,8 +327,10 @@ type fakeGitHub struct {
 	goneComments                        int
 	// repoPageSize, when set, lists the installation's repositories that many on a
 	// page, each page's Link header naming the next; repoPageDown answers that page,
-	// counted from 1, 502.
+	// counted from 1, 502. repoAfter, when set, is called with each page's number once
+	// the page is answered, with f.mu held.
 	repoPageSize, repoPageDown int
+	repoAfter                  func(f *fakeGitHub, page int)
 	// gqlFailOn answers that page of GraphQL's listing, counted from 1, as gqlFail
 	// says: "errors", a 200 whose errors say the query failed; "limited", a 200 that
 	// says GraphQL's rate limit, for that page and every try after it; or "502".
@@ -441,6 +443,9 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			repos = append(repos, map[string]any{"full_name": name, "html_url": "https://github.com/" + name})
 		}
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.repos), "repositories": repos})
+		if f.repoAfter != nil {
+			f.repoAfter(f, page)
+		}
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":

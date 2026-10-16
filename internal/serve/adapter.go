@@ -60,8 +60,11 @@ type Adapter struct {
 	installs  map[int64]chan struct{}
 	lockWaits func(installation int64)
 	// firsts are the links' first listings kept, see [Adapter.sendFirst], in memory
-	// alone, by installation and connection.
-	firsts map[firstKey]*firstListing
+	// alone, by installation and connection. firstGens are the installations'
+	// generations of them, which [Adapter.dropFirsts] moves on: a listing read across a
+	// move is sent and not kept.
+	firsts    map[firstKey]*firstListing
+	firstGens map[int64]uint64
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most.
@@ -494,8 +497,12 @@ type firstListing struct {
 // more: from part 1 after a 403 connection_unknown, which Qory Apiary answers before it
 // takes any part, and from the part that failed after a failure that passes. A read
 // that fails, or is stopped, before every page is read keeps and sends nothing, and the
-// next try reads again. A link live with no listing kept, a re-connect's, is listed as
-// [Adapter.listLocked] lists it. The listing kept is forgotten, see
+// next try reads again. A listing read while [Adapter.dropFirsts] forgot the
+// installation's listings, which moves its generation on, is sent, as a listing in
+// flight was before, and not kept, so the next try reads again: a drop that lands while
+// GitHub is read, a change of the installation's repositories among them, never leaves
+// a listing read before it kept. A link live with no listing kept, a re-connect's, is
+// listed as [Adapter.listLocked] lists it. The listing kept is forgotten, see
 // [Adapter.dropFirsts], once the try that makes the link live has sent every part, once
 // the last listing is due, which reads GitHub again, once a connect replaces the link or
 // writes it again, once the link is dropped, by its last listing, a 409
@@ -511,16 +518,21 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 		if l.State != linkPending {
 			return a.listLocked(ctx, installation, l.Connection)
 		}
+		a.mu.Lock()
+		gen := a.firstGens[installation]
+		a.mu.Unlock()
 		parts, err := a.lister(installation, l.Connection).ReadRepositories(ctx)
 		if err != nil {
 			return a.forgetOn401(installation, err)
 		}
 		f = &firstListing{parts: parts}
 		a.mu.Lock()
-		if a.firsts == nil {
-			a.firsts = map[firstKey]*firstListing{}
+		if a.firstGens[installation] == gen {
+			if a.firsts == nil {
+				a.firsts = map[firstKey]*firstListing{}
+			}
+			a.firsts[key] = f
 		}
-		a.firsts[key] = f
 		a.mu.Unlock()
 	}
 	sink := reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: l.Connection}
@@ -534,22 +546,39 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 
 // forgetEnded is ended, what serve does when Qory Apiary answers that a connection
 // ended, see [endedIn], which then forgets the connection's first listings kept, see
-// [Adapter.sendFirst], with its link.
+// [Adapter.sendFirst], with its link: those of each installation linked to the
+// connection before it ended, whose generations move on, and any other of the
+// connection.
 func (a *Adapter) forgetEnded(ended func(connection string)) func(connection string) {
 	return func(connection string) {
+		linked, _ := linkedTo(a.Store, connection)
 		ended(connection)
+		for _, installation := range linked {
+			a.dropFirsts(installation, connection)
+		}
 		a.dropFirsts(0, connection)
 	}
 }
 
 // dropFirsts forgets the first listings kept, see [Adapter.sendFirst]: those of the
-// installation, unless it is 0, and of connection, unless it is "".
+// installation, unless it is 0, and of connection, unless it is "". It moves on the
+// generation of the installation, unless it is 0, and of each installation whose
+// listing it forgets, so a listing of one that is being read is not kept.
 func (a *Adapter) dropFirsts(installation int64, connection string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.firstGens == nil {
+		a.firstGens = map[int64]uint64{}
+	}
+	if installation != 0 {
+		a.firstGens[installation]++
+	}
 	for k := range a.firsts {
 		if (installation == 0 || k.installation == installation) && (connection == "" || k.connection == connection) {
 			delete(a.firsts, k)
+			if k.installation != installation {
+				a.firstGens[k.installation]++
+			}
 		}
 	}
 }
@@ -633,7 +662,8 @@ func (a *Adapter) endConnection(ctx context.Context, connection string) error {
 // repositories are listed again, which a listing of more than one page needs, since it
 // never says it is complete. The installation's tokens are dropped first, so the
 // listing never reads with a token minted before the change, and so are its first
-// listings kept, see [Adapter.sendFirst], which the change makes stale.
+// listings kept, see [Adapter.sendFirst], which the change makes stale: one being read
+// as they are dropped is sent and not kept, so the next try reads GitHub again.
 func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) error {
 	if d.Action != "added" && d.Action != "removed" {
 		return nil

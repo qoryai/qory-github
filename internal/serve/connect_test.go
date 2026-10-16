@@ -2770,3 +2770,69 @@ func TestAFirstListingKeptIsForgottenAtTheLastListing(t *testing.T) {
 		t.Errorf("%d listings kept", n)
 	}
 }
+
+// TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept removes a repository while a
+// pending link's first listing reads GitHub, once the page that names it, or the page
+// after it, is answered, and runs installation_repositories's first steps meanwhile,
+// which drop the installation's tokens and first listings without its lock: that try's
+// listing, which names the repository, is sent, and Qory Apiary answers it 403
+// connection_unknown, but it is not kept, so the next try reads GitHub again, and the
+// listing Qory Apiary takes does not name the repository.
+func TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		repos         []string
+		pageSize, at  int
+		removed, kept string
+	}{
+		{"one page", []string{"acme/widgets", "acme/gadgets"}, 0, 1, "acme/gadgets", "acme/widgets"},
+		{"the page that names it", []string{"acme/repo0", "acme/repo1", "acme/repo2"}, 1, 1, "acme/repo0", "acme/repo2"},
+		{"the page after it", []string{"acme/repo0", "acme/repo1", "acme/repo2"}, 1, 2, "acme/repo0", "acme/repo1"},
+	} {
+		rig := newConnectRig(t)
+		rig.gh.repos, rig.gh.repoPageSize = tc.repos, tc.pageSize
+		once := false
+		rig.gh.repoAfter = func(f *fakeGitHub, page int) {
+			if once || page != tc.at {
+				return
+			}
+			once = true
+			// GitHub has answered the page; now the repository is removed, and the
+			// installation_repositories handler's first steps run, outside the lock.
+			f.repos = slices.DeleteFunc(slices.Clone(f.repos), func(r string) bool { return r == tc.removed })
+			rig.adapter.forgetTokens(42)
+			rig.adapter.dropFirsts(42, "")
+		}
+		rig.apiary.refuse = func(route string, n int) (int, string) {
+			if route == routeCollections && n == 1 {
+				return 403, `{"error":"connection_unknown"}`
+			}
+			return 0, ""
+		}
+		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		rig.c.listSoon(42, testConnection, false)
+		eventually(t, tc.name+": live", func() bool { l, _, _ := linkOf(rig.st, 42); return l.State == linkLive })
+		rig.c.stop()
+		sent := rig.apiary.sent(routeCollections)
+		if len(sent) != 2 {
+			t.Fatalf("%s: %d parts sent", tc.name, len(sent))
+		}
+		first, _ := json.Marshal(sent[0].body["collections"])
+		last, _ := json.Marshal(sent[1].body["collections"])
+		if !strings.Contains(string(first), `"ref":"`+tc.removed+`"`) {
+			t.Errorf("%s: the try under way sent %s", tc.name, first)
+		}
+		if strings.Contains(string(last), tc.removed) || !strings.Contains(string(last), `"ref":"`+tc.kept+`"`) {
+			t.Errorf("%s: the listing Qory Apiary took names %s, which the installation no longer reaches, or not %s: %s", tc.name, tc.removed, tc.kept, last)
+		}
+		if listingOf(sent[0])["id"] == listingOf(sent[1])["id"] {
+			t.Errorf("%s: the next try sent the listing read before the change", tc.name)
+		}
+		if n := rig.gh.listings(); n != 2 {
+			t.Errorf("%s: GitHub's repositories read %d times", tc.name, n)
+		}
+		if n := rig.adapter.keptFirsts(); n != 0 {
+			t.Errorf("%s: %d listings kept", tc.name, n)
+		}
+	}
+}
