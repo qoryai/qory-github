@@ -11,6 +11,7 @@
       "Write",
       "NotebookEdit"
     ],
-    "blockReadsOutsideWorkingDirectories": true
+    "blockReadsOutsideWorkingDirectories": true,
+    "defaultMode": "dontAsk"
   }
 }
