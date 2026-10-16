@@ -36,9 +36,9 @@ import (
 var accessKeyHelp = cli.Help{
 	Short: "Enrol the integration's access key with a code from Qory Apiary",
 	Use:   "qory-github-server access-key enrol --secret-file FILE [--] SERVER CODE",
-	Long: `Enrol a new access key for this integration with an enrolment code an owner or
-administrator in Qory Apiary created on the integration's Access key tab in
-Organisation settings. The code is valid for 15 minutes and used once.
+	Long: `Enrol a new access key for this integration with an enrolment code an instance
+admin of Qory Apiary created on the adapter's Access key tab in Instance
+settings. The code is valid for 15 minutes and used once.
 
 qory-github-server makes the key, prints its fingerprint and sends Qory Apiary, at SERVER, the
 public key. Qory Apiary's signed answer gives the key its id and lists Qory Apiary's
@@ -127,7 +127,7 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if !ok {
 			return notACode
 		}
-		return fmt.Errorf("this code is for %s: use a code from the integration's Access key tab", what)
+		return fmt.Errorf("this code is for %s: use a code from the adapter's Access key tab", what)
 	}
 	// The secret file is checked before the code is sent: its path, that no file is
 	// there, and that its directory exists and can be written. Qory Apiary's 201 spends
@@ -172,11 +172,11 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return notAnIntegration(ans.AccessKeyID, ans.NodeKind, ans.NodeID, fingerprint)
 	}
 	if ans.Pin.Fixture() {
-		return fmt.Errorf("Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an owner or administrator in Qory Apiary revoke the key %s", fingerprint)
+		return fmt.Errorf("Qory Apiary's answer lists the Forager contract's published fixture key, whose secret anyone can read: it is no server to pin; no secret was written: have an instance admin of Qory Apiary revoke the key %s", fingerprint)
 	}
 	fmt.Fprintf(stderr, "enrolled as %s in the integration %s\n", ans.AccessKeyID, ans.NodeID)
 	if err := writeSecretFile(file, []byte(key.Secret()+"\n")); err != nil {
-		return fmt.Errorf("the key is enrolled as %s, and %w; the secret was not kept: enrol a key again with a new code, and have an owner or administrator in Qory Apiary revoke the key %s", ans.AccessKeyID, err, fingerprint)
+		return fmt.Errorf("the key is enrolled as %s, and %w; the secret was not kept: enrol a key again with a new code, and have an instance admin of Qory Apiary revoke the key %s", ans.AccessKeyID, err, fingerprint)
 	}
 	fmt.Fprintf(stderr, "wrote the access key's secret to %s\n", file)
 	fragment, err := enrolledSettings(server, ans.AccessKeyID, file, ans.Pin, ans.NodeID)
@@ -185,7 +185,7 @@ func enrol(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stderr, "add these settings to serve's settings:")
 	fmt.Fprint(stdout, fragment)
-	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the integration's Access key tab in Organisation settings; the key is active\n", fingerprint)
+	fmt.Fprintf(stderr, "compare the fingerprint %s with the one Qory Apiary shows on the adapter's Access key tab in Instance settings; the key is active\n", fingerprint)
 	return nil
 }
 
@@ -201,7 +201,7 @@ var codeKindNames = map[string]string{
 // the node of kind and id node, which is not an integration's, so its secret is not
 // kept. Its text is a placeholder awaiting the user's wording, see [accessKeyHelp].
 func notAnIntegration(id, kind, node, fingerprint string) error {
-	return fmt.Errorf("Qory Apiary enrolled the key as %s in the %s %s, which is not an integration: the code was not made on the integration's Access key tab; no secret was written: have an owner or administrator in Qory Apiary revoke the key %s, and enrol with a code made on the integration's Access key tab in Organisation settings", id, kind, node, fingerprint)
+	return fmt.Errorf("Qory Apiary enrolled the key as %s in the %s %s, which is not an integration: the code was not made on the adapter's Access key tab; no secret was written: have an instance admin of Qory Apiary revoke the key %s, and enrol with a code made on the adapter's Access key tab in Instance settings", id, kind, node, fingerprint)
 }
 
 // checkServer takes Qory Apiary's origin, as accesskey's enrolment posts to it: an https
@@ -341,7 +341,7 @@ func accessKeyName() string {
 // that did not verify cannot be finished: its key is to be revoked. Its texts are
 // placeholders awaiting the user's wording, see [accessKeyHelp].
 func enrolFailed(err error, server, fingerprint string) error {
-	lost := "; no secret was written: get a new code, and have an owner or administrator in Qory Apiary revoke the key " + fingerprint + " should it have been enrolled"
+	lost := "; no secret was written: get a new code, and have an instance admin of Qory Apiary revoke the key " + fingerprint + " should it have been enrolled"
 	var ref *accesskey.Refusal
 	if !errors.As(err, &ref) {
 		return fmt.Errorf("the enrolment did not complete: %w%s", err, lost)
@@ -351,7 +351,7 @@ func enrolFailed(err error, server, fingerprint string) error {
 		// Qory Apiary answers every code it does not accept with one 401, whatever the
 		// reason, and anything on the path can answer one too; only a used code has
 		// enrolled a key.
-		return fmt.Errorf("the server at %s answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at %s, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an owner or administrator in Qory Apiary, who must revoke the key it enrolled", server, server)
+		return fmt.Errorf("the server at %s answered 401: Qory Apiary answers so when the code was used, has expired or was cancelled, is no code of the Qory Apiary at %s, or its record fails Qory Apiary's integrity check; when its maker can no longer make codes; when what the code was made for was deleted, its workspace or organisation is marked for deletion, or its organisation is not in use; when Qory Apiary has the feature factory off; or when this machine's clock is more than 5 minutes off. Something in front of Qory Apiary, or a server that is not Qory Apiary, may also have refused the request. If the code was used and not by you, tell an instance admin of Qory Apiary, who must revoke the key it enrolled", server, server)
 	case accesskey.CodeKeyInvalid:
 		names := ""
 		if len(ref.Names) > 0 {
@@ -359,7 +359,7 @@ func enrolFailed(err error, server, fingerprint string) error {
 		}
 		return fmt.Errorf("Qory Apiary refused the key%s; the code is not used: the same command, run within the code's 15 minutes, makes a new key", names)
 	case accesskey.CodeKeyLimit:
-		return errors.New("the integration already holds two keys: have an owner or administrator in Qory Apiary revoke one, then run the same command again within the code's 15 minutes")
+		return errors.New("the integration already holds two keys: have an instance admin of Qory Apiary revoke one, then run the same command again within the code's 15 minutes")
 	case accesskey.CodeRateLimited:
 		return errors.New("Qory Apiary refused the attempt: this code was tried too often; run the same command again later, within the code's 15 minutes")
 	case accesskey.CodeAnswerUnsigned:
