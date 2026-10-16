@@ -141,7 +141,8 @@ later stage. It has no member but the ones above.
 - `version` is the number `1`. `verdict` is `understood` or `not_understood`.
 - Every text is plain text, not Markdown or HTML. Tab and line feed are the only control
   characters it may hold: no terminal escape sequences, which start with the ESC
-  character, such as colour codes. JSON escapes inside a string, such as `\n`, are fine.
+  character, such as colour codes. In JSON, write a line feed as `\n` and a tab as `\t`:
+  they are the only escapes for a control character. Never use `\u001b` or any other.
 - `complexity.reason`, each `scope` entry, `approach.summary`, each alternative's
   `summary` and `reason`, each question and each knowledge `text` hold 1 to 2000
   characters. `understanding` holds 1 to 20000.
