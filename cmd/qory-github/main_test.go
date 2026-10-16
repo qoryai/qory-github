@@ -405,6 +405,81 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	}
 }
 
+// TestDescribeHasASourceRoleTheContractAccepts pins that describe names the source role,
+// qory-github-server, with every member the integration contract requires, and that the
+// contract's schema, as conformance compiles it, checks that role: the description
+// without any one member, or with a member the schema refuses, does not conform.
+func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+	if err := conformance.Description(out.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	roles, _ := doc["roles"].(map[string]any)
+	source, ok := roles["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("describe names no source role: %s", out.String())
+	}
+	members := []string{"description", "program", "setup", "start", "connect", "access", "disconnect"}
+	for _, m := range members {
+		if _, ok := source[m]; !ok {
+			t.Errorf("the source role has no %s", m)
+		}
+	}
+	if len(source) != len(members) {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members), source)
+	}
+	if source["program"] != "qory-github-server" {
+		t.Errorf("the source role's program is %v, want qory-github-server", source["program"])
+	}
+	if start, _ := source["start"].(string); !strings.HasPrefix(start, "qory-github-server serve ") {
+		t.Errorf("the source role's start is %q, want qory-github-server serve", start)
+	}
+	if setup, _ := source["setup"].(map[string]any); setup == nil || !strings.HasPrefix(fmt.Sprint(setup["command"]), "qory-github setup ") {
+		t.Errorf("the source role's setup is %v, want the command qory-github setup", source["setup"])
+	}
+
+	// changed is describe's output with the source role changed by change.
+	changed := func(change func(source map[string]any)) []byte {
+		var d map[string]any
+		if err := json.Unmarshal(out.Bytes(), &d); err != nil {
+			t.Fatal(err)
+		}
+		change(d["roles"].(map[string]any)["source"].(map[string]any))
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	refused := map[string]func(map[string]any){
+		"an unknown member":         func(s map[string]any) { s["extra"] = "x" },
+		"a program with a space":    func(s map[string]any) { s["program"] = "qory github" },
+		"a line with a line break":  func(s map[string]any) { s["connect"] = "one\ntwo" },
+		"a line with a bidi mark":   func(s map[string]any) { s["access"] = "a‏b" },
+		"a line of 301 characters":  func(s map[string]any) { s["disconnect"] = strings.Repeat("a", 301) },
+		"a command not ASCII":       func(s map[string]any) { s["start"] = "qory-github-server serve --settings FILÉ" },
+		"a setup without its help":  func(s map[string]any) { delete(s["setup"].(map[string]any), "help") },
+		"a setup command too long":  func(s map[string]any) { s["setup"].(map[string]any)["command"] = strings.Repeat("a", 201) },
+		"an empty catalogue line":   func(s map[string]any) { s["description"] = "" },
+		"a setup that is a command": func(s map[string]any) { s["setup"] = "qory-github setup" },
+	}
+	for _, m := range members {
+		refused["no "+m] = func(s map[string]any) { delete(s, m) }
+	}
+	for name, change := range refused {
+		if err := conformance.Description(changed(change)); err == nil {
+			t.Errorf("the contract accepts the source role with %s", name)
+		}
+	}
+}
+
 // fakeGitHub answers the manifest flow's exchange with the App 123456 and a key, and
 // PATCH /app/hook/config as [fakeHook] says, recording the secrets it is sent.
 func fakeGitHub(t *testing.T) string {
