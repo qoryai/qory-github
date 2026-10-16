@@ -63,6 +63,7 @@ func newWired(t *testing.T, dir string) *wired {
 		return nil
 	}
 	w.adapter = &Adapter{Store: st, GitHub: github.Client{API: w.gh.srv.URL}, AppID: "1", Key: appKey(), Slug: testSlug, Sink: w.client, Log: logger}
+	w.client.Ended = w.adapter.forgetEnded(w.client.Ended)
 	hs := &Handlers{}
 	w.adapter.Register(hs)
 	worker := &Worker{Store: st, Handlers: hs, Log: logger, Attempts: 3, Backoff: func(int) time.Duration { return time.Millisecond }}

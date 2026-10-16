@@ -183,7 +183,7 @@ const (
 	linkWait = 5 * time.Second
 	// firstListingWait and firstListingMaxWait are the first and the longest wait
 	// between the tries of a connection's first listing, see [Connect.listSoon].
-	firstListingWait    = 8 * time.Second
+	firstListingWait    = time.Second
 	firstListingMaxWait = 64 * time.Second
 	// lastListingMaxWait is the longest wait between the tries of a pending link's last
 	// listing that fail passing, see [Connect.lastListing].
@@ -371,8 +371,9 @@ func (c *Connect) log() *slog.Logger {
 	return c.Log
 }
 
-// stop stops the first listings and the fills a connect started and waits for them, and
-// logs the count of refusals held back, if any.
+// stop stops the first listings and the fills a connect started and waits for them,
+// each first listing forgetting the parts it kept as it stops, see [Connect.listSoon],
+// and logs the count of refusals held back, if any.
 func (c *Connect) stop() {
 	c.init()
 	c.fillMu.Lock()
@@ -854,7 +855,10 @@ func (c *Connect) administers(ctx context.Context, token string, account github.
 // only for the connection's newest pass, which may be that return, still unspent. Each
 // linked return it allows keeps its pass as that newest, with the link.
 // A link it writes to the session's connection forgets the connection's record as
-// replaced, see [keepReplaced], which is stale from then on.
+// replaced, see [keepReplaced], which is stale from then on, and the installation's
+// first listings kept, see [Adapter.sendFirst], as a pending link a newer pass replaces
+// forgets the first listing kept for it, so the first listing after a link it writes
+// reads GitHub again.
 //
 // An installation GitHub deleted meanwhile, see [keepDeleted], is refused,
 // grant_not_confirmed, and nothing is linked.
@@ -909,6 +913,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		if err := putLink(c.Store, installation, l); err != nil {
 			return false, nil, nil, err
 		}
+		c.Adapter.dropFirsts(installation, s.Connection)
 		if err := forgetReplaced(c.Store, s.Connection); err != nil {
 			return false, nil, nil, err
 		}
@@ -965,6 +970,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		l, ok, err := linkOf(c.Store, other)
 		if err == nil && ok && l.Connection == s.Connection {
 			err = dropInstallation(c.Store, other)
+			c.Adapter.dropFirsts(other, s.Connection)
 			c.log().Info("a newer pass for the connection replaces its pending link", slog.String("connection", s.Connection), slog.Int64("installation", other))
 		}
 		if err != nil {
@@ -980,6 +986,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 	if err := putLink(c.Store, installation, link{Connection: s.Connection, State: linkPending, Pass: s.Pass, Return: returnExpires}); err != nil {
 		return false, nil, nil, err
 	}
+	c.Adapter.dropFirsts(installation, "")
 	// A record of the connection replaced before is stale once the connection is
 	// linked again: its listings would end or empty it.
 	if err := forgetReplaced(c.Store, s.Connection); err != nil {
@@ -1029,14 +1036,18 @@ func (c *Connect) listFailed(installation int64, connection string, err error) {
 // 403 forbidden, which is logged, is sent again, the waits doubling from
 // [firstListingWait] up to [firstListingMaxWait], until the moment of the last listing:
 // the expiry of the return the link keeps, or the replaced record keeps, and
-// [returnSkew] more, on the adapter's clock. Then the link's last listing settles it,
-// see [Adapter.listFor], sent again past failures that pass, the waits doubling up to
-// [lastListingMaxWait]. A signed 204 makes the link live, and a 409 connection_ended to
-// any try drops it at once. Once a connect for another connection has replaced the
+// [returnSkew] more, on the adapter's clock. Until then each try is
+// [Adapter.listFirst]'s, which reads GitHub once and sends the parts it keeps again,
+// with the same listing's id and started_at, see [Adapter.sendFirst]. Then the parts
+// kept are forgotten, and the link's last listing settles it, see [Adapter.listFor],
+// which reads GitHub again, sent again past failures that pass, the waits doubling up
+// to [lastListingMaxWait]. A signed 204 makes the link live, and a 409 connection_ended
+// to any try drops it at once. Once a connect for another connection has replaced the
 // link, each listing is the replaced connection's, empty, see [Adapter.listReplaced].
 // It stops once the link is live or settled, once Qory Apiary refuses otherwise, a 409
 // connection_suspended among them, which keeps the link, which is logged and which the
-// round's listing takes up again, and once [Connect.stop] has run. again, a
+// round's listing takes up again, and once [Connect.stop] has run; as it stops, for
+// any reason, it forgets the parts kept, see [Adapter.dropFirsts]. again, a
 // re-connect, fills the linked collections again once the listing is taken, see
 // [Connect.refill].
 func (c *Connect) listSoon(installation int64, connection string, again bool) {
@@ -1049,6 +1060,7 @@ func (c *Connect) listSoon(installation int64, connection string, again bool) {
 	c.fills.Add(1)
 	go func() {
 		defer c.fills.Done()
+		defer c.Adapter.dropFirsts(installation, connection)
 		wait := firstListingWait
 		for {
 			moment, ok := c.lastListing(installation, connection)
@@ -1056,7 +1068,13 @@ func (c *Connect) listSoon(installation int64, connection string, again bool) {
 				return
 			}
 			last := !c.Adapter.clock().Before(moment)
-			err := c.Adapter.listFor(c.fillCtx, installation, connection)
+			var err error
+			if last {
+				c.Adapter.dropFirsts(installation, connection)
+				err = c.Adapter.listFor(c.fillCtx, installation, connection)
+			} else {
+				err = c.Adapter.listFirst(c.fillCtx, installation, connection)
+			}
 			if c.fillCtx.Err() != nil {
 				return
 			}

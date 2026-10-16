@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -715,7 +716,8 @@ func TestTheSavePageIsShownWhenTheAppIsInstalled(t *testing.T) {
 // TestAConnectLinksTheInstallationPendingAndListsItAtOnce connects the installation
 // 42 of acme, which alice administers: it goes back to Qory Apiary linked, the link is
 // pending, and the connection's first listing goes at once, sent again while Qory
-// Apiary answers 403, until its 204 makes the link live.
+// Apiary answers 403, after a second and then two, the same listing each time, read
+// from GitHub once, until its 204 makes the link live.
 func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 	rig := newConnectRig(t)
 	// GitHub announces the installation before its link: it is kept as not linked, and
@@ -732,9 +734,9 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 		if n == 1 {
 			<-listed
 		}
-		if n <= 4 {
+		if n <= 2 {
 			// The connection is not made until Qory Apiary takes the return: the first
-			// listing and the part that ends it, then the next try's.
+			// listing's one part, then the next try's, which sends it again.
 			return 403, `{"error":"connection_unknown"}`
 		}
 		return 0, ""
@@ -758,20 +760,27 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 	close(listed)
 	eventually(t, "live", func() bool { l, _, _ := linkOf(rig.st, 42); return l.State == linkLive })
 	sent := rig.apiary.sent(routeCollections)
-	if len(sent) != 5 {
+	if len(sent) != 3 {
 		t.Fatalf("%d listings sent", len(sent))
 	}
 	for _, s := range sent {
-		if s.body["connection_id"] != testConnection {
-			t.Errorf("sent %s", s.raw)
+		if s.body["connection_id"] != testConnection || !reflect.DeepEqual(s.body["listing"], sent[0].body["listing"]) || !reflect.DeepEqual(s.body["collections"], sent[0].body["collections"]) {
+			t.Errorf("sent %s, then %s", sent[0].raw, s.raw)
 		}
 	}
-	cols, _ := json.Marshal(sent[4].body["collections"])
-	if !strings.Contains(string(cols), `"ref":"acme/widgets"`) || !strings.Contains(string(cols), `"ref":"acme/gadgets"`) {
-		t.Errorf("sent %s", sent[4].raw)
+	if l := sent[0].body["listing"].(map[string]any); l["part"] != 1.0 || l["complete"] != true {
+		t.Errorf("sent %s", sent[0].raw)
 	}
+	cols, _ := json.Marshal(sent[2].body["collections"])
+	if !strings.Contains(string(cols), `"ref":"acme/widgets"`) || !strings.Contains(string(cols), `"ref":"acme/gadgets"`) {
+		t.Errorf("sent %s", sent[2].raw)
+	}
+	if n := rig.gh.listings(); n != 1 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
+	eventually(t, "the parts kept forgotten", func() bool { return rig.adapter.keptFirsts() == 0 })
 	rig.mu.Lock()
-	if len(rig.waits) != 2 || rig.waits[0] != 8*time.Second || rig.waits[1] != 16*time.Second {
+	if len(rig.waits) != 2 || rig.waits[0] != time.Second || rig.waits[1] != 2*time.Second {
 		t.Errorf("waited %v", rig.waits)
 	}
 	rig.mu.Unlock()
@@ -1892,12 +1901,12 @@ func TestAWaitForTheInstallationsLockPastTheDeadlineGoesBack(t *testing.T) {
 }
 
 // TestAFirstListingEndsWithTheLastListing lists, on a clock each wait moves on, a
-// pending link whose connect return expired now: the tries wait 8 seconds, doubling,
+// pending link whose connect return expired now: the tries wait a second, doubling,
 // up to 64, and the last wait ends at the expiry and returnSkew more, where the last
-// listing is sent. Its 403 connection_unknown drops the link; a 500 keeps it, and its
-// tries go on, the waits doubling up to an hour.
+// listing is sent, read from GitHub again. Its 403 connection_unknown drops the link; a
+// 500 keeps it, and its tries go on, the waits doubling up to an hour.
 func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
-	before := []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second, 64 * time.Second, 64 * time.Second}
+	before := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second, 64 * time.Second, 64 * time.Second}
 	for _, status := range []int{403, 500} {
 		rig := newConnectRig(t)
 		rig.budget = 4 * time.Hour
@@ -1930,24 +1939,28 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 		rig.mu.Lock()
 		waits := slices.Clone(rig.waits)
 		rig.mu.Unlock()
-		if len(waits) < 7 || !slices.Equal(waits[:6], before) {
+		if len(waits) < 10 || !slices.Equal(waits[:9], before) {
 			t.Fatalf("%d: waited %v", status, waits)
 		}
-		// The seventh wait ends at the expiry and returnSkew more.
+		// The tenth wait ends at the expiry and returnSkew more.
 		var upTo time.Duration
-		for _, w := range waits[:7] {
+		for _, w := range waits[:10] {
 			upTo += w
 		}
 		if upTo != returnSkew {
 			t.Errorf("%d: the last listing after %v", status, upTo)
 		}
 		if status == 403 {
-			if len(waits) != 7 {
+			if len(waits) != 10 {
 				t.Errorf("waited past the last listing: %v", waits)
+			}
+			// The first listing's ten tries read GitHub once, and the last listing again.
+			if n := rig.gh.listings(); n != 2 {
+				t.Errorf("GitHub's repositories read %d times", n)
 			}
 			continue
 		}
-		after := waits[7:]
+		after := waits[10:]
 		want := []time.Duration{64 * time.Second, 128 * time.Second, 256 * time.Second, 512 * time.Second, 1024 * time.Second, 2048 * time.Second, time.Hour}
 		if len(after) < len(want)+1 || !slices.Equal(after[:len(want)], want) || after[len(want)] != time.Hour {
 			t.Errorf("waited after the last listing %v", after)
@@ -2190,8 +2203,8 @@ func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 }
 
 // TestAFirstListingAnswered403ForbiddenIsSentAgain has Qory Apiary answer a pending
-// link's first listing 403 forbidden: it is logged, and sent again with the waits that
-// double, and the link stays.
+// link's first listing 403 forbidden: it is logged, and sent again, read from GitHub
+// once, with the waits that double, and the link stays.
 func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
@@ -2202,10 +2215,14 @@ func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
 	rig.mu.Lock()
 	waits := slices.Clone(rig.waits[:3])
 	rig.mu.Unlock()
-	if !slices.Equal(waits, []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second}) {
+	if !slices.Equal(waits, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}) {
 		t.Errorf("waited %v", waits)
 	}
 	rig.linked(t, 42, testConnection, linkPending)
+	// Each try sends the listing read from GitHub once.
+	if n := rig.gh.listings(); n != 1 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
 	if !strings.Contains(rig.log.String(), `"msg":"Qory Apiary answered a listing 403 forbidden, so it is sent again later","connection":"`+testConnection+`","installation":42`) {
 		t.Errorf("the log %s", rig.log.String())
 	}
@@ -2471,5 +2488,285 @@ func TestAReConnectForgetsTheConnectionsRecordAsReplaced(t *testing.T) {
 	rig.linked(t, 42, testConnection, linkPending)
 	if _, ok, _ := replacedOf(rig.st, testConnection); ok {
 		t.Error("the re-connect kept the connection's record as replaced")
+	}
+}
+
+// manyRepos has the installation reach n repositories, acme/repo0 and on, which GitHub
+// lists on one page.
+func manyRepos(rig *connectRig, n int) {
+	rig.gh.mu.Lock()
+	defer rig.gh.mu.Unlock()
+	rig.gh.repos = nil
+	for i := range n {
+		rig.gh.repos = append(rig.gh.repos, "acme/repo"+strconv.Itoa(i))
+	}
+}
+
+// listingOf is the listing member of a listing's part as Qory Apiary received it.
+func listingOf(r apiaryRequest) map[string]any {
+	l, _ := r.body["listing"].(map[string]any)
+	return l
+}
+
+// TestAFirstListingIsReadOnceAndSentAgainFromThePartNotTaken lists a pending link of
+// an installation that reaches 101 repositories, two parts, which Qory Apiary answers
+// 403 connection_unknown, then takes part 1, fails part 2 once, passing, with a 500,
+// then takes it: each try sends again the part not taken, part 1 after the 403
+// connection_unknown and part 2 after its failure, the same listing's parts, id and
+// started_at, with no part between them that ends the listing; GitHub's repositories
+// are read once; the tries wait a second, then two; and once the link is live and every
+// part taken, no listing is kept.
+func TestAFirstListingIsReadOnceAndSentAgainFromThePartNotTaken(t *testing.T) {
+	rig := newConnectRig(t)
+	manyRepos(rig, 101)
+	rig.apiary.refuse = func(route string, n int) (int, string) {
+		switch {
+		case route != routeCollections:
+		case n == 1:
+			return 403, `{"error":"connection_unknown"}`
+		case n == 3:
+			return 500, `{"error":"internal"}`
+		}
+		return 0, ""
+	}
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	// Each part keeps each of its collections' installations in the store first, which
+	// takes a while.
+	for deadline := time.Now().Add(time.Minute); rig.adapter.keptFirsts() != 0 || len(rig.apiary.sent(routeCollections)) < 4; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d parts sent, %d listings kept", len(rig.apiary.sent(routeCollections)), rig.adapter.keptFirsts())
+		}
+	}
+	rig.c.stop()
+	sent := rig.apiary.sent(routeCollections)
+	if len(sent) != 4 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	first := listingOf(sent[0])
+	parts := []float64{1, 1, 2, 2}
+	for i, want := range parts {
+		l := listingOf(sent[i])
+		if l["part"] != want || l["id"] != first["id"] || l["started_at"] != first["started_at"] || l["complete"] != (want == 2) {
+			t.Errorf("sent %d is %v, want part %v of %v", i+1, l, want, first)
+		}
+		if j := slices.Index(parts, want); !reflect.DeepEqual(sent[i].body["collections"], sent[j].body["collections"]) {
+			t.Errorf("part %v sent again changed", want)
+		}
+	}
+	for i, n := range map[int]int{0: 100, 2: 1} {
+		if cols, _ := sent[i].body["collections"].([]any); len(cols) != n {
+			t.Errorf("sent %d holds %d collections", i+1, len(cols))
+		}
+	}
+	if n := rig.gh.listings(); n != 1 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
+	rig.mu.Lock()
+	if !slices.Equal(rig.waits, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Errorf("waited %v", rig.waits)
+	}
+	rig.mu.Unlock()
+	rig.linked(t, 42, testConnection, linkLive)
+	if inst, ok, _ := reachOf(rig.st, "acme/repo100"); !ok || inst != 42 {
+		t.Errorf("the last part's repository's installation is %d", inst)
+	}
+}
+
+// TestAFirstListingGitHubFailsMidwayKeepsNothingAndReadsAgain lists a pending link of
+// an installation whose three repositories GitHub lists one on a page and fails the
+// second page once: the try sends nothing and keeps nothing, and the next, a second
+// later, reads GitHub again, and sends the listing, one part, not complete, since it
+// read more than one page, which Qory Apiary takes.
+func TestAFirstListingGitHubFailsMidwayKeepsNothingAndReadsAgain(t *testing.T) {
+	rig := newConnectRig(t)
+	manyRepos(rig, 3)
+	rig.gh.repoPageSize, rig.gh.repoPageDown = 1, 2
+	var mu sync.Mutex
+	var waits []time.Duration
+	var kept, sentThen []int
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		waits = append(waits, d)
+		kept = append(kept, rig.adapter.keptFirsts())
+		sentThen = append(sentThen, len(rig.apiary.sent(routeCollections)))
+		mu.Unlock()
+		rig.gh.mu.Lock()
+		rig.gh.repoPageDown = 0
+		rig.gh.mu.Unlock()
+		return nil
+	}
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	rig.c.listSoon(42, testConnection, false)
+	eventually(t, "live", func() bool { l, _, _ := linkOf(rig.st, 42); return l.State == linkLive })
+	eventually(t, "the parts kept forgotten", func() bool { return rig.adapter.keptFirsts() == 0 })
+	rig.c.stop()
+	mu.Lock()
+	if !slices.Equal(waits, []time.Duration{time.Second}) || !slices.Equal(kept, []int{0}) || !slices.Equal(sentThen, []int{0}) {
+		t.Errorf("waited %v, keeping %v listings, %v parts sent", waits, kept, sentThen)
+	}
+	mu.Unlock()
+	sent := rig.apiary.sent(routeCollections)
+	if cols, _ := sent[0].body["collections"].([]any); len(sent) != 1 || len(cols) != 3 || listingOf(sent[0])["part"] != 1.0 || listingOf(sent[0])["complete"] != false {
+		t.Errorf("sent %v", sent)
+	}
+	if n := rig.gh.listings(); n != 2 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
+}
+
+// TestAFirstListingKeptIsForgottenWithItsLink has a pending link's first listing kept
+// between its tries, which Qory Apiary answers 403 connection_unknown, and forgotten
+// when: a try's 409 connection_ended drops the link; another request's 409
+// connection_ended does; GitHub deletes the installation; the installation's
+// repositories change, and the next try keeps a listing read again; a connect for
+// another connection replaces the link, whose listing kept stays; a newer pass for the
+// connection links another installation; and Connect stops.
+func TestAFirstListingKeptIsForgottenWithItsLink(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// during runs while the first try's wait holds, the listing kept.
+		during func(t *testing.T, rig *connectRig)
+		// stays is the listing kept that stays, if any.
+		stays *firstKey
+	}{
+		{name: "a try's connection_ended"},
+		{name: "another request's connection_ended", during: func(t *testing.T, rig *connectRig) {
+			rig.apiary.mu.Lock()
+			rig.apiary.refuse = func(route string, _ int) (int, string) { return 409, `{"error":"connection_ended"}` }
+			rig.apiary.mu.Unlock()
+			rig.adapter.listFor(context.Background(), 42, testConnection)
+		}},
+		{name: "deleted", during: func(t *testing.T, rig *connectRig) {
+			rig.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+		}},
+		{name: "repositories changed", during: func(t *testing.T, rig *connectRig) {
+			rig.deliver(t, "installation_repositories", guid1, map[string]any{"action": "added", "installation": map[string]any{"id": 42}, "repositories_added": []any{}, "repositories_removed": []any{}})
+		}},
+		{name: "replaced", during: func(t *testing.T, rig *connectRig) {
+			if r := rig.backTo(t, rig.browser(t).connect(rig.passFor(otherConnection), "42"), otherConnection); r.Outcome != outcomeLinked {
+				t.Fatalf("%+v", r)
+			}
+		}, stays: &firstKey{42, otherConnection}},
+		{name: "a newer pass", during: func(t *testing.T, rig *connectRig) {
+			if r := rig.backTo(t, rig.browser(t).connect(rig.passFor(testConnection), "9"), testConnection); r.Outcome != outcomeLinked {
+				t.Fatalf("%+v", r)
+			}
+		}},
+		{name: "stop", during: func(t *testing.T, rig *connectRig) { rig.c.stop() }},
+	} {
+		rig := newConnectRig(t)
+		var made atomic.Bool
+		twoOrgs(rig, &made)
+		if tc.name == "a try's connection_ended" {
+			rig.apiary.refuse = func(route string, n int) (int, string) {
+				if n == 1 {
+					return 403, `{"error":"connection_unknown"}`
+				}
+				return 409, `{"error":"connection_ended"}`
+			}
+		}
+		gate, gated := make(chan struct{}), make(chan struct{})
+		var mu sync.Mutex
+		var kept []bool
+		rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+			mu.Lock()
+			kept = append(kept, rig.adapter.keptFirst(42, testConnection))
+			n := len(kept)
+			mu.Unlock()
+			if n == 1 {
+				close(gated)
+				select {
+				case <-gate:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
+		rig.c.listSoon(42, testConnection, false)
+		<-gated
+		if tc.during != nil {
+			tc.during(t, rig)
+			if rig.adapter.keptFirst(42, testConnection) {
+				t.Errorf("%s: the listing is kept", tc.name)
+			}
+		}
+		close(gate)
+		if tc.stays != nil {
+			eventually(t, tc.name+": the other link's listing kept", func() bool { return rig.adapter.keptFirst(tc.stays.installation, tc.stays.connection) })
+		}
+		switch tc.name {
+		case "a try's connection_ended", "another request's connection_ended", "deleted":
+			eventually(t, tc.name+": the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
+			eventually(t, tc.name+": the listing forgotten", func() bool { return rig.adapter.keptFirsts() == 0 })
+		case "repositories changed":
+			// The next try reads GitHub again, and keeps that listing.
+			eventually(t, tc.name+": the next try", func() bool { mu.Lock(); defer mu.Unlock(); return len(kept) == 2 })
+			mu.Lock()
+			if !kept[1] {
+				t.Errorf("%s: the next try keeps no listing", tc.name)
+			}
+			mu.Unlock()
+		}
+		mu.Lock()
+		if len(kept) == 0 || !kept[0] {
+			t.Errorf("%s: kept %v at the waits", tc.name, kept)
+		}
+		mu.Unlock()
+		if tc.stays == nil && tc.name != "repositories changed" && rig.adapter.keptFirsts() != 0 {
+			t.Errorf("%s: %d listings kept", tc.name, rig.adapter.keptFirsts())
+		}
+		if rig.adapter.keptFirst(42, testConnection) && tc.name != "repositories changed" {
+			t.Errorf("%s: the listing is kept", tc.name)
+		}
+		rig.c.stop()
+		if n := rig.adapter.keptFirsts(); n != 0 {
+			t.Errorf("%s: %d listings kept after stop", tc.name, n)
+		}
+	}
+}
+
+// TestAFirstListingKeptIsForgottenAtTheLastListing lists, on a clock each wait moves
+// on, a pending link whose connect return expired now, which Qory Apiary answers 500:
+// each try before the last listing's moment sends the listing kept, and from the
+// moment on no listing is kept, and each try reads GitHub again.
+func TestAFirstListingKeptIsForgottenAtTheLastListing(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.apiary.refuse = func(string, int) (int, string) { return 500, `{"error":"internal"}` }
+	clock := &pullClock{t: time.Now().Truncate(time.Second)}
+	rig.adapter.now, rig.c.now = clock.now, clock.now
+	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
+	var mu sync.Mutex
+	var kept []int
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		kept = append(kept, rig.adapter.keptFirsts())
+		n := len(kept)
+		mu.Unlock()
+		if n >= 13 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return clock.sleep(ctx, d)
+	}
+	rig.c.listSoon(42, testConnection, false)
+	eventually(t, "thirteen waits", func() bool { mu.Lock(); defer mu.Unlock(); return len(kept) == 13 })
+	rig.c.stop()
+	mu.Lock()
+	defer mu.Unlock()
+	// Ten tries before the moment, the waits a second doubling up to 64 and the rest to
+	// the moment, then the last listing's three.
+	if want := []int{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0}; !slices.Equal(kept, want) {
+		t.Errorf("listings kept at the waits %v, want %v", kept, want)
+	}
+	if n := rig.gh.listings(); n != 4 {
+		t.Errorf("GitHub's repositories read %d times", n)
+	}
+	if n := rig.adapter.keptFirsts(); n != 0 {
+		t.Errorf("%d listings kept", n)
 	}
 }
