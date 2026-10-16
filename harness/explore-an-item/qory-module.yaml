@@ -1,0 +1,6 @@
+apiVersion: qory.dev/v1alpha1
+name: explore-an-item
+description: >-
+  Explore one ticket in a headless run: read the ticket and the code, and end with an
+  explore v1 document that says what the ticket asks, its scope and a proposed approach,
+  or the questions that block it.
