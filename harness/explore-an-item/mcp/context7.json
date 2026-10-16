@@ -1,0 +1,5 @@
+{
+  "description": "Context7: current public documentation for libraries and APIs, reached over HTTP without a key.",
+  "type": "http",
+  "url": "https://mcp.context7.com/mcp"
+}

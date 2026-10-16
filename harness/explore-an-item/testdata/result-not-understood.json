@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "verdict": "not_understood",
+  "understanding": "The ticket says the cart shows a wrong total for some orders, but names no order and no expected total, and the cart computes totals in two places.",
+  "questions": [
+    "Which order shows the wrong total, and what total did you expect?",
+    "Does the wrong total appear in the cart page, in the order confirmation, or in both?"
+  ]
+}

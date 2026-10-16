@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "verdict": "understood",
+  "complexity": {
+    "level": "simple",
+    "reason": "One rule in the cart module changes, and its tests sit beside it."
+  },
+  "understanding": "The shop's cart keeps a line whose quantity is 0. The ticket asks that the cart refuse such a line, as it already refuses a negative quantity.\nCode areas:\ncart/line.go: checks a cart line before it is added, and refuses a negative quantity.\ncart/line_test.go: the tests of that check.\nAssumptions:\nThe refusal uses the message the cart gives for a negative quantity.",
+  "scope": {
+    "in": [
+      "Refuse a cart line whose quantity is 0.",
+      "Test the refusal beside the test for a negative quantity."
+    ],
+    "out": [
+      "Changing how the cart is shown.",
+      "Changing other modules."
+    ]
+  },
+  "approach": {
+    "summary": "Change the quantity check in the cart line's validation from below 0 to below 1, and add a test for 0.",
+    "alternatives": [
+      {
+        "summary": "Filter lines with quantity 0 out in the page that adds them.",
+        "reason": "Other callers of the cart would still add them, and the instruction keeps the change in the cart module."
+      }
+    ]
+  },
+  "knowledge": [
+    {
+      "text": "The standard library's errors package wraps a refusal so a caller can test for it with errors.Is.",
+      "sources": [
+        "https://pkg.go.dev/errors"
+      ]
+    }
+  ]
+}
