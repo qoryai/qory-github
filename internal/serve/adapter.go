@@ -477,8 +477,9 @@ type firstKey struct {
 }
 
 // firstListing is a link's first listing as [Adapter.sendFirst] keeps it: its parts,
-// read from GitHub once, and next, the index of the first part Qory Apiary has not
-// taken, which only a holder of the installation's lock reads or moves on.
+// read from GitHub once, and next, the index of the first part the next try sends, the
+// first Qory Apiary has not taken, or 0 after a 403 connection_unknown, which only a
+// holder of the installation's lock reads or moves.
 type firstListing struct {
 	parts []contracts.SourceCollections
 	next  int
@@ -493,9 +494,9 @@ type firstListing struct {
 // started_at; and it keeps them, in memory alone, never in the store. Then it sends,
 // through [reachSink], in order, each part Qory Apiary has not taken, and stops at the
 // first it does not take, with no part that ends the listing, so the next try sends
-// that part again, built anew with its time, and the parts after it, and reads GitHub no
-// more: from part 1 after a 403 connection_unknown, which Qory Apiary answers before it
-// takes any part, and from the part that failed after a failure that passes. A read
+// the parts again, each built anew with its time, and reads GitHub no more: from part 1
+// after a 403 connection_unknown to any part, a part after one Qory Apiary took among
+// them, and from the part that failed after a failure that passes. A read
 // that fails, or is stopped, before every page is read keeps and sends nothing, and the
 // next try reads again. A listing read while [Adapter.dropFirsts] forgot the
 // installation's listings, which moves its generation on, is sent, as a listing in
@@ -539,6 +540,9 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 	sink := reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: l.Connection}
 	for ; f.next < len(f.parts); f.next++ {
 		if err := sink.Collections(ctx, f.parts[f.next]); err != nil {
+			if refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
+				f.next = 0
+			}
 			return err
 		}
 	}
