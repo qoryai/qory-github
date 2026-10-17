@@ -96,13 +96,15 @@ func (a *Adapter) Register(hs *Handlers) {
 
 // linked is h for the deliveries of a linked installation; another's is done and
 // logged. The installation event's deleted is [Adapter.deleted]'s, and the repository
-// event's transferred is [Adapter.transferred]'s, for any installation.
+// event's transferred is [Adapter.transferred]'s, for any installation whose id is
+// above 0; one that names an id of 0 or below, or none, is done and logged as an
+// installation not linked, before any state changes or any request is sent.
 func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(context.Context, Delivery) error {
 	return func(ctx context.Context, d Delivery) error {
 		if d.Event == "installation" && d.Action == "deleted" && d.InstallationID > 0 {
 			return a.deleted(ctx, d)
 		}
-		if d.Event == "repository" && d.Action == "transferred" {
+		if d.Event == "repository" && d.Action == "transferred" && d.InstallationID > 0 {
 			return a.transferred(ctx, d)
 		}
 		ok, err := Linked(a.Store, d.InstallationID)
@@ -759,9 +761,11 @@ func (a *Adapter) endConnection(ctx context.Context, connection string) error {
 
 // installationRepositories handles the installation_repositories event: each
 // repository removed, by its id, which is its collection's ref, that the store holds as
-// the installation's is disconnected, removed, and forgotten, one it does not hold is
-// passed, and the installation's repositories are listed again, which a listing of
-// more than one page needs, since it never says it is complete. The installation's
+// the installation's is disconnected, removed, and forgotten, with whether its
+// collection is linked, unless the change feed linked it after serve began to remove
+// it, see [unlinkSince]; one it does not hold is passed; and the installation's
+// repositories are listed again, which a listing of more than one page needs, since it
+// never says it is complete. The installation's
 // tokens are dropped first, so the listing never reads with a token minted before the
 // change, and so are its first listings kept, see [Adapter.sendFirst], which the change
 // makes stale: one being read as they are dropped is sent and not kept, so the next try
@@ -780,6 +784,7 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 	if err := json.Unmarshal(d.Body, &ev); err != nil {
 		return Permanent(errors.New("the installation_repositories event is not JSON GitHub sends"))
 	}
+	began := linkMoment()
 	var refs []string
 	for _, r := range ev.Removed {
 		ref := github.CollectionRef(r.ID)
@@ -801,6 +806,9 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 		if err := a.Store.Delete(nsRepositories, collectionKey(ref)); err != nil {
 			return err
 		}
+		if _, err := unlinkSince(a.Store, ref, began); err != nil {
+			return err
+		}
 	}
 	return a.listRepositories(ctx, d.InstallationID)
 }
@@ -819,8 +827,12 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 //   - created: the installation's tokens and first listings kept, see
 //     [Adapter.sendFirst], are dropped, as installation_repositories drops them, and its
 //     repositories are listed again, the new one among them.
-//   - renamed: the repositories are listed again, which names the repository by the
-//     same ref with its new title, URL and target. Nothing is disconnected.
+//   - renamed: the installation's first listings kept, see [Adapter.sendFirst], are
+//     dropped, as for created, so no try of a pending link's first listing sends the
+//     repository's old title, URL and target again, and a listing being read as they
+//     are dropped is sent and not kept; then the repositories are listed again, which
+//     names the repository by the same ref with its new title, URL and target. Nothing
+//     is disconnected.
 //
 // Any other action, archived, unarchived, privatized, publicized and edited among them,
 // changes nothing. transferred is [Adapter.transferred]'s.
@@ -849,27 +861,29 @@ func (a *Adapter) repository(ctx context.Context, d Delivery) error {
 		a.dropFirsts(d.InstallationID, "")
 		return a.listRepositories(ctx, d.InstallationID)
 	case "renamed":
+		a.dropFirsts(d.InstallationID, "")
 		return a.listRepositories(ctx, d.InstallationID)
 	}
 	return nil
 }
 
-// transferred handles the repository event's transferred, for any installation, linked
-// or not. GitHub sends it only to the installation on the account the repository was
-// transferred to, with the repository as it is now, by the same id, which is its
-// collection's ref. When that installation is linked, its tokens and first listings
-// kept are dropped and its repositories are listed again, as for created, and the
-// repository's installation becomes this one. The listing names the repository by the
+// transferred handles the repository event's transferred, for any installation whose
+// id is above 0, see [Adapter.linked], linked or not. GitHub sends it only to the
+// installation on the account the repository was transferred to, with the repository
+// as it is now, by the same id, which is its collection's ref. When that installation
+// is linked, its tokens and first listings kept are dropped and its repositories are
+// listed again, as for created, and the repository's installation becomes this one. The listing names the repository by the
 // same ref under this installation's connection, which is not the connection of the
-// installation serve listed it for before, since a connection holds one installation:
-// Qory Apiary ends the collection under the previous connection, as a disconnect would,
-// and makes a new one under this one, which a person links again. The first listings
-// kept for the installation serve listed it for before, if another, are dropped too, so
-// none of them names the repository as that installation's again. When the
-// installation is not linked, the repository's collection is disconnected under the
-// installation serve listed it for, see [reachOf], and its records dropped, see
-// [Adapter.dropRepository]; a repository serve never listed is logged and changes
-// nothing.
+// installation serve listed it for before, since a connection holds one installation.
+// When the collection is still live under the previous connection, Qory Apiary ends it,
+// as a disconnect would, and makes a new one under this one; when it is not, Qory
+// Apiary only makes the new one. A person links the collection again only if the
+// previous one was linked. The first listings kept for the installation serve listed
+// it for before, if another, are dropped too, so none of them names the repository as
+// that installation's again. When the installation is not linked, the repository's
+// collection is disconnected under the installation serve listed it for, see
+// [reachOf], and its records dropped, see [Adapter.dropRepository]; a repository serve
+// never listed is logged and changes nothing.
 func (a *Adapter) transferred(ctx context.Context, d Delivery) error {
 	ref, err := repositoryRef(d)
 	if err != nil {
@@ -904,13 +918,15 @@ func (a *Adapter) transferred(ctx context.Context, d Delivery) error {
 
 // dropRepository sends a disconnect for the collection ref, a repository the
 // installation reaches, then drops the repository's records, which installation reaches
-// it and its pulls, and the installation's first listings kept, see [Adapter.sendFirst],
-// which name it. It says whether Qory Apiary took the disconnect. A disconnect Qory
-// Apiary refuses for good is logged, as [Adapter.disconnect] logs it, and the records are
-// dropped all the same; any other error stops it, to be tried again, with the records
-// kept. Qory Apiary answers a ref with no live collection with the signed 204, so a
+// it, its pulls and whether its collection is linked, unless the change feed linked it
+// after the drop began, see [unlinkSince], and the installation's first listings kept,
+// see [Adapter.sendFirst], which name it. It says whether Qory Apiary took the
+// disconnect. A disconnect Qory Apiary refuses for good is logged, as
+// [Adapter.disconnect] logs it, and the records are dropped all the same; any other
+// error stops it, to be tried again, with the records kept. Qory Apiary answers a ref with no live collection with the signed 204, so a
 // disconnect sent again, or after the collection ended, is taken.
 func (a *Adapter) dropRepository(ctx context.Context, ref string, installation int64) (bool, error) {
+	began := linkMoment()
 	err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref})
 	if err != nil && !IsPermanent(err) {
 		return false, err
@@ -922,6 +938,9 @@ func (a *Adapter) dropRepository(ctx context.Context, ref string, installation i
 		if err := a.Store.Delete(ns, collectionKey(ref)); err != nil {
 			return false, err
 		}
+	}
+	if _, err := unlinkSince(a.Store, ref, began); err != nil {
+		return false, err
 	}
 	a.dropFirsts(installation, "")
 	return err == nil, nil

@@ -3082,3 +3082,173 @@ func TestARepositoryEventWithoutARepositoryFailsForGood(t *testing.T) {
 		t.Errorf("%d requests", w.apiary.count())
 	}
 }
+
+// TestARepositoryTransferredWithoutAnInstallationIDChangesNothing delivers repository
+// transferred for a repository serve listed for the installation 42, naming no
+// installation, the installation 0 and the installation -1: each is done and logged as
+// an installation not linked, as the installation event's deleted is, and none reaches
+// GitHub or Qory Apiary or changes a record.
+func TestARepositoryTransferredWithoutAnInstallationIDChangesNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	linkCollection(w.st, widgetsRef)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	none := repositoryEvent(42, "octo-org/widgets", "transferred")
+	delete(none, "installation")
+	for i, ev := range []map[string]any{none, repositoryEvent(0, "octo-org/widgets", "transferred"), repositoryEvent(-1, "octo-org/widgets", "transferred")} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, ev)
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%d: the delivery is %v", i, s)
+		}
+	}
+	w.gh.mu.Lock()
+	requests := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if len(requests) != 0 || w.apiary.count() != 0 {
+		t.Errorf("GitHub was asked %v, Qory Apiary %d times", requests, w.apiary.count())
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/widgets: %d %v", inst, ok)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() {
+		t.Error("the repository's pulls are dropped")
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Error("the collection is unlinked")
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+	if n := strings.Count(w.log.String(), "the installation is not linked to Qory Apiary, so the delivery is not handled"); n != 3 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// repositoryDrops are the deliveries that drop the records of acme/widgets, which serve
+// listed for the installation 42: repository deleted, repository transferred to the
+// installation 43, which is not linked, and installation_repositories removed.
+var repositoryDrops = []struct {
+	name  string
+	event string
+	body  map[string]any
+}{
+	{"deleted", "repository", repositoryEvent(42, "acme/widgets", "deleted")},
+	{"transferred", "repository", repositoryEvent(43, "octo-org/widgets", "transferred")},
+	{"removed", "installation_repositories", repositoriesEvent("removed", "selected", nil, []string{"acme/widgets"})},
+}
+
+// TestARepositoryDroppedLeavesNoCollectionLink links the collections of acme/widgets
+// and acme/gadgets, both the installation 42's, and drops acme/widgets' records by each
+// of [repositoryDrops]: its collection is disconnected and no longer linked, while
+// acme/gadgets' stays linked, and a link the change feed stores later is kept.
+func TestARepositoryDroppedLeavesNoCollectionLink(t *testing.T) {
+	for _, tc := range repositoryDrops {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		setReach(w.st, gadgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		linkCollection(w.st, gadgetsRef)
+		w.gh.installed("acme/gadgets")
+		w.deliver(t, tc.event, guid1, tc.body)
+		if s := state(w.st, guid1); s != store.Done {
+			t.Errorf("%s: the delivery is %v", tc.name, s)
+		}
+		if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+			t.Errorf("%s: disconnected %v", tc.name, got)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); ok {
+			t.Errorf("%s: the dropped repository's collection is still linked", tc.name)
+		}
+		if ok, _ := collectionLinked(w.st, gadgetsRef); !ok {
+			t.Errorf("%s: another repository's collection is unlinked", tc.name)
+		}
+		if err := linkCollection(w.st, widgetsRef); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+			t.Errorf("%s: a link the change feed stores after the drop is not kept", tc.name)
+		}
+	}
+}
+
+// TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked has the change feed link
+// the collection of acme/widgets while Qory Apiary is sent its disconnect, as each of
+// [repositoryDrops] drops its records: the link, stored after the drop began, stays.
+func TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked(t *testing.T) {
+	for _, tc := range repositoryDrops {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		w.gh.installed("acme/gadgets")
+		w.apiary.refuse = func(route string, _ int) (int, string) {
+			if route == routeDisconnect {
+				linkCollection(w.st, widgetsRef)
+			}
+			return 0, ""
+		}
+		w.deliver(t, tc.event, guid1, tc.body)
+		if s := state(w.st, guid1); s != store.Done {
+			t.Errorf("%s: the delivery is %v", tc.name, s)
+		}
+		if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+			t.Errorf("%s: disconnected %v", tc.name, got)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+			t.Errorf("%s: the link stored during the drop is dropped", tc.name)
+		}
+	}
+}
+
+// TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept lists a pending
+// link's first listing of acme/widgets, which Qory Apiary answers 403
+// connection_unknown, so the listing is kept, and renames acme/widgets to
+// acme/sprockets, which keeps its id: the rename drops the listing kept, its listing,
+// which Qory Apiary takes, names the new title, URL and target, and so does the next
+// try of the first listing; no part after the rename names the old name.
+func TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.gh.installed("acme/widgets")
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeCollections && n == 1 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listFirst(context.Background(), 42, testConnection); !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
+		t.Fatalf("the first try: %v", err)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Fatal("the first listing is not kept")
+	}
+	w.gh.installed("acme/sprockets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/sprockets", "renamed"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the first listing read before the rename is kept")
+	}
+	if err := w.adapter.listFirst(context.Background(), 42, testConnection); err != nil {
+		t.Fatalf("the next try: %v", err)
+	}
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 3 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
+	for i, s := range sent[1:] {
+		var req contracts.SourceCollections
+		json.Unmarshal(s.raw, &req)
+		if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+			t.Errorf("part %d after the rename: %s", i+1, s.raw)
+		}
+		if strings.Contains(string(s.raw), "acme/widgets") {
+			t.Errorf("part %d after the rename names the old name: %s", i+1, s.raw)
+		}
+	}
+}
