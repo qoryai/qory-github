@@ -40,6 +40,9 @@ const (
 	maxKeyBits = 8192
 	// leeway is the clock skew exp, nbf and iat are allowed.
 	leeway = 30 * time.Second
+	// maxAhead is the furthest after now a token's exp, nbf or iat may be, in seconds.
+	// A later one is refused before it is made a time, so no value wraps.
+	maxAhead = 24 * 60 * 60
 	// fetchTimeout bounds one fetch of the openid-configuration and the JWKS together.
 	fetchTimeout = 10 * time.Second
 	// refetchInterval is the least time between two fetches of the JWKS, whatever
@@ -64,14 +67,15 @@ type Expect struct {
 	// Workflow is the template's file name in .github/workflows.
 	Workflow string
 	// Ref is the branch or tag the run was dispatched on: a full name, refs/heads/main
-	// or refs/tags/v1, which the token's ref must equal, or a short one, which the
-	// token's ref must be under refs/heads/ or refs/tags/.
+	// or refs/tags/v1, which the token's ref must equal, or a short one, main, which is a
+	// branch: the token's ref must be refs/heads/ and the name. A tag is given in full.
 	Ref string
 	// SHA is the commit the template must be at, 40 hexadecimal digits, or empty.
 	SHA string
 	// RunID is the dispatched workflow run's id.
 	RunID int64
-	// LeaseUntil is the dispatch's deadline: a token is refused at or after it.
+	// LeaseUntil is the dispatch's deadline: a token is refused at or after it, both
+	// before the issuer's key is fetched and after.
 	LeaseUntil time.Time
 }
 
@@ -130,7 +134,8 @@ func refuse(reason string) error { return &Refusal{reason: reason} }
 var errExpect = errors.New("the run a token is checked against is incomplete")
 
 // Verifier verifies GitHub Actions OIDC tokens. Its keys are cached and fetched again
-// at most once per [refetchInterval]. It is safe for concurrent use.
+// at most once per [refetchInterval], by one fetch at a time. A token whose key is
+// cached does not wait for a fetch. It is safe for concurrent use.
 type Verifier struct {
 	issuer string
 	client *http.Client
@@ -140,6 +145,8 @@ type Verifier struct {
 	keys      map[string]*rsa.PublicKey
 	fetchedAt time.Time
 	attempted time.Time
+	// inflight is closed when the fetch that runs now ends, or nil when none runs.
+	inflight chan struct{}
 }
 
 // NewVerifier is a Verifier of [Issuer]'s tokens.
@@ -220,25 +227,29 @@ func (v *Verifier) Verify(ctx context.Context, raw string, want Expect) (Claims,
 	return v.claims(payload, want)
 }
 
-// claims checks a token's payload, whose signature holds, against want.
+// claims checks a token's payload, whose signature holds, against want. The lease is
+// checked again here, since fetching the key takes time.
 func (v *Verifier) claims(p map[string]json.RawMessage, want Expect) (Claims, error) {
 	now := v.now()
+	if !now.Before(want.LeaseUntil) {
+		return Claims{}, refuse("lease_until")
+	}
 	if iss, ok := str(p, "iss"); !ok || iss != v.issuer {
 		return Claims{}, refuse("iss")
 	}
 	if !audience(p["aud"], want.Audience) {
 		return Claims{}, refuse("aud")
 	}
-	exp, ok := numericDate(p, "exp")
+	exp, ok := numericDate(p, "exp", now)
 	if !ok || !now.Before(exp.Add(leeway)) {
 		return Claims{}, refuse("exp")
 	}
 	if _, present := p["nbf"]; present {
-		if nbf, ok := numericDate(p, "nbf"); !ok || nbf.After(now.Add(leeway)) {
+		if nbf, ok := numericDate(p, "nbf", now); !ok || nbf.After(now.Add(leeway)) {
 			return Claims{}, refuse("nbf")
 		}
 	}
-	if iat, ok := numericDate(p, "iat"); !ok || iat.After(now.Add(leeway)) {
+	if iat, ok := numericDate(p, "iat", now); !ok || iat.After(now.Add(leeway)) {
 		return Claims{}, refuse("iat")
 	}
 	if repo, ok := str(p, "repository"); !ok || repo != want.Repository {
@@ -289,12 +300,13 @@ func (v *Verifier) claims(p map[string]json.RawMessage, want Expect) (Claims, er
 }
 
 // refMatches is whether the token's ref, a full name, is the ref want: equal to it
-// when want is a full name, or want under refs/heads/ or refs/tags/ when it is short.
+// when want is a full name, refs/..., or the branch refs/heads/ and want when want is
+// short. A short want never matches a tag, a pull request's ref or any other ref.
 func refMatches(ref, want string) bool {
 	if strings.HasPrefix(want, "refs/") {
 		return ref == want
 	}
-	return ref == "refs/heads/"+want || ref == "refs/tags/"+want
+	return ref == "refs/heads/"+want
 }
 
 // audience is whether aud, a token's aud claim, names want: a string equal to it, or
@@ -332,14 +344,14 @@ func str(obj map[string]json.RawMessage, name string) (string, bool) {
 }
 
 // numericDate is the member name of an object as a NumericDate in whole seconds after
-// the epoch, positive, and whether it is one.
-func numericDate(obj map[string]json.RawMessage, name string) (time.Time, bool) {
+// the epoch, positive and at most maxAhead seconds after now, and whether it is one.
+func numericDate(obj map[string]json.RawMessage, name string, now time.Time) (time.Time, bool) {
 	raw, ok := obj[name]
 	if !ok {
 		return time.Time{}, false
 	}
 	var n int64
-	if json.Unmarshal(raw, &n) != nil || n <= 0 {
+	if json.Unmarshal(raw, &n) != nil || n <= 0 || n > now.Unix()+maxAhead {
 		return time.Time{}, false
 	}
 	return time.Unix(n, 0), true
@@ -431,31 +443,54 @@ func walkValue(dec *json.Decoder, depth int) error {
 
 // key is the issuer's key kid names. The keys are fetched when there are none, when
 // they are older than keysMaxAge, or when kid is not among them, but never twice within
-// refetchInterval.
+// refetchInterval. The fetch runs without the lock held, one at a time: a caller whose
+// kid is cached takes its key at once, and a caller that needs the keys waits for the
+// fetch that runs, or for ctx to end, which refuses the token.
 func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	now := v.now()
-	fresh := v.keys != nil && now.Sub(v.fetchedAt) < keysMaxAge
-	if k, ok := v.keys[kid]; ok && fresh {
-		return k, nil
-	}
-	if !v.attempted.IsZero() && now.Sub(v.attempted) < refetchInterval {
-		if fresh {
-			return nil, refuse("key")
+	for {
+		v.mu.Lock()
+		now := v.now()
+		fresh := v.keys != nil && now.Sub(v.fetchedAt) < keysMaxAge
+		if k, ok := v.keys[kid]; ok && fresh {
+			v.mu.Unlock()
+			return k, nil
 		}
-		return nil, refuse("jwks")
+		if done := v.inflight; done != nil {
+			v.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, &Refusal{reason: "jwks", err: ctx.Err()}
+			}
+		}
+		if !v.attempted.IsZero() && now.Sub(v.attempted) < refetchInterval {
+			v.mu.Unlock()
+			if fresh {
+				return nil, refuse("key")
+			}
+			return nil, refuse("jwks")
+		}
+		done := make(chan struct{})
+		v.attempted, v.inflight = now, done
+		v.mu.Unlock()
+
+		keys, err := v.fetch(ctx)
+		v.mu.Lock()
+		if err == nil {
+			v.keys, v.fetchedAt = keys, now
+		}
+		v.inflight = nil
+		v.mu.Unlock()
+		close(done)
+		if err != nil {
+			return nil, err
+		}
+		if k, ok := keys[kid]; ok {
+			return k, nil
+		}
+		return nil, refuse("key")
 	}
-	v.attempted = now
-	keys, err := v.fetch(ctx)
-	if err != nil {
-		return nil, err
-	}
-	v.keys, v.fetchedAt = keys, now
-	if k, ok := keys[kid]; ok {
-		return k, nil
-	}
-	return nil, refuse("key")
 }
 
 // fetch reads the issuer's openid-configuration and the JWKS its jwks_uri names,
@@ -491,14 +526,38 @@ func (v *Verifier) fetch(ctx context.Context) (map[string]*rsa.PublicKey, error)
 }
 
 // sameHost is whether u is an https URL on issuer's host and port, with no user and no
-// fragment.
+// fragment. The host must be ASCII, and is compared in ASCII lower case only, so no
+// Unicode character that folds to an ASCII letter passes for one.
 func sameHost(u, issuer string) bool {
 	a, err := url.Parse(u)
-	if err != nil || a.Scheme != "https" || a.User != nil || a.Fragment != "" || a.Opaque != "" {
+	if err != nil || a.Scheme != "https" || a.User != nil || a.Fragment != "" || a.Opaque != "" ||
+		a.Host == "" || !isASCII(a.Host) {
 		return false
 	}
 	b, err := url.Parse(issuer)
-	return err == nil && a.Host != "" && strings.EqualFold(a.Host, b.Host)
+	return err == nil && lowerASCII(a.Host) == lowerASCII(b.Host)
+}
+
+// isASCII is whether s holds only ASCII bytes.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// lowerASCII is s with its ASCII upper-case letters made lower case, and every other
+// byte kept.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // get fetches u, which must answer 200 with at most limit bytes. A redirect is not

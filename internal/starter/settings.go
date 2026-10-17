@@ -66,7 +66,8 @@ type Settings struct {
 	// Workflow is the file name of the workflow in the repository's .github/workflows
 	// the starter runs, such as qory-runner.yml.
 	Workflow string
-	// Ref is the branch or tag the workflow runs on.
+	// Ref is the branch or tag the workflow runs on: a short name, main, is a branch,
+	// and a tag is given in full, refs/tags/v1.
 	Ref string
 	// WorkflowSHA is the commit, 40 lower-case hexadecimal digits, the workflow's run
 	// must be at. It may be left out.

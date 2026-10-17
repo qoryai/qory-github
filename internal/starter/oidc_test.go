@@ -92,6 +92,9 @@ type fakeIssuer struct {
 	status    int
 	jwksHits  int
 	discHits  int
+	// onJWKS, when set, runs as the JWKS is asked for, before the answer, without the
+	// lock held: a test blocks the fetch, or moves its clock, with it.
+	onJWKS func()
 }
 
 func newFakeIssuer(t *testing.T, keys ...map[string]any) *fakeIssuer {
@@ -99,6 +102,14 @@ func newFakeIssuer(t *testing.T, keys ...map[string]any) *fakeIssuer {
 	f := &fakeIssuer{status: http.StatusOK}
 	f.setKeys(t, keys...)
 	f.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/jwks" {
+			f.mu.Lock()
+			hook := f.onJWKS
+			f.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch r.URL.Path {
@@ -254,7 +265,7 @@ func TestVerifyTakesTheDispatchedRunsToken(t *testing.T) {
 }
 
 // TestVerifyTakesTheFormsItAllows pins the forms that pass: an aud array that names
-// the audience, a full ref, a tag, no sha pinned, no nbf, and the leeway.
+// the audience, a full ref, a tag given in full, no sha pinned, no nbf, and the leeway.
 func TestVerifyTakesTheFormsItAllows(t *testing.T) {
 	a, _, _ := testKeys(t)
 	cases := []struct {
@@ -263,11 +274,9 @@ func TestVerifyTakesTheFormsItAllows(t *testing.T) {
 	}{
 		{"aud array", func(c map[string]any, _ *Expect) { c["aud"] = []any{"https://other.example.com", testAudience} }},
 		{"full ref", func(_ map[string]any, w *Expect) { w.Ref = "refs/heads/main" }},
-		{"tag", func(c map[string]any, w *Expect) {
-			w.Ref = "v1"
-			c["ref"] = "refs/tags/v1"
-			c["job_workflow_ref"] = testRepo + "/.github/workflows/" + testWorkflow + "@refs/tags/v1"
-			c["workflow_ref"] = c["job_workflow_ref"]
+		{"tag given in full", func(c map[string]any, w *Expect) {
+			w.Ref = "refs/tags/v1"
+			atRef(c, "refs/tags/v1")
 		}},
 		{"no sha pinned", func(c map[string]any, w *Expect) {
 			w.SHA = ""
@@ -291,6 +300,13 @@ func TestVerifyTakesTheFormsItAllows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// atRef moves the claims c to the run of the ref ref: its ref and both templates.
+func atRef(c map[string]any, ref string) {
+	c["ref"] = ref
+	c["job_workflow_ref"] = testRepo + "/.github/workflows/" + testWorkflow + "@" + ref
+	c["workflow_ref"] = c["job_workflow_ref"]
 }
 
 // refusalCase is one way a token is refused: change sets up the token, the run and the
@@ -342,11 +358,29 @@ func refusalCases() []refusalCase {
 		{name: "job in a reusable workflow", change: setClaim("job_workflow_ref", "example-org/shared/.github/workflows/"+marker+".yml@refs/heads/main"), reason: "job_workflow_ref"},
 		{name: "called from another workflow", change: setClaim("workflow_ref", otherTemplate), reason: "workflow_ref"},
 		{name: "wrong ref", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, _ *Expect) {
-			c["ref"] = "refs/heads/" + marker
-			c["job_workflow_ref"] = testRepo + "/.github/workflows/" + testWorkflow + "@refs/heads/" + marker
-			c["workflow_ref"] = c["job_workflow_ref"]
+			atRef(c, "refs/heads/"+marker)
 		}, reason: "ref"},
-		{name: "ref and template at different refs", change: setClaim("ref", "refs/tags/main"), reason: "job_workflow_ref"},
+		{name: "short ref, a tag of that name", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, _ *Expect) {
+			atRef(c, "refs/tags/main")
+		}, reason: "ref"},
+		{name: "short ref, a tag of that name, no sha pinned", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, w *Expect) {
+			w.SHA = ""
+			atRef(c, "refs/tags/main")
+		}, reason: "ref"},
+		{name: "short ref, a pull request's ref ending in it", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, _ *Expect) {
+			atRef(c, "refs/pull/1/main")
+		}, reason: "ref"},
+		{name: "short ref, a longer branch", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, _ *Expect) {
+			atRef(c, "refs/heads/main2")
+		}, reason: "ref"},
+		{name: "full ref, a longer branch", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, w *Expect) {
+			w.Ref = "refs/heads/main"
+			atRef(c, "refs/heads/main2")
+		}, reason: "ref"},
+		{name: "ref and template at different refs", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, w *Expect) {
+			w.Ref = "refs/tags/main"
+			c["ref"] = "refs/tags/main"
+		}, reason: "job_workflow_ref"},
 		{name: "full ref expected, short claim", change: func(_ *testing.T, _ *fakeIssuer, c map[string]any, w *Expect) {
 			w.Ref = "refs/heads/main"
 			c["ref"] = "main"
@@ -363,6 +397,10 @@ func refusalCases() []refusalCase {
 		{name: "exp a fraction", change: setClaim("exp", float64(t0.Unix())+300.5), reason: "exp"},
 		{name: "nbf in the future", change: setClaim("nbf", t0.Unix()+31), reason: "nbf"},
 		{name: "iat in the future", change: setClaim("iat", t0.Unix()+31), reason: "iat"},
+		{name: "iat the largest int64", change: setClaim("iat", int64(9223372036854775807)), reason: "iat"},
+		{name: "exp the largest int64", change: setClaim("exp", int64(9223372036854775807)), reason: "exp"},
+		{name: "exp over a day ahead", change: setClaim("exp", t0.Unix()+maxAhead+1), reason: "exp"},
+		{name: "nbf the largest int64", change: setClaim("nbf", int64(9223372036854775807)), reason: "nbf"},
 		{name: "at lease_until", change: func(_ *testing.T, _ *fakeIssuer, _ map[string]any, w *Expect) { w.LeaseUntil = t0 }, reason: "lease_until"},
 		{name: "after lease_until", change: func(_ *testing.T, _ *fakeIssuer, _ map[string]any, w *Expect) { w.LeaseUntil = t0.Add(-time.Second) }, reason: "lease_until"},
 		{name: "alg none", raw: func(t *testing.T, issuer string) string {
@@ -454,7 +492,7 @@ func refusalCases() []refusalCase {
 		{name: "a claim twice, escaped", raw: func(t *testing.T, issuer string) string {
 			a, _, _ := testKeys(t)
 			b, _ := json.Marshal(claims(issuer))
-			b = append([]byte(`{"run_id":"`+marker+`",`), b[1:]...)
+			b = append([]byte(`{"run_\u0069d":"`+marker+`",`), b[1:]...)
 			return signRaw(t, a, crypto.SHA256, encode(t, map[string]any{"alg": "RS256", "kid": "k1"}), b64(b))
 		}, reason: "payload_json"},
 		{name: "a header member twice", raw: func(t *testing.T, issuer string) string {
@@ -672,6 +710,128 @@ func TestVerifyFetchesForACallerThatWentAway(t *testing.T) {
 	}
 }
 
+// TestVerifyChecksTheLeaseAfterTheKeyFetch pins that a token whose key fetch ends at or
+// after lease_until is refused, though the lease held when it arrived.
+func TestVerifyChecksTheLeaseAfterTheKeyFetch(t *testing.T) {
+	a, _, _ := testKeys(t)
+	f := newFakeIssuer(t, jwk(&a.PublicKey, "k1", nil))
+	c := &clock{now: t0}
+	f.onJWKS = func() { c.add(2 * time.Second) }
+	w := expect()
+	w.LeaseUntil = t0.Add(time.Second)
+	_, err := f.verifier(c).Verify(context.Background(), token(t, a, "k1", claims(f.srv.URL)), w)
+	if Reason(err) != "lease_until" {
+		t.Errorf("err = %v, want reason lease_until", err)
+	}
+}
+
+// TestVerifyDoesNotWaitForAFetchItDoesNotNeed pins that while a fetch of the JWKS is
+// blocked, a token whose key is cached is verified at once, and a token that needs the
+// keys stops waiting when its context ends.
+func TestVerifyDoesNotWaitForAFetchItDoesNotNeed(t *testing.T) {
+	a, b, _ := testKeys(t)
+	f := newFakeIssuer(t, jwk(&a.PublicKey, "k1", nil))
+	c := &clock{now: t0}
+	v := f.verifier(c)
+	w := expect()
+	if _, err := v.Verify(context.Background(), token(t, a, "k1", claims(f.srv.URL)), w); err != nil {
+		t.Fatal(err)
+	}
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	f.mu.Lock()
+	f.onJWKS = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	f.mu.Unlock()
+	c.add(refetchInterval)
+	fetching := make(chan error, 1)
+	go func() {
+		_, err := v.Verify(context.Background(), token(t, b, "k2", claims(f.srv.URL)), w)
+		fetching <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fetch for the unknown kid did not start")
+	}
+
+	cached := make(chan error, 1)
+	go func() {
+		_, err := v.Verify(context.Background(), token(t, a, "k1", claims(f.srv.URL)), w)
+		cached <- err
+	}()
+	select {
+	case err := <-cached:
+		if err != nil {
+			t.Errorf("cached kid: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a token whose key is cached waits for the fetch")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := v.Verify(ctx, token(t, b, "k3", claims(f.srv.URL)), w)
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("a token waiting for the fetch returned after %v, past its deadline", took)
+	}
+	if Reason(err) != "jwks" || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("waiting kid: err = %v, want reason jwks and the deadline", err)
+	}
+
+	once.Do(func() { close(release) })
+	if err := <-fetching; Reason(err) != "key" {
+		t.Errorf("unknown kid: err = %v, want reason key", err)
+	}
+	if got := f.hits(); got != 2 {
+		t.Errorf("%d fetches of the JWKS, want 2", got)
+	}
+}
+
+// TestSameHostTakesOnlyTheIssuersASCIIHost pins jwks_uri's host check: https on the
+// issuer's host, ASCII letters in any case, no user, and no Unicode letter that folds to
+// an ASCII one.
+func TestSameHostTakesOnlyTheIssuersASCIIHost(t *testing.T) {
+	cases := []struct {
+		u    string
+		want bool
+	}{
+		{Issuer + "/.well-known/jwks", true},
+		{"https://" + strings.ToUpper(strings.TrimPrefix(Issuer, "https://")) + "/.well-known/jwks", true},
+		{strings.Replace(Issuer, "token", "to\u212aen", 1) + "/.well-known/jwks", false},
+		{strings.Replace(Issuer, "actions", "action\u017f", 1) + "/.well-known/jwks", false},
+		{"https://user@" + strings.TrimPrefix(Issuer, "https://") + "/.well-known/jwks", false},
+		{"https://user:pass@" + strings.TrimPrefix(Issuer, "https://") + "/.well-known/jwks", false},
+		{strings.Replace(Issuer, "https:", "http:", 1) + "/.well-known/jwks", false},
+		{Issuer + "/.well-known/jwks#x", false},
+		{"https://token.actions.githubusercontent.com.example.com/.well-known/jwks", false},
+	}
+	for _, tc := range cases {
+		if got := sameHost(tc.u, Issuer); got != tc.want {
+			t.Errorf("sameHost(%q) = %v, want %v", tc.u, got, tc.want)
+		}
+	}
+}
+
+// TestStrictObjectRefusesDeepNesting pins the nesting limit: shallow JSON passes, and
+// JSON nested deeper than maxDepth is refused.
+func TestStrictObjectRefusesDeepNesting(t *testing.T) {
+	nest := func(n int) []byte {
+		return []byte(`{"a":` + strings.Repeat("[", n) + strings.Repeat("]", n) + `}`)
+	}
+	if _, err := strictObject(nest(8)); err != nil {
+		t.Errorf("8 deep: %v", err)
+	}
+	if _, err := strictObject(nest(maxDepth + 8)); err == nil {
+		t.Errorf("%d deep is taken", maxDepth+8)
+	}
+}
+
 func TestNewVerifierTrustsGitHubsIssuer(t *testing.T) {
 	v := NewVerifier()
 	if v.issuer != "https://token.actions.githubusercontent.com" || v.client.Timeout != fetchTimeout {
@@ -689,7 +849,7 @@ func TestParseJWKSSkipsKeysThatCannotVerifyRS256(t *testing.T) {
 		jwk(&a.PublicKey, "ec", map[string]any{"kty": "EC"}),
 		jwk(&a.PublicKey, "enc", map[string]any{"use": "enc"}),
 		jwk(&a.PublicKey, "null-use", map[string]any{"use": json.RawMessage("null")}),
-		jwk(&a.PublicKey, "even-e", map[string]any{"e": "Ag"}),
+		jwk(&a.PublicKey, "even-e", map[string]any{"e": "AQAC"}),
 		jwk(&a.PublicKey, "leading-zero", map[string]any{"n": b64(append([]byte{0}, a.N.Bytes()...))}),
 		jwk(&a.PublicKey, "padded-n", map[string]any{"n": base64.URLEncoding.EncodeToString(append([]byte{1}, a.N.Bytes()...))}),
 		jwk(&a.PublicKey, "", nil),
