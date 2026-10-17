@@ -117,10 +117,10 @@ var (
 	// ErrUnreachable is Qory Apiary out of reach after every try: no answer.
 	ErrUnreachable = errors.New("Qory Apiary could not be reached")
 	// ErrAnswerUnusable is a signed answer within its bound that breaks the contract: a
-	// success status the request's schema does not give, a body that is not one JSON document,
-	// that breaks its schema, that names another revision, that is for another node pool
-	// or run than the one asked, or whose inputs are over their bound. Nothing in it is
-	// used, and the request is not sent again, since Qory Apiary acted on it.
+	// success status the request's schema does not give, a body that is not one JSON
+	// document, that breaks its schema, that names another revision, that is for another
+	// node pool or run than the one asked, or whose inputs are over their bound. Nothing
+	// in it is used, and the request is not sent again, since Qory Apiary acted on it.
 	ErrAnswerUnusable = errors.New("Qory Apiary's answer breaks the contract, so nothing in it is used")
 )
 
