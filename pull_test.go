@@ -164,8 +164,8 @@ func sentItems(t *testing.T, s *sink) []string {
 
 // TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem lists what changed, an
 // issue closed and a pull request among it, and checks the requests ask from the time
-// given, every state's, oldest change first; the items are sent as an event, closed ones
-// with their reason, and the comments grouped by item, none complete; a pull request's
+// given, every state's, oldest change first; the items are sent as an event, each with
+// its key, # and the issue's number, closed ones with their reason, and the comments grouped by item, none complete; a pull request's
 // comment and the App's work item comment are left out, and a comment that names no
 // issue is skipped by its ref.
 func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
@@ -212,12 +212,12 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 		if it.StateReason != nil {
 			reason = " " + *it.StateReason
 		}
-		got = append(got, it.Ref+" "+it.State+reason)
+		got = append(got, it.Ref+" "+it.Key+" "+it.State+reason)
 		if it.Target == nil || it.Target.Path != "acme/widgets" || !strings.HasPrefix(it.URL, "https://github.com/acme/widgets/issues/") {
 			t.Errorf("item %s: target %+v, url %s", it.Ref, it.Target, it.URL)
 		}
 	}
-	if strings.Join(got, ", ") != "1296269#1 open, 1296269#2 closed Not planned, 1296269#4 open" {
+	if strings.Join(got, ", ") != "1296269#1 #1 open, 1296269#2 #2 closed Not planned, 1296269#4 #4 open" {
 		t.Errorf("items %v", got)
 	}
 	got = nil

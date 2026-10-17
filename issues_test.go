@@ -342,7 +342,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	}
 	it, why, _ := itemOf("github.com", r, base)
 	want := contracts.Item{
-		Ref: "1296269#42", URL: "https://github.com/acme/widgets/issues/42", Title: "Widgets spin backwards", Body: "They should not.",
+		Ref: "1296269#42", URL: "https://github.com/acme/widgets/issues/42", Key: "#42", Title: "Widgets spin backwards", Body: "They should not.",
 		BodyFormat: "markdown", Type: "issue", State: "open", Labels: []string{"bug", "good first issue"},
 		FiledBy: contracts.Person{Name: "alice", Kind: "person"}, CommentCount: 3, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
 		Target: &contracts.Target{System: "github.com", Path: "acme/widgets"},
@@ -391,9 +391,12 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 func TestTheWireIsTheContractsJSON(t *testing.T) {
 	it, _, _ := itemOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
 	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: widgetsRef, Items: []contracts.Item{it}})
-	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"1296269","items":[{"ref":"1296269#1","url":"https://github.com/acme/widgets/issues/1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
+	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"1296269","items":[{"ref":"1296269#1","url":"https://github.com/acme/widgets/issues/1","key":"#1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
 	if string(b) != want {
 		t.Errorf("items\n%s\nwant\n%s", b, want)
+	}
+	if bad := check(contracts.SourceItems{Version: contracts.Version, CollectionRef: widgetsRef, Items: []contracts.Item{it}}); bad != "" {
+		t.Errorf("items: %s", bad)
 	}
 	got, _ := IssueCommentWebhook(event("deleted", issue(1, 1), map[string]any{"comment": comment(9, "bob", "User", "b")}), "qory-test")
 	req := got.Comments[0]
@@ -439,20 +442,20 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 		issue  map[string]any
 		extra  map[string]any
 		active func(string) bool
-		want   []string // collection item path state reason, one per items request
+		want   []string // collection item key path state reason, one per items request
 	}{
-		{"opened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
-		{"reopened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
-		{"edited", issue(1, 0), map[string]any{"changes": map[string]any{"title": map[string]any{"from": "old"}}}, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
-		{"closed", closed, nil, nil, []string{"1296269 1296269#1 acme/widgets closed Not planned"}},
-		{"labeled", issue(1, 0), map[string]any{"label": map[string]any{"name": "bug"}}, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
-		{"unlabeled", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets open <nil>"}},
-		{"deleted", issue(1, 0), nil, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
-		{"deleted", closed, nil, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
-		{"transferred", issue(1, 0), transfer, active, []string{"1296269 1296269#1 acme/widgets closed <nil>", "1296270 1296270#9 acme/gadgets open <nil>"}},
-		{"transferred", issue(1, 0), transfer, inactive, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
-		{"transferred", issue(1, 0), transfer, nil, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
-		{"transferred", issue(1, 0), noID, active, []string{"1296269 1296269#1 acme/widgets closed <nil>"}},
+		{"opened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 #1 acme/widgets open <nil>"}},
+		{"reopened", issue(1, 0), nil, nil, []string{"1296269 1296269#1 #1 acme/widgets open <nil>"}},
+		{"edited", issue(1, 0), map[string]any{"changes": map[string]any{"title": map[string]any{"from": "old"}}}, nil, []string{"1296269 1296269#1 #1 acme/widgets open <nil>"}},
+		{"closed", closed, nil, nil, []string{"1296269 1296269#1 #1 acme/widgets closed Not planned"}},
+		{"labeled", issue(1, 0), map[string]any{"label": map[string]any{"name": "bug"}}, nil, []string{"1296269 1296269#1 #1 acme/widgets open <nil>"}},
+		{"unlabeled", issue(1, 0), nil, nil, []string{"1296269 1296269#1 #1 acme/widgets open <nil>"}},
+		{"deleted", issue(1, 0), nil, nil, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>"}},
+		{"deleted", closed, nil, nil, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), transfer, active, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>", "1296270 1296270#9 #9 acme/gadgets open <nil>"}},
+		{"transferred", issue(1, 0), transfer, inactive, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), transfer, nil, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>"}},
+		{"transferred", issue(1, 0), noID, active, []string{"1296269 1296269#1 #1 acme/widgets closed <nil>"}},
 		{"assigned", issue(1, 0), nil, nil, nil},
 		{"pinned", issue(1, 0), nil, nil, nil},
 		{"milestoned", issue(1, 0), nil, nil, nil},
@@ -473,7 +476,7 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 			if it.StateReason != nil {
 				reason = *it.StateReason
 			}
-			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.Target.Path+" "+it.State+" "+reason)
+			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.Key+" "+it.Target.Path+" "+it.State+" "+reason)
 			if it.Target.System != "github.com" {
 				t.Errorf("%s: target %+v", tc.action, it.Target)
 			}
