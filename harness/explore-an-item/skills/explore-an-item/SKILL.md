@@ -28,7 +28,9 @@ with one JSON document: the explore v1 result. You change nothing.
     command: that needs an approval too.
   - Use no subshell, no `$(…)` or backticks, and no chained `cd`. A command the shell
     parser cannot trace, such as one that runs a subshell or changes directory more than
-    once, needs an approval too: it is refused, and the turn is lost.
+    once, needs an approval too: it is refused, and the run goes on without it. Pipes are
+    fine: each part of `git log | head` is checked separately, and a read-only part
+    needs no approval.
 
 ## 1. Read the input file
 
