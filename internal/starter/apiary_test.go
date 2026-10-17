@@ -1012,10 +1012,14 @@ func TestTimes(t *testing.T) {
 			cancel()
 			return sl.sleep(ctx, d)
 		}
+		d := &deadlines{}
+		a.HTTP = &http.Client{Transport: d}
 		if err := a.Dispatched(cctx, testDispatch, nil); !errors.Is(err, context.Canceled) {
 			t.Fatalf("not the context's error: %v", err)
 		}
-		if len(f.requests()) != 1 || logs.Len() != 0 {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if len(d.left) != 0 || len(f.requests()) != 1 || logs.Len() != 0 {
 			t.Errorf("a request cancelled during its wait is sent or logged:\n%s", logs.String())
 		}
 	})
