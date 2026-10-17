@@ -158,14 +158,15 @@ func (l Lister) issuePager(p *Pacer, id int64, repo Repository, first int) *issu
 // next reads the next page: the repository as GitHub names it and the page's issues, or
 // false once the last page is read. A rate limit GitHub answers in the body is waited
 // out and the page asked for again, at most limitedTries times. It fails, and the
-// listing with it, for any error GraphQL answers, a repository it cannot resolve, which
-// wraps [ErrRepositoryGone], a repository whose id is not the pager's or that has none,
-// an issue it answers as null, a next cursor that is missing or repeats one already
-// read, and a page past maxIssuePages. The id is checked on every page: owner/name may
-// name another repository by the time GraphQL reads it, as when a rename or a transfer
-// lands after the name was read, and such a page is never taken for the repository's.
-// That error does not wrap [ErrRepositoryGone], since the repository is there by its
-// id, and a later listing, which reads its name again, may list it.
+// listing with it, for any error GraphQL answers, a repository it cannot resolve by
+// owner/name, a repository whose id is not the pager's or that has none, an issue it
+// answers as null, a next cursor that is missing or repeats one already read, and a page
+// past maxIssuePages. The id is checked on every page: owner/name may name another
+// repository, or none, by the time GraphQL reads it, as when a rename or a transfer
+// lands after the name was read by the id, and such a page is never taken for the
+// repository's. Neither error wraps [ErrRepositoryGone]: the read by the id, which a
+// rename or a transfer does not change, is what says the repository is gone, and a
+// later listing, which reads the name again, may list it.
 func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) {
 	if g.done {
 		return g.r, nil, false, nil
@@ -233,14 +234,15 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 	return g.r, issues, true, nil
 }
 
-// answered is the error GraphQL's answer says, or nil: a repository it cannot resolve,
-// or that it answers as null, wraps [ErrRepositoryGone]; any other error, a rate limit
-// that held among them, is the error of the page. Only GitHub's type and message are
-// said, never the query or the token.
+// answered is the error GraphQL's answer says, or nil: a repository it cannot resolve
+// by owner/name, or that it answers as null, is the race of a rename or a transfer
+// with the read of the name, see [issuePager.next], and wraps no [ErrRepositoryGone];
+// any other error, a rate limit that held among them, is the error of the page. Only
+// GitHub's type and message are said, never the query or the token.
 func (g *issuePager) answered(got gqlOpenIssues) error {
 	for _, e := range got.Errors {
 		if e.Type == "NOT_FOUND" && len(e.Path) > 0 && e.Path[0] == "repository" {
-			return fmt.Errorf("%w: %s: GitHub answered: %s", ErrRepositoryGone, g.what, e.Message)
+			return fmt.Errorf("%s: GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again; GitHub answered: %s", g.what, e.Message)
 		}
 	}
 	if len(got.Errors) > 0 {
@@ -251,7 +253,7 @@ func (g *issuePager) answered(got gqlOpenIssues) error {
 		return fmt.Errorf("%s: GitHub answered %d errors, the first %s: %s", g.what, len(got.Errors), orUntyped(e.Type), e.Message)
 	}
 	if got.Data.Repository == nil {
-		return fmt.Errorf("%w: %s: GitHub answered no repository", ErrRepositoryGone, g.what)
+		return fmt.Errorf("%s: GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again", g.what)
 	}
 	return nil
 }
@@ -299,12 +301,11 @@ func rateLimited(errs []gqlError) bool {
 // part before it; one that fails on its first page sends nothing. A listing that fails
 // on the comments of its last part's items, once that part is sent, returns the error,
 // and that part, sent already, says it is complete, since every open issue was read and
-// sent and comments are no part of complete. A repository GitHub answers it cannot
-// resolve stops the listing with an error that wraps [ErrRepositoryGone]. A page whose
-// repository's id is not repository, or that has none, as when owner/name names another
-// repository by the time GraphQL reads it, stops the listing with an error that does
-// not, so a later listing, which reads the name again, lists it; when that is the first
-// page, nothing is sent. An issue whose comments GitHub answers are gone has its
+// sent and comments are no part of complete. A page that GraphQL answers with no
+// repository by owner/name, or with one whose id is not repository or that has none, as
+// when a rename or a transfer lands after the name was read, stops the listing with an
+// error that does not wrap [ErrRepositoryGone], so a later listing, which reads the
+// name again, lists it; when that is the first page, nothing is sent. An issue whose comments GitHub answers are gone has its
 // comments skipped and logged by its ref, and the listing goes on.
 func (l Lister) ListOpenIssuesComplete(ctx context.Context, repository int64, repo Repository) error {
 	return l.listOpenComplete(ctx, repository, repo, openIssuesPerPage)

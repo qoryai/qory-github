@@ -907,9 +907,9 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // reach, since a rename or a transfer keeps its id, and fails for good as
 // [github.ErrRepositoryGone]; any other failure of that read fails the fill as a failure
 // of the listing would, to be tried again. A listing that finds the name naming
-// another repository by then, as a rename or a transfer that lands between the two
-// requests makes it, fails without sending anything, to be tried again, which reads
-// the name again.
+// another repository, or none, by then, as a rename or a transfer that lands between
+// the two requests makes it, fails without sending anything, to be tried again, which
+// reads the name again.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	id, err := repositoryID(ref)
 	if err != nil {

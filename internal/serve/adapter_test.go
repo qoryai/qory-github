@@ -1398,18 +1398,22 @@ func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 
 // TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain fills acme/widgets while GraphQL
 // answers, for the name read by the id, a repository whose id is another, as when the
-// name came to name another repository between the two requests, or no id: the fill
-// sends nothing, no item and no complete listing, keeps no start, and fails with an
-// error that passes, not for good and not as a repository gone, so the change feed tries
-// it again.
+// name came to name another repository between the two requests, one with no id, or
+// NOT_FOUND, as when the name came to name none: the fill sends nothing, no item and no
+// complete listing, keeps no start, and fails with an error that passes, not for good
+// and not as a repository gone, so the change feed tries it again.
 func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
-	for _, id := range []any{gadgetsID, nil} {
+	for _, id := range []any{gadgetsID, nil, "not found"} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		linkCollection(w.st, widgetsRef)
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
-		w.gh.gqlIDSet, w.gh.gqlID = true, id
+		if id == "not found" {
+			w.gh.gqlNotFound = true
+		} else {
+			w.gh.gqlIDSet, w.gh.gqlID = true, id
+		}
 		err := w.adapter.fill(context.Background(), widgetsRef)
 		if err == nil || IsPermanent(err) || errors.Is(err, github.ErrRepositoryGone) {
 			t.Errorf("%v: err %v", id, err)

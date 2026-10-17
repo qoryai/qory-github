@@ -322,16 +322,21 @@ func TestAPullListsByTheNameItReadOnce(t *testing.T) {
 
 // TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater pulls a collection whose
 // daily listing is due while GraphQL answers, for the name read by the id, a repository
-// whose id is another, or no id: what changed is sent, the listing sends no part, and
+// whose id is another, one with no id, or NOT_FOUND, no repository by that name: what
+// changed is sent, the listing sends no part, and
 // the pull fails with an error that is no repository gone and keeps no time, so the
 // next round reads the name and lists again.
 func TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater(t *testing.T) {
-	for _, id := range []any{gadgetsID, nil} {
+	for _, id := range []any{gadgetsID, nil, "not found"} {
 		w, _, p, _ := pulling(t)
 		mark := pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)}
 		keepPulled(w.st, widgetsRef, mark)
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
-		w.gh.gqlIDSet, w.gh.gqlID = true, id
+		if id == "not found" {
+			w.gh.gqlNotFound = true
+		} else {
+			w.gh.gqlIDSet, w.gh.gqlID = true, id
+		}
 		err := p.pull(context.Background(), widgetsRef, 42)
 		if err == nil || errors.Is(err, github.ErrRepositoryGone) {
 			t.Errorf("%v: err %v", id, err)

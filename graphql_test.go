@@ -40,9 +40,10 @@ type fakeGraphQL struct {
 	limited, limitFrom int
 	limitHeaders       bool
 	// errorOn answers that page, counted from 1, with a GraphQL error, statusOn with
-	// status; notFound answers that the repository cannot be resolved.
+	// status; notFound answers that the repository cannot be resolved, and
+	// nullRepository answers it as null with no error.
 	errorOn, statusOn, status int
-	notFound                  bool
+	notFound, nullRepository  bool
 	// sameCursor names the first page's cursor again on every page, noCursor names
 	// none, and nullNode answers the first page's first issue as null.
 	sameCursor, noCursor, nullNode bool
@@ -126,6 +127,10 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if g.notFound {
 		io.WriteString(w, `{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name 'acme/widgets'."}]}`)
+		return
+	}
+	if g.nullRepository {
+		io.WriteString(w, `{"data":{"repository":null}}`)
 		return
 	}
 	if page == g.errorOn {
@@ -622,6 +627,7 @@ func TestAnEmptyListingThatFailsSendsNothing(t *testing.T) {
 		{name: "GraphQL's errors on the first page", g: &fakeGraphQL{errorOn: 1}},
 		{name: "a rate limit that holds on the first page", g: &fakeGraphQL{limited: 5}},
 		{name: "the repository not found", g: &fakeGraphQL{notFound: true}},
+		{name: "the repository answered as null", g: &fakeGraphQL{nullRepository: true}},
 		{name: "another repository by that name", g: &fakeGraphQL{name: "acme/gadgets", databaseID: gadgetsID}},
 		{name: "the repository without an id", g: &fakeGraphQL{noDatabaseID: true}},
 		{name: "another repository's id on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, otherIDOn: 2}},
@@ -656,6 +662,7 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 	}
 	const what = "listing the open issues of acme/widgets: "
 	const otherID = "GitHub answers a repository whose id is not 1296269, or no id; it may have been renamed or transferred since its name was read, so a later listing reads it again"
+	const noneByName = "GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again"
 	for _, tc := range []struct {
 		name  string
 		g     *fakeGraphQL
@@ -667,7 +674,8 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 		{"a GraphQL error", &fakeGraphQL{nodes: five(), errorOn: 2}, what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", false, "1 2", 2},
 		{"a GraphQL error on the first page", &fakeGraphQL{nodes: five(), errorOn: 1}, what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", false, "", 1},
 		{"a status", &fakeGraphQL{nodes: five(), statusOn: 3, status: 502}, what + "GitHub answered 502: Bad credentials", false, "1 2 3 4", 3},
-		{"the repository not found", &fakeGraphQL{nodes: five(), notFound: true}, "the repository is deleted, moved or out of the App's reach: " + what + "GitHub answered: Could not resolve to a Repository with the name 'acme/widgets'.", true, "", 1},
+		{"the repository not found", &fakeGraphQL{nodes: five(), notFound: true}, what + noneByName + "; GitHub answered: Could not resolve to a Repository with the name 'acme/widgets'.", false, "", 1},
+		{"the repository answered as null", &fakeGraphQL{nodes: five(), nullRepository: true}, what + noneByName, false, "", 1},
 		{"another repository by that name", &fakeGraphQL{nodes: five(), name: "acme/gadgets", databaseID: gadgetsID}, what + otherID, false, "", 1},
 		{"the repository without an id", &fakeGraphQL{nodes: five(), noDatabaseID: true}, what + otherID, false, "", 1},
 		{"another repository's id while it is listed", &fakeGraphQL{nodes: five(), otherIDOn: 2}, what + otherID, false, "1 2", 2},

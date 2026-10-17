@@ -379,10 +379,13 @@ type fakeGitHub struct {
 	// readStatus, when set, answers the read of acme/widgets by its id, GET
 	// /repositories/{id}, with that status and no repository. gqlIDSet makes GraphQL
 	// answer gqlID as acme/widgets's databaseId, nil for none, or another repository's
-	// id, as when the name came to name another repository after it was read.
-	readStatus int
-	gqlIDSet   bool
-	gqlID      any
+	// id, as when the name came to name another repository after it was read, and
+	// gqlNotFound makes GraphQL answer that it resolves no repository by acme/widgets, as
+	// when the name came to name none.
+	readStatus  int
+	gqlIDSet    bool
+	gqlID       any
+	gqlNotFound bool
 	// gqlAsked is the owner/name each GraphQL request named, in order.
 	gqlAsked []string
 	// person is the person signed in with Connect; userInstallations are the
@@ -647,9 +650,9 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 	}
 	name := v.Owner + "/" + v.Name
 	id := repoID(name)
-	switch name {
-	case "acme/widgets":
-	case "acme/moved":
+	switch {
+	case name == "acme/widgets" && !f.gqlNotFound:
+	case name == "acme/moved":
 		name = "acme/renamed"
 	default:
 		io.WriteString(w, `{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name '`+name+`'."}]}`)
