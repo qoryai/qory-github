@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,9 +24,9 @@ const (
 	maxJobHeader = 32 << 10
 )
 
-// handoverPath is the one path the pass-through serves: the handover of a dispatch,
-// named by the provisioner contract's dispatch_id.
-var handoverPath = regexp.MustCompile(`^/v1/dispatches/(dp_[0-9a-hjkmnp-tv-z]{16})/handover$`)
+// handoverRoute is the one route the pass-through serves below the public URL's path:
+// the handover of a dispatch, named by the provisioner contract's dispatch_id.
+var handoverRoute = regexp.MustCompile(`^/v1/dispatches/(dp_[0-9a-hjkmnp-tv-z]{16})/handover$`)
 
 // The pass-through's answers but the run key's. A request that names a dispatch the
 // starter does not hold, whose token fails any check, or that comes after the
@@ -44,21 +45,28 @@ const (
 	contentTypeJSON = "application/json"
 )
 
-// ServeHTTP is the pass-through: POST /v1/dispatches/<dispatch_id>/handover, with the
-// job's GitHub Actions OIDC token as a bearer, and nothing else. The path is taken
-// exactly as sent, with no escape, no query and no other form; any other path is 404
-// and any other method 405. A body over [maxJobBody] is 413.
+// ServeHTTP is the pass-through: POST <path>/v1/dispatches/<dispatch_id>/handover,
+// where <path> is public_url's path without its trailing slash, as [publicPath] gives
+// it, with the job's GitHub Actions OIDC token as a bearer, and nothing else. The
+// request's target is taken exactly as sent, with no other escape, no query and no
+// other form; any other target is 404, the route outside that path among them. On the
+// handover's target, any other method is 405, and a body over [maxJobBody] is 413.
 //
 // The token is checked against the dispatch's workflow run, see [starter.expect]. A
 // request for a dispatch the starter does not hold, whose token fails a check, or that
 // is not the first request whose token passed for its dispatch, gets the same 403 and
-// body. The first that passes sends the handover, again while it fails for a while, see
-// [starter.handover], and on the signed 200 answers {"run_key", "inputs"} with
-// Cache-Control: no-store, after which the starter holds the run key nowhere. Any other
-// end of the handover answers 502, and the dispatch ends as the handover's end says.
+// body, and so does the first when its request ends while it waits for the dispatched
+// answer, as when the starter stops. The first that passes sends the handover, again
+// while it fails for a while, see [starter.handover], and on the signed 200 answers
+// {"run_key", "inputs"} with Cache-Control: no-store, after which the starter keeps no
+// reference to the run key; copies of it stay in memory at least until they are
+// collected as garbage, in the [Handed] value, the body of the signed answer and
+// net/http's buffers among them. Any other end of the handover answers 502, and the
+// dispatch ends as the handover's end says. No answer is a 200 without the run key.
 func (st *starter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	m := handoverPath.FindStringSubmatch(r.URL.Path)
-	if m == nil || r.RequestURI != r.URL.Path || r.URL.RawPath != "" || r.URL.RawQuery != "" || r.URL.ForceQuery {
+	route, under := strings.CutPrefix(r.RequestURI, st.prefix)
+	m := handoverRoute.FindStringSubmatch(route)
+	if !under || m == nil {
 		writeJob(w, http.StatusNotFound, answerNotFound)
 		return
 	}
@@ -71,23 +79,33 @@ func (st *starter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJob(w, http.StatusRequestEntityTooLarge, answerTooLarge)
 		return
 	}
-	values := r.Header.Values(authorization)
-	if len(values) != 1 || !strings.HasPrefix(values[0], bearer) || len(values[0]) == len(bearer) {
+	token, ok := bearerOf(r)
+	if !ok {
 		writeJob(w, statusRefused, answerRefused)
 		return
 	}
-	token := values[0][len(bearer):]
 	st.mu.Lock()
 	d := st.dispatches[m[1]]
 	st.mu.Unlock()
 	if d == nil {
-		// The token is checked all the same, against a run no token is for, so an
-		// unknown dispatch takes the time a known one does.
+		// The token is checked all the same, in full, against a run no token is for,
+		// so an unknown dispatch is refused after the signature check, as a known
+		// one is.
 		_, _ = st.verifier.Verify(r.Context(), token, st.decoy())
 		writeJob(w, statusRefused, answerRefused)
 		return
 	}
-	if _, err := st.verifier.Verify(r.Context(), token, st.expect(d)); err != nil {
+	var err error
+	if st.now().Before(d.lease) {
+		_, err = st.verifier.Verify(r.Context(), token, st.expect(d))
+	} else {
+		// Verify refuses a token at or after the lease before its signature is
+		// checked; the token is checked in full against the decoy instead, so this
+		// refusal comes after the signature check, as an unknown dispatch's does.
+		_, _ = st.verifier.Verify(r.Context(), token, st.decoy())
+		err = refuse("lease_until")
+	}
+	if err != nil {
 		reason := Reason(err)
 		if reason == "" {
 			reason = "expect"
@@ -103,6 +121,7 @@ func (st *starter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-d.ready:
 	case <-r.Context().Done():
+		writeJob(w, statusRefused, answerRefused)
 		return
 	}
 	if !d.begin() {
@@ -131,6 +150,27 @@ func (st *starter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.log.Info("handed the run to its job", slog.String("dispatch_id", d.id), slog.String("run_id", d.runID), slog.Int64("workflow_run_id", d.workflowRun))
+}
+
+// bearerOf is the token of the request's one Authorization, Bearer and a token that is
+// not empty; ok is false for any other.
+func bearerOf(r *http.Request) (token string, ok bool) {
+	values := r.Header.Values(authorization)
+	if len(values) != 1 || !strings.HasPrefix(values[0], bearer) || len(values[0]) == len(bearer) {
+		return "", false
+	}
+	return values[0][len(bearer):], true
+}
+
+// publicPath is the path of publicURL, escaped as it is sent, without its trailing
+// slash: the pass-through's route is served below it, as a proxy that passes the path
+// on sends it. A URL without a path, or one that does not parse, gives "".
+func publicPath(publicURL string) string {
+	u, err := url.Parse(publicURL)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(u.EscapedPath(), "/")
 }
 
 // take takes the dispatch's one request, and reports whether it was still there: a

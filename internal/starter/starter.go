@@ -129,6 +129,7 @@ func Run(ctx context.Context, s Settings, d Deps) error {
 	}
 	st := &starter{
 		settings:   s,
+		prefix:     publicPath(s.PublicURL),
 		now:        d.Now,
 		sleep:      d.Sleep,
 		poll:       d.Poll,
@@ -207,6 +208,9 @@ func (st *starter) run(ctx context.Context, ln net.Listener) error {
 // starter is one running starter: its clients, its clock and the dispatches it holds.
 type starter struct {
 	settings Settings
+	// prefix is public_url's path, as [publicPath] gives it, which the pass-through
+	// serves its route below.
+	prefix   string
 	apiary   *Apiary
 	actions  *github.Actions
 	repo     github.ActionsRepository
@@ -565,7 +569,9 @@ func (st *starter) release(ctx context.Context, id, runID, reason string, retry 
 // instance-id in the state directory, 0600, so the starter is the same instance after
 // a restart. The directory is made 0700 when it does not exist, and it and the file
 // must be the user's the starter runs as and grant group and others no permission. A
-// file that holds no instance id is written anew.
+// file larger than 256 bytes is refused, and the error is returned; a file within that
+// bound that holds no instance id, i_ and an id [accesskey.CheckInstanceID] takes, is
+// written anew.
 func instanceID(dir string) (string, error) {
 	if err := ownerfile.Dir(dir, "the state directory"); err != nil {
 		return "", err

@@ -344,9 +344,11 @@ type harness struct {
 	tmp      string
 	logs     *lockedBuffer
 	addr     string
-	cancel   context.CancelFunc
-	done     chan error
-	stopped  bool
+	// path is put before the handover's route in a job's request.
+	path    string
+	cancel  context.CancelFunc
+	done    chan error
+	stopped bool
 }
 
 var (
@@ -486,7 +488,7 @@ type jobReply struct {
 // empty.
 func (h *harness) job(dispatch, auth string) jobReply {
 	h.t.Helper()
-	req, err := http.NewRequest(http.MethodPost, "http://"+h.addr+"/v1/dispatches/"+dispatch+"/handover", nil)
+	req, err := http.NewRequest(http.MethodPost, "http://"+h.addr+h.path+"/v1/dispatches/"+dispatch+"/handover", nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -502,8 +504,8 @@ func (h *harness) job(dispatch, auth string) jobReply {
 	return jobReply{status: resp.StatusCode, body: b, header: resp.Header}
 }
 
-// bearer is the Authorization of token.
-func bearerOf(token string) string { return "Bearer " + token }
+// bearerAuth is the Authorization of token.
+func bearerAuth(token string) string { return "Bearer " + token }
 
 // checkReleased checks the one release Qory Apiary saw: its reason and its retry.
 func (h *harness) checkReleased(reason string, retry bool) {
@@ -579,7 +581,7 @@ func (h *harness) handOver() jobReply {
 	h.t.Helper()
 	h.start()
 	h.dispatchedSeen()
-	got := h.job(testDispatch, bearerOf(h.token(nil)))
+	got := h.job(testDispatch, bearerAuth(h.token(nil)))
 	if got.status != http.StatusOK {
 		h.t.Fatalf("the job got %d %s; the log:\n%s", got.status, got.body, h.logs.String())
 	}
@@ -617,7 +619,9 @@ func TestHappyPath(t *testing.T) {
 
 	h.gh.set("completed", "success")
 	h.tick()
-	h.eventually("the outcome", func() bool { return len(h.apiary.sent("/outcome")) == 1 })
+	for _, l := range []string{"handed the run to its job", "posted the run's outcome"} {
+		h.eventually("the line "+l, func() bool { return slices.Contains(h.logLines(), l) })
+	}
 	h.stop()
 
 	want := []string{
@@ -739,7 +743,7 @@ func TestHandedOver(t *testing.T) {
 			h.gh.set("in_progress", "")
 			h.start()
 			h.dispatchedSeen()
-			got := h.job(testDispatch, bearerOf(h.token(nil)))
+			got := h.job(testDispatch, bearerAuth(h.token(nil)))
 			if got.status != http.StatusBadGateway || bytes.Contains(got.body, []byte("qrk_")) {
 				t.Fatalf("the job got %d %s", got.status, got.body)
 			}
@@ -796,7 +800,7 @@ func TestHandedOverStale(t *testing.T) {
 			h.apiary.release = refusalOf(status, code)
 			h.start()
 			h.dispatchedSeen()
-			if got := h.job(testDispatch, bearerOf(h.token(nil))); got.status != http.StatusBadGateway {
+			if got := h.job(testDispatch, bearerAuth(h.token(nil))); got.status != http.StatusBadGateway {
 				t.Fatalf("the job got %d", got.status)
 			}
 			h.eventually("the release", func() bool { return len(h.apiary.sent("/release")) == 1 })
@@ -820,7 +824,7 @@ func TestHandedOverStale(t *testing.T) {
 func TestSecondRequestRefused(t *testing.T) {
 	h := newHarness(t)
 	h.handOver()
-	again := h.job(testDispatch, bearerOf(h.token(nil)))
+	again := h.job(testDispatch, bearerAuth(h.token(nil)))
 	if again.status != http.StatusForbidden || string(again.body) != answerRefused {
 		t.Errorf("a second request got %d %s", again.status, again.body)
 	}
@@ -832,7 +836,7 @@ func TestSecondRequestRefused(t *testing.T) {
 	h = newHarness(t)
 	h.start()
 	h.dispatchedSeen()
-	tok := bearerOf(h.token(nil))
+	tok := bearerAuth(h.token(nil))
 	var wg sync.WaitGroup
 	statuses := make([]int, 2)
 	for i := range statuses {
@@ -869,14 +873,14 @@ func TestSameRefusal(t *testing.T) {
 		{"no bearer", testDispatch, "", ""},
 		{"basic", testDispatch, "Basic " + h.token(nil), ""},
 		{"empty bearer", testDispatch, "Bearer ", ""},
-		{"unknown dispatch", "dp_0000000000000000", bearerOf(h.token(nil)), ""},
-		{"another key", testDispatch, bearerOf(token(t, keyB, "k1", other)), "signature"},
-		{"another run", testDispatch, bearerOf(h.token(func(c map[string]any) { c["run_id"] = "1" })), "run_id"},
-		{"the settings' case", testDispatch, bearerOf(h.token(func(c map[string]any) {
+		{"unknown dispatch", "dp_0000000000000000", bearerAuth(h.token(nil)), ""},
+		{"another key", testDispatch, bearerAuth(token(t, keyB, "k1", other)), "signature"},
+		{"another run", testDispatch, bearerAuth(h.token(func(c map[string]any) { c["run_id"] = "1" })), "run_id"},
+		{"the settings' case", testDispatch, bearerAuth(h.token(func(c map[string]any) {
 			c["repository"] = "example-org/runners"
 		})), "repository"},
-		{"another audience", testDispatch, bearerOf(h.token(func(c map[string]any) { c["aud"] = "https://other.example.com" })), "aud"},
-		{"another attempt", testDispatch, bearerOf(h.token(func(c map[string]any) { c["run_attempt"] = "2" })), "run_attempt"},
+		{"another audience", testDispatch, bearerAuth(h.token(func(c map[string]any) { c["aud"] = "https://other.example.com" })), "aud"},
+		{"another attempt", testDispatch, bearerAuth(h.token(func(c map[string]any) { c["run_attempt"] = "2" })), "run_attempt"},
 		{"not a token", testDispatch, "Bearer " + marker, "format"},
 	}
 	for _, c := range cases {
@@ -895,7 +899,7 @@ func TestSameRefusal(t *testing.T) {
 		t.Errorf("the log quotes a token")
 	}
 	// The dispatch's one request is still there for its job.
-	if got := h.job(testDispatch, bearerOf(h.token(nil))); got.status != http.StatusOK {
+	if got := h.job(testDispatch, bearerAuth(h.token(nil))); got.status != http.StatusOK {
 		t.Errorf("the job got %d after the refusals", got.status)
 	}
 	h.stop()
@@ -925,7 +929,7 @@ func TestHandoverSentAgainWhileTheLeaseLasts(t *testing.T) {
 			h.gh.set("in_progress", "")
 			h.start()
 			h.dispatchedSeen()
-			got := h.job(testDispatch, bearerOf(h.token(nil)))
+			got := h.job(testDispatch, bearerAuth(h.token(nil)))
 			if got.status != http.StatusBadGateway || string(got.body) != answerNoRunKey {
 				t.Fatalf("the job got %d %s", got.status, got.body)
 			}
@@ -968,7 +972,7 @@ func TestHandoverStaleOrGone(t *testing.T) {
 		h.gh.set("in_progress", "")
 		h.start()
 		h.dispatchedSeen()
-		if got := h.job(testDispatch, bearerOf(h.token(nil))); got.status != http.StatusBadGateway {
+		if got := h.job(testDispatch, bearerAuth(h.token(nil))); got.status != http.StatusBadGateway {
 			t.Fatalf("the job got %d", got.status)
 		}
 		h.eventually("the cancel", func() bool { _, c, _ := h.gh.counts(); return c == 1 })
@@ -976,6 +980,7 @@ func TestHandoverStaleOrGone(t *testing.T) {
 		if n := len(h.apiary.sent("/release")); n != 0 {
 			t.Errorf("%s: %d releases", rep.body, n)
 		}
+		h.checkNoLeak()
 	}
 }
 
@@ -994,7 +999,7 @@ func TestLeaseLapse(t *testing.T) {
 	if _, cancels, _ := h.gh.counts(); cancels != 1 {
 		t.Errorf("%d cancels", cancels)
 	}
-	if got := h.job(testDispatch, bearerOf(h.token(nil))); got.status != http.StatusForbidden {
+	if got := h.job(testDispatch, bearerAuth(h.token(nil))); got.status != http.StatusForbidden {
 		t.Errorf("a job after the lease got %d", got.status)
 	}
 	h.stop()
@@ -1115,7 +1120,7 @@ func TestDispatchedRefused(t *testing.T) {
 				h.eventually("the release", func() bool { return len(h.apiary.sent("/release")) == 1 })
 				h.checkReleased(reasonNotRecorded, true)
 			}
-			if got := h.job(testDispatch, bearerOf(h.token(nil))); got.status != http.StatusForbidden {
+			if got := h.job(testDispatch, bearerAuth(h.token(nil))); got.status != http.StatusForbidden {
 				t.Errorf("the job got %d", got.status)
 			}
 			h.stop()
@@ -1161,33 +1166,115 @@ func TestClaimBacksOff(t *testing.T) {
 	}
 }
 
-// TestPassThroughTakesOnlyTheHandover answers 404 to any other path, the handover's
-// path with an escape, a query or a trailing slash among them, 405 to another method,
-// and 413 to a body over its bound, before any dispatch is looked up.
+// TestPassThroughTakesOnlyTheHandover answers 404 to any other target, the handover's
+// route with an escape, a query or a trailing slash among them, and the route outside
+// public_url's path; 405 to another method on the handover's target and 413 to a body
+// over its bound, before any dispatch is looked up.
 func TestPassThroughTakesOnlyTheHandover(t *testing.T) {
-	st := &starter{dispatches: map[string]*dispatch{}, log: slog.New(slog.DiscardHandler), now: time.Now}
+	route := "/v1/dispatches/" + testDispatch + "/handover"
 	for _, c := range []struct {
-		method, target string
-		body           string
-		status         int
+		prefix, method, target string
+		body                   string
+		status                 int
 	}{
-		{http.MethodGet, "/v1/dispatches/" + testDispatch + "/handover", "", http.StatusMethodNotAllowed},
-		{http.MethodPost, "/v1/dispatches/" + testDispatch + "/handover/", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/" + testDispatch + "/handover?x=1", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/" + testDispatch + "/handover?", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/dp_8w3k0q9t2v7m4r6%78/handover", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/DP_8W3K0Q9T2V7M4R6X/handover", "", http.StatusNotFound},
-		{http.MethodPost, "//v1/dispatches/" + testDispatch + "/handover", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/" + testDispatch + "/dispatched", "", http.StatusNotFound},
-		{http.MethodPost, "/", "", http.StatusNotFound},
-		{http.MethodPost, "/v1/dispatches/" + testDispatch + "/handover", strings.Repeat("x", maxJobBody+1), http.StatusRequestEntityTooLarge},
+		{"", http.MethodGet, route, "", http.StatusMethodNotAllowed},
+		{"", http.MethodPost, route + "/", "", http.StatusNotFound},
+		{"", http.MethodPost, route + "?x=1", "", http.StatusNotFound},
+		{"", http.MethodPost, route + "?", "", http.StatusNotFound},
+		{"", http.MethodPost, "/v1/dispatches/dp_8w3k0q9t2v7m4r6%78/handover", "", http.StatusNotFound},
+		{"", http.MethodPost, "/v1/dispatches/DP_8W3K0Q9T2V7M4R6X/handover", "", http.StatusNotFound},
+		{"", http.MethodPost, "/" + route, "", http.StatusNotFound},
+		{"", http.MethodPost, "/v1/dispatches/" + testDispatch + "/dispatched", "", http.StatusNotFound},
+		{"", http.MethodPost, "/", "", http.StatusNotFound},
+		{"", http.MethodGet, "/starter" + route, "", http.StatusNotFound},
+		{"", http.MethodPost, route, strings.Repeat("x", maxJobBody+1), http.StatusRequestEntityTooLarge},
+		{"/starter", http.MethodGet, "/starter" + route, "", http.StatusMethodNotAllowed},
+		{"/starter", http.MethodGet, route, "", http.StatusNotFound},
+		{"/starter", http.MethodPost, "/starter/" + route, "", http.StatusNotFound},
+		{"/starter", http.MethodPost, "/starterx" + route, "", http.StatusNotFound},
+		{"/a%20b", http.MethodGet, "/a%20b" + route, "", http.StatusMethodNotAllowed},
 	} {
+		st := &starter{prefix: c.prefix, dispatches: map[string]*dispatch{}, log: slog.New(slog.DiscardHandler), now: time.Now}
 		req := httptest.NewRequest(c.method, c.target, strings.NewReader(c.body))
 		w := httptest.NewRecorder()
 		st.ServeHTTP(w, req)
 		if w.Code != c.status {
-			t.Errorf("%s %s: %d, not %d", c.method, c.target, w.Code, c.status)
+			t.Errorf("%q %s %s: %d, not %d", c.prefix, c.method, c.target, w.Code, c.status)
 		}
+		if c.status == http.StatusNotFound && w.Body.String() != answerNotFound {
+			t.Errorf("%q %s %s: the body is %s", c.prefix, c.method, c.target, w.Body)
+		}
+	}
+	for in, want := range map[string]string{
+		"https://starter.example.com":              "",
+		"https://starter.example.com/":             "",
+		"https://starter.example.com/starter":      "/starter",
+		"https://starter.example.com/a/b/":         "/a/b",
+		"https://starter.example.com:8443/a%20b//": "/a%20b",
+	} {
+		if got := publicPath(in); got != want {
+			t.Errorf("publicPath(%q) is %q, not %q", in, got, want)
+		}
+	}
+}
+
+// TestPublicURLPath serves the handover below public_url's path, whose URL the token's
+// audience names, and answers 404 to the route at the root, sending no handover; the
+// dispatch's one request is left for its job.
+func TestPublicURLPath(t *testing.T) {
+	h := newHarness(t)
+	h.settings.PublicURL = testAudience + "/starter"
+	h.start()
+	h.dispatchedSeen()
+	tok := bearerAuth(h.token(func(c map[string]any) { c["aud"] = testAudience + "/starter" }))
+	if got := h.job(testDispatch, tok); got.status != http.StatusNotFound || string(got.body) != answerNotFound {
+		t.Errorf("the route at the root got %d %s", got.status, got.body)
+	}
+	if n := len(h.apiary.sent("/handover")); n != 0 {
+		t.Errorf("%d handovers", n)
+	}
+	h.path = "/starter"
+	if got := h.job(testDispatch, tok); got.status != http.StatusOK {
+		t.Errorf("the route below the path got %d %s", got.status, got.body)
+	}
+	h.eventually("the line", func() bool { return slices.Contains(h.logLines(), "handed the run to its job") })
+	h.stop()
+	h.checkNoLeak()
+}
+
+// TestStopWhileWaitingForDispatched answers a job whose token passed, and that waits
+// for the dispatched answer, with the same 403 and body as any refusal when the
+// starter stops, never a 200 without the run key.
+func TestStopWhileWaitingForDispatched(t *testing.T) {
+	h := newHarness(t)
+	d := &dispatch{id: testDispatch, runID: testRun, lease: leaseUntil, workflowRun: testRunID, ready: make(chan struct{}), wake: make(chan struct{}, 1)}
+	st := &starter{
+		settings: h.settings, repo: github.ActionsRepository{Installation: ghInstallation, ID: testRepoID, FullName: ghFullName},
+		verifier: newVerifier(h.issuer.srv.URL, h.issuer.srv.Client().Transport, h.clock.Now),
+		now:      h.clock.Now, log: slog.New(slog.DiscardHandler), dispatches: map[string]*dispatch{testDispatch: d},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/dispatches/"+testDispatch+"/handover", nil)
+	req.Header.Set("Authorization", bearerAuth(h.token(nil)))
+	w := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		st.ServeHTTP(w, req)
+	}()
+	h.eventually("the request taken", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.asked
+	})
+	cancel()
+	select {
+	case <-served:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the request was never answered")
+	}
+	if w.Code != http.StatusForbidden || w.Body.String() != answerRefused || w.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("the job got %d %s", w.Code, w.Body)
 	}
 }
 
@@ -1236,5 +1323,37 @@ func TestRunRefusesARepositoryGitHubDoesNotName(t *testing.T) {
 	}
 	if n := len(h.apiary.requests()); n != 0 {
 		t.Errorf("%d requests reached Qory Apiary", n)
+	}
+}
+
+// TestLapsedLeaseCheckedInFull refuses a token for a known dispatch whose lease has
+// passed with the same 403 and body, after a full check of the token against the decoy,
+// so the issuer's keys are fetched as for an unknown dispatch, and logs the check
+// lease_until.
+func TestLapsedLeaseCheckedInFull(t *testing.T) {
+	h := newHarness(t)
+	h.clock.set(leaseUntil)
+	logs := &lockedBuffer{}
+	d := &dispatch{id: testDispatch, runID: testRun, lease: leaseUntil, workflowRun: testRunID, ready: make(chan struct{}), wake: make(chan struct{}, 1)}
+	st := &starter{
+		settings: h.settings, repo: github.ActionsRepository{Installation: ghInstallation, ID: testRepoID, FullName: ghFullName},
+		verifier: newVerifier(h.issuer.srv.URL, h.issuer.srv.Client().Transport, h.clock.Now),
+		now:      h.clock.Now, log: slog.New(slog.NewJSONHandler(logs, nil)), dispatches: map[string]*dispatch{testDispatch: d},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/dispatches/"+testDispatch+"/handover", nil)
+	req.Header.Set("Authorization", bearerAuth(h.token(nil)))
+	w := httptest.NewRecorder()
+	st.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || w.Body.String() != answerRefused {
+		t.Errorf("the job got %d %s", w.Code, w.Body)
+	}
+	if h.issuer.hits() == 0 {
+		t.Errorf("the token was refused before the signature check")
+	}
+	if !strings.Contains(logs.String(), `"reason":"lease_until"`) {
+		t.Errorf("no line names the check lease_until: %s", logs)
+	}
+	if d.asked {
+		t.Errorf("the dispatch's request was taken")
 	}
 }
