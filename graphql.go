@@ -32,10 +32,12 @@ const openIssuesPerPage = 100
 // openIssuesQuery reads one page of a repository's open issues, oldest first, the page
 // after the cursor $after, or the first page when it is null. It names the repository
 // too, as GitHub has it, and its id, which must be the id the listing is for, and which
-// the refs of its collection and its items are.
+// the refs of its collection and its items are. The id is fullDatabaseId, GraphQL's
+// BigInt, which GitHub writes as a JSON string, not databaseId, an Int, which GraphQL
+// holds to 32 bits and cannot answer once an id passes 2,147,483,647.
 const openIssuesQuery = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
-    databaseId
+    fullDatabaseId
     nameWithOwner
     url
     issues(states: OPEN, first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -81,10 +83,10 @@ type (
 	gqlOpenIssues struct {
 		Data struct {
 			Repository *struct {
-				DatabaseID    int64  `json:"databaseId"`
-				NameWithOwner string `json:"nameWithOwner"`
-				URL           string `json:"url"`
-				Issues        struct {
+				FullDatabaseID json.RawMessage `json:"fullDatabaseId"`
+				NameWithOwner  string          `json:"nameWithOwner"`
+				URL            string          `json:"url"`
+				Issues         struct {
 					PageInfo struct {
 						HasNextPage bool    `json:"hasNextPage"`
 						EndCursor   *string `json:"endCursor"`
@@ -159,9 +161,9 @@ func (l Lister) issuePager(p *Pacer, id int64, repo Repository, first int) *issu
 // false once the last page is read. A rate limit GitHub answers in the body is waited
 // out and the page asked for again, at most limitedTries times. It fails, and the
 // listing with it, for any error GraphQL answers, a repository it cannot resolve by
-// owner/name, a repository whose id is not the pager's or that has none, an issue it
-// answers as null, a next cursor that is missing or repeats one already read, and a page
-// past maxIssuePages. The id is checked on every page: owner/name may name another
+// owner/name, a repository whose id is not the pager's or that has none that is an id,
+// see [fullDatabaseID], an issue it answers as null, a next cursor that is missing or
+// repeats one already read, and a page past maxIssuePages. The id is checked on every page: owner/name may name another
 // repository, or none, by the time GraphQL reads it, as when a rename or a transfer
 // lands after the name was read by the id, and such a page is never taken for the
 // repository's. Neither error wraps [ErrRepositoryGone]: the read by the id, which a
@@ -205,8 +207,9 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 		return g.r, nil, false, err
 	}
 	repo := got.Data.Repository
-	r := ghRepo{ID: repo.DatabaseID, FullName: repo.NameWithOwner, HTMLURL: repo.URL}
-	if r.ID != g.id {
+	id, ok := fullDatabaseID(repo.FullDatabaseID)
+	r := ghRepo{ID: id, FullName: repo.NameWithOwner, HTMLURL: repo.URL}
+	if !ok || r.ID != g.id {
 		return g.r, nil, false, fmt.Errorf("%s: GitHub answers a repository whose id is not %d, or no id; it may have been renamed or transferred since its name was read, so a later listing reads it again", g.what, g.id)
 	}
 	g.r = r
@@ -232,6 +235,18 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 	g.after = *info.EndCursor
 	g.cursors[g.after] = true
 	return g.r, issues, true, nil
+}
+
+// fullDatabaseID is the id a repository's fullDatabaseId says, or false when it is
+// missing, null, not a JSON string, as GraphQL writes a BigInt, or not an id by the
+// rules of a ref's, [parseID]: decimal digits alone, with no sign and no leading zero,
+// within an int64.
+func fullDatabaseID(raw json.RawMessage) (int64, bool) {
+	var s string
+	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &s) != nil {
+		return 0, false
+	}
+	return parseID(s)
 }
 
 // answered is the error GraphQL's answer says, or nil: a repository it cannot resolve

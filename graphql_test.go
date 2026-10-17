@@ -29,11 +29,14 @@ type fakeGraphQL struct {
 	// nodes are the issues, open and closed, in the order they were created, as
 	// GraphQL says them.
 	nodes []map[string]any
-	// name is the repository as GitHub names it; "" is acme/widgets. databaseID is its
-	// id, 0 widgetsID, and noDatabaseID answers it without one, as null.
-	name         string
-	databaseID   int
-	noDatabaseID bool
+	// name is the repository as GitHub names it; "" is acme/widgets. fullDatabaseID is
+	// its id, 0 widgetsID, which GraphQL answers as fullDatabaseId, a BigInt, in a JSON
+	// string; noFullDatabaseID answers it without one, as null; and rawFullDatabaseID,
+	// when set, is answered as fullDatabaseId as it is, malformed or not a string.
+	name              string
+	fullDatabaseID    int64
+	noFullDatabaseID  bool
+	rawFullDatabaseID any
 	// limited answers that many requests with GraphQL's rate limit, from the page
 	// limitFrom on, counted from 1, and limitHeaders says with them that no request
 	// remains until a minute after t0.
@@ -177,20 +180,24 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if g.renameOn != 0 && page >= g.renameOn {
 		name = "acme/gadgets"
 	}
-	var id any = g.databaseID
-	if g.databaseID == 0 {
-		id = widgetsID
+	n := g.fullDatabaseID
+	if n == 0 {
+		n = widgetsID
 	}
 	if g.otherIDOn != 0 && page >= g.otherIDOn {
-		id = gadgetsID
+		n = gadgetsID
 	}
-	if g.noDatabaseID {
+	var id any = strconv.FormatInt(n, 10)
+	if g.noFullDatabaseID {
 		id = nil
 	}
+	if g.rawFullDatabaseID != nil {
+		id = g.rawFullDatabaseID
+	}
 	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
-		"databaseId":    id,
-		"nameWithOwner": name,
-		"url":           "https://github.com/" + name,
+		"fullDatabaseId": id,
+		"nameWithOwner":  name,
+		"url":            "https://github.com/" + name,
 		"issues": map[string]any{
 			"pageInfo": map[string]any{"hasNextPage": more, "endCursor": end},
 			"nodes":    nodes,
@@ -333,15 +340,18 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 }
 
 // TestTheOpenListingRefsByTheRepositorysID lists open issues and checks the query asks
-// GraphQL for the repository's id, the collection's ref and every item's are that id,
-// "<id>#<n>", the comments on an item are read through /repositories/{id} and sent on
-// "<id>#<n>", and the item's URL and target's path still name the repository as GitHub
-// does. A repository GraphQL answers without an id, or with another, is not the one the
-// listing is for: the listing fails, with an error that is not ErrRepositoryGone, so a
-// later listing tries again, and sends nothing.
+// GraphQL for the repository's id as fullDatabaseId, a BigInt, and not as databaseId, a
+// 32-bit Int, the collection's ref and every item's are that id, "<id>#<n>", the
+// comments on an item are read through /repositories/{id} and sent on "<id>#<n>", and
+// the item's URL and target's path still name the repository as GitHub does. A
+// repository GraphQL answers without an id, with another, or with one that is not a
+// JSON string of decimal digits alone, with no sign and no leading zero, within an
+// int64, as a ref's id is, is not the one the listing is for: the listing fails, with
+// an error that is not ErrRepositoryGone, so a later listing tries again, and sends
+// nothing.
 func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
-	if !strings.Contains(openIssuesQuery, "databaseId") {
-		t.Error("the query does not ask for the repository's id")
+	if !strings.Contains(openIssuesQuery, "fullDatabaseId") || strings.Contains(openIssuesQuery, "databaseId") {
+		t.Error("the query does not ask for the repository's id as fullDatabaseId alone")
 	}
 	g := &fakeGraphQL{
 		fakeIssues: &fakeIssues{comments: map[int][]map[string]any{2: {comment(21, "bob", "User", "Same here.")}}},
@@ -372,8 +382,20 @@ func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
 	}
 
 	for name, g := range map[string]*fakeGraphQL{
-		"no id":      {nodes: []map[string]any{node(1, 0)}, noDatabaseID: true},
-		"another id": {nodes: []map[string]any{node(1, 0)}, databaseID: gadgetsID},
+		"no id":                   {nodes: []map[string]any{node(1, 0)}, noFullDatabaseID: true},
+		"another id":              {nodes: []map[string]any{node(1, 0)}, fullDatabaseID: gadgetsID},
+		"a leading zero":          {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "01"},
+		"a sign":                  {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "-5"},
+		"an exponent":             {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "1e3"},
+		"a number, not a string":  {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: widgetsID},
+		"the id after a zero":     {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "01296269"},
+		"the id after a plus":     {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "+1296269"},
+		"the id with a fraction":  {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "1296269.0"},
+		"the id with a space":     {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: " 1296269"},
+		"an empty string":         {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: ""},
+		"an id past an int64":     {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: "9223372036854775808"},
+		"an object, not a string": {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: map[string]any{"id": "1296269"}},
+		"a true, not a string":    {nodes: []map[string]any{node(1, 0)}, rawFullDatabaseID: true},
 	} {
 		s = &sink{}
 		l, _ = g.lister(t, s, &logs)
@@ -384,6 +406,26 @@ func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
 		if !reflect.DeepEqual(g.requested(), []string{"POST /graphql"}) {
 			t.Errorf("%s: requested %v", name, g.requested())
 		}
+	}
+}
+
+// TestAnIDPastThirtyTwoBitsIsListed lists the open issues of a repository whose id,
+// 3000000000, is past 2,147,483,647, the most a GraphQL Int holds, as GraphQL answers it
+// in fullDatabaseId, and checks the listing is sent and complete, its collection's ref
+// that id and its item's "<id>#<n>".
+func TestAnIDPastThirtyTwoBitsIsListed(t *testing.T) {
+	const big = 3000000000
+	g := &fakeGraphQL{nodes: []map[string]any{node(1, 0)}, fullDatabaseID: big}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), big, widgets); err != nil {
+		t.Fatal(err)
+	}
+	refs, parts := sentParts(s)
+	items := s.items()
+	if len(items) != 1 || items[0].CollectionRef != "3000000000" || !reflect.DeepEqual(refs, []string{"3000000000#1"}) || len(parts) != 1 || !parts[0].Complete {
+		t.Errorf("items %+v", items)
 	}
 }
 
@@ -628,8 +670,8 @@ func TestAnEmptyListingThatFailsSendsNothing(t *testing.T) {
 		{name: "a rate limit that holds on the first page", g: &fakeGraphQL{limited: 5}},
 		{name: "the repository not found", g: &fakeGraphQL{notFound: true}},
 		{name: "the repository answered as null", g: &fakeGraphQL{nullRepository: true}},
-		{name: "another repository by that name", g: &fakeGraphQL{name: "acme/gadgets", databaseID: gadgetsID}},
-		{name: "the repository without an id", g: &fakeGraphQL{noDatabaseID: true}},
+		{name: "another repository by that name", g: &fakeGraphQL{name: "acme/gadgets", fullDatabaseID: gadgetsID}},
+		{name: "the repository without an id", g: &fakeGraphQL{noFullDatabaseID: true}},
 		{name: "another repository's id on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, otherIDOn: 2}},
 		{name: "the context cancelled on the first page", g: &fakeGraphQL{}, ctx: cancelOn(1)},
 		{name: "a status on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, statusOn: 2, status: 502}},
@@ -676,8 +718,8 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 		{"a status", &fakeGraphQL{nodes: five(), statusOn: 3, status: 502}, what + "GitHub answered 502: Bad credentials", false, "1 2 3 4", 3},
 		{"the repository not found", &fakeGraphQL{nodes: five(), notFound: true}, what + noneByName + "; GitHub answered: Could not resolve to a Repository with the name 'acme/widgets'.", false, "", 1},
 		{"the repository answered as null", &fakeGraphQL{nodes: five(), nullRepository: true}, what + noneByName, false, "", 1},
-		{"another repository by that name", &fakeGraphQL{nodes: five(), name: "acme/gadgets", databaseID: gadgetsID}, what + otherID, false, "", 1},
-		{"the repository without an id", &fakeGraphQL{nodes: five(), noDatabaseID: true}, what + otherID, false, "", 1},
+		{"another repository by that name", &fakeGraphQL{nodes: five(), name: "acme/gadgets", fullDatabaseID: gadgetsID}, what + otherID, false, "", 1},
+		{"the repository without an id", &fakeGraphQL{nodes: five(), noFullDatabaseID: true}, what + otherID, false, "", 1},
 		{"another repository's id while it is listed", &fakeGraphQL{nodes: five(), otherIDOn: 2}, what + otherID, false, "1 2", 2},
 		{"a cursor repeated", &fakeGraphQL{nodes: five(), sameCursor: true}, what + "GitHub's next cursor repeats one already read", false, "1 2", 2},
 		{"no cursor", &fakeGraphQL{nodes: five(), noCursor: true}, what + "GitHub says there is a next page and names no cursor for it", false, "", 1},

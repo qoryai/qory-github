@@ -661,11 +661,12 @@ func (e *tokenError) Error() string { return e.err.Error() }
 func (e *tokenError) Unwrap() error { return e.err }
 
 // ErrRepositoryGone is wrapped in the error of a listing whose repository GitHub
-// answers is gone or moved, [Gone], as it answers the read of the repository by its id
-// or of a page of what changed in it: deleted or out of the App's reach, since a rename
-// or a transfer keeps the id. Asking again does not change it. The listing of open
-// issues, which GraphQL reads by owner/name, never wraps it.
-var ErrRepositoryGone = errors.New("the repository is deleted, moved or out of the App's reach")
+// answers is gone, [Gone], as it answers the read of the repository by its id or of a
+// page of what changed in it: a 404 or a 410, deleted or out of the App's reach, since a
+// rename or a transfer keeps the id, or a 301 or a 308, a redirect of that request by
+// the id, which the adapter never follows. Asking again does not change it. The listing
+// of open issues, which GraphQL reads by owner/name, never wraps it.
+var ErrRepositoryGone = errors.New("the repository is deleted or out of the App's reach, or GitHub redirects a request by its id")
 
 // answeredGone is whether err is GitHub's answer to a listing's request, not to its
 // token's mint, that what was asked for is gone or moved.
@@ -819,7 +820,12 @@ func (l Lister) repositoryParts(ctx context.Context, emit func(context.Context, 
 			c.Target = &contracts.Target{System: system, Path: r.FullName}
 			n := size(c)
 			if why := checkCollection(c); why != "" || envelope+n > contracts.MaxRequest {
-				l.logf("skipped the collection %s: %s", c.Ref, orTooLarge(why))
+				if c.Ref == "" {
+					// No ref names it, so the line names the repository as GitHub does.
+					l.logf("skipped the collection of the repository %q: GitHub answers it without an id, or with one that is not positive", r.FullName)
+				} else {
+					l.logf("skipped the collection %s: %s", c.Ref, orTooLarge(why))
+				}
 				skipped = true
 				continue
 			}

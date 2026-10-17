@@ -1403,7 +1403,7 @@ func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 // complete listing, keeps no start, and fails with an error that passes, not for good
 // and not as a repository gone, so the change feed tries it again.
 func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
-	for _, id := range []any{gadgetsID, nil, "not found"} {
+	for _, id := range []any{gadgetsRef, nil, "not found"} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
@@ -1432,12 +1432,13 @@ func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
 }
 
 // TestAFillWhoseReadFailsSendsNothing fills acme/widgets while GitHub fails the read of
-// the repository by its id: a 404, which by the id says the repository is deleted or out
-// of the App's reach, since a rename or a transfer keeps the id, fails it for good as a
-// repository gone; a 500 fails it with an error that passes. Either way GraphQL is never
-// asked, nothing is sent and no start is kept.
+// the repository by its id: a 404 or a 410, which by the id says the repository is
+// deleted or out of the App's reach, since a rename or a transfer keeps the id, fails it
+// for good as a repository gone, and says so; a 500 fails it with an error that passes.
+// Either way GraphQL is never asked, nothing is sent and no start is kept.
 func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
-	for _, status := range []int{404, 500} {
+	const goneText = "the repository is deleted or out of the App's reach, or GitHub redirects a request by its id"
+	for _, status := range []int{404, 410, 500} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
@@ -1445,8 +1446,8 @@ func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
 		w.gh.readStatus = status
 		err := w.adapter.fill(context.Background(), widgetsRef)
-		gone := status == 404
-		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone {
+		gone := status == 404 || status == 410
+		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone || strings.Contains(err.Error(), goneText) != gone {
 			t.Errorf("%d: err %v", status, err)
 		}
 		w.gh.mu.Lock()

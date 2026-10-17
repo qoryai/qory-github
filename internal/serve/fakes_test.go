@@ -378,8 +378,9 @@ type fakeGitHub struct {
 	gqlPages  int
 	// readStatus, when set, answers the read of acme/widgets by its id, GET
 	// /repositories/{id}, with that status and no repository. gqlIDSet makes GraphQL
-	// answer gqlID as acme/widgets's databaseId, nil for none, or another repository's
-	// id, as when the name came to name another repository after it was read, and
+	// answer gqlID as acme/widgets's fullDatabaseId, nil for none, or another
+	// repository's id as a JSON string, as when the name came to name another repository
+	// after it was read, and
 	// gqlNotFound makes GraphQL answer that it resolves no repository by acme/widgets, as
 	// when the name came to name none.
 	readStatus  int
@@ -604,10 +605,11 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // graphql answers the listing of a repository's open issues by GraphQL's cursor, the
-// repository named by owner/name and answered with its id, databaseId: acme/widgets's
-// issues, open ones alone, first to a page after the cursor, which is the issue's place
-// in f.issues; acme/moved as GitHub names it since it was renamed, with the same id; and
-// any other repository as one GraphQL cannot resolve. f.mu is held.
+// repository named by owner/name and answered with its id, fullDatabaseId, a BigInt
+// that GraphQL writes as a JSON string: acme/widgets's issues, open ones alone, first to
+// a page after the cursor, which is the issue's place in f.issues; acme/moved as GitHub
+// names it since it was renamed, with the same id; and any other repository as one
+// GraphQL cannot resolve. f.mu is held.
 func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 	var req struct {
 		Variables struct {
@@ -678,14 +680,14 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 			end = "cursor:" + strconv.Itoa(i+1)
 		}
 	}
-	var dbID any = id
+	var dbID any = strconv.FormatInt(id, 10)
 	if name == "acme/widgets" && f.gqlIDSet {
 		dbID = f.gqlID
 	}
 	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
-		"databaseId":    dbID,
-		"nameWithOwner": name,
-		"url":           "https://github.com/" + name,
+		"fullDatabaseId": dbID,
+		"nameWithOwner":  name,
+		"url":            "https://github.com/" + name,
 		"issues": map[string]any{
 			"pageInfo": map[string]any{"hasNextPage": more, "endCursor": end},
 			"nodes":    nodes,

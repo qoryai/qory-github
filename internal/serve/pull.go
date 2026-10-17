@@ -544,10 +544,12 @@ func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarge
 // part without items that says the listing is complete. What changed is read through
 // the repository's id, which needs no name. The listing is GraphQL's, which names a
 // repository by owner/name: it takes the name the read of what changed got in the same
-// run, and only a pull that read no change, its collection's first, reads the name
-// first, [github.Lister.ReadRepository]; the name is kept nowhere. A listing that finds
-// the name naming another repository, or none, by then fails without sending anything,
-// and its start is not kept, so the next pull reads the name again and lists again.
+// run, and a pull that read no change, its collection's first, or whose read of what
+// changed got a full_name that is not owner/name, reads the name first,
+// [github.Lister.ReadRepository], which refuses one that is not owner/name; the name is
+// kept nowhere. A listing that finds the name naming another repository, or none, by
+// then fails without sending anything, and its start is not kept, so the next pull
+// reads the name again and lists again.
 func (p *puller) pull(ctx context.Context, ref string, installation int64) error {
 	a := p.adapter
 	id, err := repositoryID(ref)
