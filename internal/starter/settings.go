@@ -92,9 +92,6 @@ var (
 	appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 	// poolIDShape is a node pool's id, the provisioner contract's pool_id.
 	poolIDShape = regexp.MustCompile(`^np_[0-9a-hjkmnp-tv-z]{16}$`)
-	// workflowShape is a workflow's file name: letters, digits, dots, underscores and
-	// hyphens, ending in .yml or .yaml.
-	workflowShape = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,250}\.ya?ml$`)
 	// shaShape is a commit's SHA-1, as GitHub writes it.
 	shaShape = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
@@ -236,12 +233,12 @@ func parseSettings(b []byte) (Settings, error) {
 				err = checkRepository(s.Repository)
 			}
 		case "workflow":
-			if s.Workflow, err = text(raw); err == nil && !workflowShape.MatchString(s.Workflow) {
-				err = errors.New("is not a workflow's file name: letters, digits, dots, underscores or hyphens, ending in .yml or .yaml")
+			if s.Workflow, err = text(raw); err == nil {
+				err = github.CheckWorkflowFile(s.Workflow)
 			}
 		case "ref":
 			if s.Ref, err = text(raw); err == nil {
-				err = checkRef(s.Ref)
+				err = github.CheckRef(s.Ref)
 			}
 		case "workflow_sha":
 			if s.WorkflowSHA, err = text(raw); err == nil && !shaShape.MatchString(s.WorkflowSHA) {
@@ -367,29 +364,6 @@ func checkRepository(s string) error {
 	}
 	if _, err := github.ParseRepositories(s); err != nil {
 		return errors.New("is not one repository, owner/name")
-	}
-	return nil
-}
-
-// checkRef takes a branch or tag name as git takes one, git check-ref-format's rules in
-// ASCII: printable characters but a space and ~ ^ : ? * [ \, no .. and no @{, not @
-// alone, no part that is empty, starts with a dot or ends in .lock, and no dot or slash
-// at its end. A full name, refs/heads/main, is taken as the short one is. The error
-// names the rule, never the value.
-func checkRef(s string) error {
-	bad := errors.New("is not a branch or tag name git takes")
-	if len(s) > 255 || s == "@" || strings.Contains(s, "..") || strings.Contains(s, "@{") || strings.HasSuffix(s, ".") {
-		return bad
-	}
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; c <= ' ' || c >= 0x7f || strings.IndexByte(`~^:?*[\`, c) >= 0 {
-			return bad
-		}
-	}
-	for _, part := range strings.Split(s, "/") {
-		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
-			return bad
-		}
 	}
 	return nil
 }
