@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1019,6 +1020,56 @@ func TestTimes(t *testing.T) {
 		reqs := f.requests()
 		if len(sl.waits()) != 0 || len(reqs) != 2 || reqs[1].lead != 0 || !reqs[1].sent.Equal(testClock.Add(-time.Hour)) {
 			t.Errorf("after a step back the identical request waits %v, or is not at the clock's time", sl.waits())
+		}
+	})
+	t.Run("a clock read is never used after a later request's", func(t *testing.T) {
+		// A reads the clock at t0+1 and is held there while another identical request
+		// is sent at t0+2. Were A's read used after it, A would forget that request,
+		// and a third identical request at t0+2 would repeat its bytes.
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		sl.set(testClock.Add(time.Second))
+		read, resume := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		a.Now = func() time.Time {
+			now := sl.clock()
+			held := false
+			once.Do(func() { held = true })
+			if held {
+				close(read)
+				<-resume
+			}
+			return now
+		}
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+				t.Errorf("the request failed: %v", err)
+			}
+		})
+		<-read
+		sl.set(testClock.Add(2 * time.Second))
+		wg.Go(func() {
+			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+				t.Errorf("the request failed: %v", err)
+			}
+		})
+		for deadline := time.Now().Add(300 * time.Millisecond); len(f.requests()) < 2 && time.Now().Before(deadline); {
+			runtime.Gosched()
+		}
+		close(resume)
+		wg.Wait()
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		for _, r := range f.requests() {
+			if r.replayed || r.lead > 0 {
+				t.Error("a request repeats the bytes of another, or is ahead of the clock")
+			}
 		}
 	})
 	t.Run("identities are pruned once per second", func(t *testing.T) {
