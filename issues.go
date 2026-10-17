@@ -669,14 +669,16 @@ func (e *tokenError) Unwrap() error { return e.err }
 var ErrRepositoryGone = errors.New("the repository is deleted or out of the App's reach, or GitHub redirects a request by its id")
 
 // answeredGone is whether err is GitHub's answer to a listing's request, not to its
-// token's mint, that what was asked for is gone or moved.
+// token's mint, that what was asked for is gone, [Gone]: a 404 or a 410, or a redirect,
+// a 301 or a 308.
 func answeredGone(err error) bool {
 	var t *tokenError
 	return Gone(err) && !errors.As(err, &t)
 }
 
-// repositoryGone is err, wrapping [ErrRepositoryGone] when GitHub answered that the
-// repository is gone or moved.
+// repositoryGone is err, wrapping [ErrRepositoryGone] when GitHub answered a request by
+// the repository's id that the repository is deleted or out of the App's reach, or
+// redirected that request.
 func repositoryGone(err error) error {
 	if answeredGone(err) {
 		return fmt.Errorf("%w: %w", ErrRepositoryGone, err)

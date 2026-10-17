@@ -897,10 +897,11 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // complete; one that fails on the comments of its last part's items has sent that part
 // already, complete, since comments are no part of complete. A repository with no open
 // issue sends one part without items that says it is complete. A repository GitHub
-// answers is gone or moved, [github.ErrRepositoryGone], or for which GitHub refuses to
-// mint a token for good, [github.ErrMintRefused], fails for good, so the change feed
-// passes it. It waits for a pull of the collection that runs, and once it has sent
-// everything, the next pull reads what changed from when it began. The listing is
+// answers is deleted or out of the App's reach, or whose request by the id GitHub
+// redirects, [github.ErrRepositoryGone], or for which GitHub refuses to mint a token for
+// good, [github.ErrMintRefused], fails for good, so the change feed passes it. It waits
+// for a pull of the collection that runs, and once it has sent everything, the next
+// pull reads what changed from when it began. The listing is
 // GraphQL's, which names a repository by owner/name, so the fill first reads that name
 // by the collection's ref, the repository's id, [github.Lister.ReadRepository], and
 // keeps it nowhere: a 404 there says the repository is deleted or out of the App's

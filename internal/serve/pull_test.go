@@ -639,7 +639,7 @@ func TestAFailingCollectionDoesNotHoldAnother(t *testing.T) {
 	}
 	log := w.log.String()
 	if !strings.Contains(log, `"msg":"pulling the collection failed","collection":"`+widgetsRef+`"`) ||
-		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again","collection":"`+refOf("acme/gone")+`"`) {
+		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is deleted or out of the App's reach, or redirects a request by its id, and the next round tries again","collection":"`+refOf("acme/gone")+`"`) {
 		t.Errorf("the log %s", log)
 	}
 	if strings.Contains(log, ghToken) {

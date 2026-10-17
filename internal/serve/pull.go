@@ -182,8 +182,9 @@ func (s linkedSink) send(send func() error) error {
 // round still runs passes the round. A pull that fails is tried again at the next round;
 // see [puller.report] for its lines: the first failure since it last passed, throttled
 // with the rounds' other failures and those held back counted, unless GitHub answers
-// that the repository is gone or moved, or refuses to mint a token for good, which is
-// logged unthrottled; and one more once it has failed for a day.
+// that the repository is deleted or out of the App's reach, or redirects a request by
+// its id, or refuses to mint a token for good, which is logged unthrottled; and one more
+// once it has failed for a day.
 type puller struct {
 	adapter *Adapter
 	store   *store.Store
@@ -450,10 +451,10 @@ func (p *puller) installationRound(ctx context.Context, installation int64, targ
 // stop; a line for a collection that is no longer linked; and for any other error, a
 // line at the target's first failure since it last passed, then none while it keeps
 // failing, round after round, and one more once it has failed for pullStuckFor. The
-// first line is throttled, unless GitHub answers that the repository is gone or moved,
-// or refuses to mint a token for good. The next round tries the target again whatever
-// the error. The failures are timed in memory alone, so a restart times them from the
-// next failure again.
+// first line is throttled, unless GitHub answers that the repository is deleted or out
+// of the App's reach, or redirects a request by its id, or refuses to mint a token for
+// good. The next round tries the target again whatever the error. The failures are
+// timed in memory alone, so a restart times them from the next failure again.
 func (p *puller) report(ctx context.Context, attr slog.Attr, what string, err error) {
 	switch {
 	case ctx.Err() != nil:
@@ -469,7 +470,7 @@ func (p *puller) report(ctx context.Context, attr slog.Attr, what string, err er
 		p.log.Error(what+" has failed for a day, and the next round tries again", attr, slog.String("error", err.Error()))
 	case !first:
 	case errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused):
-		p.log.Warn(what+" failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again", attr, slog.String("error", err.Error()))
+		p.log.Warn(what+" failed: GitHub answers it is deleted or out of the App's reach, or redirects a request by its id, and the next round tries again", attr, slog.String("error", err.Error()))
 	default:
 		p.failed(what+" failed", err, attr)
 	}
