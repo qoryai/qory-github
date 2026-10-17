@@ -55,9 +55,9 @@ const (
 )
 
 // The tries of one request: tries in all, the waits between them doubling from
-// firstWait. A try that fails, an answer not signed under the pin, a server error or no
-// answer, is built anew and sent again after the wait. A signed 429's Retry-After is
-// read from one second to an hour.
+// firstWait. A try that fails, an answer not signed under the pin, a server error other
+// than a handover's signed 503 unavailable, or no answer, is built anew and sent again
+// after the wait. A signed 429's Retry-After is read from one second to an hour.
 const (
 	tries         = 5
 	firstWait     = time.Second
@@ -98,6 +98,12 @@ var (
 	// handover's, the dispatch stays claimed until its lease lapses, and the handover
 	// may be sent again, built anew, while the lease lasts.
 	ErrNoGateway = errors.New("409 no_gateway")
+	// ErrUnavailable is a handover's signed 503 unavailable: Qory Apiary failed to make
+	// the run's inputs or its run key. The handover took no effect: no run is registered,
+	// no run key is issued, and the dispatch is left dispatched and not handed over. The
+	// contract allows the handover to be sent again, built anew, with backoff, while the
+	// lease lasts. The client does not send it again itself.
+	ErrUnavailable = errors.New("503 unavailable")
 	// ErrRateLimited is the signed 429 rate_limited; [Refusal.RetryAfter] is the wait it
 	// asks for, after which the request is sent again, built anew. An unsigned 429 is not
 	// one: it is [ErrUnsigned].
@@ -141,6 +147,7 @@ var codeOf = map[error]struct {
 	ErrLeaseExpired:  {http.StatusConflict, "lease_expired"},
 	ErrNotDispatched: {http.StatusConflict, "not_dispatched"},
 	ErrNoGateway:     {http.StatusConflict, "no_gateway"},
+	ErrUnavailable:   {http.StatusServiceUnavailable, "unavailable"},
 	ErrRateLimited:   {http.StatusTooManyRequests, "rate_limited"},
 	ErrOutcomeGiven:  {http.StatusConflict, "outcome_given"},
 	ErrRunNotFound:   {http.StatusNotFound, "not_found"},
@@ -167,7 +174,7 @@ const (
 var refusalsOf = map[kind][]error{
 	kindClaim:      {ErrForbidden, ErrNoGateway, ErrRateLimited},
 	kindDispatched: {ErrForbidden, ErrGone, ErrLeaseExpired, ErrRateLimited},
-	kindHandover:   {ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited},
+	kindHandover:   {ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrUnavailable, ErrRateLimited},
 	kindRelease:    {ErrForbidden, ErrGone, ErrLeaseExpired, ErrRateLimited},
 	kindOutcome:    {ErrRunNotFound, ErrOutcomeGiven, ErrRateLimited},
 	// The GET of the configuration document.
@@ -534,7 +541,10 @@ func (a *Apiary) toDispatch(ctx context.Context, what string, k kind, dispatchID
 // and the job's input, once checked, see [Handed]: its run_id must be runID, and its
 // inputs at most contracts.MaxInputs bytes, compacted. A refusal is a [*Refusal], in
 // handover.schema.json's order: [ErrForbidden], [ErrGone], [ErrHandedOver],
-// [ErrLeaseExpired], [ErrNotDispatched], [ErrNoGateway], or [ErrRateLimited].
+// [ErrLeaseExpired], [ErrNotDispatched], [ErrNoGateway], [ErrUnavailable], or
+// [ErrRateLimited]. A signed 503 unavailable is returned after one try, as
+// [ErrUnavailable]: the handover took no effect, and the contract allows it to be sent
+// again, built anew, with backoff, while the lease lasts.
 func (a *Apiary) Handover(ctx context.Context, dispatchID, runID string) (Handed, error) {
 	what := "the handover of " + dispatchID
 	if !dispatchIDShape.MatchString(dispatchID) {
@@ -613,13 +623,14 @@ type answer struct {
 	limit         int64
 }
 
-// do sends req until Qory Apiary answers a signed status below 500, up to [tries]
-// tries. Each try is built anew, its time from [Apiary.nextTime], so its bytes and its
-// signature are new. A try that fails is no answer, an answer over its bound, whatever
-// its status, an answer not signed under the pin, whatever its status, a 429 among
-// them, or a signed server error: it changes nothing, and it is sent again after a wait
-// that doubles from [firstWait]. After the last try, the failure is the error. Once ctx
-// is done, its error is the error, and nothing more is logged or sent.
+// do sends req until Qory Apiary answers a signed status below 500, or a handover's
+// signed 503 unavailable, [ErrUnavailable], up to [tries] tries. Each try is built anew,
+// its time from [Apiary.nextTime], so its bytes and its signature are new. A try that
+// fails is no answer, an answer over its bound, whatever its status, an answer not
+// signed under the pin, whatever its status, a 429 among them, or any other signed
+// server error: it changes nothing, and it is sent again after a wait that doubles from
+// [firstWait]. After the last try, the failure is the error. Once ctx is done, its
+// error is the error, and nothing more is logged or sent.
 func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 	var b []byte
 	if !req.get {
@@ -663,6 +674,9 @@ func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 			}
 		case ans.status >= 500:
 			failure = a.refused(req.what, req.kind, ans)
+			if errors.Is(failure, ErrUnavailable) {
+				return ans, nil
+			}
 			line = "Qory Apiary answered a server error, so the request is sent again, built anew"
 			attrs = []any{slog.Int("status", ans.status)}
 		default:

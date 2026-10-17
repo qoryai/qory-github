@@ -479,7 +479,7 @@ func TestInvalidFixtures(t *testing.T) {
 }
 
 // sentinels are every refusal a later step may act on.
-var sentinels = []error{ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited, ErrOutcomeGiven, ErrRunNotFound}
+var sentinels = []error{ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrUnavailable, ErrRateLimited, ErrOutcomeGiven, ErrRunNotFound}
 
 // refusalCodes are every signed refusal code the tests answer with, each with its
 // status and the error that names it, written out from refusal.schema.json and Forager's
@@ -495,6 +495,7 @@ var refusalCodes = []struct {
 	{409, "lease_expired", ErrLeaseExpired},
 	{409, "not_dispatched", ErrNotDispatched},
 	{409, "no_gateway", ErrNoGateway},
+	{503, "unavailable", ErrUnavailable},
 	{429, "rate_limited", ErrRateLimited},
 	{409, "outcome_given", ErrOutcomeGiven},
 	{404, "not_found", ErrRunNotFound},
@@ -507,7 +508,7 @@ var refusalCodes = []struct {
 var givenCodes = map[string][]string{
 	"claim":      {"forbidden", "no_gateway", "rate_limited"},
 	"dispatched": {"forbidden", "gone", "lease_expired", "rate_limited"},
-	"handover":   {"forbidden", "gone", "handed_over", "lease_expired", "not_dispatched", "no_gateway", "rate_limited"},
+	"handover":   {"forbidden", "gone", "handed_over", "lease_expired", "not_dispatched", "no_gateway", "unavailable", "rate_limited"},
 	"release":    {"forbidden", "gone", "lease_expired", "rate_limited"},
 	"outcome":    {"not_found", "outcome_given", "rate_limited"},
 	// The GET of Forager's configuration document: of its signed refusals, only the 429
@@ -517,7 +518,8 @@ var givenCodes = map[string][]string{
 
 // TestRefusals answers each request with each signed refusal code in [refusalCodes],
 // and checks the error matches that code's refusal exactly when [givenCodes] lists the
-// code for the request, matches no other refusal, and comes after one try. It checks
+// code for the request, matches no other refusal, and comes after one try, or after
+// every try for a server error the request's schema does not give. It checks
 // the client's table holds the lists in their order, and that a code with another
 // status, or a refusal body refusal.schema.json refuses, matches none.
 func TestRefusals(t *testing.T) {
@@ -571,8 +573,12 @@ func TestRefusals(t *testing.T) {
 				if c.code == "rate_limited" && r.RetryAfter != 7*time.Second {
 					t.Errorf("Retry-After is %s, not 7s", r.RetryAfter)
 				}
-				if n := len(f.requests()); n != 1 {
-					t.Errorf("a signed refusal was sent %d times", n)
+				want := 1
+				if c.status >= 500 && !given {
+					want = tries
+				}
+				if n := len(f.requests()); n != want {
+					t.Errorf("a signed refusal was sent %d times, not %d", n, want)
 				}
 			})
 		}
@@ -597,14 +603,129 @@ func TestRefusals(t *testing.T) {
 		}
 	})
 	t.Run("the refusal fixtures", func(t *testing.T) {
-		for name, want := range map[string]error{"handed-over.json": ErrHandedOver, "no-gateway.json": ErrNoGateway} {
+		for name, want := range map[string]struct {
+			status int
+			err    error
+		}{
+			"handed-over.json": {http.StatusConflict, ErrHandedOver},
+			"no-gateway.json":  {http.StatusConflict, ErrNoGateway},
+			"unavailable.json": {http.StatusServiceUnavailable, ErrUnavailable},
+		} {
 			body := fixture(t, "refusal/"+name)
-			f := newFake(t, func(int, seen) reply { return reply{status: http.StatusConflict, body: body} })
-			if err := send["handover"](f.client(&sleeps{}, nil)); !errors.Is(err, want) {
-				t.Errorf("%s: %v is not %v", name, err, want)
+			f := newFake(t, func(int, seen) reply { return reply{status: want.status, body: body} })
+			if err := send["handover"](f.client(&sleeps{}, nil)); !errors.Is(err, want.err) {
+				t.Errorf("%s: %v is not %v", name, err, want.err)
+			}
+			if n := len(f.requests()); n != 1 {
+				t.Errorf("%s: the handover was sent %d times", name, n)
 			}
 		}
 	})
+}
+
+// TestUnavailable checks a handover's signed 503 unavailable is ErrUnavailable after
+// one try, with no wait, and that every other 503 keeps the behaviour of any server
+// error: the same answer to another request, a signed 503 with another code, no code or
+// a body refusal.schema.json refuses, a signed 500 unavailable, and a 503 unavailable
+// not signed under the pin are sent again, built anew, and never match ErrUnavailable.
+func TestUnavailable(t *testing.T) {
+	ctx := context.Background()
+	unavailable := reply{status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`}
+	handover := func(a *Apiary) error {
+		got, err := a.Handover(ctx, testDispatch, testRun)
+		if got.RunKey.Value() != "" || got.Inputs.Value() != "" {
+			t.Error("a refused handover returns a run key or inputs")
+		}
+		return err
+	}
+	t.Run("a handover's signed 503 unavailable", func(t *testing.T) {
+		f := newFake(t, func(int, seen) reply { return unavailable })
+		sl := &sleeps{}
+		err := handover(f.client(sl, nil))
+		var r *Refusal
+		if !errors.Is(err, ErrUnavailable) || !errors.As(err, &r) || !r.Signed || r.Status != http.StatusServiceUnavailable || r.Code != "unavailable" {
+			t.Fatalf("not the signed 503 unavailable: %v", err)
+		}
+		if errors.Is(err, ErrUnsigned) || errors.Is(err, ErrTooLarge) {
+			t.Error("a signed 503 unavailable is ErrUnsigned or ErrTooLarge")
+		}
+		if n := len(f.requests()); n != 1 {
+			t.Errorf("the handover was sent %d times, not once", n)
+		}
+		if len(sl.waits()) != 0 {
+			t.Errorf("the client waited %v", sl.waits())
+		}
+	})
+	others := map[string]func(a *Apiary) error{
+		"claim":      func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err },
+		"dispatched": func(a *Apiary) error { return a.Dispatched(ctx, testDispatch, nil) },
+		"release":    func(a *Apiary) error { return a.Release(ctx, testDispatch, "gone", false) },
+		"outcome": func(a *Apiary) error {
+			return a.PostOutcome(ctx, a.URL+"/v1/runs", testRun, Outcome{State: StateFailed})
+		},
+	}
+	backoff := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	for name, fn := range others {
+		t.Run("the same answer to the "+name, func(t *testing.T) {
+			f := newFake(t, func(int, seen) reply { return unavailable })
+			sl := &sleeps{}
+			err := fn(f.client(sl, nil))
+			var r *Refusal
+			if !errors.As(err, &r) || !r.Signed || r.Status != http.StatusServiceUnavailable {
+				t.Fatalf("not the signed 503: %v", err)
+			}
+			for _, s := range sentinels {
+				if errors.Is(err, s) {
+					t.Errorf("%v matches %v", err, s)
+				}
+			}
+			checkBuiltAnew(t, f.requests(), tries)
+			if !slices.Equal(sl.waits(), backoff) {
+				t.Errorf("the waits are %v, not %v", sl.waits(), backoff)
+			}
+			g := newFake(t, func(n int, _ seen) reply {
+				if n == 1 {
+					return unavailable
+				}
+				if name == "outcome" {
+					return reply{status: http.StatusOK, body: `{"version":1}`}
+				}
+				return reply{status: http.StatusNoContent}
+			})
+			if err := fn(g.client(&sleeps{}, nil)); err != nil {
+				t.Errorf("a 503 then a 204 fails: %v", err)
+			}
+			checkBuiltAnew(t, g.requests(), 2)
+		})
+	}
+	for name, rep := range map[string]reply{
+		"a signed 503 with another code":      {status: http.StatusServiceUnavailable, body: `{"error":"overloaded"}`},
+		"a signed 503 with no body":           {status: http.StatusServiceUnavailable},
+		"a signed 503 the schema refuses":     {status: http.StatusServiceUnavailable, body: `{"error":"unavailable","extra":1}`},
+		"a signed 500 unavailable":            {status: http.StatusInternalServerError, body: `{"error":"unavailable"}`},
+		"a 503 unavailable with no signature": {status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`, unsigned: true},
+		"a 503 unavailable under another key": {status: http.StatusServiceUnavailable, body: `{"error":"unavailable"}`, wrongKey: true},
+	} {
+		t.Run(name+" to a handover", func(t *testing.T) {
+			f := newFake(t, func(int, seen) reply { return rep })
+			sl := &sleeps{}
+			err := handover(f.client(sl, nil))
+			if errors.Is(err, ErrUnavailable) {
+				t.Errorf("%v is ErrUnavailable", err)
+			}
+			var r *Refusal
+			if !errors.As(err, &r) || r.Status != rep.status {
+				t.Fatalf("not the %d: %v", rep.status, err)
+			}
+			if signed := !rep.unsigned && !rep.wrongKey; r.Signed != signed || errors.Is(err, ErrUnsigned) == signed {
+				t.Errorf("signed is %v, ErrUnsigned %v: %v", r.Signed, errors.Is(err, ErrUnsigned), err)
+			}
+			checkBuiltAnew(t, f.requests(), tries)
+			if !slices.Equal(sl.waits(), backoff) {
+				t.Errorf("the waits are %v, not %v", sl.waits(), backoff)
+			}
+		})
+	}
 }
 
 // TestUnusable answers a claim and a handover with answers that break the contract and
