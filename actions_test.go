@@ -183,27 +183,65 @@ func TestADispatchGitHubAnswers204NamesNoRun(t *testing.T) {
 }
 
 // TestADispatch200WithoutARunIDFails refuses a 200 that names no run, a run's id
-// missing, 0 or below, as ErrActionsNoRun alone, and one that is not JSON as one that
-// may pass.
+// missing, 0 or below, or an answer that does not decode, as ErrActionsNoRun alone: GitHub
+// took the dispatch.
 func TestADispatch200WithoutARunIDFails(t *testing.T) {
-	for body, want := range map[string]error{
-		`{}`:                        ErrActionsNoRun,
-		`{"workflow_run_id":null}`:  ErrActionsNoRun,
-		`{"workflow_run_id":0}`:     ErrActionsNoRun,
-		`{"workflow_run_id":-1}`:    ErrActionsNoRun,
-		`{"run_url":"x"}`:           ErrActionsNoRun,
-		`not json`:                  ErrActionsTransient,
-		`{"workflow_run_id":"99"}`:  ErrActionsTransient,
-		`{"workflow_run_id":99.5}`:  ErrActionsTransient,
-		`{"workflow_run_id":[99]}`:  ErrActionsTransient,
-		`{"workflow_run_id":true}`:  ErrActionsTransient,
-		`{"workflow_run_id":{}}`:    ErrActionsTransient,
-		`{"workflow_run_id":1e400}`: ErrActionsTransient,
+	for body, want := range map[string]string{
+		`{}`:                        "GitHub answered 200 without a run's id above 0",
+		`{"workflow_run_id":null}`:  "GitHub answered 200 without a run's id above 0",
+		`{"workflow_run_id":0}`:     "GitHub answered 200 without a run's id above 0",
+		`{"workflow_run_id":-1}`:    "GitHub answered 200 without a run's id above 0",
+		`{"run_url":"x"}`:           "GitHub answered 200 without a run's id above 0",
+		`not json`:                  "GitHub's answer: invalid character",
+		`{"workflow_run_id":"99"}`:  "GitHub's answer: json: cannot unmarshal",
+		`{"workflow_run_id":99.5}`:  "GitHub's answer: json: cannot unmarshal",
+		`{"workflow_run_id":[99]}`:  "GitHub's answer: json: cannot unmarshal",
+		`{"workflow_run_id":true}`:  "GitHub's answer: json: cannot unmarshal",
+		`{"workflow_run_id":{}}`:    "GitHub's answer: json: cannot unmarshal",
+		`{"workflow_run_id":1e400}`: "GitHub's answer: json: cannot unmarshal",
 	} {
 		f := &fakeActions{answer: answering(200, body)}
 		got, err := serveActions(t, f).DispatchWorkflow(context.Background(), 7, 42, "runner.yml", "main", dispatchID)
-		if !wrapsOnly(err, want) || got != (DispatchedRun{}) {
-			t.Errorf("%s: %+v, %v", body, got, err)
+		if !wrapsOnly(err, ErrActionsNoRun) || got != (DispatchedRun{}) || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %+v, %v; want %q", body, got, err, want)
+		}
+	}
+}
+
+// truncated answers status with a Content-Length longer than the body it writes, so
+// reading the answer fails.
+func truncated(status int) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(status)
+		io.WriteString(w, `{"workflow_run_id":`)
+	}
+}
+
+// TestADispatch200ThatCannotBeReadNamesNoRun refuses a dispatch's 200 larger than 1 MiB,
+// or whose answer cannot be read, as ErrActionsNoRun alone, and the same answers with
+// another status, and to a read, as ones that may pass.
+func TestADispatch200ThatCannotBeReadNamesNoRun(t *testing.T) {
+	large := `{"workflow_run_id":99,"padding":"` + strings.Repeat("x", 1<<20) + `"}`
+	dispatch := actionsCalls["dispatch"]
+	cases := []struct {
+		name   string
+		call   func(*Actions) error
+		answer func(http.ResponseWriter, *http.Request)
+		want   error
+		says   string
+	}{
+		{"a dispatch's large 200", dispatch, answering(200, large), ErrActionsNoRun, "GitHub took the dispatch and named no workflow run: dispatching the workflow runner.yml: GitHub's answer is larger than 1048576 bytes"},
+		{"a dispatch's cut 200", dispatch, truncated(200), ErrActionsNoRun, "GitHub took the dispatch and named no workflow run: dispatching the workflow runner.yml: GitHub's answer could not be read"},
+		{"a dispatch's large 500", dispatch, answering(500, large), ErrActionsTransient, "GitHub's answer is larger than 1048576 bytes"},
+		{"a dispatch's cut 500", dispatch, truncated(500), ErrActionsTransient, "GitHub's answer could not be read"},
+		{"a read's cut 200", actionsCalls["read"], truncated(200), ErrActionsTransient, "GitHub's answer could not be read"},
+	}
+	for _, c := range cases {
+		f := &fakeActions{answer: c.answer}
+		err := c.call(serveActions(t, f))
+		if !wrapsOnly(err, c.want) || !strings.Contains(err.Error(), c.says) {
+			t.Errorf("%s: %v", c.name, err)
 		}
 	}
 }
@@ -233,25 +271,29 @@ func TestADispatchSendsTheFullRef(t *testing.T) {
 }
 
 // TestCheckRefTakesABranchOrATag takes a short name, refs/heads/NAME and
-// refs/tags/NAME, and refuses a name under another refs/ prefix, HEAD, and a part that
-// begins with a hyphen, with the rule each fails.
+// refs/tags/NAME, and refuses a name under another refs/ prefix, HEAD, a name that
+// begins with a hyphen, as git does, and a later part that begins with one, with the
+// rule each fails.
 func TestCheckRefTakesABranchOrATag(t *testing.T) {
 	for _, ref := range []string{"main", "release/1.2", "a-b", "a/b-", "refs", "heads/main", "HEADS", "a/HEAD", "refs/heads/main", "refs/heads/release/1.2", "refs/tags/v1.2.3", "refs/tags/runner-1.2", "refs/heads/refs/tags/x"} {
 		if err := CheckRef(ref); err != nil {
 			t.Errorf("%q: %v", ref, err)
 		}
 	}
-	const bad, prefix = "is not a branch or tag name git takes", "is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME"
+	const bad, prefix, hyphen = "is not a branch or tag name git takes", "is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME", "has a part that begins with a hyphen"
 	for ref, want := range map[string]string{
 		"-main":                    bad,
 		"-":                        bad,
-		"a/-b":                     bad,
+		"a/-b":                     hyphen,
+		"a/b/-":                    hyphen,
+		"refs/tags/v1/-rc":         hyphen,
 		"HEAD":                     bad,
 		"refs/heads/HEAD":          bad,
 		"refs/tags/HEAD":           bad,
 		"refs/heads/-main":         bad,
 		"refs/tags/-v1":            bad,
-		"refs/heads/a/-b":          bad,
+		"refs/heads/a/-b":          hyphen,
+		"refs/heads/a/-b/.c":       bad,
 		"refs/heads/":              bad,
 		"refs/tags/":               bad,
 		"refs/heads/.x":            bad,
@@ -504,13 +546,16 @@ func TestARedirectIsNotFollowed(t *testing.T) {
 func TestAnAnswerLargerThan1MiBIsRefused(t *testing.T) {
 	large := `{"padding":"` + strings.Repeat("x", 1<<20) + `"}`
 	for name, call := range actionsCalls {
-		status := 200
-		if name == "cancel" {
+		status, want := 200, ErrActionsTransient
+		switch name {
+		case "cancel":
 			status = 202
+		case "dispatch":
+			want = ErrActionsNoRun
 		}
 		f := &fakeActions{answer: answering(status, large)}
 		err := call(serveActions(t, f))
-		if !errors.Is(err, ErrActionsTransient) || !strings.Contains(err.Error(), "larger than 1048576 bytes") {
+		if !wrapsOnly(err, want) || !strings.Contains(err.Error(), "larger than 1048576 bytes") {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

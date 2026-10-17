@@ -41,9 +41,8 @@ func init() {
 	ownerfile.Program = "qory-github-starter"
 }
 
-// gitHub is the client the starter reaches GitHub's API at api with: every request it
-// sends, an installation token's mint among them, has the User-Agent
-// qory-github-starter/ and the program's version.
+// gitHub is a client of GitHub's API at api whose requests, an installation token's mint
+// among them, have the User-Agent qory-github-starter/ and the program's version.
 func gitHub(api string) github.Client {
 	return github.Client{API: api, UserAgent: "qory-github-starter/" + version}
 }
