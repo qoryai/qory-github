@@ -17,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/cli"
 	"github.com/qoryai/qory-github/internal/enrol"
 	"github.com/qoryai/qory-github/internal/ownerfile"
@@ -40,10 +41,16 @@ func init() {
 	ownerfile.Program = "qory-github-starter"
 }
 
+// gitHub is a client of GitHub's API at api whose requests, an installation token's mint
+// among them, have the User-Agent qory-github-starter/ and the program's version.
+func gitHub(api string) github.Client {
+	return github.Client{API: api, UserAgent: "qory-github-starter/" + version}
+}
+
 // usage is what the program prints when it is run without a command it knows: the
 // usage line, and, where QORY_FEATURES names factory, see [cli.Factory], the commands.
-// Work behind a feature that is off is described nowhere a person sees. The program has
-// no description yet: it comes with a later command.
+// Work behind a feature that is off is described nowhere a person sees. The usage holds
+// no description of the program.
 func usage() string {
 	line := `usage:
   qory-github-starter <command> [flags]`

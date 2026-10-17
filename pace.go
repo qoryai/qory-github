@@ -258,6 +258,20 @@ type apiReply struct {
 	body   []byte
 }
 
+// unreadAnswer is the error of an answer [Client.sendBounded] could not read, or that is
+// larger than it reads, with the status GitHub answered, so a caller to whom that status
+// means the request was taken, as a dispatch's 200, can say so.
+type unreadAnswer struct {
+	status int
+	err    error
+}
+
+// Error is why the answer could not be read.
+func (e *unreadAnswer) Error() string { return e.err.Error() }
+
+// Unwrap is why the answer could not be read.
+func (e *unreadAnswer) Unwrap() error { return e.err }
+
 // err is the answer as an [answerError] for the request what names.
 func (a *apiReply) err(what string) error {
 	var e struct {
@@ -310,7 +324,7 @@ func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, m
 		}
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-		req.Header.Set("User-Agent", "qory-github")
+		req.Header.Set("User-Agent", c.userAgent())
 		req.Header.Set("Authorization", "Bearer "+tok)
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -336,10 +350,10 @@ func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, m
 	defer resp.Body.Close()
 	a, err := io.ReadAll(io.LimitReader(resp.Body, int64(largest)+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))
+		return nil, &unreadAnswer{status: resp.StatusCode, err: fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))}
 	}
 	if len(a) > largest {
-		return nil, fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, largest)
+		return nil, &unreadAnswer{status: resp.StatusCode, err: fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, largest)}
 	}
 	return &apiReply{status: resp.StatusCode, header: resp.Header, body: a}, nil
 }

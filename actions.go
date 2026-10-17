@@ -52,11 +52,14 @@ func CheckWorkflowFile(s string) error {
 	return nil
 }
 
-// CheckRef takes a branch or tag name as git takes one, git check-ref-format's rules in
-// ASCII: printable characters but a space and ~ ^ : ? * [ \, no .. and no @{, not @
-// alone, no part that is empty, starts with a dot or ends in .lock, and no dot or slash
-// at its end. A full name, refs/heads/main, is taken as the short one is. The error
-// names the rule, never the value.
+// CheckRef takes a branch or a tag: a short name is a branch, as refs/heads/NAME is,
+// and a tag is given as refs/tags/NAME; a name under any other refs/ prefix, such as
+// refs/pull/ or refs/remotes/, is refused. The name is one git takes as a branch's or a
+// tag's, git check-ref-format's rules in ASCII: printable characters but a space and
+// ~ ^ : ? * [ \, no .. and no @{, not @ alone, no part that is empty, starts with a dot
+// or ends in .lock, no dot or slash at its end, not HEAD, and no hyphen at its start;
+// and further, no later part begins with a hyphen. The error names the rule, never the
+// value.
 func CheckRef(s string) error {
 	bad := errors.New("is not a branch or tag name git takes")
 	if len(s) > 255 || s == "@" || strings.Contains(s, "..") || strings.Contains(s, "@{") || strings.HasSuffix(s, ".") {
@@ -67,12 +70,38 @@ func CheckRef(s string) error {
 			return bad
 		}
 	}
-	for _, part := range strings.Split(s, "/") {
+	name, full := strings.CutPrefix(s, "refs/heads/")
+	if !full {
+		name, full = strings.CutPrefix(s, "refs/tags/")
+	}
+	if !full && strings.HasPrefix(s, "refs/") {
+		return errors.New("is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME")
+	}
+	if name == "HEAD" || strings.HasPrefix(name, "-") {
+		return bad
+	}
+	parts := strings.Split(name, "/")
+	for _, part := range parts {
 		if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
 			return bad
 		}
 	}
+	for _, part := range parts {
+		if strings.HasPrefix(part, "-") {
+			return errors.New("has a part that begins with a hyphen")
+		}
+	}
 	return nil
+}
+
+// FullRef is the full ref of a branch or a tag [CheckRef] takes, as a dispatch sends it
+// to GitHub: a short name is a branch, sent as refs/heads/NAME, and a name that begins
+// with refs/heads/ or refs/tags/ is sent as it is.
+func FullRef(ref string) string {
+	if strings.HasPrefix(ref, "refs/heads/") || strings.HasPrefix(ref, "refs/tags/") {
+		return ref
+	}
+	return "refs/heads/" + ref
 }
 
 // The errors [Actions] wraps, by what a caller does next. Each error it returns wraps
@@ -99,9 +128,15 @@ var (
 	// ErrActionsTransient is wrapped in the error of a request that may pass when it is
 	// sent again: GitHub's API could not be reached, the request was given up, GitHub
 	// answered 5xx, 401, 408 or 429, or a 403 for a rate limit after the [Pacer]'s tries,
-	// or an answer it cannot read. A 401 drops the token it answers, so the next request
-	// mints a new one.
+	// or an answer it cannot read, but a dispatch's 200, which wraps [ErrActionsNoRun]. A
+	// 401 drops the token it answers, so the next request mints a new one.
 	ErrActionsTransient = errors.New("the request failed, and may pass when it is sent again")
+	// ErrActionsNoRun is wrapped in the error of a dispatch GitHub took without naming
+	// the workflow run it made: it answered 204, with no run's details, or 200 without a
+	// run's id above 0, as an answer that does not decode, is larger than 1 MiB or cannot
+	// be read. The workflow may be running all the same, so a dispatch sent again may
+	// start a second run.
+	ErrActionsNoRun = errors.New("GitHub took the dispatch and named no workflow run")
 )
 
 // invalidActions is a request refused before anything is sent, with the rule it fails;
@@ -147,9 +182,9 @@ type actionsTokenKey struct {
 
 // DispatchedRun is the workflow run GitHub made for a dispatch.
 type DispatchedRun struct {
-	// ID is the run's id, which [Actions.ReadWorkflowRun] and [Actions.CancelWorkflowRun]
-	// take; 0 when GitHub took the dispatch and named no run, see
-	// [Actions.DispatchWorkflow].
+	// ID is the run's id, above 0, which [Actions.ReadWorkflowRun] and
+	// [Actions.CancelWorkflowRun] take: [Actions.DispatchWorkflow] never returns ID 0
+	// with a nil error.
 	ID int64
 	// URL is the run in GitHub's API, its run_url.
 	URL string
@@ -182,16 +217,20 @@ type WorkflowRun struct {
 // DispatchWorkflow starts the workflow whose file name is workflow, in the repository
 // whose id is repository, of the installation installation, on the branch or tag ref,
 // with one input, dispatch_id, POST
-// /repositories/{id}/actions/workflows/{workflow}/dispatches. The workflow's file name,
-// see [CheckWorkflowFile], the ref, see [CheckRef], and the dispatch_id, which must fit
-// the provisioner contract's pattern, are checked before anything is sent, and a
-// request that fails wraps [ErrActionsInvalid].
+// /repositories/{id}/actions/workflows/{workflow}/dispatches. A short ref is a branch,
+// and a tag is given as refs/tags/NAME; the ref is sent as [FullRef] writes it, so a
+// short name goes as refs/heads/NAME. The workflow's file name, see
+// [CheckWorkflowFile], the ref, see [CheckRef], and the dispatch_id, which must fit the
+// provisioner contract's pattern, are checked before anything is sent, and a request
+// that fails wraps [ErrActionsInvalid].
 //
 // The body asks for the run's details, return_run_details, and GitHub answers 200 with
-// the run's id, its API URL and its page, which it returns. GitHub answers 204 with no
-// body for a dispatch that does not ask for them; should it answer 204 all the same, the
-// dispatch is taken and no run is named, and it returns a [DispatchedRun] whose ID is 0
-// and nil. Any other answer fails, see [ErrActionsGone], [ErrActionsRefused] and
+// the run's id, its API URL and its page, which it returns, the id above 0. A caller
+// never receives a run whose ID is 0 with a nil error: GitHub answers 204 with no body
+// for a dispatch that does not ask for the run's details, and should it answer 204 all
+// the same, or 200 without a run's id above 0, as an answer that does not decode, is
+// larger than 1 MiB or cannot be read, the error wraps [ErrActionsNoRun]. Any
+// other answer fails, see [ErrActionsGone], [ErrActionsRefused] and
 // [ErrActionsTransient]. No error contains the token.
 func (a *Actions) DispatchWorkflow(ctx context.Context, installation, repository int64, workflow, ref, dispatchID string) (DispatchedRun, error) {
 	if repository <= 0 {
@@ -212,17 +251,21 @@ func (a *Actions) DispatchWorkflow(ctx context.Context, installation, repository
 			DispatchID string `json:"dispatch_id"`
 		} `json:"inputs"`
 		ReturnRunDetails bool `json:"return_run_details"`
-	}{Ref: ref, ReturnRunDetails: true}
+	}{Ref: FullRef(ref), ReturnRunDetails: true}
 	body.Inputs.DispatchID = dispatchID
 	what := "dispatching the workflow " + workflow
 	path := repositoryPath(repository) + "/actions/workflows/" + workflow + "/dispatches"
 	reply, err := a.request(ctx, what, http.MethodPost, path, installation, repository, "write", body)
+	var unread *unreadAnswer
+	if errors.As(err, &unread) && unread.status == http.StatusOK {
+		return DispatchedRun{}, fmt.Errorf("%w: %w", ErrActionsNoRun, unread)
+	}
 	if err != nil {
 		return DispatchedRun{}, err
 	}
 	switch reply.status {
 	case http.StatusNoContent:
-		return DispatchedRun{}, nil
+		return DispatchedRun{}, fmt.Errorf("%w: %s: GitHub answered 204, with no run's details", ErrActionsNoRun, what)
 	case http.StatusOK:
 	default:
 		return DispatchedRun{}, actionsFailed(reply, what)
@@ -233,10 +276,10 @@ func (a *Actions) DispatchWorkflow(ctx context.Context, installation, repository
 		HTMLURL       string `json:"html_url"`
 	}
 	if err := json.Unmarshal(reply.body, &got); err != nil {
-		return DispatchedRun{}, fmt.Errorf("%w: %s: GitHub's answer: %w", ErrActionsTransient, what, err)
+		return DispatchedRun{}, fmt.Errorf("%w: %s: GitHub's answer: %w", ErrActionsNoRun, what, err)
 	}
 	if got.WorkflowRunID <= 0 {
-		return DispatchedRun{}, fmt.Errorf("%w: %s: GitHub answered 200 without the run's id", ErrActionsTransient, what)
+		return DispatchedRun{}, fmt.Errorf("%w: %s: GitHub answered 200 without a run's id above 0", ErrActionsNoRun, what)
 	}
 	return DispatchedRun{ID: got.WorkflowRunID, URL: got.RunURL, HTMLURL: got.HTMLURL}, nil
 }

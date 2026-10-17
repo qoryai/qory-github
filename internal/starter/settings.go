@@ -44,8 +44,7 @@ type Settings struct {
 	// checked under before it is used.
 	ApiaryPublicKey accesskey.Pin
 	// PoolID is the node pool the access key is enrolled in, np_ and 16 characters,
-	// which access-key enrol prints. It may be left out: a claim then covers the key's
-	// node pool.
+	// which access-key enrol prints. It may be left out, and is then empty.
 	PoolID string
 	// Listen is the address and port the starter listens on, plain HTTP: the
 	// operator's proxy terminates TLS.
@@ -67,8 +66,9 @@ type Settings struct {
 	// Workflow is the file name of the workflow in the repository's .github/workflows
 	// the starter runs, such as qory-runner.yml.
 	Workflow string
-	// Ref is the branch or tag the workflow runs on: a short name, main, is a branch,
-	// and a tag is given in full, refs/tags/v1.
+	// Ref is the branch or tag the workflow runs on, which [github.CheckRef] takes: a
+	// short name is a branch, as refs/heads/NAME is, and a tag is given as
+	// refs/tags/NAME.
 	Ref string
 	// WorkflowSHA is the commit, 40 lower-case hexadecimal digits, the workflow's run
 	// must be at. It may be left out.

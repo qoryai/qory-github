@@ -130,6 +130,13 @@ func TestReadSettingsRefusesAWrongField(t *testing.T) {
 		{"ref", "main.lock", "/ref: is not a branch or tag name git takes"},
 		{"ref", "@", "/ref: is not a branch or tag name git takes"},
 		{"ref", "main@{1}", "/ref: is not a branch or tag name git takes"},
+		{"ref", "-main", "/ref: is not a branch or tag name git takes"},
+		{"ref", "HEAD", "/ref: is not a branch or tag name git takes"},
+		{"ref", "refs/heads/HEAD", "/ref: is not a branch or tag name git takes"},
+		{"ref", "refs/tags/-v1", "/ref: is not a branch or tag name git takes"},
+		{"ref", "release/-rc", "/ref: has a part that begins with a hyphen"},
+		{"ref", "refs/pull/1/head", "/ref: is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME"},
+		{"ref", "refs/remotes/origin/main", "/ref: is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME"},
 		{"workflow_sha", "0123456789ABCDEF0123456789ABCDEF01234567", "/workflow_sha: is not a commit's SHA, 40 lower-case hexadecimal digits"},
 		{"workflow_sha", "0123456", "/workflow_sha: is not a commit's SHA, 40 lower-case hexadecimal digits"},
 	} {

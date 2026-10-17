@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,10 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/starter"
 )
 
@@ -376,4 +380,53 @@ func TestEnrolNeverWritesOverAFile(t *testing.T) {
 		t.Errorf("%d requests were sent", n)
 	}
 	noLeak(t, nil, c, out, errs)
+}
+
+// TestTheStarterSendsItsUserAgentToGitHub dispatches a workflow through the starter's
+// GitHub client to a fake of GitHub's API, and checks every request, the installation's
+// check and the mint among them, has the User-Agent qory-github-starter/ and the
+// program's version.
+func TestTheStarterSendsItsUserAgentToGitHub(t *testing.T) {
+	var mu sync.Mutex
+	var paths, agents []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		agents = append(agents, r.Header.Get("User-Agent"))
+		mu.Unlock()
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/app/installations/7":
+			io.WriteString(w, `{"id":7,"account":{"login":"example-org","type":"Organization"}}`)
+		case r.Method == "POST" && r.URL.Path == "/app/installations/7/access_tokens":
+			w.WriteHeader(201)
+			io.WriteString(w, `{"token":"ghs_example","expires_at":"2099-01-01T00:00:00Z"}`)
+		case r.Method == "POST" && r.URL.Path == "/repositories/42/actions/workflows/qory-runner.yml/dispatches":
+			io.WriteString(w, `{"workflow_run_id":99}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &github.Actions{Client: gitHub(srv.URL), AppID: "12345", Key: key}
+	if _, err := a.DispatchWorkflow(context.Background(), 7, 42, "qory-runner.yml", "main", "dp_0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) < 2 || paths[len(paths)-1] != "POST /repositories/42/actions/workflows/qory-runner.yml/dispatches" {
+		t.Fatalf("the requests were %q", paths)
+	}
+	want := "qory-github-starter/" + version
+	if version == "" {
+		t.Fatal("the program has no version")
+	}
+	for i, got := range agents {
+		if got != want {
+			t.Errorf("%s has the User-Agent %q, not %q", paths[i], got, want)
+		}
+	}
 }

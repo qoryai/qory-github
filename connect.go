@@ -106,7 +106,7 @@ func (c Client) UserToken(ctx context.Context, clientID string, clientSecret []b
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "qory-github")
+	req.Header.Set("User-Agent", c.userAgent())
 	hc := http.Client{Timeout: 30 * time.Second}
 	if c.HTTP != nil {
 		hc = *c.HTTP

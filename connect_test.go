@@ -15,13 +15,13 @@ func TestUserTokenSaysNoCodeNoSecretAndFollowsNoRedirect(t *testing.T) {
 	var answer func(w http.ResponseWriter)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		if r.URL.Path != "/login/oauth/access_token" || r.Method != http.MethodPost || !strings.Contains(string(b), "code="+code) || r.Header.Get("Accept") != "application/json" {
-			t.Errorf("%s %s %s", r.Method, r.URL.Path, b)
+		if r.URL.Path != "/login/oauth/access_token" || r.Method != http.MethodPost || !strings.Contains(string(b), "code="+code) || r.Header.Get("Accept") != "application/json" || r.Header.Get("User-Agent") != "example-program/1.2.3" {
+			t.Errorf("%s %s %s %q", r.Method, r.URL.Path, b, r.Header.Get("User-Agent"))
 		}
 		answer(w)
 	}))
 	defer srv.Close()
-	c := Client{API: srv.URL}
+	c := Client{API: srv.URL, UserAgent: "example-program/1.2.3"}
 	if c.Web() != srv.URL || (Client{}).Web() != WebURL {
 		t.Errorf("the website %s", c.Web())
 	}
