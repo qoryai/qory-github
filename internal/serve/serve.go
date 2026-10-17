@@ -159,7 +159,7 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	adapter := &Adapter{Store: st, GitHub: github.Client{API: s.APIURL}, AppID: s.AppID, Key: key, Slug: s.AppSlug, Sink: apiary, Log: log}
 	apiary.Ended = adapter.forgetEnded(apiary.Ended)
 	// The adapter's handlers serve only a linked installation, so the receiver keeps no
-	// other's delivery, see [Receiver.Linked].
+	// other's delivery but those [Receiver.Linked] names.
 	handlers, linked := opts.Handlers, func(int64) (bool, error) { return true, nil }
 	if handlers == nil {
 		handlers = &Handlers{}

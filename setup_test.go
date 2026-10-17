@@ -516,7 +516,7 @@ func TestTheManifestWithAPublicURLIsTheAppServeNeeds(t *testing.T) {
 	wait()
 	b, _ := json.Marshal(m)
 	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
-		`"default_events":["issues","issue_comment","workflow_run","pull_request","push"],` +
+		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
 		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
 		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/github/webhook"},` +
 		`"name":"qory-github-test","public":true,"redirect_url":"` + origin(local) + `/callback","request_oauth_on_install":false,` +

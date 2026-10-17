@@ -84,22 +84,26 @@ func (a *Adapter) log() *slog.Logger {
 }
 
 // Register registers the adapter's handlers: installation, installation_repositories,
-// issues and issue_comment. workflow_run, pull_request and push have none yet, so their
-// deliveries are not kept, see [Receiver.Handlers].
+// issues, issue_comment and repository. workflow_run, pull_request and push have none
+// yet, so their deliveries are not kept, see [Receiver.Handlers].
 func (a *Adapter) Register(hs *Handlers) {
 	hs.HandleFunc("installation", a.linked(a.installation))
 	hs.HandleFunc("installation_repositories", a.linked(a.installationRepositories))
 	hs.HandleFunc("issues", a.linked(a.issues))
 	hs.HandleFunc("issue_comment", a.linked(a.issueComment))
+	hs.HandleFunc("repository", a.linked(a.repository))
 }
 
 // linked is h for the deliveries of a linked installation; another's is done and
-// logged. The installation event's deleted is [Adapter.deleted]'s, for any
-// installation.
+// logged. The installation event's deleted is [Adapter.deleted]'s, and the repository
+// event's transferred is [Adapter.transferred]'s, for any installation.
 func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(context.Context, Delivery) error {
 	return func(ctx context.Context, d Delivery) error {
 		if d.Event == "installation" && d.Action == "deleted" && d.InstallationID > 0 {
 			return a.deleted(ctx, d)
+		}
+		if d.Event == "repository" && d.Action == "transferred" {
+			return a.transferred(ctx, d)
 		}
 		ok, err := Linked(a.Store, d.InstallationID)
 		if err != nil {
@@ -799,6 +803,141 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 		}
 	}
 	return a.listRepositories(ctx, d.InstallationID)
+}
+
+// repository handles the repository event of a linked installation, for the repository
+// the event names by its id, which is its collection's ref:
+//
+//   - deleted: a repository serve listed for the installation, see [reachOf], is
+//     disconnected and its records dropped, see [Adapter.dropRepository]; any other is
+//     logged and changes nothing. GitHub's docs say an App is not sent deleted, so a
+//     deleted repository mostly reaches serve as installation_repositories removed, or
+//     as a fill or a pull GitHub answers it is gone; a deleted that arrives is handled
+//     all the same.
+//   - created: the installation's tokens and first listings kept, see
+//     [Adapter.sendFirst], are dropped, as installation_repositories drops them, and its
+//     repositories are listed again, the new one among them.
+//   - renamed: the repositories are listed again, which names the repository by the
+//     same ref with its new title, URL and target. Nothing is disconnected.
+//
+// Any other action, archived, unarchived, privatized, publicized and edited among them,
+// changes nothing. transferred is [Adapter.transferred]'s.
+func (a *Adapter) repository(ctx context.Context, d Delivery) error {
+	switch d.Action {
+	case "deleted":
+		ref, err := repositoryRef(d)
+		if err != nil {
+			return err
+		}
+		installation, ok, err := reachOf(a.Store, ref)
+		if err != nil {
+			return err
+		}
+		if !ok || installation != d.InstallationID {
+			a.log().Info("the repository is not one serve listed for the installation, so nothing is disconnected", slog.String("collection", ref), slog.Int64("installation", d.InstallationID))
+			return nil
+		}
+		sent, err := a.dropRepository(ctx, ref, installation)
+		if sent {
+			a.log().Info("GitHub deleted the repository, so its collection is disconnected", slog.String("collection", ref), slog.Int64("installation", installation))
+		}
+		return err
+	case "created":
+		a.forgetTokens(d.InstallationID)
+		a.dropFirsts(d.InstallationID, "")
+		return a.listRepositories(ctx, d.InstallationID)
+	case "renamed":
+		return a.listRepositories(ctx, d.InstallationID)
+	}
+	return nil
+}
+
+// transferred handles the repository event's transferred, for any installation, linked
+// or not. GitHub sends it only to the installation on the account the repository was
+// transferred to, with the repository as it is now, by the same id, which is its
+// collection's ref. When that installation is linked, its tokens and first listings
+// kept are dropped and its repositories are listed again, as for created: the listing
+// names the collection by the same ref, so Qory Apiary moves it to the installation's
+// connection, and the repository's installation becomes this one. The first listings
+// kept for the installation serve listed it for before, if another, are dropped too, so
+// none of them names the repository as that installation's again. When the
+// installation is not linked, the repository's collection is disconnected under the
+// installation serve listed it for, see [reachOf], and its records dropped, see
+// [Adapter.dropRepository]; a repository serve never listed is logged and changes
+// nothing.
+func (a *Adapter) transferred(ctx context.Context, d Delivery) error {
+	ref, err := repositoryRef(d)
+	if err != nil {
+		return err
+	}
+	linked, err := Linked(a.Store, d.InstallationID)
+	if err != nil {
+		return err
+	}
+	before, listed, err := reachOf(a.Store, ref)
+	if err != nil {
+		return err
+	}
+	if linked {
+		a.forgetTokens(d.InstallationID)
+		a.dropFirsts(d.InstallationID, "")
+		if listed && before != d.InstallationID {
+			a.dropFirsts(before, "")
+		}
+		return a.listRepositories(ctx, d.InstallationID)
+	}
+	if !listed {
+		a.log().Info("the repository is not one serve listed, so nothing is disconnected", slog.String("collection", ref), slog.Int64("installation", d.InstallationID))
+		return nil
+	}
+	sent, err := a.dropRepository(ctx, ref, before)
+	if sent {
+		a.log().Info("GitHub transferred the repository to an installation not linked to Qory Apiary, so its collection is disconnected", slog.String("collection", ref), slog.Int64("installation", before))
+	}
+	return err
+}
+
+// dropRepository sends a disconnect for the collection ref, a repository the
+// installation reaches, then drops the repository's records, which installation reaches
+// it and its pulls, and the installation's first listings kept, see [Adapter.sendFirst],
+// which name it. It says whether Qory Apiary took the disconnect. A disconnect Qory
+// Apiary refuses for good is logged, as [Adapter.disconnect] logs it, and the records are
+// dropped all the same; any other error stops it, to be tried again, with the records
+// kept. Qory Apiary answers a ref with no live collection with the signed 204, so a
+// disconnect sent again, or after the collection ended, is taken.
+func (a *Adapter) dropRepository(ctx context.Context, ref string, installation int64) (bool, error) {
+	err := a.Sink.Disconnect(ctx, contracts.SourcesDisconnect{Version: contracts.Version, CollectionRef: ref})
+	if err != nil && !IsPermanent(err) {
+		return false, err
+	}
+	if err != nil {
+		a.log().Error("the disconnect is refused", slog.String("collection", ref), slog.String("error", err.Error()))
+	}
+	for _, ns := range []string{nsRepositories, nsPulls} {
+		if err := a.Store.Delete(ns, collectionKey(ref)); err != nil {
+			return false, err
+		}
+	}
+	a.dropFirsts(installation, "")
+	return err == nil, nil
+}
+
+// repositoryRef is the collection ref of the repository a repository event names, its
+// id; an event that names none fails for good.
+func repositoryRef(d Delivery) (string, error) {
+	var ev struct {
+		Repository struct {
+			ID int64 `json:"id"`
+		} `json:"repository"`
+	}
+	if err := json.Unmarshal(d.Body, &ev); err != nil {
+		return "", Permanent(errors.New("the repository event is not JSON GitHub sends"))
+	}
+	ref := github.CollectionRef(ev.Repository.ID)
+	if ref == "" {
+		return "", Permanent(errors.New("the repository event names no repository's id"))
+	}
+	return ref, nil
 }
 
 // disconnect sends a disconnect for each collection. One Qory Apiary refuses for good is

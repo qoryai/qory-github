@@ -2708,3 +2708,376 @@ func TestOneListingOfAReplacedConnectionAtATime(t *testing.T) {
 		t.Errorf("%d listings, %d waits", n, waits.Load())
 	}
 }
+
+// repositoryEvent is a repository event of the installation on the repository repo,
+// owner/name, with action. transferred names, as GitHub does, the account the repository
+// was transferred from in changes.owner.from, and the repository as it is now.
+func repositoryEvent(installation int64, repo, action string) map[string]any {
+	ev := map[string]any{
+		"action": action, "installation": map[string]any{"id": installation},
+		"repository": map[string]any{"id": repoID(repo), "full_name": repo, "html_url": "https://github.com/" + repo},
+		"sender":     map[string]any{"login": "alice", "id": alice.ID, "type": "User"},
+	}
+	switch action {
+	case "transferred":
+		ev["changes"] = map[string]any{"owner": map[string]any{"from": map[string]any{"organization": map[string]any{"login": "acme", "id": acme.ID}}}}
+	case "renamed":
+		ev["changes"] = map[string]any{"repository": map[string]any{"name": map[string]any{"from": "widgets"}}}
+	}
+	return ev
+}
+
+// keepFirsts makes the adapter keep a first listing for each installation and
+// connection given in turn.
+func (a *Adapter) keepFirsts(keys ...firstKey) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.firsts == nil {
+		a.firsts = map[firstKey]*firstListing{}
+	}
+	for _, k := range keys {
+		a.firsts[k] = &firstListing{}
+	}
+}
+
+// TestARepositoryDeletedIsDisconnectedAndForgotten delivers repository deleted for a
+// repository serve listed for the installation: its collection is disconnected, which
+// installation reaches it and its pulls are forgotten, and so are the installation's
+// first listings kept, while another installation's and another repository's stay.
+// Nothing is listed.
+func TestARepositoryDeletedIsDisconnectedAndForgotten(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	setReach(w.st, gadgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	keepPulled(w.st, gadgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	w.adapter.keepFirsts(firstKey{42, testConnection}, firstKey{43, otherConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "deleted"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the deleted repository's installation is kept")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+		t.Errorf("the deleted repository's pulls are kept: %+v", m)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if !w.adapter.keptFirst(43, otherConnection) {
+		t.Error("another installation's first listing is dropped")
+	}
+	if inst, ok, _ := reachOf(w.st, gadgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+	if m, _ := pulledOf(w.st, gadgetsRef); m.Since.IsZero() {
+		t.Error("another repository's pulls are dropped")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+	if !strings.Contains(w.log.String(), "GitHub deleted the repository, so its collection is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestARepositoryDeletedThatServeDidNotListForTheInstallationChangesNothing delivers
+// repository deleted for a repository the store holds as another installation's, and
+// for one serve never listed: neither is disconnected and the records stay.
+func TestARepositoryDeletedThatServeDidNotListForTheInstallationChangesNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("octo-org/tools"), 43)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "octo-org/tools", "deleted"))
+	w.deliver(t, "repository", guid2, repositoryEvent(42, "acme/never", "deleted"))
+	for _, g := range []string{guid1, guid2} {
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%s: the delivery is %v", g, s)
+		}
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("octo-org/tools")); inst != 43 || !ok {
+		t.Errorf("octo-org/tools: %d %v", inst, ok)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+	if n := strings.Count(w.log.String(), "the repository is not one serve listed for the installation, so nothing is disconnected"); n != 2 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// TestARepositoryDeletedWhoseDisconnectFails has Qory Apiary refuse the disconnect of a
+// deleted repository: for good, 409 connection_suspended, which is logged, and the
+// records are dropped all the same, with no line that says the collection is
+// disconnected; or with a 502, which keeps the records and the delivery, to be tried
+// again.
+func TestARepositoryDeletedWhoseDisconnectFails(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		body    string
+		dropped bool
+	}{
+		{409, `{"error":"connection_suspended"}`, true},
+		{502, `{"error":"bad_gateway"}`, false},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
+		if tc.dropped {
+			w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "deleted"))
+		} else {
+			b, _ := json.Marshal(repositoryEvent(42, "acme/widgets", "deleted"))
+			if rec := post(w.mux, "repository", guid1, string(b), sign(string(b))); rec.Code != http.StatusAccepted {
+				t.Fatalf("status %d", rec.Code)
+			}
+			eventually(t, "a disconnect sent", func() bool { return len(w.apiary.sent(routeDisconnect)) > 0 })
+			if s := state(w.st, guid1); s == store.Done {
+				t.Errorf("%d: the delivery is done", tc.status)
+			}
+		}
+		if _, ok, _ := reachOf(w.st, widgetsRef); ok == tc.dropped {
+			t.Errorf("%d: the repository's installation kept %v", tc.status, ok)
+		}
+		if strings.Contains(w.log.String(), "its collection is disconnected") {
+			t.Errorf("%d: the log says the collection is disconnected: %s", tc.status, w.log.String())
+		}
+		if tc.dropped && !strings.Contains(w.log.String(), "the disconnect is refused") {
+			t.Errorf("%d: the log: %s", tc.status, w.log.String())
+		}
+	}
+}
+
+// TestARepositoryCreatedListsWithANewToken lists the installation, which keeps its
+// listing token, keeps a first listing for it, and delivers repository created: the
+// installation's tokens and first listing are dropped, and it is listed again with a
+// token minted after the change, the new repository in the listing, kept as reached by
+// the installation. Nothing is disconnected.
+func TestARepositoryCreatedListsWithANewToken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/tools", "created"))
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	if mints != 2 {
+		t.Errorf("%d listing tokens minted, want 2", mints)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets", "acme/tools")) {
+		t.Errorf("listed %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("acme/tools")); inst != 42 || !ok {
+		t.Errorf("acme/tools: %d %v", inst, ok)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+}
+
+// TestARepositoryRenamedIsListedAgainAndNotDisconnected renames acme/widgets to
+// acme/sprockets, which keeps its id: the installation is listed again, which names the
+// collection by the same ref with the new title, URL and target, the repository stays
+// the installation's, and nothing is disconnected.
+func TestARepositoryRenamedIsListedAgainAndNotDisconnected(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.gh.installed("acme/sprockets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/sprockets", "renamed"))
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 1 {
+		t.Fatalf("%d listings", len(sent))
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[0].raw, &req)
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
+	if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+		t.Errorf("sent %s", sent[0].raw)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("the renamed repository: %d %v", inst, ok)
+	}
+}
+
+// TestRepositoryActionsThatChangeNothing delivers repository archived, unarchived,
+// privatized, publicized and edited: each is done, and none reaches GitHub or Qory
+// Apiary or changes a record.
+func TestRepositoryActionsThatChangeNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	for i, action := range []string{"archived", "unarchived", "privatized", "publicized", "edited"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, repositoryEvent(42, "acme/widgets", action))
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%s: the delivery is %v", action, s)
+		}
+	}
+	w.gh.mu.Lock()
+	requests := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if len(requests) != 0 || w.apiary.count() != 0 {
+		t.Errorf("GitHub was asked %v, Qory Apiary %d times", requests, w.apiary.count())
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/widgets: %d %v", inst, ok)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+}
+
+// TestRepositoryDeliveriesOfAnInstallationNotLinked sends repository deliveries of an
+// installation that is not linked: each is answered 202 and not kept, but transferred,
+// which is kept and handled.
+func TestRepositoryDeliveriesOfAnInstallationNotLinked(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	for i, action := range []string{"deleted", "created", "renamed", "archived", "unarchived", "privatized", "publicized", "edited"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		b, _ := json.Marshal(repositoryEvent(43, "acme/widgets", action))
+		if rec := post(w.mux, "repository", g, string(b), sign(string(b))); rec.Code != http.StatusAccepted || state(w.st, g) != "" {
+			t.Errorf("%s: %d %q", action, rec.Code, state(w.st, g))
+		}
+	}
+	if n := strings.Count(w.log.String(), `"outcome":"not_linked"`); n != 8 || w.apiary.count() != 0 {
+		t.Errorf("%d lines not_linked, %d requests", n, w.apiary.count())
+	}
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("transferred: the delivery is %v", s)
+	}
+}
+
+// TestARepositoryTransferredToALinkedInstallationMovesItsCollection transfers
+// octo-org/widgets, which serve listed for the installation 9, to acme, whose
+// installation 42 is linked to another connection: GitHub sends transferred to 42 alone,
+// with the repository as acme/widgets, by the same id. The installation 42 is listed
+// again, with a token minted after the change, naming the collection by the same ref
+// under its connection, the repository becomes 42's, the first listings kept for both
+// installations are dropped, and nothing is disconnected.
+func TestARepositoryTransferredToALinkedInstallationMovesItsCollection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	Link(w.st, 9, otherConnection, linkLive)
+	setReach(w.st, widgetsRef, 9)
+	setReach(w.st, refOf("octo-org/tools"), 9)
+	w.adapter.keepFirsts(firstKey{42, testConnection}, firstKey{9, otherConnection}, firstKey{43, "ac_00000000000000aa"})
+	w.adapter.mu.Lock()
+	w.adapter.tokens = map[string]github.InstallationToken{"42 0 ": {Token: "minted-before", ExpiresAt: time.Now().Add(time.Hour)}}
+	w.adapter.mu.Unlock()
+	w.gh.installed("acme/widgets", "acme/gadgets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection {
+		t.Fatalf("sent %v", sent)
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets")) {
+		t.Errorf("listed %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("the transferred repository: %d %v", inst, ok)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("octo-org/tools")); inst != 9 || !ok {
+		t.Errorf("octo-org/tools: %d %v", inst, ok)
+	}
+	if w.adapter.keptFirst(42, testConnection) || w.adapter.keptFirst(9, otherConnection) {
+		t.Error("a first listing of either installation is kept")
+	}
+	if !w.adapter.keptFirst(43, "ac_00000000000000aa") {
+		t.Error("another installation's first listing is dropped")
+	}
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	if mints != 1 {
+		t.Errorf("%d listing tokens minted, want 1", mints)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+}
+
+// TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected transfers
+// acme/widgets, which serve listed for the installation 42, to an account whose
+// installation 43 is not linked: the delivery is kept, the collection is disconnected
+// under 42, which installation reaches it and its pulls are forgotten, and so are 42's
+// first listings kept. Nothing is listed. A repository serve never listed, transferred
+// so, disconnects nothing.
+func TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the transferred repository's installation is kept")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+		t.Errorf("the transferred repository's pulls are kept: %+v", m)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+	if !strings.Contains(w.log.String(), "GitHub transferred the repository to an installation not linked to Qory Apiary, so its collection is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+	w.deliver(t, "repository", guid2, repositoryEvent(43, "octo-org/never", "transferred"))
+	if got := w.disconnected(0); len(got) != 1 {
+		t.Errorf("disconnected %v", got)
+	}
+	if !strings.Contains(w.log.String(), "the repository is not one serve listed, so nothing is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestARepositoryEventWithoutARepositoryFailsForGood delivers repository events that
+// name no repository's id: each fails for good, at once, and reaches nobody.
+func TestARepositoryEventWithoutARepositoryFailsForGood(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	for i, action := range []string{"deleted", "transferred"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, map[string]any{"action": action, "installation": map[string]any{"id": 42}, "repository": map[string]any{"id": 0}})
+		if s := state(w.st, g); s != store.Failed {
+			t.Errorf("%s: the delivery is %v", action, s)
+		}
+	}
+	if w.apiary.count() != 0 {
+		t.Errorf("%d requests", w.apiary.count())
+	}
+}

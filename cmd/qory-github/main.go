@@ -126,10 +126,11 @@ policy that selects it.`,
 // setupPublicHelp is the paragraph setup's help adds after the App's description where
 // QORY_FEATURES names factory, see [cli.Factory], for the App --public-url makes.
 const setupPublicHelp = `With --public-url, the App is instead public, with a webhook at the public URL and
-` + github.WebhookPath + `, the events issues, issue_comment, workflow_run, pull_request and
-push, and actions, checks, contents, issues and pull requests write, administration,
-members and metadata read. It is qory-github-server's App: setup then prints
-qory-github-server serve's settings in place of the declaration and the policy.
+` + github.WebhookPath + `, the events issues, issue_comment, repository, workflow_run,
+pull_request and push, and actions, checks, contents, issues and pull requests
+write, administration, members and metadata read. It is qory-github-server's App:
+setup then prints qory-github-server serve's settings in place of the declaration
+and the policy.
 Without --org, setup asks which GitHub account the App is for. Unless --name gives a
 name, setup suggests qory- and the account's handle, which you can change on
 GitHub's form.`
