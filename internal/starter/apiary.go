@@ -3,6 +3,7 @@ package starter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
@@ -227,12 +228,14 @@ func (r *Refusal) Is(target error) bool {
 // against its schema and its revision, before anything in it is used. A request's time
 // is the clock's, in whole seconds, and never ahead of it. A request with the same
 // method, URL and body but its time as one sent within the clock's current second, a
-// try sent again or an identical call, waits for the clock's next second first, so the
-// same bytes are never sent twice; a distinct request does not wait. No redirect is
-// followed. No error it returns and no line it logs holds the access
-// key's secret, a run key, a handover's inputs or a work item's title; a [Claimed] or a
-// [Handed] prints, logs and marshals without them. It is safe for concurrent use, and is
-// used by its pointer.
+// try sent again or an identical call, waits for the clock's next second first, so
+// within one Apiary value, while the clock does not step back, the same bytes are never
+// sent twice; a distinct request does not wait. After the clock steps back, a request
+// may repeat the bytes of one sent before: Qory Apiary answers it with the unsigned 401
+// for a replay, and the try is sent again, built anew. No redirect is followed. No error
+// it returns and no line it logs holds the access key's secret, a run key, a handover's
+// inputs or a work item's title; a [Claimed] or a [Handed] prints, logs and marshals
+// without them. It is safe for concurrent use, and is used by its pointer.
 type Apiary struct {
 	// URL is Qory Apiary's origin, without a trailing slash, as [Settings.ApiaryURL].
 	URL string
@@ -251,40 +254,51 @@ type Apiary struct {
 	// HTTP is the client; nil is one with no other setting. Its timeout is set per
 	// request, and no redirect is followed.
 	HTTP *http.Client
-	// Now is the clock a request's time is read from; nil is time.Now.
+	// Now is the clock a request's time is read from; nil is time.Now. Now must advance
+	// across Sleep: a wait for the clock's next second ends only once Now reads it.
 	Now func() time.Time
-	// Sleep waits d or until ctx is done; nil waits on a timer.
+	// Sleep waits d or until ctx is done; nil waits on a timer. Now must read d later
+	// after it.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Log takes a line for each try sent again; nil logs nothing.
 	Log *slog.Logger
 
-	// mu guards last, the second each request identity was last sent at, see
-	// [Apiary.nextTime].
-	mu   sync.Mutex
-	last map[string]time.Time
+	// mu guards last, the SHA-256 of each request identity sent within the clock's
+	// second pruned, and the second it was sent at, see [Apiary.nextTime].
+	mu     sync.Mutex
+	last   map[[sha256.Size]byte]time.Time
+	pruned time.Time
 }
 
 // nextTime is the time of a request whose identity, its method, its URL and its body
-// built without the time, is id: the clock's second, once it is later than the second
-// that identity was last sent at. Until it is, it waits for the clock's next second
-// with [Apiary.Sleep], so it never runs ahead of the clock. An identity the clock is
-// past is forgotten. Once ctx is done, its error is the error.
+// built without the time, is id: the clock's second, once that identity was not sent
+// within it. Until then, it waits for the clock's next second with [Apiary.Sleep], less
+// than a second, so it never runs ahead of the clock. Once the clock's second is
+// another than the one last pruned, every identity sent at another second is
+// forgotten, after the clock steps back too, so the identities kept are those of the
+// current second. Once ctx is done, its error is the error.
 func (a *Apiary) nextTime(ctx context.Context, id string) (time.Time, error) {
+	key := sha256.Sum256([]byte(id))
 	for {
+		// The clock is read under mu, so a read made before another request's is never
+		// used after it, which would count as the clock stepping back.
+		a.mu.Lock()
 		now := a.now().UTC()
 		t := now.Truncate(time.Second)
-		a.mu.Lock()
-		for k, last := range a.last {
-			if t.After(last) {
-				delete(a.last, k)
+		if !t.Equal(a.pruned) {
+			for k, last := range a.last {
+				if !t.Equal(last) {
+					delete(a.last, k)
+				}
 			}
+			a.pruned = t
 		}
-		last, held := a.last[id]
+		last, held := a.last[key]
 		if !held {
 			if a.last == nil {
-				a.last = map[string]time.Time{}
+				a.last = map[[sha256.Size]byte]time.Time{}
 			}
-			a.last[id] = t
+			a.last[key] = t
 			a.mu.Unlock()
 			return t, nil
 		}
@@ -567,13 +581,17 @@ type answer struct {
 // that doubles from [firstWait]. After the last try, the failure is the error. Once ctx
 // is done, its error is the error, and nothing more is logged or sent.
 func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
-	id, err := json.Marshal(req.body(""))
+	b, err := json.Marshal(req.body(""))
 	if err != nil {
 		return nil, fmt.Errorf("%s: the request could not be made", req.what)
 	}
+	id := http.MethodPost + " " + req.url + "\n" + string(b)
+	if accesskey.ContainsSecret(id) {
+		return nil, fmt.Errorf("%s: the request holds what looks like a secret, qak_ or qrk_, so it is not sent", req.what)
+	}
 	wait := firstWait
 	for try := 1; ; try++ {
-		t, err := a.nextTime(ctx, http.MethodPost+" "+req.url+"\n"+string(id))
+		t, err := a.nextTime(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", req.what, err)
 		}

@@ -176,6 +176,13 @@ func (s *sleeps) sleep(_ context.Context, d time.Duration) error {
 	return nil
 }
 
+// set steps the clock to t, forward or back.
+func (s *sleeps) set(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = t
+}
+
 // clock is the time the clock reads.
 func (s *sleeps) clock() time.Time {
 	s.mu.Lock()
@@ -996,6 +1003,73 @@ func TestTimes(t *testing.T) {
 		noLead(t, reqs)
 		if last := reqs[len(reqs)-1]; last.lead != 0 {
 			t.Errorf("after 400 requests the lead is %s, not 0", last.lead)
+		}
+	})
+	t.Run("a step back of the clock", func(t *testing.T) {
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		sl.set(testClock.Add(-time.Hour))
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		reqs := f.requests()
+		if len(sl.waits()) != 0 || len(reqs) != 2 || reqs[1].lead != 0 || !reqs[1].sent.Equal(testClock.Add(-time.Hour)) {
+			t.Errorf("after a step back the identical request waits %v, or is not at the clock's time", sl.waits())
+		}
+	})
+	t.Run("identities are pruned once per second", func(t *testing.T) {
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		stale := [32]byte{1}
+		a.mu.Lock()
+		a.last[stale] = testClock.Add(-time.Second)
+		a.mu.Unlock()
+		if err := a.Dispatched(ctx, "dp_8w3k0q9t2v7m4r6y", nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		a.mu.Lock()
+		_, kept := a.last[stale]
+		a.mu.Unlock()
+		if !kept {
+			t.Error("the identities are scanned again within the second already pruned")
+		}
+		sl.set(testClock.Add(time.Second))
+		if err := a.Dispatched(ctx, "dp_8w3k0q9t2v7m4r6z", nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if _, kept := a.last[stale]; kept || len(a.last) != 1 {
+			t.Errorf("a new second keeps %d identities, not 1", len(a.last))
+		}
+	})
+	t.Run("the identities hold no request's text", func(t *testing.T) {
+		f := newFake(t, ok204)
+		a := f.client(&sleeps{}, nil)
+		if err := a.Release(ctx, testDispatch, "see QRK_abc.def", false); err == nil {
+			t.Fatal("a reason that holds qrk_ is sent")
+		}
+		a.mu.Lock()
+		n := len(a.last)
+		a.mu.Unlock()
+		if n != 0 {
+			t.Error("a request refused for a secret leaves its identity")
+		}
+		if err := a.Release(ctx, testDispatch, "ReasonMarker4hJ", false); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+		for _, out := range []string{fmt.Sprintf("%+v", a), fmt.Sprintf("%#v", a)} {
+			if strings.Contains(strings.ToLower(out), "qrk_") || strings.Contains(out, "ReasonMarker4hJ") {
+				t.Error("the client prints a request's text")
+			}
 		}
 	})
 	t.Run("a cancel during the wait", func(t *testing.T) {
