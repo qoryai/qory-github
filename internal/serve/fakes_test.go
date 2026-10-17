@@ -181,7 +181,7 @@ func itemOf(name string, n int) string { return refOf(name) + "#" + strconv.Itoa
 // widgetsItem is a request that sends one item of acme/widgets, as the contract takes it.
 func widgetsItem() contracts.SourceItems {
 	return contracts.SourceItems{Version: contracts.Version, CollectionRef: widgetsRef, Items: []contracts.Item{{
-		Ref: widgetsRef + "#1", URL: "https://github.com/acme/widgets/issues/1", Type: "issue", Title: "Widget 1 is broken",
+		Ref: widgetsRef + "#1", URL: "https://github.com/acme/widgets/issues/1", Key: "#1", Type: "issue", Title: "Widget 1 is broken",
 		BodyFormat: github.FormatMarkdown, FiledBy: contracts.Person{Name: "alice", Kind: github.KindPerson}, Labels: []string{},
 		State: github.StateOpen, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
 	}}}

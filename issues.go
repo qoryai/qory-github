@@ -317,7 +317,8 @@ func utc(s string) (string, bool) {
 }
 
 // itemOf is an issue of the repository r as an item whose target is on system, or why
-// it is skipped, and the texts cut to fit it.
+// it is skipped, and the texts cut to fit it. The item's key is the issue's number as
+// GitHub shows it, # and the number in decimal, such as #42.
 func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut) {
 	lim := contractLimits()
 	var cuts []Cut
@@ -333,6 +334,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 	it := contracts.Item{
 		Ref:          ref,
 		URL:          is.HTMLURL,
+		Key:          "#" + strconv.FormatInt(is.Number, 10),
 		Title:        fit(&cuts, ref, "title", is.Title, lim.title),
 		Body:         fit(&cuts, ref, "body", body, lim.body),
 		BodyFormat:   FormatMarkdown,

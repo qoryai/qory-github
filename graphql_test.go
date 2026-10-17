@@ -268,8 +268,8 @@ func sentParts(s *sink) ([]string, []contracts.Listing) {
 
 // TestTheCompleteListingPagesByCursor lists five open issues, two to a page, and a
 // closed one GraphQL leaves out, and checks each page is asked for by POST to /graphql
-// with the token, after the cursor of the page before it; the items are sent once, in
-// one part that says the listing is complete; and the comments are read by REST, the
+// with the token, after the cursor of the page before it; the items are sent once, each
+// with its key, # and the issue's number, in one part that says the listing is complete; and the comments are read by REST, the
 // App's work item comment left out, in a request that says nothing of complete.
 func TestTheCompleteListingPagesByCursor(t *testing.T) {
 	closed := node(3, 0)
@@ -326,6 +326,15 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 	refs, parts := sentParts(s)
 	if strings.Join(refs, " ") != "1296269#1 1296269#2 1296269#4 1296269#5 1296269#6" {
 		t.Errorf("items %v", refs)
+	}
+	var keys []string
+	for _, req := range s.items() {
+		for _, it := range req.Items {
+			keys = append(keys, it.Key)
+		}
+	}
+	if strings.Join(keys, " ") != "#1 #2 #4 #5 #6" {
+		t.Errorf("keys %v", keys)
 	}
 	if len(parts) != 1 || parts[0].Part != 1 || !parts[0].Complete || parts[0].StartedAt != "2026-09-21T14:13:20Z" || s.items()[0].CollectionRef != widgetsRef {
 		t.Errorf("parts %+v", parts)
