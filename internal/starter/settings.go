@@ -1,5 +1,6 @@
 // Package starter is qory-github-starter's: the settings it serves a node pool of Qory
-// Apiary with, which start GitHub Actions workflow runs for the pool's runs.
+// Apiary with, which start GitHub Actions workflow runs for the pool's runs, and the
+// verifier of the GitHub Actions OIDC token a run's job presents.
 package starter
 
 import (
