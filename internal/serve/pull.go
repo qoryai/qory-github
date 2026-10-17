@@ -137,8 +137,8 @@ func (a *Adapter) clock() time.Time {
 
 // linkedSink is a pull's sink: it sends the collection's items and comments while the
 // collection is linked, and stops the pull with errNotLinked once it is not, as the
-// change feed or Qory Apiary's 409 collection_not_linked says. A request Qory Apiary
-// refuses for good is logged and passed, as a webhook's is.
+// change feed, or Qory Apiary's 409 collection_not_linked to the collection's items,
+// says. A request Qory Apiary refuses for good is logged and passed, as a webhook's is.
 type linkedSink struct {
 	github.Sink
 	adapter *Adapter
