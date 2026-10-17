@@ -148,18 +148,24 @@ later stage. It has no member but the ones above.
   characters it may hold: no terminal escape sequences, which start with the ESC
   character, such as colour codes. In JSON, write a line feed as `\n` and a tab as `\t`:
   they are the only escapes for a control character. Never use `\u001b` or any other.
-- No text holds a bidirectional control, such as a right-to-left override, an invisible
-  format character, such as a zero-width space, a soft hyphen or a byte order mark, or a
-  line or paragraph separator (U+2028, U+2029), nor a `\u` escape of one. Never copy them
-  from the ticket, the comments or a web page.
+- No text holds one of these characters, nor a `\u` escape of one. Never copy them from
+  the ticket, the comments or a web page.
+  - The bidirectional marks and controls: U+061C, U+200E, U+200F, U+202A to U+202E and
+    U+2066 to U+2069.
+  - The invisible characters: U+00AD (soft hyphen), U+180E, U+200B (zero-width space),
+    U+2060 to U+2064, U+FEFF (byte order mark) and U+FFF9 to U+FFFB.
+  - The line and paragraph separators: U+2028 and U+2029.
+
+  This rule refuses no other character: the zero-width non-joiner U+200C and the
+  zero-width joiner U+200D, which some scripts and emoji need, may stay.
 - `complexity.reason`, each `scope` entry, `approach.summary`, each alternative's
   `summary` and `reason`, each question and each knowledge `text` hold 1 to 2000
   characters. `understanding` holds 1 to 20000.
 - Each source is an absolute `https://` address of at most 2048 characters. Its host
   part, from `https://` to the first `/`, `?` or `#`, is not empty and holds no `@`, so
-  it carries no user name; an `@` after it, such as in the path, is fine. A source holds no
-  space, no control character and none of the format characters or separators above. Never
-  `http://`.
+  it carries no user name, and no backslash `\`. An `@` or a backslash after it, such as
+  in the path, is fine. A source holds no space, no control character and none of the
+  characters listed above. Never `http://`.
 - The whole document is under 128 KiB. Aim far below it.
 - It is valid JSON: inside a string, escape `"` and `\`, and write a line break as `\n`.
 
