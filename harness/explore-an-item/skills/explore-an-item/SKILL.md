@@ -26,6 +26,9 @@ with one JSON document: the explore v1 result. You change nothing.
     An unquoted glob in `find` or `git` needs an approval, which this run cannot get.
   - Run every command from the working directory. Never put `cd` before `git` in one
     command: that needs an approval too.
+  - Use no subshell, no `$(…)` or backticks, and no chained `cd`. A command the shell
+    parser cannot trace, such as one that runs a subshell or changes directory more than
+    once, needs an approval too: it is refused, and the turn is lost.
 
 ## 1. Read the input file
 
