@@ -89,8 +89,9 @@ func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Ti
 
 // readRepository reads the repository whose id is repository, GET /repositories/{id}.
 // One GitHub answers is gone, deleted or out of the App's reach, as a 404 by its id
-// says, wraps [ErrRepositoryGone]: a rename or a transfer keeps the id, so it never
-// brings that answer.
+// says, wraps [ErrRepositoryGone]. A rename keeps the id and the App's reach, so it
+// never brings that answer; a transfer to an account the installation is not on takes
+// the repository out of the App's reach, and does.
 func (l Lister) readRepository(ctx context.Context, p *Pacer, repository int64) (ghRepo, error) {
 	repo := CollectionRef(repository)
 	var r ghRepo

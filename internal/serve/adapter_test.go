@@ -1483,9 +1483,10 @@ func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
 
 // TestAFillWhoseReadFailsSendsNothing fills acme/widgets while GitHub fails the read of
 // the repository by its id: a 404 or a 410, which by the id says the repository is
-// deleted or out of the App's reach, since a rename or a transfer keeps the id, fails it
-// for good as a repository gone, and says so; a 500 fails it with an error that passes.
-// Either way GraphQL is never asked, nothing is sent and no start is kept.
+// deleted or out of the App's reach, as after a transfer to an account the installation
+// is not on, never after a rename, fails it for good as a repository gone, and says so;
+// a 500 fails it with an error that passes. Either way GraphQL is never asked, nothing
+// is sent and no start is kept.
 func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
 	const goneText = "the repository is deleted or out of the App's reach, or GitHub redirects a request by its id"
 	for _, status := range []int{404, 410, 500} {

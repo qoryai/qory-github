@@ -662,10 +662,11 @@ func (e *tokenError) Unwrap() error { return e.err }
 
 // ErrRepositoryGone is wrapped in the error of a listing whose repository GitHub
 // answers is gone, [Gone], as it answers the read of the repository by its id or of a
-// page of what changed in it: a 404 or a 410, deleted or out of the App's reach, since a
-// rename or a transfer keeps the id, or a 301 or a 308, a redirect of that request by
-// the id, which the adapter never follows. Asking again does not change it. The listing
-// of open issues, which GraphQL reads by owner/name, never wraps it.
+// page of what changed in it: a 404 or a 410, deleted or out of the App's reach, as
+// after a transfer to an account the installation is not on, though never after a
+// rename, which keeps the id and the reach; or a 301 or a 308, a redirect of that
+// request by the id, which the adapter never follows. Asking again does not change it.
+// The listing of open issues, which GraphQL reads by owner/name, never wraps it.
 var ErrRepositoryGone = errors.New("the repository is deleted or out of the App's reach, or GitHub redirects a request by its id")
 
 // answeredGone is whether err is GitHub's answer to a listing's request, not to its

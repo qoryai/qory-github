@@ -163,12 +163,13 @@ func (l Lister) issuePager(p *Pacer, id int64, repo Repository, first int) *issu
 // listing with it, for any error GraphQL answers, a repository it cannot resolve by
 // owner/name, a repository whose id is not the pager's or that has none that is an id,
 // see [fullDatabaseID], an issue it answers as null, a next cursor that is missing or
-// repeats one already read, and a page past maxIssuePages. The id is checked on every page: owner/name may name another
-// repository, or none, by the time GraphQL reads it, as when a rename or a transfer
-// lands after the name was read by the id, and such a page is never taken for the
-// repository's. Neither error wraps [ErrRepositoryGone]: the read by the id, which a
-// rename or a transfer does not change, is what says the repository is gone, and a
-// later listing, which reads the name again, may list it.
+// repeats one already read, and a page past maxIssuePages. The id is checked on every
+// page: owner/name may name another repository, or none, by the time GraphQL reads it,
+// as when a rename or a transfer lands after the name was read by the id, and such a
+// page is never taken for the repository's. Neither error wraps [ErrRepositoryGone]:
+// the read by the id is what says the repository is gone, as it says for a transfer to
+// an account the installation is not on, and never for a rename, and a later listing,
+// which reads the name again, may list it.
 func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) {
 	if g.done {
 		return g.r, nil, false, nil

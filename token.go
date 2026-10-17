@@ -102,10 +102,11 @@ func (c Client) MintListingToken(ctx context.Context, appID string, key *rsa.Pri
 // ErrMintRefused is wrapped in the error of a mint GitHub refuses for good: the
 // installation is not the App's on the repositories' owner, or GitHub answers the mint
 // 404 or 422, as it answers for an installation gone or a repository it no longer
-// reaches: deleted or removed from it, or, for a repository the mint names by
-// owner/name, renamed or transferred. A repository the mint names by its id, as
-// repository_ids, keeps that id through a rename or a transfer, so neither brings that
-// answer. Asking again does not change it.
+// reaches: deleted, removed from the installation, or transferred to an account the
+// installation is not on, whether the mint names it by owner/name or by its id, as
+// repository_ids; or, for a repository the mint names by owner/name, renamed. A rename
+// keeps the id and the installation's reach, so it never brings that answer to a mint
+// by the id. Asking again does not change it.
 var ErrMintRefused = errors.New("GitHub refuses to mint the installation token")
 
 // errNotTheInstallation is [errNotTheOwners] for a token the adapter mints, whose

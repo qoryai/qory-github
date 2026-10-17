@@ -459,9 +459,10 @@ func TestAPullWhereNothingChangedSendsNothing(t *testing.T) {
 
 // TestReadRepositoryReadsTheNameByID reads a repository's owner/name by its id and
 // checks it asks GitHub once, GET /repositories/{id} with the listing's token, and
-// returns owner/name; a 404 wraps ErrRepositoryGone, since a rename or a transfer keeps
-// the id; a 500 does not; a full_name that is not owner/name is refused; and an id that
-// is not one, or a lister with no token, asks nothing.
+// returns owner/name; a 404 wraps ErrRepositoryGone, as GitHub answers for a repository
+// deleted or out of the App's reach, never for one renamed; a 500 does not; a full_name
+// that is not owner/name is refused; and an id that is not one, or a lister with no
+// token, asks nothing.
 func TestReadRepositoryReadsTheNameByID(t *testing.T) {
 	var logs []string
 	f := &fakeChanged{}
