@@ -178,7 +178,8 @@ type Receiver struct {
 	Handlers *Handlers
 	// Linked, when set, says whether an installation is linked to Qory Apiary: a
 	// delivery of an installation that is not is answered 202 and not kept, but for the
-	// installation event's created and deleted, see [linkedOrAnnounced].
+	// installation event's created and deleted and the repository event's transferred,
+	// see [linkedOrAnnounced].
 	Linked func(installation int64) (bool, error)
 
 	once sync.Once
@@ -354,10 +355,13 @@ func (rc *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // linkedOrAnnounced is whether a delivery of event and action for installation is kept:
-// when [Receiver.Linked] is set, only one of a linked installation, or the installation
-// event's created or deleted, which the adapter keeps a record of, see [keepUnlinked].
+// when [Receiver.Linked] is set, only one of a linked installation, the installation
+// event's created or deleted, which the adapter keeps a record of, see [keepUnlinked],
+// or the repository event's transferred, which GitHub sends only to the installation
+// the repository was transferred to, and which disconnects the repository's collection
+// when that installation is not linked, see [Adapter.transferred].
 func (rc *Receiver) linkedOrAnnounced(event, action string, installation int64) (bool, error) {
-	if rc.Linked == nil || event == "installation" && (action == "created" || action == "deleted") {
+	if rc.Linked == nil || event == "installation" && (action == "created" || action == "deleted") || event == "repository" && action == "transferred" {
 		return true, nil
 	}
 	return rc.Linked(installation)

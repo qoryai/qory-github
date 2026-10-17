@@ -1263,7 +1263,7 @@ App's webhook:
 // manifestServe is the manifest setup posts with factory and --public-url public, with
 // the redirect URL redirect.
 func manifestServe(public, redirect string) string {
-	return `{"callback_urls":["` + public + `/v1/connect/authorized"],"default_events":["issues","issue_comment","workflow_run","pull_request","push"],` +
+	return `{"callback_urls":["` + public + `/v1/connect/authorized"],"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
 		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
 		`"hook_attributes":{"active":true,"url":"` + public + `/github/webhook"},"name":"qory-github-test","public":true,"redirect_url":"` + redirect + `",` +
 		`"request_oauth_on_install":false,"setup_on_update":true,"setup_url":"` + public + `/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
@@ -1439,10 +1439,11 @@ func TestSetupHelpSaysWhatAppPublicURLMakes(t *testing.T) {
 	withFactory := strings.Replace(setupLongBefore, "setup waits ten minutes at most.\n\n", `setup waits ten minutes at most.
 
 With --public-url, the App is instead public, with a webhook at the public URL and
-/github/webhook, the events issues, issue_comment, workflow_run, pull_request and
-push, and actions, checks, contents, issues and pull requests write, administration,
-members and metadata read. It is qory-github-server's App: setup then prints
-qory-github-server serve's settings in place of the declaration and the policy.
+/github/webhook, the events issues, issue_comment, repository, workflow_run,
+pull_request and push, and actions, checks, contents, issues and pull requests
+write, administration, members and metadata read. It is qory-github-server's App:
+setup then prints qory-github-server serve's settings in place of the declaration
+and the policy.
 Without --org, setup asks which GitHub account the App is for. Unless --name gives a
 name, setup suggests qory- and the account's handle, which you can change on
 GitHub's form.

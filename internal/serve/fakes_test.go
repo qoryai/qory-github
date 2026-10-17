@@ -154,8 +154,10 @@ const (
 	movedID    = 1296272
 )
 
-// knownIDs are the fake's repositories' ids by owner/name, in lower case.
-var knownIDs = map[string]int64{"acme/widgets": widgetsID, "acme/gadgets": gadgetsID, "acme/old": oldID, "acme/moved": movedID, "acme/gone": 1296273}
+// knownIDs are the fake's repositories' ids by owner/name, in lower case. acme/sprockets
+// is acme/widgets renamed, and octo-org/widgets is acme/widgets on octo-org, before or
+// after a transfer, each with acme/widgets's id.
+var knownIDs = map[string]int64{"acme/widgets": widgetsID, "acme/gadgets": gadgetsID, "acme/old": oldID, "acme/moved": movedID, "acme/gone": 1296273, "acme/sprockets": widgetsID, "octo-org/widgets": widgetsID}
 
 // repoID is the id the fake gives the repository name, owner/name, in any case: one of
 // knownIDs, or else one made from the name, the same each time, past the known ones.

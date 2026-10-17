@@ -141,8 +141,8 @@ const (
 // serveManifest changes the manifest m to the App serve needs, under serve's public
 // URL publicURL: public, so it can be installed on an account other than its owner's;
 // what Connect needs, see [ConnectManifest]; a webhook, active, at [WebhookPath], for
-// the events issues, issue_comment, workflow_run, pull_request and push; and, in place
-// of those [Manifest] sets, the permissions metadata read, issues write, members read,
+// the events issues, issue_comment, repository, workflow_run, pull_request and push;
+// and, in place of those [Manifest] sets, the permissions metadata read, issues write, members read,
 // contents write, pull_requests write, actions write, checks write and administration
 // read, which an installation approves once, when it is made. Each installation token
 // serve mints is narrowed to its step all the same, see [Client.MintListingToken] and
@@ -151,7 +151,7 @@ func serveManifest(m map[string]any, publicURL string) {
 	ConnectManifest(m, publicURL)
 	m["public"] = true
 	m["hook_attributes"] = map[string]any{"url": publicURL + WebhookPath, "active": true}
-	m["default_events"] = []string{"issues", "issue_comment", "workflow_run", "pull_request", "push"}
+	m["default_events"] = []string{"issues", "issue_comment", "repository", "workflow_run", "pull_request", "push"}
 	m["default_permissions"] = map[string]string{
 		"metadata": "read", "issues": "write", "members": "read", "contents": "write",
 		"pull_requests": "write", "actions": "write", "checks": "write", "administration": "read",
