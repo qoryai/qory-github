@@ -51,15 +51,20 @@ type seen struct {
 
 // reply is what the fake answers one request with: its status and body, whether it
 // is left unsigned or signed under a key other than the pinned one, whether its
-// signature header is sent twice, and where it redirects to.
+// signature header is sent twice, where it redirects to, and its X-Qory-Configuration,
+// which the signature covers unless confOutside says it is left out of it, and whether
+// that header is sent twice.
 type reply struct {
-	status       int
-	body         string
-	unsigned     bool
-	wrongKey     bool
-	retryAfter   string
-	dupSignature bool
-	location     string
+	status           int
+	body             string
+	unsigned         bool
+	wrongKey         bool
+	retryAfter       string
+	dupSignature     bool
+	location         string
+	configuration    string
+	dupConfiguration bool
+	confOutside      bool
 }
 
 // fake is Qory Apiary as the starter reaches it. It verifies each request's signature
@@ -106,14 +111,18 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	sig := r.Header.Get(accesskey.HeaderSignature)
 	s := seen{target: r.URL.RequestURI(), header: r.Header.Clone(), body: b, signature: sig}
-	s.verified = r.Method == http.MethodPost && f.pool.PublicKey().VerifyRequest(accesskey.Request{
+	s.verified = f.pool.PublicKey().VerifyRequest(accesskey.Request{
 		AccessKeyID: r.Header.Get(accesskey.HeaderAccessKeyID), InstanceID: r.Header.Get(accesskey.HeaderInstanceID),
-		Method: r.Method, Target: r.URL.RequestURI(), Body: b,
+		Method: r.Method, Target: r.URL.RequestURI(), Body: b, Timestamp: r.Header.Get(accesskey.HeaderTimestamp),
 	}, sig)
 	var doc struct {
 		Time string `json:"time"`
 	}
-	if json.Unmarshal(b, &doc) == nil {
+	if r.Method == http.MethodGet {
+		if sec, err := strconv.ParseInt(r.Header.Get(accesskey.HeaderTimestamp), 10, 64); err == nil {
+			s.sent = time.Unix(sec, 0).UTC()
+		}
+	} else if json.Unmarshal(b, &doc) == nil {
 		s.sent, _ = time.Parse(time.RFC3339, doc.Time)
 	}
 	f.mu.Lock()
@@ -133,12 +142,22 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 	if rep.retryAfter != "" {
 		w.Header().Set("Retry-After", rep.retryAfter)
 	}
+	if rep.configuration != "" {
+		w.Header().Set(accesskey.HeaderConfiguration, rep.configuration)
+		if rep.dupConfiguration {
+			w.Header().Add(accesskey.HeaderConfiguration, rep.configuration)
+		}
+	}
 	if !rep.unsigned {
 		k := f.server
 		if rep.wrongKey {
 			k = f.other
 		}
-		signature := k.SignAnswer(accesskey.Answer{Status: rep.status, RequestSignature: sig, Body: []byte(rep.body)})
+		signed := rep.configuration
+		if rep.confOutside {
+			signed = ""
+		}
+		signature := k.SignAnswer(accesskey.Answer{Status: rep.status, RequestSignature: sig, Body: []byte(rep.body), Configuration: signed})
 		w.Header().Set(accesskey.HeaderSignature, signature)
 		if rep.dupSignature {
 			w.Header().Add(accesskey.HeaderSignature, signature)
@@ -484,13 +503,16 @@ var refusalCodes = []struct {
 // givenCodes are the codes each request's schema gives, in the order the control plane
 // decides them, written out from claim.schema.json, dispatched.schema.json,
 // handover.schema.json, release.schema.json and Forager's run-outcome.schema.json, with
-// refusal.schema.json's 429 last.
+// refusal.schema.json's 429 last, and the 429 of Forager's configuration document.
 var givenCodes = map[string][]string{
 	"claim":      {"forbidden", "no_gateway", "rate_limited"},
 	"dispatched": {"forbidden", "gone", "lease_expired", "rate_limited"},
 	"handover":   {"forbidden", "gone", "handed_over", "lease_expired", "not_dispatched", "no_gateway", "rate_limited"},
 	"release":    {"forbidden", "gone", "lease_expired", "rate_limited"},
 	"outcome":    {"not_found", "outcome_given", "rate_limited"},
+	// The GET of Forager's configuration document: of its signed refusals, only the 429
+	// is one a later step acts on.
+	"configuration": {"rate_limited"},
 }
 
 // TestRefusals answers each request with each signed refusal code in [refusalCodes],
@@ -508,8 +530,12 @@ func TestRefusals(t *testing.T) {
 		"outcome": func(a *Apiary) error {
 			return a.PostOutcome(ctx, a.URL+"/v1/runs", testRun, Outcome{State: StateFailed})
 		},
+		"configuration": func(a *Apiary) error { _, err := a.Configuration(ctx); return err },
 	}
-	kinds := map[string]kind{"claim": kindClaim, "dispatched": kindDispatched, "handover": kindHandover, "release": kindRelease, "outcome": kindOutcome}
+	kinds := map[string]kind{
+		"claim": kindClaim, "dispatched": kindDispatched, "handover": kindHandover, "release": kindRelease, "outcome": kindOutcome,
+		"configuration": kindConfiguration,
+	}
 	for name, want := range givenCodes {
 		var got []string
 		for _, e := range refusalsOf[kinds[name]] {
@@ -667,7 +693,8 @@ func TestBadSignature(t *testing.T) {
 }
 
 // checkBuiltAnew checks reqs are n tries, each signed under the pool's key, none a
-// replay, each with a new signature, and each body's time later than the last's.
+// replay, each with a new signature, and each time, a body's or a GET's
+// X-Qory-Timestamp, later than the last's.
 func checkBuiltAnew(t *testing.T, reqs []seen, n int) {
 	t.Helper()
 	if len(reqs) != n {
@@ -679,7 +706,9 @@ func checkBuiltAnew(t *testing.T, reqs []seen, n int) {
 		var doc struct {
 			Time string `json:"time"`
 		}
-		if err := json.Unmarshal(r.body, &doc); err != nil {
+		if len(r.body) == 0 && !r.sent.IsZero() {
+			doc.Time = r.sent.Format(time.RFC3339)
+		} else if err := json.Unmarshal(r.body, &doc); err != nil {
 			t.Fatal(err)
 		}
 		switch {

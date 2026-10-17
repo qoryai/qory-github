@@ -19,6 +19,26 @@ var (
 	reasonShape = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 )
 
+// What [runURLProblem] finds wrong with a run endpoint.
+const (
+	runURLSecret = "the run endpoint holds what looks like a secret, qak_ or qrk_"
+	runURLForm   = "the run endpoint is not https, or http to a loopback address, with no query, no fragment and no trailing slash"
+)
+
+// runURLProblem is what is wrong with runURL as a run endpoint, the one check
+// [Apiary.PostOutcome] and [Apiary.Configuration] both make: [runURLSecret] when it
+// holds qak_ or qrk_, [runURLForm] when [runURLShape] refuses it, or "" when neither.
+// It never quotes runURL.
+func runURLProblem(runURL string) string {
+	switch {
+	case accesskey.ContainsSecret(runURL):
+		return runURLSecret
+	case !runURLShape.MatchString(runURL):
+		return runURLForm
+	}
+	return ""
+}
+
 // The states an outcome may carry, dev.qory.run.exited's, run-outcome.schema.json.
 const (
 	StateSucceeded = "succeeded"
@@ -66,10 +86,11 @@ func OutcomeOf(conclusion string) Outcome {
 // <runURL>/<runID>/outcome, Forager's run-outcome.schema.json, signed with the node
 // pool's access key, a key of the node pool that registered the run at its handover.
 // runURL is the run endpoint, run.url of the configuration document Qory Apiary answers
-// the key's signed GET of /.well-known/qory-configuration with; the handover's answer
-// does not carry it. X-Qory-Contract-Version is Forager's revision. A State other than
-// the three, a Reason without a State or that is no code, a runURL or a runID outside
-// its form, and a runURL that holds qak_ or qrk_ are refused before anything is sent.
+// the key's signed GET of /.well-known/qory-configuration with, [Apiary.Configuration];
+// the handover's answer does not carry it. X-Qory-Contract-Version is Forager's
+// revision. A State other than the three, a Reason without a State or that is no code,
+// a runURL or a runID outside its form, and a runURL that holds qak_ or qrk_ are
+// refused before anything is sent.
 // Each try is built anew, its time the clock's: within one Apiary value, while the clock
 // does not step back, no try repeats the bytes of another. An outcome that repeats
 // earlier bytes after a step back, its time within 300 seconds of the server's clock,
@@ -81,13 +102,14 @@ func OutcomeOf(conclusion string) Outcome {
 // 200.
 func (a *Apiary) PostOutcome(ctx context.Context, runURL, runID string, o Outcome) error {
 	what := "the outcome of run " + runID
+	problem := runURLProblem(runURL)
 	switch {
 	case !runIDShape.MatchString(runID):
 		return errors.New("the outcome: the run id is not a UUID in the canonical lower-case form")
-	case accesskey.ContainsSecret(runURL):
-		return errors.New(what + ": the run endpoint holds what looks like a secret, qak_ or qrk_, so nothing is sent")
-	case !runURLShape.MatchString(runURL):
-		return errors.New(what + ": the run endpoint is not https, or http to a loopback address, with no query, no fragment and no trailing slash")
+	case problem == runURLSecret:
+		return errors.New(what + ": " + runURLSecret + ", so nothing is sent")
+	case problem != "":
+		return errors.New(what + ": " + problem)
 	case o.State != "" && o.State != StateSucceeded && o.State != StateFailed && o.State != StateCancelled:
 		return errors.New(what + ": the state is not succeeded, failed or cancelled")
 	case o.State == "" && o.Reason != "":
