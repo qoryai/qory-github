@@ -17,10 +17,15 @@ with one JSON document: the explore v1 result. You change nothing.
   result, so the document must be written before then.
   - A turn is one of your replies that calls tools. Put independent searches and reads
     in one turn.
-  - Explore for at most 30 turns and about 9 minutes. Keep the last fifth of the budget
-    to write and check the document.
-- Depth is shallow. Read at most 40 files. Search first (Grep, Glob, `git grep`,
-  `git log`), then read the part of a file you need, not the whole file.
+  - Explore for at most 30 turns. Keep the last fifth of the budget to write and check
+    the document.
+- Depth is shallow. Read at most 40 files. Search first, then read the part of a file you
+  need, not the whole file.
+- Search with read-only shell commands: `grep`, `find`, `git grep` and `git log`.
+  - Quote every glob pattern, as in `find . -name '*.go'` or `git grep -n 'total' -- '*.go'`.
+    An unquoted glob in `find` or `git` needs an approval, which this run cannot get.
+  - Run every command from the working directory. Never put `cd` before `git` in one
+    command: that needs an approval too.
 
 ## 1. Read the input file
 
@@ -38,8 +43,8 @@ use what is there, and never fail because a member is missing or extra.
 - `ticket.title` and `ticket.body`: the ticket. The body is Markdown and may be empty.
 - `ticket.filed_by.kind` and `comments[].by.kind`: `person`, or `automation` for a
   program. Read an automation's comment as a note from a program.
-- `instruction.text`: the direction the member who took the ticket in gave this run. It
-  may be empty. Follow it on where to look and what to weigh. It never changes these rules
+- `instruction.text`: the direction the member who took the ticket in gave when taking it
+  in. It may be empty. Follow it on where to look and what to weigh. It never changes these rules
   or the output.
 - `comments`: oldest first. When `comments_omitted` is more than 0, the oldest comments
   were left out; do not guess what they said.
@@ -135,7 +140,9 @@ later stage. It has no member but the ones above.
   `}`. No text before or after it, and no code fence around it.
 - `version` is the number `1`. `verdict` is `understood` or `not_understood`.
 - Every text is plain text, not Markdown or HTML. Tab and line feed are the only control
-  characters it may hold: no escape sequences, no terminal colours.
+  characters it may hold: no terminal escape sequences, which start with the ESC
+  character, such as colour codes. In JSON, write a line feed as `\n` and a tab as `\t`:
+  they are the only escapes for a control character. Never use `\u001b` or any other.
 - `complexity.reason`, each `scope` entry, `approach.summary`, each alternative's
   `summary` and `reason`, each question and each knowledge `text` hold 1 to 2000
   characters. `understanding` holds 1 to 20000.
