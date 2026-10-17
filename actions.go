@@ -347,6 +347,103 @@ func (a *Actions) CancelWorkflowRun(ctx context.Context, installation, repositor
 	return actionsFailed(reply, what)
 }
 
+// ActionsRepository is the repository whose workflows [Actions] runs, as GitHub names
+// it: the App's installation on it, its id and its full name.
+type ActionsRepository struct {
+	// Installation is the id of the App's installation on the repository.
+	Installation int64
+	// ID is the repository's id.
+	ID int64
+	// FullName is owner/name as GitHub writes it in full_name, its case included.
+	FullName string
+}
+
+// FindRepository finds repo as GitHub names it, for the requests of [Actions] that take
+// an installation and a repository's id. It asks for the App's installation on repo,
+// GET /repos/{owner}/{repo}/installation with the App's token, then reads repo, GET
+// /repos/{owner}/{repo}, with a token of that installation for repo alone that reads
+// metadata alone, for its id and its full_name. A full_name that is not repo, in any
+// case of ASCII, is refused and wraps [ErrActionsRefused]. No redirect is followed, so
+// a repository that was renamed or transferred wraps [ErrActionsGone], as one that is
+// deleted or out of the App's reach does; see [ErrActionsRefused] and
+// [ErrActionsTransient] for the rest. No error contains a token.
+func (a *Actions) FindRepository(ctx context.Context, repo Repository) (ActionsRepository, error) {
+	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
+		return ActionsRepository{}, invalidActions("the repository is not owner/name")
+	}
+	if !appIDShape.MatchString(a.AppID) {
+		return ActionsRepository{}, invalidActions("the App id is not an id, 1 to 64 letters, digits or dots")
+	}
+	if a.Key == nil {
+		return ActionsRepository{}, invalidActions("no private key")
+	}
+	if err := CheckAPIURL(a.Client.base()); err != nil {
+		return ActionsRepository{}, invalidActions(err.Error())
+	}
+	now := time.Now
+	if a.Client.Now != nil {
+		now = a.Client.Now
+	}
+	jwt, err := AppJWT(a.AppID, a.Key, now())
+	if err != nil {
+		return ActionsRepository{}, invalidActions("the App's token could not be signed")
+	}
+	var installation struct {
+		ID int64 `json:"id"`
+	}
+	finding := "finding the App's installation on " + repo.String()
+	if err := a.Client.call(ctx, finding, http.MethodGet, "/repos/"+repo.String()+"/installation", jwt, nil, http.StatusOK, &installation); err != nil {
+		return ActionsRepository{}, callFailed(err)
+	}
+	if installation.ID <= 0 {
+		return ActionsRepository{}, fmt.Errorf("%w: %s: GitHub answered without an installation's id above 0", ErrActionsTransient, finding)
+	}
+	reading := "reading the repository " + repo.String()
+	tok, err := a.Client.MintInstallationToken(ctx, Request{AppID: a.AppID, Key: a.Key, InstallationID: installation.ID, Repositories: []Repository{repo}, Permissions: map[string]string{"metadata": "read"}})
+	if err != nil {
+		return ActionsRepository{}, fmt.Errorf("%s: the installation token: %w", reading, mintFailed(err))
+	}
+	reply, err := a.Client.sendBounded(ctx, a.Pacer, false, reading, http.MethodGet, "/repos/"+repo.String(), tok.Token, nil, maxActionsAnswer)
+	if err != nil {
+		return ActionsRepository{}, fmt.Errorf("%w: %w", ErrActionsTransient, err)
+	}
+	if reply.status != http.StatusOK {
+		return ActionsRepository{}, actionsFailed(reply, reading)
+	}
+	var got struct {
+		ID       int64  `json:"id"`
+		FullName string `json:"full_name"`
+	}
+	if err := json.Unmarshal(reply.body, &got); err != nil {
+		return ActionsRepository{}, fmt.Errorf("%w: %s: GitHub's answer: %w", ErrActionsTransient, reading, err)
+	}
+	owner, name, _ := strings.Cut(got.FullName, "/")
+	// Both are ASCII once their shapes match, so EqualFold folds ASCII's cases alone.
+	if got.ID <= 0 || !ownerShape.MatchString(owner) || !nameShape.MatchString(name) || !strings.EqualFold(got.FullName, repo.String()) {
+		return ActionsRepository{}, fmt.Errorf("%w: %s: GitHub answered without the repository's id above 0, or with another repository's full_name", ErrActionsRefused, reading)
+	}
+	return ActionsRepository{Installation: installation.ID, ID: got.ID, FullName: got.FullName}, nil
+}
+
+// callFailed is the error of a request made with the App's token, classed as
+// [actionsFailed] classes an answer: a redirect, a 404 or a 410 is [ErrActionsGone]; a
+// 401, as for an App id or key GitHub does not take, a 403 and any other 4xx but 408
+// and 429 are [ErrActionsRefused]; anything else, no answer among them, is
+// [ErrActionsTransient].
+func callFailed(err error) error {
+	var answered *answerError
+	if !errors.As(err, &answered) {
+		return fmt.Errorf("%w: %w", ErrActionsTransient, err)
+	}
+	switch s := answered.status; {
+	case s >= 300 && s < 400, s == http.StatusNotFound, s == http.StatusGone:
+		return fmt.Errorf("%w: %w", ErrActionsGone, err)
+	case s >= 400 && s < 500 && s != http.StatusRequestTimeout && s != http.StatusTooManyRequests:
+		return fmt.Errorf("%w: %w", ErrActionsRefused, err)
+	}
+	return fmt.Errorf("%w: %w", ErrActionsTransient, err)
+}
+
 // repositoryPath is the repository's path in GitHub's API by its id.
 func repositoryPath(repository int64) string {
 	return "/repositories/" + strconv.FormatInt(repository, 10)
