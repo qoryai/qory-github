@@ -86,9 +86,9 @@ func endedIn(st *store.Store, log *slog.Logger) func(connection string) {
 	}
 }
 
-// answeredIn is what serve does with Qory Apiary's signed answer for a connection: it
-// notes it, see [noteAnswer], and drops the connection as [endedIn] does once its 403s
-// have lasted.
+// answeredIn is what serve does with Qory Apiary's signed answer to a request that
+// names a connection: it notes it, see [noteAnswer], and drops the connection as
+// [endedIn] does once its 403s have lasted.
 func answeredIn(st *store.Store, log *slog.Logger) func(connection string, status int, code string, at time.Time) {
 	ended := endedIn(st, log)
 	return func(connection string, status int, code string, at time.Time) {
