@@ -137,10 +137,11 @@ type Apiary struct {
 	// Sleep waits d or until ctx is done; nil waits on a timer.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Unlinked, when set, is called with a collection's ref when Qory Apiary answers
-	// its items, or its disconnect, 409 collection_not_linked, so serve stops sending
-	// its items, and with the [linkMoment] the request began at, so a link the change
-	// feed stored since is kept. A 409 collection_not_linked to comments never calls it,
-	// see [Apiary.Comments].
+	// its items 409 collection_not_linked, so serve stops sending its items, and with
+	// the [linkMoment] the request began at, so a link the change feed stored since is
+	// kept. A 409 collection_not_linked to comments never calls it, see
+	// [Apiary.Comments], and Qory Apiary never answers a disconnect so, see
+	// [Apiary.Disconnect].
 	Unlinked func(collectionRef string, began uint64)
 	// Ended, when set, is called with a connection's id when Qory Apiary answers a
 	// request of that connection, or of a collection of it, 409 connection_ended, so
@@ -234,17 +235,16 @@ func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments)
 	return nil
 }
 
-// Disconnect sends POST /v1/sources/disconnect. A 409 collection_not_linked calls
-// [Apiary.Unlinked] as [Apiary.Items] does.
+// Disconnect sends POST /v1/sources/disconnect. Qory Apiary answers a ref with no live
+// collection with the signed 204, and of the 409s only connection_suspended applies, so
+// a disconnect never unlinks a collection.
 func (a *Apiary) Disconnect(ctx context.Context, req contracts.SourcesDisconnect) error {
-	began := linkMoment()
-	err := a.post(ctx, "disconnecting "+req.CollectionRef, routeDisconnect, req.CollectionRef, "", func(t string) any { req.Time = t; return req })
-	return a.unlinkOn(err, req.CollectionRef, began)
+	return a.post(ctx, "disconnecting "+req.CollectionRef, routeDisconnect, req.CollectionRef, "", func(t string) any { req.Time = t; return req })
 }
 
 // unlinkOn calls [Apiary.Unlinked] with collection and began when err is Qory Apiary's
-// 409 collection_not_linked to a request for the collection that began at began, and
-// returns err.
+// 409 collection_not_linked to a request for the collection's items that began at
+// began, and returns err.
 func (a *Apiary) unlinkOn(err error, collection string, began uint64) error {
 	if a.Unlinked != nil && refusedAs(err, http.StatusConflict, codeCollectionNotLinked) {
 		a.Unlinked(collection, began)
