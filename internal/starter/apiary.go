@@ -231,8 +231,11 @@ func (r *Refusal) Is(target error) bool {
 // try sent again or an identical call, waits for the clock's next second first, so
 // within one Apiary value, while the clock does not step back, the same bytes are never
 // sent twice; a distinct request does not wait. After the clock steps back, a request
-// may repeat the bytes of one sent before: Qory Apiary answers it with the unsigned 401
-// for a replay, and the try is sent again, built anew. No redirect is followed. No error
+// may repeat the bytes of one sent before. A provisioner/v1 request that does is
+// answered by Qory Apiary with the unsigned 401 for a replay, and the try is sent again,
+// built anew, which may repeat bytes again if the clock steps back again; a run's
+// outcome that does is answered with the answer the server stored for those bytes, see
+// [Apiary.PostOutcome]. No redirect is followed. No error
 // it returns and no line it logs holds the access key's secret, a run key, a handover's
 // inputs or a work item's title; a [Claimed] or a [Handed] prints, logs and marshals
 // without them. It is safe for concurrent use, and is used by its pointer.
@@ -255,7 +258,8 @@ type Apiary struct {
 	// request, and no redirect is followed.
 	HTTP *http.Client
 	// Now is the clock a request's time is read from; nil is time.Now. Now must advance
-	// across Sleep: a wait for the clock's next second ends only once Now reads it.
+	// across Sleep: a wait for the clock's next second ends only once Now reads it. Now
+	// is called with mu held, so it must not block or call back into the Apiary.
 	Now func() time.Time
 	// Sleep waits d or until ctx is done; nil waits on a timer. Now must read d later
 	// after it.
@@ -264,7 +268,8 @@ type Apiary struct {
 	Log *slog.Logger
 
 	// mu guards last, the SHA-256 of each request identity sent within the clock's
-	// second pruned, and the second it was sent at, see [Apiary.nextTime].
+	// second pruned, and the second it was sent at; pruned, that second; and the read of
+	// the clock, Now, that decides them. See [Apiary.nextTime].
 	mu     sync.Mutex
 	last   map[[sha256.Size]byte]time.Time
 	pruned time.Time
@@ -272,44 +277,55 @@ type Apiary struct {
 
 // nextTime is the time of a request whose identity, its method, its URL and its body
 // built without the time, is id: the clock's second, once that identity was not sent
-// within it. Until then, it waits for the clock's next second with [Apiary.Sleep], less
-// than a second, so it never runs ahead of the clock. Once the clock's second is
+// within it. Until then, it waits for the clock's next second with [Apiary.Sleep], at
+// most a second, so it never runs ahead of the clock. Once the clock's second is
 // another than the one last pruned, every identity sent at another second is
 // forgotten, after the clock steps back too, so the identities kept are those of the
 // current second. Once ctx is done, its error is the error.
 func (a *Apiary) nextTime(ctx context.Context, id string) (time.Time, error) {
 	key := sha256.Sum256([]byte(id))
 	for {
-		// The clock is read under mu, so a read made before another request's is never
-		// used after it, which would count as the clock stepping back.
-		a.mu.Lock()
-		now := a.now().UTC()
-		t := now.Truncate(time.Second)
-		if !t.Equal(a.pruned) {
-			for k, last := range a.last {
-				if !t.Equal(last) {
-					delete(a.last, k)
-				}
-			}
-			a.pruned = t
-		}
-		last, held := a.last[key]
-		if !held {
-			if a.last == nil {
-				a.last = map[[sha256.Size]byte]time.Time{}
-			}
-			a.last[key] = t
-			a.mu.Unlock()
+		t, wait := a.take(key)
+		if wait == 0 {
 			return t, nil
 		}
-		a.mu.Unlock()
-		if err := a.sleep(ctx, max(last.Add(time.Second).Sub(now), time.Millisecond)); err != nil {
+		if err := a.sleep(ctx, wait); err != nil {
 			return time.Time{}, err
 		}
 		if err := ctx.Err(); err != nil {
 			return time.Time{}, err
 		}
 	}
+}
+
+// take reads the clock and, once the clock's second is another than the one last
+// pruned, forgets every identity sent at another second. When the identity key was not
+// sent within the clock's second, it keeps key at that second and returns it, with no
+// wait; otherwise it returns the wait until the clock's next second. It holds mu
+// throughout and releases it on any return, a panic of Now included. The clock is read
+// under mu, so a read made before another request's is never used after it, which
+// would count as the clock stepping back.
+func (a *Apiary) take(key [sha256.Size]byte) (t time.Time, wait time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now().UTC()
+	t = now.Truncate(time.Second)
+	if !t.Equal(a.pruned) {
+		for k, last := range a.last {
+			if !t.Equal(last) {
+				delete(a.last, k)
+			}
+		}
+		a.pruned = t
+	}
+	if last, held := a.last[key]; held {
+		return t, max(last.Add(time.Second).Sub(now), time.Millisecond)
+	}
+	if a.last == nil {
+		a.last = map[[sha256.Size]byte]time.Time{}
+	}
+	a.last[key] = t
+	return t, 0
 }
 
 func (a *Apiary) now() time.Time {

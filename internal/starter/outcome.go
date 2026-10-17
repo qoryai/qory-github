@@ -71,8 +71,10 @@ func OutcomeOf(conclusion string) Outcome {
 // the three, a Reason without a State or that is no code, a runURL or a runID outside
 // its form, and a runURL that holds qak_ or qrk_ are refused before anything is sent.
 // Each try is built anew, its time the clock's: within one Apiary value, while the clock
-// does not step back, no try repeats the bytes of another, and one that does after a
-// step back is answered with the unsigned 401 for a replay and sent again, built anew.
+// does not step back, no try repeats the bytes of another. An outcome that repeats
+// earlier bytes after a step back, its time within 300 seconds of the server's clock,
+// is answered with the answer the server stored for those bytes, as Forager's contract
+// gives, and is not sent again.
 // The answer is a signed 200 whose body run-outcome-answer.schema.json accepts, a member
 // it does not define ignored. A refusal is a [*Refusal]: [ErrOutcomeGiven],
 // [ErrRunNotFound] or [ErrRateLimited]; the same outcome again is answered the signed

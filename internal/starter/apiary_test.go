@@ -1072,6 +1072,34 @@ func TestTimes(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a panic of Now leaves the client usable", func(t *testing.T) {
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		var once sync.Once
+		a.Now = func() time.Time {
+			once.Do(func() { panic("the clock fails") })
+			return sl.clock()
+		}
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Error("the panic of Now did not reach the caller")
+				}
+			}()
+			_ = a.Dispatched(ctx, testDispatch, nil)
+		}()
+		done := make(chan error, 1)
+		go func() { done <- a.Dispatched(ctx, testDispatch, nil) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("the request after the panic failed: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the request after the panic of Now is blocked")
+		}
+	})
 	t.Run("identities are pruned once per second", func(t *testing.T) {
 		f := newFake(t, ok204)
 		sl := &sleeps{}
