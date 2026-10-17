@@ -68,8 +68,8 @@ jobs:
             printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
               curl --fail --silent --show-error --proto =https --header @- --get --data-urlencode "audience=$STARTER_URL" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
               jq -re '.value | strings | "Authorization: Bearer " + .' |
-              curl --fail --silent --show-error --proto =https --request POST --header @- "$STARTER_URL/v1/dispatches/$DISPATCH_ID/handover" |
-              tee >(jq -je .run_key >&3) |
-              jq '.inputs' > "$RUNNER_TEMP/in/inputs.json"
+              curl --fail --silent --show-error --proto =https --data '' --header @- "$STARTER_URL/v1/dispatches/$DISPATCH_ID/handover" |
+              tee >(jq -sje 'if length == 1 and (.[0] | type) == "object" and (.[0].inputs | type) == "object" then .[0].run_key | strings else empty end' >&3) |
+              jq -se 'if length == 1 and (.[0] | type) == "object" then .[0].inputs | objects else empty end' > "$RUNNER_TEMP/in/inputs.json"
           } 3>&1 1>&2 |
             qory run claude --home "$RUNNER_TEMP/homes" --run-key-fd 0 --wall docker --image "$AGENT_IMAGE" --mount "$RUNNER_TEMP/in:ro" --timeout 12m -- --max-turns 40 --add-dir "$RUNNER_TEMP/in" -p "Explore the ticket described in $RUNNER_TEMP/in/inputs.json, following the explore-an-item skill. End with the explore v1 JSON document alone as your final response."

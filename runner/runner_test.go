@@ -3,10 +3,12 @@ package runner
 import (
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
 	"gopkg.in/yaml.v3"
 )
 
@@ -21,8 +23,8 @@ var valid = Values{
 // The lines of the run step the plan pins byte for byte, and its prompt.
 const (
 	mkdirLine = `mkdir "$RUNNER_TEMP/in"`
-	jqLine    = `jq '.inputs' > "$RUNNER_TEMP/in/inputs.json"`
-	teeLine   = `tee >(jq -je .run_key >&3) |`
+	jqLine    = `jq -se 'if length == 1 and (.[0] | type) == "object" then .[0].inputs | objects else empty end' > "$RUNNER_TEMP/in/inputs.json"`
+	teeLine   = `tee >(jq -sje 'if length == 1 and (.[0] | type) == "object" and (.[0].inputs | type) == "object" then .[0].run_key | strings else empty end' >&3) |`
 	groupLine = `} 3>&1 1>&2 |`
 	qoryLine  = `qory run claude --home "$RUNNER_TEMP/homes" --run-key-fd 0 --wall docker --image "$AGENT_IMAGE" --mount "$RUNNER_TEMP/in:ro" --timeout 12m -- --max-turns 40 --add-dir "$RUNNER_TEMP/in" -p "Explore the ticket described in $RUNNER_TEMP/in/inputs.json, following the explore-an-item skill. End with the explore v1 JSON document alone as your final response."`
 )
@@ -206,8 +208,19 @@ func TestNoExpressionInARun(t *testing.T) {
 
 // TestTheRunLines pins the run step: the dispatch id checked against the provisioner
 // contract's pattern before anything else, then the plan's lines byte for byte, in
-// order: the mkdir, the handover with curl --fail, the run key to descriptor 3 through
-// jq -je, the inputs to the file alone, and qory run with --run-key-fd 0.
+// order: the mkdir, the handover with curl --fail, the run key to descriptor 3, the
+// inputs to the file alone, and qory run with --run-key-fd 0.
+//
+// Both jq calls slurp the answer, -s, so each reads all the answer it reads before it
+// writes anything, and takes it only when it is exactly one JSON value, an object. The
+// run key goes to descriptor 3 only when the answer's inputs is also an object and its
+// run_key a string; the inputs go to the file only when they are an object. Otherwise
+// a call writes nothing and exits non-zero, and prints on stderr at most a parse
+// error, whose message names the line and column alone. How a raw NUL byte in the
+// answer is read differs between versions of jq, but both calls read the answer with
+// the same jq and judge what they read by the same rules. Neither call prints
+// anything of the answer, since each ends in empty, not error. Without a run key, qory
+// refuses it before anything starts.
 func TestTheRunLines(t *testing.T) {
 	script := runs(t, parse(t, filled(t)))[2]
 	ls := lines(script)
@@ -235,7 +248,7 @@ func TestTheRunLines(t *testing.T) {
 		`printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |`,
 		`curl --fail --silent --show-error --proto =https --header @- --get --data-urlencode "audience=$STARTER_URL" "$ACTIONS_ID_TOKEN_REQUEST_URL" |`,
 		`jq -re '.value | strings | "Authorization: Bearer " + .' |`,
-		`curl --fail --silent --show-error --proto =https --request POST --header @- "$STARTER_URL/v1/dispatches/$DISPATCH_ID/handover" |`,
+		`curl --fail --silent --show-error --proto =https --data '' --header @- "$STARTER_URL/v1/dispatches/$DISPATCH_ID/handover" |`,
 		teeLine, jqLine, groupLine, qoryLine}
 	if !reflect.DeepEqual(ls[2:len(ls)-1], order) || ls[len(ls)-1] != "" {
 		t.Errorf("the run step's lines after the check are\n%q\nwant\n%q", ls[2:], order)
@@ -443,6 +456,93 @@ func TestShapesHoldNoSpecialCharacter(t *testing.T) {
 	for _, s := range []string{valid.PublicURL, valid.Repository, valid.AgentImage, valid.HarnessRef} {
 		if special.MatchString(s) {
 			t.Errorf("%q holds a special character", s)
+		}
+	}
+}
+
+// TestThePublicURLLayer pins what Fill's check of the public URL takes beyond
+// github.CheckPublicURL: publicURLChars on the URL as given and publicURLShape on the
+// URL as CheckPublicURL returns it: each URL refused here is one CheckPublicURL takes,
+// so the refusal is this layer's, with its error, word for word.
+func TestThePublicURLLayer(t *testing.T) {
+	for _, c := range []struct{ given, filled string }{
+		{"https://starter.example.com", "https://starter.example.com"},
+		{"https://Starter.Example.COM/", "https://starter.example.com"},
+		{"https://starter-1.example.com:8443", "https://starter-1.example.com:8443"},
+		{"https://203.0.113.7:443", "https://203.0.113.7:443"},
+		{"https://[2001:db8::1]", "https://[2001:db8::1]"},
+		{"https://[2001:DB8::1]:8443/", "https://[2001:db8::1]:8443"},
+		{"https://[::ffff:192.0.2.1]", "https://[::ffff:192.0.2.1]"},
+		{"https://starter.example.com/qory/starter", "https://starter.example.com/qory/starter"},
+		{"https://starter.example.com/a%2Fb/c%20d", "https://starter.example.com/a%2Fb/c%20d"},
+		{"https://starter.example.com/~a_b.c-d", "https://starter.example.com/~a_b.c-d"},
+		{"https://starter.example.com/A/Z/0/9//", "https://starter.example.com/A/Z/0/9"},
+	} {
+		v := valid
+		v.PublicURL = c.given
+		s, err := Fill(v)
+		if err != nil {
+			t.Errorf("%q: %v", c.given, err)
+			continue
+		}
+		if got := parse(t, s).Jobs["explore"].Env["STARTER_URL"]; got != c.filled {
+			t.Errorf("%q: STARTER_URL %q, want %q", c.given, got, c.filled)
+		}
+	}
+	const layer = "--public-url has a character the runner template does not take: its host is letters, digits, dots and hyphens, or an IPv6 address in brackets, and its path letters, digits and . _ ~ - / %"
+	// Each group's comment is checked: CheckPublicURL returns a URL of kept as it is
+	// given, and changes each of changed.
+	kept := []string{
+		// The host: an underscore, a character outside ASCII, or another character
+		// CheckPublicURL leaves as it is.
+		"https://star_ter.example.com",
+		"https://stärter.example.com",
+		"https://starter.example.com~",
+		"https://starter!.example.com",
+		"https://starter$.example.com",
+		// The path: a character CheckPublicURL leaves as it is.
+		"https://starter.example.com/a$b",
+		"https://starter.example.com/a'b",
+		"https://starter.example.com/a(b)",
+		"https://starter.example.com/a*b",
+		"https://starter.example.com/a!b",
+		"https://starter.example.com/a+b",
+		"https://starter.example.com/a,b",
+		"https://starter.example.com/a;b",
+		"https://starter.example.com/a=b",
+		"https://starter.example.com/a&b",
+		"https://starter.example.com/a@b",
+		"https://starter.example.com/a:b",
+		"https://starter.example.com/a[b]",
+	}
+	changed := []string{
+		// The host: an IPv6 zone, whose %25 CheckPublicURL turns into %, which the
+		// host's shape does not take.
+		"https://[fe80::1%25en0]",
+		// The path: a character CheckPublicURL would escape, which is refused, not
+		// escaped.
+		`https://starter.example.com/a"b`,
+		`https://starter.example.com/a\b`,
+		"https://starter.example.com/a`b",
+		"https://starter.example.com/a{b}",
+		"https://starter.example.com/a|b",
+		"https://starter.example.com/a<b>",
+		"https://starter.example.com/a^b",
+		"https://starter.example.com/é",
+	}
+	for _, given := range append(append([]string(nil), kept...), changed...) {
+		public, err := github.CheckPublicURL(given)
+		if err != nil {
+			t.Errorf("%q: CheckPublicURL refuses it, so it tests nothing here: %v", given, err)
+			continue
+		}
+		if wantKept := slices.Contains(kept, given); (public == given) != wantKept {
+			t.Errorf("%q: CheckPublicURL returns %q, which the group's comment does not say", given, public)
+		}
+		v := valid
+		v.PublicURL = given
+		if out, err := Fill(v); err == nil || err.Error() != layer || out != "" {
+			t.Errorf("%q: %q, %v", given, out, err)
 		}
 	}
 }
