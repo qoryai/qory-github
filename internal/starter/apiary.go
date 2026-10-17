@@ -117,7 +117,7 @@ var (
 	// ErrUnreachable is Qory Apiary out of reach after every try: no answer.
 	ErrUnreachable = errors.New("Qory Apiary could not be reached")
 	// ErrAnswerUnusable is a signed answer within its bound that breaks the contract: a
-	// status the request's schema does not give, a body that is not one JSON document,
+	// success status the request's schema does not give, a body that is not one JSON document,
 	// that breaks its schema, that names another revision, that is for another node pool
 	// or run than the one asked, or whose inputs are over their bound. Nothing in it is
 	// used, and the request is not sent again, since Qory Apiary acted on it.
@@ -224,11 +224,12 @@ func (r *Refusal) Is(target error) bool {
 // Apiary is the starter's client of Qory Apiary's provisioner contract, provisioner/v1,
 // and of Forager's run outcome. Each request is signed with the node pool's access key
 // as forager/accesskey signs one, and each answer is checked under the pin, then
-// against its schema and its revision, before anything in it is used. Every request it
-// sends, a try sent again or another call, has a time later than the last request's,
-// by a second at least, and so a new signature: the same bytes are never sent twice.
-// So the times run ahead of the clock while it sends more than one request a second.
-// No redirect is followed. No error it returns and no line it logs holds the access
+// against its schema and its revision, before anything in it is used. A request's time
+// is the clock's, in whole seconds, and never ahead of it. A request with the same
+// method, URL and body but its time as one sent within the clock's current second, a
+// try sent again or an identical call, waits for the clock's next second first, so the
+// same bytes are never sent twice; a distinct request does not wait. No redirect is
+// followed. No error it returns and no line it logs holds the access
 // key's secret, a run key, a handover's inputs or a work item's title; a [Claimed] or a
 // [Handed] prints, logs and marshals without them. It is safe for concurrent use, and is
 // used by its pointer.
@@ -257,22 +258,44 @@ type Apiary struct {
 	// Log takes a line for each try sent again; nil logs nothing.
 	Log *slog.Logger
 
-	// mu guards last, the time of the last request sent.
+	// mu guards last, the second each request identity was last sent at, see
+	// [Apiary.nextTime].
 	mu   sync.Mutex
-	last time.Time
+	last map[string]time.Time
 }
 
-// nextTime is a request's time: the clock's, in whole seconds, or a second after the
-// last request's when the clock is not later than it.
-func (a *Apiary) nextTime() time.Time {
-	t := a.now().UTC().Truncate(time.Second)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !t.After(a.last) {
-		t = a.last.Add(time.Second)
+// nextTime is the time of a request whose identity, its method, its URL and its body
+// built without the time, is id: the clock's second, once it is later than the second
+// that identity was last sent at. Until it is, it waits for the clock's next second
+// with [Apiary.Sleep], so it never runs ahead of the clock. An identity the clock is
+// past is forgotten. Once ctx is done, its error is the error.
+func (a *Apiary) nextTime(ctx context.Context, id string) (time.Time, error) {
+	for {
+		now := a.now().UTC()
+		t := now.Truncate(time.Second)
+		a.mu.Lock()
+		for k, last := range a.last {
+			if t.After(last) {
+				delete(a.last, k)
+			}
+		}
+		last, held := a.last[id]
+		if !held {
+			if a.last == nil {
+				a.last = map[string]time.Time{}
+			}
+			a.last[id] = t
+			a.mu.Unlock()
+			return t, nil
+		}
+		a.mu.Unlock()
+		if err := a.sleep(ctx, max(last.Add(time.Second).Sub(now), time.Millisecond)); err != nil {
+			return time.Time{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
 	}
-	a.last = t
-	return t
 }
 
 func (a *Apiary) now() time.Time {
@@ -303,7 +326,8 @@ const hiddenText = "[hidden]"
 // a work item's title. It prints, logs and marshals as [hidden], whatever the verb and
 // however deep it sits in another value, even in a field fmt cannot call its methods
 // on: it holds the value behind a pointer, which fmt prints as an address below the top
-// level. Value is the value itself; the zero Hidden is "".
+// level. A printer that follows pointers by reflection, such as go-spew, would show the
+// value. Value is the value itself; the zero Hidden is "".
 type Hidden struct{ p *string }
 
 // hide is s, hidden.
@@ -368,8 +392,8 @@ type Handed struct {
 	Inputs   Hidden
 }
 
-// Document is the handover's answer as the contract's document, run key, inputs and
-// title in the clear.
+// Document is the handover's answer as the contract's document. It holds the raw run
+// key, inputs and title, so it must never be logged or printed.
 func (h Handed) Document() contracts.HandoverAnswer {
 	return contracts.HandoverAnswer{
 		Version: 1, Revision: contracts.ProvisionerRevision, RunID: h.RunID, RunKey: h.RunKey.Value(),
@@ -536,16 +560,24 @@ type answer struct {
 }
 
 // do sends req until Qory Apiary answers a signed status below 500, up to [tries]
-// tries. Each try is built anew with [Apiary.nextTime], so its bytes and its signature
-// are new. A try that fails is no answer, an answer over its bound, whatever its
-// status, an answer not signed under the pin, whatever its status, a 429 among them,
-// or a signed server error: it changes nothing, and it is sent again after a wait that
-// doubles from [firstWait]. After the last try, the failure is the error. Once ctx is
-// done, its error is the error, and nothing more is logged or sent.
+// tries. Each try is built anew, its time from [Apiary.nextTime], so its bytes and its
+// signature are new. A try that fails is no answer, an answer over its bound, whatever
+// its status, an answer not signed under the pin, whatever its status, a 429 among
+// them, or a signed server error: it changes nothing, and it is sent again after a wait
+// that doubles from [firstWait]. After the last try, the failure is the error. Once ctx
+// is done, its error is the error, and nothing more is logged or sent.
 func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
+	id, err := json.Marshal(req.body(""))
+	if err != nil {
+		return nil, fmt.Errorf("%s: the request could not be made", req.what)
+	}
 	wait := firstWait
 	for try := 1; ; try++ {
-		b, err := a.build(req, a.nextTime())
+		t, err := a.nextTime(ctx, http.MethodPost+" "+req.url+"\n"+string(id))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", req.what, err)
+		}
+		b, err := a.build(req, t)
 		if err != nil {
 			return nil, err
 		}

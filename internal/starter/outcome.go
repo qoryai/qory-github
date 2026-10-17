@@ -62,18 +62,18 @@ func OutcomeOf(conclusion string) Outcome {
 	return Outcome{}
 }
 
-// PostOutcome posts how the handed-over run runID ended, o, to <runURL>/<runID>/outcome,
-// Forager's run-outcome.schema.json, signed with the node pool's access key, a key of
-// the node pool that registered the run at its handover. runURL is the run endpoint,
-// run.url of the configuration document Qory Apiary answers the key's signed GET of
-// /.well-known/qory-configuration with; the handover's answer does not carry it.
-// X-Qory-Contract-Version is Forager's revision. A State other than the three, a Reason
-// without a State or that is no code, a runURL or a runID outside its form, and a runURL
-// that holds qak_ or qrk_ are refused before anything is sent. Each try is built anew, with a later time. The
-// answer is a signed 200 whose body run-outcome-answer.schema.json accepts, a member it
-// does not define ignored. A refusal is a [*Refusal]: [ErrOutcomeGiven],
-// [ErrRunNotFound] or [ErrRateLimited]; the same outcome again is answered the signed
-// 200.
+// PostOutcome posts how the handed-over run runID ended, o, to
+// <runURL>/<runID>/outcome, Forager's run-outcome.schema.json, signed with the node
+// pool's access key, a key of the node pool that registered the run at its handover.
+// runURL is the run endpoint, run.url of the configuration document Qory Apiary answers
+// the key's signed GET of /.well-known/qory-configuration with; the handover's answer
+// does not carry it. X-Qory-Contract-Version is Forager's revision. A State other than
+// the three, a Reason without a State or that is no code, a runURL or a runID outside
+// its form, and a runURL that holds qak_ or qrk_ are refused before anything is sent.
+// Each try is built anew, with a later time. The answer is a signed 200 whose body
+// run-outcome-answer.schema.json accepts, a member it does not define ignored. A
+// refusal is a [*Refusal]: [ErrOutcomeGiven], [ErrRunNotFound] or [ErrRateLimited]; the
+// same outcome again is answered the signed 200.
 func (a *Apiary) PostOutcome(ctx context.Context, runURL, runID string, o Outcome) error {
 	what := "the outcome of run " + runID
 	switch {

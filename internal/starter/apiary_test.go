@@ -42,6 +42,10 @@ type seen struct {
 	signature string
 	verified  bool
 	replayed  bool
+	// sent is the body's time, and lead how far it is ahead of the client's clock as
+	// the request arrives.
+	sent time.Time
+	lead time.Duration
 }
 
 // reply is what the fake answers one request with: its status and body, whether it
@@ -72,6 +76,8 @@ type fake struct {
 	seen  []seen
 	sigs  map[string]bool
 	other *accesskey.Key
+	// clock is the client's clock, which a request's time is checked against.
+	clock func() time.Time
 }
 
 func newKey(t *testing.T) *accesskey.Key {
@@ -103,7 +109,16 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 		AccessKeyID: r.Header.Get(accesskey.HeaderAccessKeyID), InstanceID: r.Header.Get(accesskey.HeaderInstanceID),
 		Method: r.Method, Target: r.URL.RequestURI(), Body: b,
 	}, sig)
+	var doc struct {
+		Time string `json:"time"`
+	}
+	if json.Unmarshal(b, &doc) == nil {
+		s.sent, _ = time.Parse(time.RFC3339, doc.Time)
+	}
 	f.mu.Lock()
+	if f.clock != nil && !s.sent.IsZero() {
+		s.lead = s.sent.Sub(f.clock())
+	}
 	s.replayed = f.sigs[sig]
 	f.sigs[sig] = true
 	f.seen = append(f.seen, s)
@@ -145,17 +160,34 @@ func (f *fake) requests() []seen {
 	return slices.Clone(f.seen)
 }
 
-// sleeps records the waits of a client's tries.
+// sleeps is a client's clock, which reads testClock until a wait moves it on, and
+// records the waits.
 type sleeps struct {
-	mu sync.Mutex
-	d  []time.Duration
+	mu  sync.Mutex
+	d   []time.Duration
+	now time.Time
 }
 
 func (s *sleeps) sleep(_ context.Context, d time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.d = append(s.d, d)
+	s.now = s.clockLocked().Add(d)
 	return nil
+}
+
+// clock is the time the clock reads.
+func (s *sleeps) clock() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clockLocked()
+}
+
+func (s *sleeps) clockLocked() time.Time {
+	if s.now.IsZero() {
+		s.now = testClock
+	}
+	return s.now
 }
 
 func (s *sleeps) waits() []time.Duration {
@@ -169,8 +201,11 @@ func (s *sleeps) waits() []time.Duration {
 func (f *fake) client(sl *sleeps, logBuf *bytes.Buffer) *Apiary {
 	a := &Apiary{
 		URL: f.srv.URL, KeyID: testKeyID, Key: f.pool, Pin: pinOf(f.server), InstanceID: testInstance,
-		Now: func() time.Time { return testClock }, Sleep: sl.sleep,
+		Now: sl.clock, Sleep: sl.sleep,
 	}
+	f.mu.Lock()
+	f.clock = sl.clock
+	f.mu.Unlock()
 	if logBuf != nil {
 		a.Log = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
@@ -417,7 +452,6 @@ func TestInvalidFixtures(t *testing.T) {
 }
 
 // sentinels are every refusal a later step may act on.
-// sentinels are every refusal a later step may act on.
 var sentinels = []error{ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited, ErrOutcomeGiven, ErrRunNotFound}
 
 // refusalCodes are every signed refusal code the tests answer with, each with its
@@ -647,6 +681,8 @@ func checkBuiltAnew(t *testing.T, reqs []seen, n int) {
 			t.Errorf("try %d reuses a signature", i+1)
 		case doc.Time <= last:
 			t.Errorf("try %d's time %s is not later than %s", i+1, doc.Time, last)
+		case r.lead > 0:
+			t.Errorf("try %d's time is %s ahead of the clock", i+1, r.lead)
 		}
 		sigs[r.signature], last = true, doc.Time
 	}
@@ -897,47 +933,118 @@ func TestBounds(t *testing.T) {
 	}
 }
 
-// TestTimesAcrossCalls checks two identical calls within one second, and identical
-// calls at once, each send a time of their own, later than the last, so no two requests
-// are the same bytes.
-func TestTimesAcrossCalls(t *testing.T) {
+// TestTimes checks a request's time against the clock, which moves on only when the
+// client waits: distinct requests in one second all carry the clock's time with no
+// wait; identical requests, one after another or at once, wait for the clock's next
+// second and so carry strictly later times; no time sent is ahead of the clock, after
+// 400 requests too; and a context cancelled during that wait ends the request with its
+// error, nothing more sent and no line logged.
+func TestTimes(t *testing.T) {
 	ctx := context.Background()
-	f := newFake(t, ok204)
-	a := f.client(&sleeps{}, nil)
-	for range 2 {
-		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+	noLead := func(t *testing.T, reqs []seen) {
+		t.Helper()
+		for i, r := range reqs {
+			if r.sent.IsZero() || r.lead > 0 {
+				t.Fatalf("request %d's time is %s ahead of the clock", i+1, r.lead)
+			}
+		}
+	}
+	t.Run("distinct requests in one second", func(t *testing.T) {
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		for i := range 50 {
+			if err := a.Dispatched(ctx, fmt.Sprintf("dp_8w3k0q9t2v7m%04d", i), nil); err != nil {
+				t.Fatalf("the request failed: %v", err)
+			}
+		}
+		for _, r := range f.requests() {
+			if !r.sent.Equal(testClock) || r.replayed {
+				t.Fatalf("a distinct request's time is %s, not the clock's", r.sent)
+			}
+		}
+		if len(sl.waits()) != 0 {
+			t.Errorf("distinct requests waited %v", sl.waits())
+		}
+	})
+	t.Run("identical requests", func(t *testing.T) {
+		f := newFake(t, ok204)
+		a := f.client(&sleeps{}, nil)
+		for range 3 {
+			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+				t.Fatalf("the request failed: %v", err)
+			}
+		}
+		reqs := f.requests()
+		checkBuiltAnew(t, reqs, 3)
+		noLead(t, reqs)
+	})
+	t.Run("400 requests leave no lead", func(t *testing.T) {
+		f := newFake(t, ok204)
+		sl := &sleeps{}
+		a := f.client(sl, nil)
+		for i := range 400 {
+			id := testDispatch
+			if i%2 == 1 {
+				id = "dp_8w3k0q9t2v7m4r6y"
+			}
+			if err := a.Dispatched(ctx, id, nil); err != nil {
+				t.Fatalf("the request failed: %v", err)
+			}
+		}
+		reqs := f.requests()
+		noLead(t, reqs)
+		if last := reqs[len(reqs)-1]; last.lead != 0 {
+			t.Errorf("after 400 requests the lead is %s, not 0", last.lead)
+		}
+	})
+	t.Run("a cancel during the wait", func(t *testing.T) {
+		f := newFake(t, ok204)
+		var logs bytes.Buffer
+		sl := &sleeps{}
+		a := f.client(sl, &logs)
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if err := a.Dispatched(cctx, testDispatch, nil); err != nil {
 			t.Fatalf("the request failed: %v", err)
 		}
-	}
-	checkBuiltAnew(t, f.requests(), 2)
-
-	f = newFake(t, ok204)
-	a = f.client(&sleeps{}, nil)
-	const n = 8
-	var wg sync.WaitGroup
-	for range n {
-		wg.Go(func() {
-			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
-				t.Errorf("the request failed: %v", err)
+		a.Sleep = func(ctx context.Context, d time.Duration) error {
+			cancel()
+			return sl.sleep(ctx, d)
+		}
+		if err := a.Dispatched(cctx, testDispatch, nil); !errors.Is(err, context.Canceled) {
+			t.Fatalf("not the context's error: %v", err)
+		}
+		if len(f.requests()) != 1 || logs.Len() != 0 {
+			t.Errorf("a request cancelled during its wait is sent or logged:\n%s", logs.String())
+		}
+	})
+	t.Run("identical requests at once", func(t *testing.T) {
+		f := newFake(t, ok204)
+		a := f.client(&sleeps{}, nil)
+		const n = 8
+		var wg sync.WaitGroup
+		for range n {
+			wg.Go(func() {
+				if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+					t.Errorf("the request failed: %v", err)
+				}
+			})
+		}
+		wg.Wait()
+		reqs := f.requests()
+		noLead(t, reqs)
+		times, sigs := map[time.Time]bool{}, map[string]bool{}
+		for _, r := range reqs {
+			if r.replayed || times[r.sent] || sigs[r.signature] {
+				t.Error("two requests at once share a time or a signature")
 			}
-		})
-	}
-	wg.Wait()
-	reqs := f.requests()
-	times, sigs := map[string]bool{}, map[string]bool{}
-	for _, r := range reqs {
-		var doc struct {
-			Time string `json:"time"`
+			times[r.sent], sigs[r.signature] = true, true
 		}
-		_ = json.Unmarshal(r.body, &doc)
-		if r.replayed || times[doc.Time] || sigs[r.signature] {
-			t.Error("two requests at once share a time or a signature")
+		if len(reqs) != n {
+			t.Errorf("%d requests, not %d", len(reqs), n)
 		}
-		times[doc.Time], sigs[r.signature] = true, true
-	}
-	if len(reqs) != n {
-		t.Errorf("%d requests, not %d", len(reqs), n)
-	}
+	})
 }
 
 // TestCancel cancels the context while a claim waits for its answer, and checks the
