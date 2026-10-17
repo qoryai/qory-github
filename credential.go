@@ -134,6 +134,8 @@ type Client struct {
 	HTTP *http.Client
 	// Now is the clock the App's token is issued by; nil is time.Now.
 	Now func() time.Time
+	// UserAgent is the User-Agent of every request; empty is qory-github.
+	UserAgent string
 }
 
 // Request is what one token is minted for.
@@ -338,6 +340,14 @@ func CheckAPIURL(api string) error {
 	return nil
 }
 
+// userAgent is the User-Agent of the client's requests, qory-github when none is set.
+func (c Client) userAgent() string {
+	if c.UserAgent == "" {
+		return "qory-github"
+	}
+	return c.UserAgent
+}
+
 // base is the API's base URL, [APIURL] when none is set.
 func (c Client) base() string {
 	if c.API == "" {
@@ -375,7 +385,7 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "qory-github")
+	req.Header.Set("User-Agent", c.userAgent())
 	if jwt != "" {
 		req.Header.Set("Authorization", "Bearer "+jwt)
 	}

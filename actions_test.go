@@ -35,6 +35,7 @@ type fakeActions struct {
 	mintStatus int      // the mint's status; zero is 201
 	mintHeader http.Header
 	requests   []actionsRequest
+	agents     []string // every request's User-Agent, the mint's among them
 	answer     func(w http.ResponseWriter, r *http.Request)
 }
 
@@ -42,6 +43,7 @@ func (f *fakeActions) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.all++
+	f.agents = append(f.agents, r.Header.Get("User-Agent"))
 	b, _ := io.ReadAll(r.Body)
 	switch {
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/app/installations/"):
@@ -144,30 +146,145 @@ func TestDispatchWorkflowSendsTheDispatchAndReturnsTheRun(t *testing.T) {
 	if r.method != "POST" || r.path != "/repositories/42/actions/workflows/runner.yml/dispatches" {
 		t.Errorf("%s %s", r.method, r.path)
 	}
-	if r.body != `{"ref":"main","inputs":{"dispatch_id":"dp_0123456789abcdef"},"return_run_details":true}` {
+	if r.body != `{"ref":"refs/heads/main","inputs":{"dispatch_id":"dp_0123456789abcdef"},"return_run_details":true}` {
 		t.Errorf("the body is %s", r.body)
 	}
 	checkHeaders(t, r, true)
 }
 
+// actionsClasses are the errors [Actions] wraps, each error exactly one of them.
+var actionsClasses = []error{ErrActionsGone, ErrActionsRefused, ErrActionsTransient, ErrActionsInvalid, ErrActionsNoRun}
+
+// wrapsOnly reports whether err wraps want and no other of [actionsClasses].
+func wrapsOnly(err, want error) bool {
+	for _, class := range actionsClasses {
+		if errors.Is(err, class) != (class == want) {
+			return false
+		}
+	}
+	return true
+}
+
 // TestADispatchGitHubAnswers204NamesNoRun takes GitHub's 204, a dispatch taken with no
-// run named, as done, with a run whose ID is 0.
+// run named, as an error that wraps ErrActionsNoRun alone, never a run whose ID is 0
+// with nil.
 func TestADispatchGitHubAnswers204NamesNoRun(t *testing.T) {
 	f := &fakeActions{answer: answering(204, "")}
 	got, err := serveActions(t, f).DispatchWorkflow(context.Background(), 7, 42, "runner.yaml", "refs/heads/main", dispatchID)
-	if err != nil || got != (DispatchedRun{}) {
+	if !wrapsOnly(err, ErrActionsNoRun) || got != (DispatchedRun{}) {
 		t.Errorf("got %+v, %v", got, err)
+	}
+	if want := "GitHub took the dispatch and named no workflow run: dispatching the workflow runner.yaml: GitHub answered 204, with no run's details"; err == nil || err.Error() != want {
+		t.Errorf("the error is %v, not %s", err, want)
+	}
+	if len(f.requests) != 1 {
+		t.Errorf("%d requests", len(f.requests))
 	}
 }
 
-// TestADispatch200WithoutARunIDFails refuses a 200 that names no run, or that is not
-// JSON, as one that may pass.
+// TestADispatch200WithoutARunIDFails refuses a 200 that names no run, a run's id
+// missing, 0 or below, as ErrActionsNoRun alone, and one that is not JSON as one that
+// may pass.
 func TestADispatch200WithoutARunIDFails(t *testing.T) {
-	for _, body := range []string{`{}`, `{"workflow_run_id":0}`, `not json`} {
+	for body, want := range map[string]error{
+		`{}`:                        ErrActionsNoRun,
+		`{"workflow_run_id":null}`:  ErrActionsNoRun,
+		`{"workflow_run_id":0}`:     ErrActionsNoRun,
+		`{"workflow_run_id":-1}`:    ErrActionsNoRun,
+		`{"run_url":"x"}`:           ErrActionsNoRun,
+		`not json`:                  ErrActionsTransient,
+		`{"workflow_run_id":"99"}`:  ErrActionsTransient,
+		`{"workflow_run_id":99.5}`:  ErrActionsTransient,
+		`{"workflow_run_id":[99]}`:  ErrActionsTransient,
+		`{"workflow_run_id":true}`:  ErrActionsTransient,
+		`{"workflow_run_id":{}}`:    ErrActionsTransient,
+		`{"workflow_run_id":1e400}`: ErrActionsTransient,
+	} {
 		f := &fakeActions{answer: answering(200, body)}
-		_, err := serveActions(t, f).DispatchWorkflow(context.Background(), 7, 42, "runner.yml", "main", dispatchID)
-		if !errors.Is(err, ErrActionsTransient) {
-			t.Errorf("%s: %v", body, err)
+		got, err := serveActions(t, f).DispatchWorkflow(context.Background(), 7, 42, "runner.yml", "main", dispatchID)
+		if !wrapsOnly(err, want) || got != (DispatchedRun{}) {
+			t.Errorf("%s: %+v, %v", body, got, err)
+		}
+	}
+}
+
+// TestADispatchSendsTheFullRef sends a short name as refs/heads/NAME, and a ref under
+// refs/heads/ or refs/tags/ as it is.
+func TestADispatchSendsTheFullRef(t *testing.T) {
+	for ref, want := range map[string]string{
+		"main":                 "refs/heads/main",
+		"release/1.2":          "refs/heads/release/1.2",
+		"refs":                 "refs/heads/refs",
+		"tags/v1":              "refs/heads/tags/v1",
+		"refs/heads/main":      "refs/heads/main",
+		"refs/tags/runner-1.2": "refs/tags/runner-1.2",
+	} {
+		if got := FullRef(ref); got != want {
+			t.Errorf("FullRef(%q) is %q, not %q", ref, got, want)
+		}
+		f := &fakeActions{answer: answering(200, `{"workflow_run_id":99}`)}
+		if _, err := serveActions(t, f).DispatchWorkflow(context.Background(), 7, 42, "runner.yml", ref, dispatchID); err != nil {
+			t.Fatalf("%s: %v", ref, err)
+		}
+		if body := `{"ref":"` + want + `","inputs":{"dispatch_id":"dp_0123456789abcdef"},"return_run_details":true}`; len(f.requests) != 1 || f.requests[0].body != body {
+			t.Errorf("%s: the requests are %+v", ref, f.requests)
+		}
+	}
+}
+
+// TestCheckRefTakesABranchOrATag takes a short name, refs/heads/NAME and
+// refs/tags/NAME, and refuses a name under another refs/ prefix, HEAD, and a part that
+// begins with a hyphen, with the rule each fails.
+func TestCheckRefTakesABranchOrATag(t *testing.T) {
+	for _, ref := range []string{"main", "release/1.2", "a-b", "a/b-", "refs", "heads/main", "HEADS", "a/HEAD", "refs/heads/main", "refs/heads/release/1.2", "refs/tags/v1.2.3", "refs/tags/runner-1.2", "refs/heads/refs/tags/x"} {
+		if err := CheckRef(ref); err != nil {
+			t.Errorf("%q: %v", ref, err)
+		}
+	}
+	const bad, prefix = "is not a branch or tag name git takes", "is neither a branch, NAME or refs/heads/NAME, nor a tag, refs/tags/NAME"
+	for ref, want := range map[string]string{
+		"-main":                    bad,
+		"-":                        bad,
+		"a/-b":                     bad,
+		"HEAD":                     bad,
+		"refs/heads/HEAD":          bad,
+		"refs/tags/HEAD":           bad,
+		"refs/heads/-main":         bad,
+		"refs/tags/-v1":            bad,
+		"refs/heads/a/-b":          bad,
+		"refs/heads/":              bad,
+		"refs/tags/":               bad,
+		"refs/heads/.x":            bad,
+		"refs/pull/1/head":         prefix,
+		"refs/remotes/origin/main": prefix,
+		"refs/heads":               prefix,
+		"refs/tags":                prefix,
+		"refs/x":                   prefix,
+		"refs/":                    prefix,
+	} {
+		if err := CheckRef(ref); err == nil || err.Error() != want {
+			t.Errorf("%q: %v, not %s", ref, err, want)
+		}
+	}
+}
+
+// TestAClientSendsItsUserAgent sends a mint and a dispatch with a client's User-Agent,
+// and qory-github with none.
+func TestAClientSendsItsUserAgent(t *testing.T) {
+	for agent, want := range map[string]string{"example-program/1.2.3": "example-program/1.2.3", "": "qory-github"} {
+		f := &fakeActions{answer: answering(200, `{"workflow_run_id":99}`)}
+		a := serveActions(t, f)
+		a.Client.UserAgent = agent
+		if _, err := a.DispatchWorkflow(context.Background(), 7, 42, "runner.yml", "main", dispatchID); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.mints) != 1 || len(f.agents) < 2 {
+			t.Fatalf("%d mints, %d requests", len(f.mints), len(f.agents))
+		}
+		for _, got := range f.agents {
+			if got != want {
+				t.Errorf("a request's User-Agent is %q, not %q", got, want)
+			}
 		}
 	}
 }
@@ -283,7 +400,6 @@ var actionsCalls = map[string]func(*Actions) error{
 // TestEachRefusalIsClassed answers each call with each status and checks which of
 // gone, refused and transient its error wraps, and that it wraps no other.
 func TestEachRefusalIsClassed(t *testing.T) {
-	classes := []error{ErrActionsGone, ErrActionsRefused, ErrActionsTransient, ErrActionsInvalid}
 	cases := []struct {
 		status int
 		header []string
@@ -309,11 +425,8 @@ func TestEachRefusalIsClassed(t *testing.T) {
 	for name, call := range actionsCalls {
 		for _, c := range cases {
 			f := &fakeActions{answer: answering(c.status, `{"message":"an example refusal"}`, c.header...)}
-			err := call(serveActions(t, f))
-			for _, class := range classes {
-				if errors.Is(err, class) != (class == c.want) {
-					t.Errorf("%s, %d %v: %v", name, c.status, c.header, err)
-				}
+			if err := call(serveActions(t, f)); !wrapsOnly(err, c.want) {
+				t.Errorf("%s, %d %v: %v", name, c.status, c.header, err)
 			}
 		}
 	}
@@ -423,7 +536,7 @@ func TestARequestThatIsNotOneIsRefusedWithNoRequest(t *testing.T) {
 	for _, w := range []string{"", "runner", ".yml", "runner.json", "../runner.yml", "a/runner.yml", "runner.yml/../x.yml", "runner.yml?x=1", "runner.yml#x", "run ner.yml", "runner.yml%2F", strings.Repeat("a", 251) + ".yml"} {
 		cases["workflow "+strconv.Quote(w)] = dispatch(7, 42, w, "main", dispatchID)
 	}
-	for _, ref := range []string{"", "@", "a..b", "a b", "main.", "main/", "/main", "a@{1}", "a~1", "a^", "a:b", "a?", "a*", "a[", `a\b`, ".hidden", "x.lock", "a\x00b", strings.Repeat("a", 256)} {
+	for _, ref := range []string{"", "-main", "HEAD", "refs/heads/HEAD", "refs/heads/-main", "refs/pull/1/head", "refs/remotes/origin/main", "@", "a..b", "a b", "main.", "main/", "/main", "a@{1}", "a~1", "a^", "a:b", "a?", "a*", "a[", `a\b`, ".hidden", "x.lock", "a\x00b", strings.Repeat("a", 256)} {
 		cases["ref "+strconv.Quote(ref)] = dispatch(7, 42, "runner.yml", ref, dispatchID)
 	}
 	cases["dispatch, installation 0"] = dispatch(0, 42, "runner.yml", "main", dispatchID)
