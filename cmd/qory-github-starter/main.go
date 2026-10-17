@@ -1,7 +1,9 @@
 // Command qory-github-starter is the program for a node pool of Qory Apiary. Its
-// commands are `qory-github-starter access-key enrol`, which enrols the node pool's
-// access key, `qory-github-starter setup`, which creates the starter's GitHub App, and
-// `qory-github-starter template`, which prints the runner template.
+// commands are `qory-github-starter serve --settings FILE`, which claims the node pool's
+// runs and starts the runner workflow for each, `qory-github-starter access-key enrol`,
+// which enrols the node pool's access key, `qory-github-starter setup`, which creates
+// the starter's GitHub App, and `qory-github-starter template`, which prints the runner
+// template.
 //
 // The whole program is switched on by QORY_FEATURES alone, see [cli.Factory]: without
 // factory it knows no command, and prints a usage that lists none.
@@ -14,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -25,6 +28,7 @@ import (
 	"github.com/qoryai/qory-github/internal/enrol"
 	"github.com/qoryai/qory-github/internal/ownerfile"
 	"github.com/qoryai/qory-github/internal/setupcmd"
+	"github.com/qoryai/qory-github/internal/starter"
 	"github.com/qoryai/qory-github/runner"
 )
 
@@ -65,6 +69,7 @@ func usage() string {
 	return line + `
 
 commands:
+  serve        ` + serveHelp.Short + `
   access-key   ` + accessKeyHelp.Short + `
   setup        ` + setupHelp.Short + `
   template     ` + templateHelp.Short + `
@@ -133,6 +138,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	var err error
 	switch args[0] {
+	case "serve":
+		err = serve(ctx, args[1:], stderr)
 	case "access-key":
 		err = enrol.AccessKey(ctx, poolKind(), enrol.Seams{GenerateKey: generateKey, Hostname: hostname, RemoveProbe: removeProbe}, args[1:], stdout, stderr)
 	case "setup":
@@ -151,6 +158,57 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// serveHelp is the help of serve, which has no section on qory-github's page: the
+// command is switched on by QORY_FEATURES alone, see [cli.Factory].
+var serveHelp = cli.Help{
+	Short: "Claim the node pool's runs and start the runner workflow for each",
+	Use:   "qory-github-starter serve --settings FILE",
+	Long: `Claim the node pool's runs from Qory Apiary, and start the runner workflow for each.
+
+serve claims the node pool's runs from Qory Apiary and, for each run of the explore
+step, starts the workflow the settings name, in repository at ref, with the GitHub
+App. It watches each job's workflow run to its end and tells Qory Apiary how the run
+ended. It runs until it is stopped with SIGINT or SIGTERM.
+
+serve serves the job's handover under public_url, at
+POST /v1/dispatches/DISPATCH_ID/handover, where the job asks with its GitHub Actions
+OIDC token for its run key. serve listens on listen, on plain HTTP: public_url must be
+reachable by GitHub's runners over HTTPS, through a proxy in front that terminates
+TLS.
+
+The settings are one JSON document in FILE: apiary_url, access_key_id,
+access_key_secret_file, apiary_public_key, listen, public_url, state_dir, app_id,
+private_key_file, repository, workflow and ref, and pool_id, api_url and
+workflow_sha, which may be left out. The access key's secret, in
+access_key_secret_file, and the App's private key, in private_key_file, are each in a
+file that belongs to the user serve runs as and that only that user may read.
+state_dir keeps the instance id; serve makes it, 0700, when it does not exist and
+its parent does.`,
+	Example: `  qory-github-starter serve --settings /etc/qory-github-starter/starter.json`,
+}
+
+// serve is the starter, see [starter.Run], until ctx is done, a signal. It writes its
+// lines, one JSON object each, on standard error, and nothing on standard output.
+func serve(ctx context.Context, args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	file := fs.String("settings", "", "the settings file, one JSON document (required)")
+	if err := serveHelp.Parse(fs, args, stderr); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("serve takes no arguments")
+	}
+	if *file == "" {
+		return errors.New("--settings is required")
+	}
+	s, err := starter.ReadSettings(*file)
+	if err != nil {
+		return err
+	}
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	return starter.Run(ctx, s, starter.Deps{Log: log, GitHub: gitHub(s.APIURL)})
 }
 
 // setupHelp is the help of setup, which has no section on qory-github's page: the
