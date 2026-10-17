@@ -28,8 +28,8 @@ import (
 //     collection belongs to.
 //   - adapter: the instance id, the change feed's cursor and the sync interval.
 //   - connections_forbidden: when Qory Apiary first answered 403 connection_unknown to
-//     a request for a live connection since its last 2xx, by the connection's id, see
-//     [noteAnswer].
+//     a request that names a live connection since its last 2xx to one, by the
+//     connection's id, see [noteAnswer].
 //   - connections_replaced: a pending link a connect for another connection replaced,
 //     by the replaced connection's id, until its last listing, see [keepReplaced].
 //   - installations_deleted: an installation GitHub deleted, by its id, for
@@ -214,11 +214,12 @@ func dropConnection(st *store.Store, connection string) (bool, error) {
 }
 
 // forbiddenFor is how long Qory Apiary answers 403 connection_unknown, and no 2xx, to
-// the requests for a live connection before serve takes the connection as ended: Qory
-// Apiary answers so once it no longer holds a connection, as after its organisation is
-// removed, not connection_ended, and such a 403 may also be passing. A day matches how
-// long serve lets other failures last before it says so, see [outageFor]. The first 403
-// is kept in the store, so a restart does not start the day again.
+// the requests that name a live connection, its listings and its disconnects, before
+// serve takes the connection as ended: Qory Apiary answers so once it no longer holds a
+// connection, as after its organisation is removed, not connection_ended, and such a
+// 403 may also be passing. A day matches how long serve lets other failures last before
+// it says so, see [outageFor]. The first 403 is kept in the store, so a restart does
+// not start the day again.
 const forbiddenFor = 24 * time.Hour
 
 // forbiddenMu orders the reads and writes of nsForbidden.
@@ -229,13 +230,13 @@ var forbiddenMu sync.Mutex
 func lasting(code string) bool { return code == codeConnectionUnknown }
 
 // noteAnswer notes Qory Apiary's signed answer, status and refusal code, at at, to a
-// request for connection, and says whether the connection is to be taken as ended, as
-// on 409 connection_ended: a 2xx, or a 409 connection_suspended, which Qory Apiary
-// answers only for a connection it holds, forgets the connection's first 403; a 403 that
-// [lasting] counts, for a connection an installation is linked to live, is kept as the
-// first, unless one is kept already, and then ends the connection once [forbiddenFor]
-// has passed since it. A pending link is never ended by 403s: Qory Apiary answers its
-// listings 403 until the browser brings the connect return.
+// request that names connection, and says whether the connection is to be taken as
+// ended, as on 409 connection_ended: a 2xx, or a 409 connection_suspended, which Qory
+// Apiary answers only for a connection it holds, forgets the connection's first 403; a
+// 403 that [lasting] counts, for a connection an installation is linked to live, is kept
+// as the first, unless one is kept already, and then ends the connection once
+// [forbiddenFor] has passed since it. A pending link is never ended by 403s: Qory
+// Apiary answers its listings 403 until the browser brings the connect return.
 func noteAnswer(st *store.Store, connection string, status int, code string, at time.Time) (bool, error) {
 	forbiddenMu.Lock()
 	defer forbiddenMu.Unlock()
@@ -409,14 +410,15 @@ func present(_ []byte, err error) (bool, error) {
 // use nowhere yet, so no record keyed by a repository's owner/name is carried over.
 func collectionKey(ref string) string { return ref }
 
-// The moments of the links this process stores. A request to Qory Apiary that is
-// answered 409 collection_not_linked may have begun before the change feed unlinked
-// the collection and linked it again; its answer then speaks of the unlink, and the
-// link stored after it stands. So each link stored takes the next moment from
-// linkClock, kept in linkedAt by store and collection, and a request notes the moment
-// it began, [linkMoment]: [unlinkSince] unlinks only when no link was stored after.
-// A link from before the process started has no moment, and is older than any request
-// of the process. linkMu orders a link and an unlink of one store.
+// The moments of the links this process stores. A request for a collection, its items
+// or its disconnect, that Qory Apiary answers 409 collection_not_linked may have begun
+// before the change feed unlinked the collection and linked it again; its answer then
+// speaks of the unlink, and the link stored after it stands. So each link stored takes
+// the next moment from linkClock, kept in linkedAt by store and collection, and a
+// request notes the moment it began, [linkMoment]: [unlinkSince] unlinks only when no
+// link was stored after. A link from before the process started has no moment, and is
+// older than any request of the process. linkMu orders a link and an unlink of one
+// store.
 var (
 	linkClock atomic.Uint64
 	linkedAt  sync.Map // linkMark -> uint64

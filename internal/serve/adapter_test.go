@@ -1846,21 +1846,68 @@ func TestTheFeedStopsDuringALongRead(t *testing.T) {
 	}
 }
 
-// TestA409OnCommentsUnlinksTheCollection has Qory Apiary answer comments with 409
-// collection_not_linked, and checks the collection is no longer linked.
-func TestA409OnCommentsUnlinksTheCollection(t *testing.T) {
-	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	linkCollection(w.st, refOf("acme/widgets"))
-	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
-	req := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
-		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
-		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
-	}}}
-	if err := w.client.Comments(context.Background(), req); !IsPermanent(err) {
+// TestA409OnCommentsIsFinalForThatRequestOnly has Qory Apiary answer a webhook's
+// comments 409 collection_not_linked, as it answers comments on an item it holds no
+// item for, and checks that request alone is dropped: it is sent once, logged at Info
+// with the item and the collection and no token or body, and the delivery is done; the
+// collection stays linked, so the next item and comment are sent, and a pull runs and
+// sends its items and comments. A 409 collection_not_linked to items still unlinks.
+func TestA409OnCommentsIsFinalForThatRequestOnly(t *testing.T) {
+	w, f, p, clock := pulling(t)
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeComments && n == 1 {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	comment := func(id int) map[string]any {
+		ev := issueEvent(42, "acme/widgets", "created")
+		ev["comment"] = map[string]any{"id": id, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-" + strconv.Itoa(id), "body": "A body that is never logged.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
+		return ev
+	}
+	w.deliver(t, "issue_comment", guid1, comment(5))
+	if n := len(w.apiary.sent(routeComments)); n != 1 || state(w.st, guid1) != store.Done {
+		t.Errorf("%d comments requests, %s", n, state(w.st, guid1))
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Fatal("a 409 to comments unlinked the collection")
+	}
+	line := `"level":"INFO","msg":"Qory Apiary answered collection_not_linked to the comments, so they are dropped","item":"` + itemOf("acme/widgets", 1) + `","collection":"` + widgetsRef + `"`
+	if log := w.log.String(); strings.Count(log, line) != 1 || strings.Contains(log, "the request is refused") || strings.Contains(log, "never logged") {
+		t.Errorf("the log: %s", log)
+	}
+	// The next item and comment of the repository are sent.
+	w.deliver(t, "issues", guid2, issueEvent(42, "acme/widgets", "edited"))
+	w.deliver(t, "issue_comment", guid3, comment(6))
+	if items, comments := len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)); items != 1 || comments != 2 {
+		t.Errorf("then %d items and %d comments requests", items, comments)
+	}
+	// And a pull runs.
+	keepPulled(w.st, widgetsRef, pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-time.Hour)})
+	w.gh.issues = []map[string]any{ghIssue(1, 1)}
+	f.comments = []map[string]any{repoComment(11, 1)}
+	clock.t = pullStart
+	if err := p.pull(context.Background(), widgetsRef, 42); err != nil {
+		t.Fatal(err)
+	}
+	if items, comments := len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)); items != 2 || comments != 3 {
+		t.Errorf("after the pull, %d items and %d comments requests", items, comments)
+	}
+	if strings.Contains(w.log.String(), ghToken) {
+		t.Error("the log holds the token")
+	}
+	// A 409 collection_not_linked to items unlinks the collection.
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeItems {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	if err := w.client.Items(context.Background(), widgetsItem()); !refusedAs(err, 409, codeCollectionNotLinked) || !IsPermanent(err) {
 		t.Errorf("err %v", err)
 	}
-	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
-		t.Error("the collection is still linked")
+	if ok, _ := collectionLinked(w.st, widgetsRef); ok {
+		t.Error("a 409 to items left the collection linked")
 	}
 }
 
@@ -2035,7 +2082,7 @@ func TestQoryApiarysRefusals(t *testing.T) {
 	}{
 		{400, `{"error":"invalid_request"}`, true, false},
 		{400, `{"error":"unsupported_contract_version"}`, true, false},
-		{403, `{"error":"connection_unknown"}`, true, false},
+		{403, `{"error":"forbidden"}`, true, false},
 		{413, `{}`, true, false},
 		{409, `{"error":"collection_not_linked"}`, true, false},
 		{401, `{"error":"unauthorized"}`, false, true},
@@ -2262,8 +2309,8 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 			t.Errorf("after a 409 connection_suspended, answer %d: %v, %v", i, end, err)
 		}
 	}
-	// A 403 forbidden, or a 409 with another code, collection_not_linked, which an items
-	// request may get, neither counts nor starts the day again.
+	// A 403 forbidden, or a 409 with another code, here collection_not_linked, neither
+	// counts nor starts the day again.
 	st5 := openStore(t, filepath.Join(t.TempDir(), "state"))
 	Link(st5, 42, testConnection, linkLive)
 	for i, a := range []struct {
@@ -2322,6 +2369,41 @@ func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
 	}
 	if !strings.Contains(w.log.String(), `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) {
 		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestOnlyARequestThatNamesTheConnectionIsNoted has the connection's first 403 kept 25
+// hours ago, and checks the answers to the items and the comments of its collection,
+// which Qory Apiary never answers 403 connection_unknown, are not noted: a 403
+// connection_unknown to them ends nothing, and a 204 keeps the first 403. A listing's
+// 204 forgets it.
+func TestOnlyARequestThatNamesTheConnectionIsNoted(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	first := []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10))
+	w.st.Put(nsForbidden, testConnection, first, 0)
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, status := range []int{403, 0} {
+		w.apiary.refuse = func(string, int) (int, string) { return status, `{"error":"connection_unknown"}` }
+		w.client.Items(context.Background(), widgetsItem())
+		w.client.Comments(context.Background(), comments)
+		if ok, _ := Linked(w.st, 42); !ok {
+			t.Fatalf("%d: the connection is dropped", status)
+		}
+		if b, _ := w.st.Get(nsForbidden, testConnection); string(b) != string(first) {
+			t.Errorf("%d: the first 403 is %q", status, b)
+		}
+	}
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("a listing's 204 kept the first 403")
 	}
 }
 
