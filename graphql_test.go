@@ -29,22 +29,27 @@ type fakeGraphQL struct {
 	// nodes are the issues, open and closed, in the order they were created, as
 	// GraphQL says them.
 	nodes []map[string]any
-	// name is the repository as GitHub names it; "" is acme/widgets.
-	name string
+	// name is the repository as GitHub names it; "" is acme/widgets. databaseID is its
+	// id, 0 widgetsID, and noDatabaseID answers it without one, as null.
+	name         string
+	databaseID   int
+	noDatabaseID bool
 	// limited answers that many requests with GraphQL's rate limit, from the page
 	// limitFrom on, counted from 1, and limitHeaders says with them that no request
 	// remains until a minute after t0.
 	limited, limitFrom int
 	limitHeaders       bool
 	// errorOn answers that page, counted from 1, with a GraphQL error, statusOn with
-	// status; notFound answers that the repository cannot be resolved.
+	// status; notFound answers that the repository cannot be resolved, and
+	// nullRepository answers it as null with no error.
 	errorOn, statusOn, status int
-	notFound                  bool
+	notFound, nullRepository  bool
 	// sameCursor names the first page's cursor again on every page, noCursor names
 	// none, and nullNode answers the first page's first issue as null.
 	sameCursor, noCursor, nullNode bool
-	// renameOn names the repository otherwise from that page on.
-	renameOn int
+	// renameOn names the repository otherwise from that page on, with the same id, and
+	// otherIDOn answers another repository's id, gadgetsID, from that page on.
+	renameOn, otherIDOn int
 	// closedToo answers the closed issues among the open ones, as GraphQL never
 	// should, so a page can hold no open issue.
 	closedToo bool
@@ -124,6 +129,10 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name 'acme/widgets'."}]}`)
 		return
 	}
+	if g.nullRepository {
+		io.WriteString(w, `{"data":{"repository":null}}`)
+		return
+	}
 	if page == g.errorOn {
 		io.WriteString(w, `{"data":null,"errors":[{"type":"SERVICE_UNAVAILABLE","message":"Something went wrong while executing your query."},{"message":"and another"}]}`)
 		return
@@ -168,7 +177,18 @@ func (g *fakeGraphQL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if g.renameOn != 0 && page >= g.renameOn {
 		name = "acme/gadgets"
 	}
+	var id any = g.databaseID
+	if g.databaseID == 0 {
+		id = widgetsID
+	}
+	if g.otherIDOn != 0 && page >= g.otherIDOn {
+		id = gadgetsID
+	}
+	if g.noDatabaseID {
+		id = nil
+	}
 	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
+		"databaseId":    id,
 		"nameWithOwner": name,
 		"url":           "https://github.com/" + name,
 		"issues": map[string]any{
@@ -260,7 +280,7 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
 	p := l.pacerOr()
-	pager := l.issuePager(p, widgets, 2)
+	pager := l.issuePager(p, widgetsID, widgets, 2)
 	var pages [][]int64
 	for {
 		_, page, more, err := pager.next(context.Background())
@@ -281,10 +301,10 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 	}
 	g.vars = nil
 	g.fakeIssues.paths = nil
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"POST /graphql", "/repos/acme/widgets/issues/1/comments?per_page=100"}
+	want := []string{"POST /graphql", "/repositories/1296269/issues/1/comments?per_page=100"}
 	if got := g.requested(); !reflect.DeepEqual(got, want) {
 		t.Errorf("requested %v", got)
 	}
@@ -297,18 +317,104 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 		}
 	}
 	refs, parts := sentParts(s)
-	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#2 acme/widgets#4 acme/widgets#5 acme/widgets#6" {
+	if strings.Join(refs, " ") != "1296269#1 1296269#2 1296269#4 1296269#5 1296269#6" {
 		t.Errorf("items %v", refs)
 	}
-	if len(parts) != 1 || parts[0].Part != 1 || !parts[0].Complete || parts[0].StartedAt != "2026-09-21T14:13:20Z" || s.items()[0].CollectionRef != "acme/widgets" {
+	if len(parts) != 1 || parts[0].Part != 1 || !parts[0].Complete || parts[0].StartedAt != "2026-09-21T14:13:20Z" || s.items()[0].CollectionRef != widgetsRef {
 		t.Errorf("parts %+v", parts)
 	}
 	cs := s.comments()
-	if len(cs) != 1 || cs[0].ItemRef != "acme/widgets#1" || len(cs[0].Comments) != 1 || cs[0].Comments[0].Ref != "12" || cs[0].Complete != nil {
+	if len(cs) != 1 || cs[0].ItemRef != "1296269#1" || len(cs[0].Comments) != 1 || cs[0].Comments[0].Ref != "12" || cs[0].Complete != nil {
 		t.Errorf("comments %+v", cs)
 	}
 	if len(logs) != 0 {
 		t.Errorf("logged %v", logs)
+	}
+}
+
+// TestTheOpenListingRefsByTheRepositorysID lists open issues and checks the query asks
+// GraphQL for the repository's id, the collection's ref and every item's are that id,
+// "<id>#<n>", the comments on an item are read through /repositories/{id} and sent on
+// "<id>#<n>", and the item's URL and target's path still name the repository as GitHub
+// does. A repository GraphQL answers without an id, or with another, is not the one the
+// listing is for: the listing fails, with an error that is not ErrRepositoryGone, so a
+// later listing tries again, and sends nothing.
+func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
+	if !strings.Contains(openIssuesQuery, "databaseId") {
+		t.Error("the query does not ask for the repository's id")
+	}
+	g := &fakeGraphQL{
+		fakeIssues: &fakeIssues{comments: map[int][]map[string]any{2: {comment(21, "bob", "User", "Same here.")}}},
+		nodes:      []map[string]any{node(1, 0), node(2, 1)},
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
+		t.Fatal(err)
+	}
+	items := s.items()
+	if len(items) != 1 || items[0].CollectionRef != "1296269" || len(items[0].Items) != 2 {
+		t.Fatalf("items %+v", items)
+	}
+	for i, it := range items[0].Items {
+		n := strconv.Itoa(i + 1)
+		if it.Ref != "1296269#"+n || it.URL != "https://github.com/acme/widgets/issues/"+n || it.Target == nil || it.Target.Path != "acme/widgets" {
+			t.Errorf("item %+v", it)
+		}
+	}
+	cs := s.comments()
+	if len(cs) != 1 || cs[0].ItemRef != "1296269#2" || len(cs[0].Comments) != 1 || cs[0].Comments[0].Ref != "21" {
+		t.Errorf("comments %+v", cs)
+	}
+	if want := []string{"POST /graphql", "/repositories/1296269/issues/2/comments?per_page=100"}; !reflect.DeepEqual(g.requested(), want) {
+		t.Errorf("requested %v", g.requested())
+	}
+
+	for name, g := range map[string]*fakeGraphQL{
+		"no id":      {nodes: []map[string]any{node(1, 0)}, noDatabaseID: true},
+		"another id": {nodes: []map[string]any{node(1, 0)}, databaseID: gadgetsID},
+	} {
+		s = &sink{}
+		l, _ = g.lister(t, s, &logs)
+		err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets)
+		if err == nil || err.Error() != "listing the open issues of acme/widgets: GitHub answers a repository whose id is not 1296269, or no id; it may have been renamed or transferred since its name was read, so a later listing reads it again" || errors.Is(err, ErrRepositoryGone) || len(s.reqs) != 0 {
+			t.Errorf("%s: %v, sent %+v", name, err, s.reqs)
+		}
+		if !reflect.DeepEqual(g.requested(), []string{"POST /graphql"}) {
+			t.Errorf("%s: requested %v", name, g.requested())
+		}
+	}
+}
+
+// TestARepositoryNamedOtherwiseWithItsIDIsListed has GraphQL name the repository
+// otherwise than the name asked for, from the first page and from the second, with its
+// id, and checks the listing lists it, complete, each item's target the name GraphQL
+// answered on its page, since the id, not the name, says it is the repository.
+func TestARepositoryNamedOtherwiseWithItsIDIsListed(t *testing.T) {
+	for _, tc := range []struct {
+		g     *fakeGraphQL
+		paths string
+	}{
+		{&fakeGraphQL{nodes: []map[string]any{node(1, 0), node(2, 0), node(3, 0)}, name: "acme/gadgets"}, "acme/gadgets acme/gadgets acme/gadgets"},
+		{&fakeGraphQL{nodes: []map[string]any{node(1, 0), node(2, 0), node(3, 0)}, renameOn: 2}, "acme/widgets acme/widgets acme/gadgets"},
+	} {
+		s := &sink{}
+		var logs []string
+		l, _ := tc.g.lister(t, s, &logs)
+		if err := l.listOpenComplete(context.Background(), widgetsID, widgets, 2); err != nil {
+			t.Fatal(err)
+		}
+		refs, parts := sentParts(s)
+		var paths []string
+		for _, req := range s.items() {
+			for _, it := range req.Items {
+				paths = append(paths, it.Target.Path)
+			}
+		}
+		if strings.Join(refs, " ") != "1296269#1 1296269#2 1296269#3" || strings.Join(paths, " ") != tc.paths || !parts[len(parts)-1].Complete {
+			t.Errorf("refs %v, paths %v, parts %+v", refs, paths, parts)
+		}
 	}
 }
 
@@ -317,7 +423,7 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 // lacks REST's [bot], an author GitHub no longer has, a closed issue's reason, and a
 // time with an offset.
 func TestAGraphQLIssueMapsAsRESTsDoes(t *testing.T) {
-	r := ghRepo{FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
+	r := ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}
 	rest := ghIssue{
 		Number: 42, Title: "Widgets spin backwards", Body: str("They should not."), State: "open",
 		HTMLURL: "https://github.com/acme/widgets/issues/42", Labels: []ghLabel{{"bug"}, {"good first issue"}},
@@ -410,7 +516,7 @@ func TestTheCompleteListingIsSentInPartsOfAHundredItemsAndAMebibyte(t *testing.T
 		s := &sink{}
 		var logs []string
 		l, _ := g.lister(t, s, &logs)
-		if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+		if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 			t.Fatal(err)
 		}
 		items := s.items()
@@ -455,21 +561,21 @@ func TestASkippedItemLeavesTheListingNotComplete(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	refs, parts := sentParts(s)
-	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#3" || len(parts) != 1 || parts[0].Complete {
+	if strings.Join(refs, " ") != "1296269#1 1296269#3" || len(parts) != 1 || parts[0].Complete {
 		t.Errorf("items %v, parts %+v", refs, parts)
 	}
-	if strings.Join(logs, "\n") != "skipped the item acme/widgets#2: its title is empty" {
+	if strings.Join(logs, "\n") != "skipped the item 1296269#2: its title is empty" {
 		t.Errorf("logged %v", logs)
 	}
 
 	g = &fakeGraphQL{nodes: []map[string]any{empty}}
 	s = &sink{}
 	l, _ = g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil || len(s.reqs) != 0 {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil || len(s.reqs) != 0 {
 		t.Errorf("one item skipped: err %v, requests %+v", err, s.reqs)
 	}
 
@@ -483,7 +589,7 @@ func TestASkippedItemLeavesTheListingNotComplete(t *testing.T) {
 		s := &sink{}
 		var logs []string
 		l, _ := g.lister(t, s, &logs)
-		err := l.listOpenComplete(context.Background(), widgets, 1)
+		err := l.listOpenComplete(context.Background(), widgetsID, widgets, 1)
 		refs, parts := sentParts(s)
 		if err != nil || len(s.reqs) != 1 || len(refs) != 0 || len(parts) != 1 || parts[0].Part != 1 || !parts[0].Complete || s.items()[0].Items == nil {
 			t.Errorf("%s: err %v, requests %+v", name, err, s.reqs)
@@ -521,7 +627,10 @@ func TestAnEmptyListingThatFailsSendsNothing(t *testing.T) {
 		{name: "GraphQL's errors on the first page", g: &fakeGraphQL{errorOn: 1}},
 		{name: "a rate limit that holds on the first page", g: &fakeGraphQL{limited: 5}},
 		{name: "the repository not found", g: &fakeGraphQL{notFound: true}},
-		{name: "the repository renamed", g: &fakeGraphQL{name: "acme/gadgets"}},
+		{name: "the repository answered as null", g: &fakeGraphQL{nullRepository: true}},
+		{name: "another repository by that name", g: &fakeGraphQL{name: "acme/gadgets", databaseID: gadgetsID}},
+		{name: "the repository without an id", g: &fakeGraphQL{noDatabaseID: true}},
+		{name: "another repository's id on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, otherIDOn: 2}},
 		{name: "the context cancelled on the first page", g: &fakeGraphQL{}, ctx: cancelOn(1)},
 		{name: "a status on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, statusOn: 2, status: 502}},
 		{name: "GraphQL's errors on the second page", g: &fakeGraphQL{nodes: pages(), closedToo: true, errorOn: 2}},
@@ -537,7 +646,7 @@ func TestAnEmptyListingThatFailsSendsNothing(t *testing.T) {
 		if tc.ctx != nil {
 			ctx = tc.ctx(tc.g)
 		}
-		if err := l.listOpenComplete(ctx, widgets, 1); err == nil || len(s.reqs) != 0 {
+		if err := l.listOpenComplete(ctx, widgetsID, widgets, 1); err == nil || len(s.reqs) != 0 {
 			t.Errorf("%s: err %v, requests %+v", tc.name, err, s.reqs)
 		}
 	}
@@ -552,6 +661,8 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 		return []map[string]any{node(1, 0), node(2, 0), node(3, 0), node(4, 0), node(5, 0)}
 	}
 	const what = "listing the open issues of acme/widgets: "
+	const otherID = "GitHub answers a repository whose id is not 1296269, or no id; it may have been renamed or transferred since its name was read, so a later listing reads it again"
+	const noneByName = "GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again"
 	for _, tc := range []struct {
 		name  string
 		g     *fakeGraphQL
@@ -563,9 +674,11 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 		{"a GraphQL error", &fakeGraphQL{nodes: five(), errorOn: 2}, what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", false, "1 2", 2},
 		{"a GraphQL error on the first page", &fakeGraphQL{nodes: five(), errorOn: 1}, what + "GitHub answered 2 errors, the first SERVICE_UNAVAILABLE: Something went wrong while executing your query.", false, "", 1},
 		{"a status", &fakeGraphQL{nodes: five(), statusOn: 3, status: 502}, what + "GitHub answered 502: Bad credentials", false, "1 2 3 4", 3},
-		{"the repository not found", &fakeGraphQL{nodes: five(), notFound: true}, "the repository is deleted, moved or out of the App's reach: " + what + "GitHub answered: Could not resolve to a Repository with the name 'acme/widgets'.", true, "", 1},
-		{"the repository renamed", &fakeGraphQL{nodes: five(), name: "acme/gadgets"}, "the repository is deleted, moved or out of the App's reach: " + what + "GitHub names the repository acme/gadgets", true, "", 1},
-		{"the repository renamed while it is listed", &fakeGraphQL{nodes: five(), renameOn: 2}, "the repository is deleted, moved or out of the App's reach: " + what + "GitHub names the repository acme/gadgets", true, "1 2", 2},
+		{"the repository not found", &fakeGraphQL{nodes: five(), notFound: true}, what + noneByName + "; GitHub answered: Could not resolve to a Repository with the name 'acme/widgets'.", false, "", 1},
+		{"the repository answered as null", &fakeGraphQL{nodes: five(), nullRepository: true}, what + noneByName, false, "", 1},
+		{"another repository by that name", &fakeGraphQL{nodes: five(), name: "acme/gadgets", databaseID: gadgetsID}, what + otherID, false, "", 1},
+		{"the repository without an id", &fakeGraphQL{nodes: five(), noDatabaseID: true}, what + otherID, false, "", 1},
+		{"another repository's id while it is listed", &fakeGraphQL{nodes: five(), otherIDOn: 2}, what + otherID, false, "1 2", 2},
 		{"a cursor repeated", &fakeGraphQL{nodes: five(), sameCursor: true}, what + "GitHub's next cursor repeats one already read", false, "1 2", 2},
 		{"no cursor", &fakeGraphQL{nodes: five(), noCursor: true}, what + "GitHub says there is a next page and names no cursor for it", false, "", 1},
 		{"an issue as null", &fakeGraphQL{nodes: five(), nullNode: true}, what + "GitHub answered an issue as null", false, "", 1},
@@ -573,12 +686,12 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 		s := &sink{}
 		var logs []string
 		l, _ := tc.g.lister(t, s, &logs)
-		err := l.listOpenComplete(context.Background(), widgets, 2)
+		err := l.listOpenComplete(context.Background(), widgetsID, widgets, 2)
 		if err == nil || err.Error() != tc.err || errors.Is(err, ErrRepositoryGone) != tc.gone {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
 		refs, parts := sentParts(s)
-		got := strings.ReplaceAll(strings.Join(refs, " "), "acme/widgets#", "")
+		got := strings.ReplaceAll(strings.Join(refs, " "), "1296269#", "")
 		if got != tc.sent || len(tc.g.vars) != tc.pages {
 			t.Errorf("%s: sent %q, %d pages", tc.name, got, len(tc.g.vars))
 		}
@@ -592,7 +705,7 @@ func TestTheCompleteListingFailsOnWhatItCannotTrust(t *testing.T) {
 	g := &fakeGraphQL{nodes: five(), statusOn: 1, status: 401}
 	var logs []string
 	l, _ := g.lister(t, &sink{}, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); !Unauthorized(err) {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); !Unauthorized(err) {
 		t.Errorf("err %v", err)
 	}
 }
@@ -616,7 +729,7 @@ func TestARateLimitInGraphQLsAnswerIsWaitedOut(t *testing.T) {
 		s := &sink{}
 		var logs []string
 		l, clock := tc.g.lister(t, s, &logs)
-		err := l.ListOpenIssuesComplete(context.Background(), widgets)
+		err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets)
 		if (err == nil) != (tc.err == "") || (err != nil && err.Error() != tc.err) {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
@@ -639,7 +752,7 @@ func TestTheCompleteListingReadsABoundedNumberOfPages(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	err := l.listOpenComplete(context.Background(), widgets, 1)
+	err := l.listOpenComplete(context.Background(), widgetsID, widgets, 1)
 	if err == nil || err.Error() != "listing the open issues of acme/widgets: GitHub has more than 2000 pages, which a listing never reads" || len(g.vars) != 2000 {
 		t.Errorf("err %v, %d pages", err, len(g.vars))
 	}
@@ -693,14 +806,14 @@ func TestTheCompleteListingReadsCommentsWhereThereAreAny(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"POST /graphql",
-		"/repos/acme/widgets/issues/1/comments?per_page=100",
-		"/repos/acme/widgets/issues/1/comments?page=2&per_page=100",
-		"/repos/acme/widgets/issues/6/comments?per_page=100",
+		"/repositories/1296269/issues/1/comments?per_page=100",
+		"/repositories/1296269/issues/1/comments?page=2&per_page=100",
+		"/repositories/1296269/issues/6/comments?per_page=100",
 	}
 	if got := g.requested(); !reflect.DeepEqual(got, want) {
 		t.Errorf("requested\n%v\nwant\n%v", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -711,7 +824,7 @@ func TestTheCompleteListingReadsCommentsWhereThereAreAny(t *testing.T) {
 		}
 	}
 	refs, parts := sentParts(s)
-	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#2 acme/widgets#6" || len(parts) != 1 || !parts[0].Complete {
+	if strings.Join(refs, " ") != "1296269#1 1296269#2 1296269#6" || len(parts) != 1 || !parts[0].Complete {
 		t.Errorf("items %v, parts %+v", refs, parts)
 	}
 	// #6 has only the work item comment, so nothing is sent for it.
@@ -723,7 +836,7 @@ func TestTheCompleteListingReadsCommentsWhereThereAreAny(t *testing.T) {
 	for _, c := range cs[0].Comments {
 		got = append(got, c.Ref+" "+c.Author.Name+" "+c.Author.Kind)
 	}
-	if cs[0].ItemRef != "acme/widgets#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
+	if cs[0].ItemRef != "1296269#1" || strings.Join(got, ", ") != "12 bob person, 13 dependabot[bot] automation" || cs[0].Complete != nil {
 		t.Errorf("comments on #1: %+v, %v", cs[0], got)
 	}
 	if _, ok := s.reqs[0].(contracts.SourceItems); !ok {
@@ -745,7 +858,7 @@ func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	cs := s.comments()
@@ -771,7 +884,7 @@ func TestCommentsGoInRequestsOfAHundred(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	var sizes []int
@@ -802,11 +915,11 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	refs, parts := sentParts(s)
-	if strings.Join(refs, " ") != "acme/widgets#1 acme/widgets#6" || len(parts) != 1 || parts[0].Complete {
+	if strings.Join(refs, " ") != "1296269#1 1296269#6" || len(parts) != 1 || parts[0].Complete {
 		t.Errorf("items %v, parts %+v", refs, parts)
 	}
 	cs := s.comments()
@@ -814,9 +927,9 @@ func TestWhatQoryApiaryWouldRefuseIsSkippedAndLoggedByRef(t *testing.T) {
 		t.Errorf("comments %+v", cs)
 	}
 	want := []string{
-		"skipped the item acme/widgets#3: its title is empty",
-		"skipped the item acme/widgets#5: its URL is not https or is longer than 2048 characters",
-		"skipped the comment 10 on acme/widgets#1: its URL is not https or is longer than 2048 characters",
+		"skipped the item 1296269#3: its title is empty",
+		"skipped the item 1296269#5: its URL is not https or is longer than 2048 characters",
+		"skipped the comment 10 on 1296269#1: its URL is not https or is longer than 2048 characters",
 	}
 	if !reflect.DeepEqual(logs, want) {
 		t.Errorf("logged\n%s", strings.Join(logs, "\n"))
@@ -855,16 +968,16 @@ func TestATextPastItsLimitIsCutToIt(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	wantLogs := []string{
-		"cut the body of acme/widgets#2, 70000 long, to the contract's limit",
-		"cut the title of acme/widgets#3, 1030 long, to the contract's limit",
-		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
-		"cut the label of acme/widgets#4, 101 long, to the contract's limit",
-		"cut the labels of acme/widgets#4, 125 long, to the contract's limit",
-		"cut the filed_by.name of acme/widgets#5, 300 long, to the contract's limit",
+		"cut the body of 1296269#2, 70000 long, to the contract's limit",
+		"cut the title of 1296269#3, 1030 long, to the contract's limit",
+		"cut the label of 1296269#4, 101 long, to the contract's limit",
+		"cut the label of 1296269#4, 101 long, to the contract's limit",
+		"cut the labels of 1296269#4, 125 long, to the contract's limit",
+		"cut the filed_by.name of 1296269#5, 300 long, to the contract's limit",
 		"cut the author.name of 20, 300 long, to the contract's limit",
 		"cut the body of 20, 70000 long, to the contract's limit",
 	}
@@ -934,7 +1047,7 @@ func TestACompleteListingStoppedEarlyNeverSaysComplete(t *testing.T) {
 		{name: "a rate limit that holds after two parts", g: &fakeGraphQL{nodes: many(250, 0), limited: 5, limitFrom: 3}, err: what + "GitHub answered an error, RATE_LIMITED: API rate limit exceeded", parts: []int{100, 100}},
 		{name: "a rate limit that holds on the second page", g: &fakeGraphQL{nodes: many(150, 0), limited: 5, limitFrom: 2}, err: what + "GitHub answered an error, RATE_LIMITED: API rate limit exceeded", parts: []int{100}},
 		{name: "Qory Apiary fails a part", g: &fakeGraphQL{nodes: many(150, 0)}, sink: &sink{failAt: 1}, err: "Qory Apiary is not reachable", parts: []int{100}},
-		{name: "comments fail before the last part", g: &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: twoComments, failComments: 2}, nodes: many(150, 1)}, err: "listing the comments on acme/widgets#1: GitHub answered 500: Server Error", parts: []int{100}},
+		{name: "comments fail before the last part", g: &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: twoComments, failComments: 2}, nodes: many(150, 1)}, err: "listing the comments on 1296269#1: GitHub answered 500: Server Error", parts: []int{100}},
 		{name: "a context cancelled", g: &fakeGraphQL{nodes: many(150, 0)}, ctx: func(g *fakeGraphQL) (context.Context, context.CancelFunc) {
 			ctx, cancel := context.WithCancel(context.Background())
 			g.onPage = func(page int, r *http.Request) {
@@ -972,7 +1085,7 @@ func TestACompleteListingStoppedEarlyNeverSaysComplete(t *testing.T) {
 		if tc.ctx != nil {
 			ctx, cancel = tc.ctx(tc.g)
 		}
-		err := l.ListOpenIssuesComplete(ctx, widgets)
+		err := l.ListOpenIssuesComplete(ctx, widgetsID, widgets)
 		cancel()
 		if err == nil || tc.err != "" && err.Error() != tc.err || tc.is != nil && !errors.Is(err, tc.is) {
 			t.Errorf("%s: err %v", tc.name, err)
@@ -1004,8 +1117,8 @@ func TestCommentsThatFailAfterTheLastPartLeaveItAsSent(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	err := l.ListOpenIssuesComplete(context.Background(), widgets)
-	if err == nil || err.Error() != "listing the comments on acme/widgets#1: GitHub answered 500: Server Error" {
+	err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets)
+	if err == nil || err.Error() != "listing the comments on 1296269#1: GitHub answered 500: Server Error" {
 		t.Errorf("err %v", err)
 	}
 	if _, parts := sentParts(s); len(s.reqs) != 1 || len(parts) != 1 || !parts[0].Complete {
@@ -1027,13 +1140,13 @@ func TestAnItemsCommentsAreReadInABoundedNumberOfPages(t *testing.T) {
 		err      string
 		requests int
 	}{
-		{"a hundred pages", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments}, nodes: many(1, 101)}, "listing the comments on acme/widgets#1: GitHub has more than 100 pages, which a listing never reads", 1 + 100},
-		{"a repeated page", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments, again: true}, nodes: many(1, 101)}, "listing the comments on acme/widgets#1: GitHub's next page repeats one already read", 1 + 1},
+		{"a hundred pages", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments}, nodes: many(1, 101)}, "listing the comments on 1296269#1: GitHub has more than 100 pages, which a listing never reads", 1 + 100},
+		{"a repeated page", &fakeGraphQL{fakeIssues: &fakeIssues{pageSize: 1, comments: manyComments, again: true}, nodes: many(1, 101)}, "listing the comments on 1296269#1: GitHub's next page repeats one already read", 1 + 1},
 	} {
 		s := &sink{}
 		var logs []string
 		l, _ := tc.g.lister(t, s, &logs)
-		err := l.ListOpenIssuesComplete(context.Background(), widgets)
+		err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets)
 		if err == nil || err.Error() != tc.err || len(tc.g.requested()) != tc.requests {
 			t.Errorf("%s: err %v, %d requests", tc.name, err, len(tc.g.requested()))
 		}
@@ -1052,21 +1165,21 @@ func TestAnIssueGoneWhileListedLosesOnlyItsComments(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l, _ := g.lister(t, s, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err != nil {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
 		t.Fatal(err)
 	}
 	refs, parts := sentParts(s)
 	comments := 0
 	for _, req := range s.comments() {
 		comments += len(req.Comments)
-		if req.ItemRef == "acme/widgets#1" {
+		if req.ItemRef == "1296269#1" {
 			t.Errorf("comments sent on the issue gone")
 		}
 	}
 	if len(refs) != 150 || comments != 149 || len(parts) != 2 || !parts[1].Complete {
 		t.Errorf("%d items, %d comments, parts %+v", len(refs), comments, parts)
 	}
-	if !reflect.DeepEqual(logs, []string{"skipped the comments on acme/widgets#1: GitHub answers that the issue is gone or moved"}) {
+	if !reflect.DeepEqual(logs, []string{"skipped the comments on 1296269#1: GitHub answers that the issue is gone or moved"}) {
 		t.Errorf("logged %v", logs)
 	}
 }
@@ -1081,12 +1194,12 @@ func TestAMintsNotFoundIsNotARepositoryGone(t *testing.T) {
 	l.Token = func(context.Context) (string, error) {
 		return "", &answerError{what: "minting the installation token", status: 404, message: "Not Found"}
 	}
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
 		t.Errorf("a mint's 404: err %v", err)
 	}
 	g = &fakeGraphQL{nodes: many(1, 0), statusOn: 1, status: 404}
 	l, _ = g.lister(t, &sink{}, &logs)
-	if err := l.ListOpenIssuesComplete(context.Background(), widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err == nil || errors.Is(err, ErrRepositoryGone) {
 		t.Errorf("a 404: err %v", err)
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,10 +20,10 @@ import (
 //     id, with the connection it is linked to and whether that connection is made, see
 //     [link]. Only a linked installation's deliveries are handled.
 //   - collections: a collection, a repository, that Qory Apiary linked to a workspace,
-//     by its ref in lower case, set from the change feed. Only a linked collection's
-//     items and comments are sent.
-//   - repositories: the installation that reaches a repository, by its ref in lower
-//     case, with the ref as GitHub writes it, set by each listing of an installation's
+//     by its ref, the repository's id, set from the change feed. Only a linked
+//     collection's items and comments are sent.
+//   - repositories: the installation that reaches a repository, by its ref, the
+//     repository's id, with the ref, set by each listing of an installation's
 //     repositories. The installation's link names the connection the repository's
 //     collection belongs to.
 //   - adapter: the instance id, the change feed's cursor and the sync interval.
@@ -38,8 +37,7 @@ import (
 //   - connections_passes: the expiry of the newest pass a linked connect return was
 //     minted under, by the connection's id, see [keepPass].
 //   - pulls: when the last pull of a collection that finished without error began, and
-//     when its last listing of open issues began, by its ref in lower case, see
-//     [pullMark].
+//     when its last listing of open issues began, by its ref, see [pullMark].
 const (
 	nsInstallations = "installations"
 	nsCollections   = "collections"
@@ -406,9 +404,10 @@ func present(_ []byte, err error) (bool, error) {
 	return err == nil, err
 }
 
-// collectionKey is a collection's key: its ref in lower case, since GitHub's owners
-// and names are the same in any case.
-func collectionKey(ref string) string { return strings.ToLower(ref) }
+// collectionKey is a collection's key: its ref, the repository's id in decimal, which
+// GitHub never gives another repository and which has one spelling. The factory is in
+// use nowhere yet, so no record keyed by a repository's owner/name is carried over.
+func collectionKey(ref string) string { return ref }
 
 // The moments of the links this process stores. A request to Qory Apiary that is
 // answered 409 collection_not_linked may have begun before the change feed unlinked
@@ -466,7 +465,7 @@ func collectionLinked(st *store.Store, ref string) (bool, error) {
 }
 
 // reach is what the store keeps of a repository: the installation that reaches it, and
-// its ref as GitHub writes it.
+// its ref, the repository's id.
 type reach struct {
 	Installation int64  `json:"installation"`
 	Ref          string `json:"ref"`

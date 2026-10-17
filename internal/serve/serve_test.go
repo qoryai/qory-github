@@ -739,7 +739,7 @@ func TestAnOutageIsTriedForADay(t *testing.T) {
 // the error of its last part is permanent only when both are.
 func TestAJoinedErrorIsPermanentOnlyWhenEveryPartIs(t *testing.T) {
 	transient := errors.New("listing the open issues of acme/widgets: GitHub answered 502: Bad Gateway")
-	refused := Permanent(errors.New("sending the items of acme/widgets: Qory Apiary answered 409 collection_not_linked"))
+	refused := Permanent(errors.New("sending the items of " + widgetsRef + ": Qory Apiary answered 409 collection_not_linked"))
 	for err, want := range map[error]bool{
 		errors.Join(transient, refused):                                      false,
 		errors.Join(refused, transient):                                      false,

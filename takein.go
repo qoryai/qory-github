@@ -18,8 +18,8 @@ import (
 type Change struct {
 	// WorkItemID is the work item's id in Qory Apiary, such as wi_42.
 	WorkItemID string `json:"work_item_id"`
-	// Ref is the item ref the adapter sent Qory Apiary for the issue,
-	// owner/name#number.
+	// Ref is the item ref the adapter sent Qory Apiary for the issue: the repository's
+	// id, #, and the issue's number, see [ParseItemRef].
 	Ref string `json:"ref"`
 	// Status is [StatusTakenIn] or [StatusUndone]; any other is not acted on.
 	Status string `json:"status"`
@@ -40,9 +40,10 @@ const (
 	takeInLabelColor = "6E56CF"
 )
 
-// TokenFunc returns an installation token that may write the issues of repo, that one
-// repository, with issues: write. Its error never contains a token.
-type TokenFunc func(ctx context.Context, repo Repository) (string, error)
+// TokenFunc returns an installation token that may write the issues of the repository
+// whose id is repository, that one repository, with issues: write. Its error never
+// contains a token.
+type TokenFunc func(ctx context.Context, repository int64) (string, error)
 
 // ErrIssueGone is what [Client.ApplyChange] wraps when GitHub answers 404 or 410 for the
 // issue of a take in: the issue was deleted, or the App no longer reaches it. Asking
@@ -51,8 +52,8 @@ var ErrIssueGone = errors.New("the issue is deleted or out of the App's reach")
 
 // ErrUnreachable is what [Client.ApplyChange] wraps when GitHub's answer says the App
 // cannot write the change where it asked to: a 404 for the repository when the label is
-// created, a permanent redirect, 301 or 308, for a repository that moved or an issue
-// that was transferred, which is never followed, or a 403 that is no rate limit when
+// created, a permanent redirect, 301 or 308, as for an issue that was transferred, which
+// is never followed, or a 403 that is no rate limit when
 // the label is added to the issue or the comment posted. Asking again would get the
 // same answer, so a caller drops the change instead of retrying it.
 var ErrUnreachable = errors.New("the repository or issue moved, or the App cannot write it")
@@ -77,9 +78,6 @@ var (
 	// yet, so this is a bounded shape that keeps the comment's marker one line and
 	// closes it where it should.
 	workItemIDShape = regexp.MustCompile(`^wi_[A-Za-z0-9_-]{1,64}$`)
-	// issueNumberShape is an issue's number: positive, decimal, without a sign or
-	// leading zero, and small enough for an int64.
-	issueNumberShape = regexp.MustCompile(`^[1-9][0-9]{0,17}$`)
 	// changeURLShape is a work item's URL in the characters RFC 3986 allows in a URI,
 	// which leave out <, >, ", `, \, {, }, |, ^, spaces, control characters and every
 	// character outside ASCII, with every % the start of an escape.
@@ -106,33 +104,32 @@ const maxChangeURL = 2048
 // a second time.
 const maxMarkerPages = 100
 
-// issueRef is the issue a change refers to.
+// issueRef is the issue a change refers to: its repository's id and its number.
 type issueRef struct {
-	repo   Repository
-	number int64
+	repository int64
+	number     int64
+}
+
+// repoPath is the repository's path in GitHub's API, by its id: /repositories/{id},
+// under which GitHub's API answers as it does under /repos/{owner}/{name}.
+func (i issueRef) repoPath() string {
+	return "/repositories/" + strconv.FormatInt(i.repository, 10)
 }
 
 // path is the issue's path in GitHub's API.
 func (i issueRef) path() string {
-	return "/repos/" + i.repo.String() + "/issues/" + strconv.FormatInt(i.number, 10)
+	return i.repoPath() + "/issues/" + strconv.FormatInt(i.number, 10)
 }
 
-// parseChange checks a change before anything is sent: its ref is owner/name#number by
-// GitHub's rules for owners and names and with a positive number, its work item id has
-// the shape of one, and its URL is https, at most 2,048 characters of RFC 3986, and has
-// no user. The errors name the rule, never the value.
+// parseChange checks a change before anything is sent: its ref is an item's ref, the
+// repository's id, #, and the issue's number, each decimal digits alone with no sign and
+// no leading zero, see [ParseItemRef], so no path is built from any other text; its work
+// item id has the shape of one, and its URL is https, at most 2,048 characters of RFC
+// 3986, and has no user. The errors name the rule, never the value.
 func parseChange(e Change) (issueRef, error) {
-	repoPart, number, ok := strings.Cut(e.Ref, "#")
-	if !ok || !issueNumberShape.MatchString(number) {
-		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
-	}
-	repos, err := ParseRepositories(repoPart)
-	if err != nil || len(repos) != 1 {
-		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
-	}
-	n, err := strconv.ParseInt(number, 10, 64)
-	if err != nil {
-		return issueRef{}, invalidChange("the change's ref is not owner/name#number")
+	repository, number, ok := ParseItemRef(e.Ref)
+	if !ok {
+		return issueRef{}, invalidChange("the change's ref is not a repository's id, #, and an issue's number")
 	}
 	if !workItemIDShape.MatchString(e.WorkItemID) {
 		return issueRef{}, invalidChange("the change's work_item_id is not wi_ and 1 to 64 letters, digits, underscores or hyphens")
@@ -140,7 +137,7 @@ func parseChange(e Change) (issueRef, error) {
 	if err := checkChangeURL(e.URL); err != nil {
 		return issueRef{}, err
 	}
-	return issueRef{repo: repos[0], number: n}, nil
+	return issueRef{repository: repository, number: number}, nil
 }
 
 // checkChangeURL takes a work item's URL: https with a host, at most 2,048 characters,
@@ -169,7 +166,9 @@ func marker(workItemID string) string {
 // ApplyChange writes on GitHub what one entry of Qory Apiary's change feed says about an
 // issue, with a token token returns for the issue's repository, each request paced by p,
 // the installation's [Pacer], or a new Pacer when p is nil. slug is the App's slug:
-// only a comment by its bot, slug[bot], counts as the one a take in posted.
+// only a comment by its bot, slug[bot], counts as the one a take in posted. Each
+// request reaches the repository through the id the change's ref names,
+// /repositories/{id}, so no request asks for its owner/name first.
 //
 // The change is checked before anything is sent, see [Change], and refused whole when it
 // fails. On [StatusTakenIn] it creates the label qory in the repository when it is
@@ -204,12 +203,12 @@ func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug
 	if token == nil {
 		return errors.New("no token function")
 	}
-	tok, err := token(ctx, issue.repo)
+	tok, err := token(ctx, issue.repository)
 	if err != nil {
-		return fmt.Errorf("the installation token for %s: %w", issue.repo, err)
+		return fmt.Errorf("the installation token for the repository %d: %w", issue.repository, err)
 	}
 	if tok == "" {
-		return fmt.Errorf("the installation token for %s is empty", issue.repo)
+		return fmt.Errorf("the installation token for the repository %d is empty", issue.repository)
 	}
 	if p == nil {
 		p = &Pacer{}
@@ -225,7 +224,7 @@ func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug
 func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, e Change) error {
 	const creating = "creating the label " + takeInLabel
 	label := map[string]string{"name": takeInLabel, "color": takeInLabelColor}
-	a, err := c.send(ctx, p, false, creating, http.MethodPost, "/repos/"+issue.repo.String()+"/labels", tok, label)
+	a, err := c.send(ctx, p, false, creating, http.MethodPost, issue.repoPath()+"/labels", tok, label)
 	if err != nil {
 		return err
 	}

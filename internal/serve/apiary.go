@@ -207,9 +207,9 @@ func (a *Apiary) Items(ctx context.Context, req contracts.SourceItems) error {
 	return a.post(ctx, "sending the items of "+req.CollectionRef, routeItems, req.CollectionRef, "", func(t string) any { req.Time = t; return req })
 }
 
-// Comments sends POST /v1/source-items/comments. An item's ref is owner/name#number, so
-// its collection is the part before #, which [Apiary.Unlinked] is called with as
-// [Apiary.Items] calls it.
+// Comments sends POST /v1/source-items/comments. An item's ref is the repository's id,
+// #, and the issue's number, so its collection is the part before #, which
+// [Apiary.Unlinked] is called with as [Apiary.Items] calls it.
 func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments) error {
 	collection, _, _ := strings.Cut(req.ItemRef, "#")
 	return a.post(ctx, "sending the comments on "+req.ItemRef, routeComments, collection, "", func(t string) any { req.Time = t; return req })

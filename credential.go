@@ -148,6 +148,11 @@ type Request struct {
 	InstallationID int64
 	// Repositories are what the token covers, one owner's.
 	Repositories []Repository
+	// RepositoryIDs are what the token covers too, by GitHub's ids of the repositories,
+	// which GitHub's mint takes as repository_ids: [Client.MintInstallationToken] reads
+	// them, for a repository the adapter knows by its id alone, and [Client.Mint] does
+	// not, so a run's token covers the repositories named and no other.
+	RepositoryIDs []int64
 	// Permissions are what the token may do; nil is [DefaultPermissions].
 	Permissions map[string]string
 }

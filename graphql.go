@@ -31,9 +31,11 @@ const openIssuesPerPage = 100
 
 // openIssuesQuery reads one page of a repository's open issues, oldest first, the page
 // after the cursor $after, or the first page when it is null. It names the repository
-// too, as GitHub has it, so a renamed or transferred one is known.
+// too, as GitHub has it, and its id, which must be the id the listing is for, and which
+// the refs of its collection and its items are.
 const openIssuesQuery = `query($owner: String!, $name: String!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
+    databaseId
     nameWithOwner
     url
     issues(states: OPEN, first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -79,6 +81,7 @@ type (
 	gqlOpenIssues struct {
 		Data struct {
 			Repository *struct {
+				DatabaseID    int64  `json:"databaseId"`
 				NameWithOwner string `json:"nameWithOwner"`
 				URL           string `json:"url"`
 				Issues        struct {
@@ -128,10 +131,11 @@ func (g gqlIssue) issue() ghIssue {
 }
 
 // issuePager reads a repository's open issues by GraphQL's cursor, oldest first, one
-// page at a time.
+// page at a time: the repository whose id is id, by its owner/name, repo.
 type issuePager struct {
 	l     Lister
 	p     *Pacer
+	id    int64
 	repo  Repository
 	first int
 	what  string
@@ -141,22 +145,28 @@ type issuePager struct {
 	cursors map[string]bool
 	read    int
 	done    bool
-	// r is the repository as the first page named it.
+	// r is the repository as the last page named it.
 	r ghRepo
 }
 
-// issuePager starts reading the open issues of repo, first to a page.
-func (l Lister) issuePager(p *Pacer, repo Repository, first int) *issuePager {
-	return &issuePager{l: l, p: p, repo: repo, first: first, what: "listing the open issues of " + repo.String(), cursors: map[string]bool{}}
+// issuePager starts reading the open issues of the repository whose id is id, by its
+// owner/name, repo, first to a page.
+func (l Lister) issuePager(p *Pacer, id int64, repo Repository, first int) *issuePager {
+	return &issuePager{l: l, p: p, id: id, repo: repo, first: first, what: "listing the open issues of " + repo.String(), cursors: map[string]bool{}}
 }
 
 // next reads the next page: the repository as GitHub names it and the page's issues, or
 // false once the last page is read. A rate limit GitHub answers in the body is waited
 // out and the page asked for again, at most limitedTries times. It fails, and the
-// listing with it, for any error GraphQL answers, a repository it cannot resolve or that
-// is renamed or moved, which wraps [ErrRepositoryGone], an issue it answers as null, a
-// next cursor that is missing or repeats one already read, and a page past
-// maxIssuePages.
+// listing with it, for any error GraphQL answers, a repository it cannot resolve by
+// owner/name, a repository whose id is not the pager's or that has none, an issue it
+// answers as null, a next cursor that is missing or repeats one already read, and a page
+// past maxIssuePages. The id is checked on every page: owner/name may name another
+// repository, or none, by the time GraphQL reads it, as when a rename or a transfer
+// lands after the name was read by the id, and such a page is never taken for the
+// repository's. Neither error wraps [ErrRepositoryGone]: the read by the id, which a
+// rename or a transfer does not change, is what says the repository is gone, and a
+// later listing, which reads the name again, may list it.
 func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) {
 	if g.done {
 		return g.r, nil, false, nil
@@ -195,12 +205,9 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 		return g.r, nil, false, err
 	}
 	repo := got.Data.Repository
-	r := ghRepo{FullName: repo.NameWithOwner, HTMLURL: repo.URL}
-	switch {
-	case !strings.EqualFold(r.FullName, g.repo.String()):
-		return g.r, nil, false, fmt.Errorf("%w: %s: GitHub names the repository %s", ErrRepositoryGone, g.what, r.FullName)
-	case g.read > 0 && r != g.r:
-		return g.r, nil, false, fmt.Errorf("%w: %s: GitHub names the repository otherwise than on the first page", ErrRepositoryGone, g.what)
+	r := ghRepo{ID: repo.DatabaseID, FullName: repo.NameWithOwner, HTMLURL: repo.URL}
+	if r.ID != g.id {
+		return g.r, nil, false, fmt.Errorf("%s: GitHub answers a repository whose id is not %d, or no id; it may have been renamed or transferred since its name was read, so a later listing reads it again", g.what, g.id)
 	}
 	g.r = r
 	g.read++
@@ -227,14 +234,15 @@ func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) 
 	return g.r, issues, true, nil
 }
 
-// answered is the error GraphQL's answer says, or nil: a repository it cannot resolve,
-// or that it answers as null, wraps [ErrRepositoryGone]; any other error, a rate limit
-// that held among them, is the error of the page. Only GitHub's type and message are
-// said, never the query or the token.
+// answered is the error GraphQL's answer says, or nil: a repository it cannot resolve
+// by owner/name, or that it answers as null, is the race of a rename or a transfer
+// with the read of the name, see [issuePager.next], and wraps no [ErrRepositoryGone];
+// any other error, a rate limit that held among them, is the error of the page. Only
+// GitHub's type and message are said, never the query or the token.
 func (g *issuePager) answered(got gqlOpenIssues) error {
 	for _, e := range got.Errors {
 		if e.Type == "NOT_FOUND" && len(e.Path) > 0 && e.Path[0] == "repository" {
-			return fmt.Errorf("%w: %s: GitHub answered: %s", ErrRepositoryGone, g.what, e.Message)
+			return fmt.Errorf("%s: GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again; GitHub answered: %s", g.what, e.Message)
 		}
 	}
 	if len(got.Errors) > 0 {
@@ -245,7 +253,7 @@ func (g *issuePager) answered(got gqlOpenIssues) error {
 		return fmt.Errorf("%s: GitHub answered %d errors, the first %s: %s", g.what, len(got.Errors), orUntyped(e.Type), e.Message)
 	}
 	if got.Data.Repository == nil {
-		return fmt.Errorf("%w: %s: GitHub answered no repository", ErrRepositoryGone, g.what)
+		return fmt.Errorf("%s: GitHub answers no repository by that name; it may have been renamed or transferred since its name was read, so a later listing reads it again", g.what)
 	}
 	return nil
 }
@@ -270,10 +278,14 @@ func rateLimited(errs []gqlError) bool {
 
 // ListOpenIssuesComplete lists the repository's open issues by GraphQL's cursor, oldest
 // first, and their comments, and sends them to Qory Apiary; the fill and the daily
-// listing of open issues use it. Items go in parts of at most 100 items and 1 MiB, and
-// after each part the comments of its items, for an issue that has any, read by REST in
-// requests of at most 100 comments and 1 MiB, the App's work item comment left out. It
-// reads at most 2,000 pages of 100 issues, and 100 pages of an issue's comments.
+// listing of open issues use it. GraphQL names a repository by owner/name, repo, which
+// a read of /repositories/{id} gives, see [Lister.ReadRepository], and answers its id,
+// which must be repository, the id the listing is for, and which the refs of its
+// collection and its items are. Items go in parts of at most 100 items and 1 MiB, and
+// after each part the comments of its items, for an issue that has any, read by REST
+// through the repository's id in requests of at most 100 comments and 1 MiB, the App's
+// work item comment left out. It reads at most 2,000 pages of 100 issues, and 100 pages
+// of an issue's comments.
 //
 // The last part says the listing is complete, since paging by cursor does not skip an
 // issue, so Qory Apiary closes every item of the collection the listing left out and
@@ -289,16 +301,21 @@ func rateLimited(errs []gqlError) bool {
 // part before it; one that fails on its first page sends nothing. A listing that fails
 // on the comments of its last part's items, once that part is sent, returns the error,
 // and that part, sent already, says it is complete, since every open issue was read and
-// sent and comments are no part of complete. A repository GitHub answers it cannot
-// resolve, or names otherwise, renamed or transferred, stops the listing with an error
-// that wraps [ErrRepositoryGone]; an issue whose comments GitHub answers are gone has
-// its comments skipped and logged by its ref, and the listing goes on.
-func (l Lister) ListOpenIssuesComplete(ctx context.Context, repo Repository) error {
-	return l.listOpenComplete(ctx, repo, openIssuesPerPage)
+// sent and comments are no part of complete. A page that GraphQL answers with no
+// repository by owner/name, or with one whose id is not repository or that has none, as
+// when a rename or a transfer lands after the name was read, stops the listing with an
+// error that does not wrap [ErrRepositoryGone], so a later listing, which reads the
+// name again, lists it; when that is the first page, nothing is sent. An issue whose comments GitHub answers are gone has its
+// comments skipped and logged by its ref, and the listing goes on.
+func (l Lister) ListOpenIssuesComplete(ctx context.Context, repository int64, repo Repository) error {
+	return l.listOpenComplete(ctx, repository, repo, openIssuesPerPage)
 }
 
 // listOpenComplete is [Lister.ListOpenIssuesComplete], first issues to a page.
-func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int) error {
+func (l Lister) listOpenComplete(ctx context.Context, repository int64, repo Repository, first int) error {
+	if repository <= 0 {
+		return errors.New("the repository's id is not one")
+	}
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
 		return fmt.Errorf("%q is not owner/name", repo.String())
 	}
@@ -310,7 +327,7 @@ func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int
 	// complete listing left out and did not hear of since it started, so a later start
 	// would close an item that changed meanwhile.
 	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
-	g := l.issuePager(p, repo, first)
+	g := l.issuePager(p, repository, repo, first)
 	var o *openParts
 	for {
 		r, page, more, err := g.next(ctx)
@@ -328,7 +345,7 @@ func (l Lister) listOpenComplete(ctx context.Context, repo Repository, first int
 			if why := checkCollection(coll); why != "" {
 				return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
 			}
-			o = l.openParts(p, repo, listing, coll)
+			o = l.openParts(p, listing, coll)
 		}
 		for _, is := range page {
 			// An issue the listing returns as not open, one closed during the read say, is

@@ -1,6 +1,7 @@
 package github
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,12 +18,14 @@ import (
 	"github.com/qoryai/integrations/contracts"
 )
 
-// fakeChanged is GitHub's API as a pull reads it: acme/widgets, and its issues and its
-// comments as GitHub lists what changed: those updated at or after since, oldest first,
+// fakeChanged is GitHub's API as a pull reads it, through the repository's id,
+// /repositories/1296269: acme/widgets, and its issues and its comments as GitHub lists
+// what changed: those updated at or after since, oldest first,
 // in the order they were added within one second, per_page to a page, paged by number.
 // after, when set, is called with f.mu held after each page of issues or comments is
 // answered, with the path, as GitHub changes between two pages. gone answers the
-// repository 404. It records the requests it is asked for.
+// repository 404, status answers it with that status, and fullName is its full_name,
+// "" acme/widgets. It records the requests it is asked for, and their authorization.
 type fakeChanged struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
@@ -30,13 +33,17 @@ type fakeChanged struct {
 	comments []map[string]any
 	after    func(path string)
 	gone     bool
+	status   int
+	fullName string
 	paths    []string
+	auth     []string
 }
 
 func (f *fakeChanged) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.paths = append(f.paths, r.URL.RequestURI())
+	f.auth = append(f.auth, r.Header.Get("Authorization"))
 	w.Header().Set("Content-Type", "application/json")
 	serve := func(all []map[string]any) {
 		q := r.URL.Query()
@@ -65,16 +72,22 @@ func (f *fakeChanged) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch r.URL.Path {
-	case "/repos/acme/widgets":
+	case "/repositories/1296269":
 		if f.gone {
 			w.WriteHeader(404)
 			io.WriteString(w, `{"message":"Not Found"}`)
 			return
 		}
-		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
-	case "/repos/acme/widgets/issues":
+		if f.status != 0 {
+			w.WriteHeader(f.status)
+			io.WriteString(w, `{"message":"Server Error"}`)
+			return
+		}
+		name := cmp.Or(f.fullName, "acme/widgets")
+		json.NewEncoder(w).Encode(map[string]any{"id": 1296269, "full_name": name, "html_url": "https://github.com/acme/widgets"})
+	case "/repositories/1296269/issues":
 		serve(f.issues)
-	case "/repos/acme/widgets/issues/comments":
+	case "/repositories/1296269/issues/comments":
 		serve(f.comments)
 	default:
 		w.WriteHeader(404)
@@ -176,17 +189,21 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince.In(time.FixedZone("CET", 3600)).Add(500*time.Millisecond)); err != nil {
+	repo, err := l.ListChanged(context.Background(), widgetsID, pullSince.In(time.FixedZone("CET", 3600)).Add(500*time.Millisecond))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := f.asked("/repos/acme/widgets/issues"); !slices.Equal(got, []string{"state=all&sort=updated&direction=asc&since=" + escaped(0) + "&per_page=100"}) {
+	if repo != widgets {
+		t.Errorf("the repository read %v", repo)
+	}
+	if got := f.asked("/repositories/1296269/issues"); !slices.Equal(got, []string{"state=all&sort=updated&direction=asc&since=" + escaped(0) + "&per_page=100"}) {
 		t.Errorf("asked for issues %v", got)
 	}
-	if got := f.asked("/repos/acme/widgets/issues/comments"); !slices.Equal(got, []string{"sort=updated&direction=asc&since=" + escaped(0) + "&per_page=100"}) {
+	if got := f.asked("/repositories/1296269/issues/comments"); !slices.Equal(got, []string{"sort=updated&direction=asc&since=" + escaped(0) + "&per_page=100"}) {
 		t.Errorf("asked for comments %v", got)
 	}
 	items := s.items()
-	if len(items) != 1 || items[0].CollectionRef != "acme/widgets" || items[0].Listing != nil {
+	if len(items) != 1 || items[0].CollectionRef != widgetsRef || items[0].Listing != nil {
 		t.Fatalf("items requests %+v", items)
 	}
 	var got []string
@@ -196,8 +213,11 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 			reason = " " + *it.StateReason
 		}
 		got = append(got, it.Ref+" "+it.State+reason)
+		if it.Target == nil || it.Target.Path != "acme/widgets" || !strings.HasPrefix(it.URL, "https://github.com/acme/widgets/issues/") {
+			t.Errorf("item %s: target %+v, url %s", it.Ref, it.Target, it.URL)
+		}
 	}
-	if strings.Join(got, ", ") != "acme/widgets#1 open, acme/widgets#2 closed Not planned, acme/widgets#4 open" {
+	if strings.Join(got, ", ") != "1296269#1 open, 1296269#2 closed Not planned, 1296269#4 open" {
 		t.Errorf("items %v", got)
 	}
 	got = nil
@@ -211,7 +231,7 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 		}
 		got = append(got, c.ItemRef+": "+strings.Join(refs, " "))
 	}
-	if strings.Join(got, ", ") != "acme/widgets#1: 11 12, acme/widgets#2: 21" {
+	if strings.Join(got, ", ") != "1296269#1: 11 12, 1296269#2: 21" {
 		t.Errorf("comments %v", got)
 	}
 	if _, ok := s.reqs[0].(contracts.SourceItems); !ok {
@@ -219,6 +239,29 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 	}
 	if strings.Join(logs, "\n") != "skipped the comment 51: it names no issue" {
 		t.Errorf("logged %q", logs)
+	}
+	for _, p := range f.paths {
+		if p != "/repositories/1296269" && !strings.HasPrefix(p, "/repositories/1296269/") {
+			t.Errorf("requested %s, not through the repository's id", p)
+		}
+	}
+	if len(f.paths) == 0 || f.paths[0] != "/repositories/1296269" {
+		t.Errorf("requested %v", f.paths)
+	}
+}
+
+// TestAPullOfAnIDThatIsNotOneAsksNothing checks a pull of a repository whose id is not
+// positive fails before any request, and sends nothing.
+func TestAPullOfAnIDThatIsNotOneAsksNothing(t *testing.T) {
+	for _, id := range []int64{0, -1} {
+		f := &fakeChanged{}
+		s := &sink{}
+		var logs []string
+		l := f.lister(t, s, &logs)
+		_, err := l.ListChanged(context.Background(), id, pullSince)
+		if err == nil || err.Error() != "the repository's id is not one" || len(f.paths) != 0 || len(s.reqs) != 0 {
+			t.Errorf("%d: %v, requested %v, sent %+v", id, err, f.paths, s.reqs)
+		}
 	}
 }
 
@@ -234,7 +277,7 @@ func TestAnIssueEditedWhileAPullPagesIsNotSkipped(t *testing.T) {
 	}
 	edited := false
 	f.after = func(path string) {
-		if path == "/repos/acme/widgets/issues" && !edited {
+		if path == "/repositories/1296269/issues" && !edited {
 			edited = true
 			f.issues[49]["updated_at"] = changedAt(1000)
 		}
@@ -242,19 +285,19 @@ func TestAnIssueEditedWhileAPullPagesIsNotSkipped(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince); err != nil {
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); err != nil {
 		t.Fatal(err)
 	}
 	var want []string
 	for n := 1; n <= 250; n++ {
-		want = append(want, "acme/widgets#"+strconv.Itoa(n)+" "+changedAt(n))
+		want = append(want, "1296269#"+strconv.Itoa(n)+" "+changedAt(n))
 	}
-	want = append(want, "acme/widgets#50 "+changedAt(1000))
+	want = append(want, "1296269#50 "+changedAt(1000))
 	if got := sentItems(t, s); !slices.Equal(got, want) {
 		t.Errorf("sent %d items\n%v", len(got), strings.Join(got, "\n"))
 	}
 	const q = "state=all&sort=updated&direction=asc&since="
-	if got := f.asked("/repos/acme/widgets/issues"); !slices.Equal(got, []string{q + escaped(0) + "&per_page=100", q + escaped(100) + "&per_page=100", q + escaped(199) + "&per_page=100"}) {
+	if got := f.asked("/repositories/1296269/issues"); !slices.Equal(got, []string{q + escaped(0) + "&per_page=100", q + escaped(100) + "&per_page=100", q + escaped(199) + "&per_page=100"}) {
 		t.Errorf("asked\n%v", strings.Join(got, "\n"))
 	}
 }
@@ -273,7 +316,7 @@ func TestATieLargerThanAPageIsReadByPageNumber(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince); err != nil {
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); err != nil {
 		t.Fatal(err)
 	}
 	var want []string
@@ -282,13 +325,13 @@ func TestATieLargerThanAPageIsReadByPageNumber(t *testing.T) {
 		if n <= 150 {
 			at = 10
 		}
-		want = append(want, "acme/widgets#"+strconv.Itoa(n)+" "+changedAt(at))
+		want = append(want, "1296269#"+strconv.Itoa(n)+" "+changedAt(at))
 	}
 	if got := sentItems(t, s); !slices.Equal(got, want) {
 		t.Errorf("sent %d items\n%v", len(got), strings.Join(got, "\n"))
 	}
 	const q = "state=all&sort=updated&direction=asc&since="
-	if got := f.asked("/repos/acme/widgets/issues"); !slices.Equal(got, []string{
+	if got := f.asked("/repositories/1296269/issues"); !slices.Equal(got, []string{
 		q + escaped(0) + "&per_page=100",
 		q + escaped(10) + "&per_page=100",
 		q + escaped(10) + "&per_page=100&page=2",
@@ -309,7 +352,7 @@ func TestACommentEditedWhileAPullPagesIsNotSkipped(t *testing.T) {
 	}
 	edited := false
 	f.after = func(path string) {
-		if path == "/repos/acme/widgets/issues/comments" && !edited {
+		if path == "/repositories/1296269/issues/comments" && !edited {
 			edited = true
 			f.comments[9]["updated_at"] = changedAt(1000)
 		}
@@ -317,7 +360,7 @@ func TestACommentEditedWhileAPullPagesIsNotSkipped(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince); err != nil {
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); err != nil {
 		t.Fatal(err)
 	}
 	count := map[string]int{}
@@ -325,7 +368,7 @@ func TestACommentEditedWhileAPullPagesIsNotSkipped(t *testing.T) {
 		for _, c := range req.Comments {
 			count[c.Ref+" "+c.UpdatedAt]++
 			id, _ := strconv.Atoi(c.Ref)
-			if want := "acme/widgets#" + strconv.Itoa(1+id%3); req.ItemRef != want {
+			if want := "1296269#" + strconv.Itoa(1+id%3); req.ItemRef != want {
 				t.Errorf("comment %s on %s, want %s", c.Ref, req.ItemRef, want)
 			}
 		}
@@ -352,8 +395,8 @@ func TestAPullThatWouldReadMoreThanItsPagesFails(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	err := l.ListChanged(context.Background(), widgets, pullSince)
-	if err == nil || err.Error() != "listing the issues of acme/widgets that changed: GitHub has more than 2 pages, which a pull never reads" {
+	_, err := l.ListChanged(context.Background(), widgetsID, pullSince)
+	if err == nil || err.Error() != "listing the issues of 1296269 that changed: GitHub has more than 2 pages, which a pull never reads" {
 		t.Errorf("err %v", err)
 	}
 }
@@ -365,7 +408,7 @@ func TestAPullOfARepositoryGoneWrapsErrRepositoryGone(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince); !errors.Is(err, ErrRepositoryGone) {
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); !errors.Is(err, ErrRepositoryGone) {
 		t.Errorf("err %v", err)
 	}
 	if len(s.reqs) != 0 {
@@ -406,10 +449,78 @@ func TestAPullWhereNothingChangedSendsNothing(t *testing.T) {
 	s := &sink{}
 	var logs []string
 	l := f.lister(t, s, &logs)
-	if err := l.ListChanged(context.Background(), widgets, pullSince); err != nil {
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.reqs) != 0 {
 		t.Errorf("sent %+v", s.reqs)
+	}
+}
+
+// TestReadRepositoryReadsTheNameByID reads a repository's owner/name by its id and
+// checks it asks GitHub once, GET /repositories/{id} with the listing's token, and
+// returns owner/name; a 404 wraps ErrRepositoryGone, since a rename or a transfer keeps
+// the id; a 500 does not; a full_name that is not owner/name is refused; and an id that
+// is not one, or a lister with no token, asks nothing.
+func TestReadRepositoryReadsTheNameByID(t *testing.T) {
+	var logs []string
+	f := &fakeChanged{}
+	l := f.lister(t, &sink{}, &logs)
+	repo, err := l.ReadRepository(context.Background(), widgetsID)
+	if err != nil || repo != widgets {
+		t.Fatalf("%v, %v", repo, err)
+	}
+	if !slices.Equal(f.paths, []string{"/repositories/1296269"}) || !slices.Equal(f.auth, []string{"Bearer " + fakeToken}) {
+		t.Errorf("asked %v with %v", f.paths, f.auth)
+	}
+
+	f = &fakeChanged{gone: true}
+	l = f.lister(t, &sink{}, &logs)
+	if _, err := l.ReadRepository(context.Background(), widgetsID); !errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a 404: %v", err)
+	}
+	f = &fakeChanged{status: 500}
+	l = f.lister(t, &sink{}, &logs)
+	if _, err := l.ReadRepository(context.Background(), widgetsID); err == nil || errors.Is(err, ErrRepositoryGone) {
+		t.Errorf("a 500: %v", err)
+	}
+	for _, name := range []string{"acme", "acme/", "/widgets", "acme/widgets/more", "acme/..", "-acme/widgets"} {
+		f = &fakeChanged{fullName: name}
+		l = f.lister(t, &sink{}, &logs)
+		if _, err := l.ReadRepository(context.Background(), widgetsID); err == nil || err.Error() != "reading the repository 1296269: GitHub's name for it is not owner/name" {
+			t.Errorf("%q: %v", name, err)
+		}
+	}
+
+	f = &fakeChanged{}
+	l = f.lister(t, &sink{}, &logs)
+	for _, id := range []int64{0, -1} {
+		if _, err := l.ReadRepository(context.Background(), id); err == nil || err.Error() != "the repository's id is not one" {
+			t.Errorf("%d: %v", id, err)
+		}
+	}
+	l.Token = nil
+	if _, err := l.ReadRepository(context.Background(), widgetsID); err == nil || err.Error() != "the lister has no token" {
+		t.Errorf("no token: %v", err)
+	}
+	if len(f.paths) != 0 {
+		t.Errorf("asked %v", f.paths)
+	}
+}
+
+// TestAPullOfANameThatIsNotOwnerNameReturnsNone has GitHub answer a full_name that is
+// not owner/name and checks the pull still sends what changed and returns a zero
+// Repository, so a listing of open issues reads the name again.
+func TestAPullOfANameThatIsNotOwnerNameReturnsNone(t *testing.T) {
+	f := &fakeChanged{fullName: "acme", issues: []map[string]any{changedIssue(1, 1)}}
+	s := &sink{}
+	var logs []string
+	l := f.lister(t, s, &logs)
+	repo, err := l.ListChanged(context.Background(), widgetsID, pullSince)
+	if err != nil || repo != (Repository{}) {
+		t.Fatalf("%v, %v", repo, err)
+	}
+	if items := s.items(); len(items) != 1 || len(items[0].Items) != 1 || items[0].Items[0].Ref != "1296269#1" {
+		t.Errorf("items %+v", items)
 	}
 }

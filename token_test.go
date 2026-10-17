@@ -46,6 +46,26 @@ func TestMintInstallationTokenAsksForTheRepositoriesAndPermissionsAlone(t *testi
 	}
 }
 
+// TestMintInstallationTokenAsksForRepositoriesByID mints a token for a repository the
+// adapter knows by its id alone, and checks the installation is checked first and the
+// mint's body names the repository by id, repository_ids, with the permissions and no
+// repositories by name.
+func TestMintInstallationTokenAsksForRepositoriesByID(t *testing.T) {
+	f := &fakeGitHub{accounts: map[int64]string{7: "acme"}}
+	c := serve(t, f)
+	tok, err := c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, RepositoryIDs: []int64{1296269}, Permissions: map[string]string{"issues": "write"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(f.mint)
+	if string(got) != `{"permissions":{"issues":"write"},"repository_ids":[1296269]}` {
+		t.Errorf("the mint requested %s", got)
+	}
+	if strings.Join(f.checks, " ") != "/app/installations/7" || f.mintPath != "/app/installations/7/access_tokens" || len(f.lookups) != 0 || tok.Token != fakeToken {
+		t.Errorf("checks %v, mint %s, lookups %v, token %v", f.checks, f.mintPath, f.lookups, tok)
+	}
+}
+
 // TestMintInstallationTokenRefusesBeforeAnythingIsSent checks every request the
 // function refuses, and that none reaches GitHub.
 func TestMintInstallationTokenRefusesBeforeAnythingIsSent(t *testing.T) {
@@ -65,6 +85,9 @@ func TestMintInstallationTokenRefusesBeforeAnythingIsSent(t *testing.T) {
 		{"admin", Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"issues": "admin"}}, "the permission issues is neither read nor write"},
 		{"administration", Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"administration": "read"}}, `"administration" is not a permission`},
 		{"no key", Request{AppID: appID, InstallationID: 7, Repositories: repos, Permissions: issues}, "no private key"},
+		{"a repository id of 0", Request{AppID: appID, Key: key(t), InstallationID: 7, RepositoryIDs: []int64{0}, Permissions: issues}, "a repository's id is not one"},
+		{"a negative repository id", Request{AppID: appID, Key: key(t), InstallationID: 7, RepositoryIDs: []int64{-1}, Permissions: issues}, "a repository's id is not one"},
+		{"a repository id that is not one among ones that are", Request{AppID: appID, Key: key(t), InstallationID: 7, RepositoryIDs: []int64{1296269, 0}, Permissions: issues}, "a repository's id is not one"},
 	} {
 		_, err := c.MintInstallationToken(context.Background(), tc.req)
 		if err == nil || !strings.HasPrefix(err.Error(), tc.want) {

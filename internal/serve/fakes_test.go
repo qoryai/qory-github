@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -141,10 +142,44 @@ func checkBody(t *testing.T, route string, b []byte) {
 	}
 }
 
+// The ids of the fake's repositories, which the refs of their collections are: acme/widgets
+// and acme/gadgets, which the installation 42 reaches, and acme/old, acme/moved and
+// acme/gone, which the take-in and the fill reach for. [repoID] gives any other its id.
+const (
+	widgetsID  = 1296269
+	widgetsRef = "1296269"
+	gadgetsID  = 1296270
+	gadgetsRef = "1296270"
+	oldID      = 1296271
+	movedID    = 1296272
+)
+
+// knownIDs are the fake's repositories' ids by owner/name, in lower case.
+var knownIDs = map[string]int64{"acme/widgets": widgetsID, "acme/gadgets": gadgetsID, "acme/old": oldID, "acme/moved": movedID, "acme/gone": 1296273}
+
+// repoID is the id the fake gives the repository name, owner/name, in any case: one of
+// knownIDs, or else one made from the name, the same each time, past the known ones.
+func repoID(name string) int64 {
+	lower := strings.ToLower(name)
+	id, ok := knownIDs[lower]
+	if !ok {
+		h := fnv.New32a()
+		io.WriteString(h, lower)
+		id = 2_000_000_000 + int64(h.Sum32())
+	}
+	return id
+}
+
+// refOf is the collection ref of the repository name, owner/name: its id, see [repoID].
+func refOf(name string) string { return strconv.FormatInt(repoID(name), 10) }
+
+// itemOf is the item ref of the issue n of the repository name.
+func itemOf(name string, n int) string { return refOf(name) + "#" + strconv.Itoa(n) }
+
 // widgetsItem is a request that sends one item of acme/widgets, as the contract takes it.
 func widgetsItem() contracts.SourceItems {
-	return contracts.SourceItems{Version: contracts.Version, CollectionRef: "acme/widgets", Items: []contracts.Item{{
-		Ref: "acme/widgets#1", URL: "https://github.com/acme/widgets/issues/1", Type: "issue", Title: "Widget 1 is broken",
+	return contracts.SourceItems{Version: contracts.Version, CollectionRef: widgetsRef, Items: []contracts.Item{{
+		Ref: widgetsRef + "#1", URL: "https://github.com/acme/widgets/issues/1", Type: "issue", Title: "Widget 1 is broken",
 		BodyFormat: github.FormatMarkdown, FiledBy: contracts.Person{Name: "alice", Kind: github.KindPerson}, Labels: []string{},
 		State: github.StateOpen, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
 	}}}
@@ -306,7 +341,8 @@ func (f *fakeApiary) client(key *accesskey.Key) *Apiary {
 
 // fakeGitHub is GitHub's API as the adapter reaches it for the installation 42 of
 // acme: the token mint, the listing of the installation's repositories, one page, and
-// acme/widgets's issues and comments, and a take in's label and comment on issue 7.
+// acme/widgets's issues and comments, and a take in's label and comment on issue 7 and
+// an undo's removal of the label, each by the repository's id, /repositories/{id}.
 type fakeGitHub struct {
 	srv *httptest.Server
 
@@ -321,8 +357,8 @@ type fakeGitHub struct {
 	// unauthorized answers the listings of acme/widgets's issues, by REST and by
 	// GraphQL, 401, as GitHub answers a token it no longer takes; issuesDown answers
 	// them 502. goneComments answers that issue's comments 404, as for an issue deleted
-	// while it is listed. reposDown answers every request under /repos/, and GraphQL's,
-	// 502.
+	// while it is listed. reposDown answers every request under /repos/ and
+	// /repositories/, and GraphQL's, 502.
 	unauthorized, issuesDown, reposDown bool
 	goneComments                        int
 	// repoPageSize, when set, lists the installation's repositories that many on a
@@ -340,6 +376,18 @@ type fakeGitHub struct {
 	gqlFail   string
 	onPage    func(page int, r *http.Request)
 	gqlPages  int
+	// readStatus, when set, answers the read of acme/widgets by its id, GET
+	// /repositories/{id}, with that status and no repository. gqlIDSet makes GraphQL
+	// answer gqlID as acme/widgets's databaseId, nil for none, or another repository's
+	// id, as when the name came to name another repository after it was read, and
+	// gqlNotFound makes GraphQL answer that it resolves no repository by acme/widgets, as
+	// when the name came to name none.
+	readStatus  int
+	gqlIDSet    bool
+	gqlID       any
+	gqlNotFound bool
+	// gqlAsked is the owner/name each GraphQL request named, in order.
+	gqlAsked []string
 	// person is the person signed in with Connect; userInstallations are the
 	// installations the person reaches, which GitHub lists one on each page; and
 	// memberships are the person's memberships of organisations, by login. userDown
@@ -408,11 +456,12 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
 	w.Header().Set("Content-Type", "application/json")
-	const widgets = "/repos/acme/widgets"
+	const widgets = "/repositories/" + widgetsRef
+	moved := "/repositories/" + strconv.Itoa(movedID)
 	switch {
 	case r.Method == "GET" && r.URL.Path == "/app/installations/42":
 		io.WriteString(w, `{"id":42,"account":{"login":"acme"}}`)
-	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && strings.Contains(string(b), `"old"`):
+	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && strings.Contains(string(b), strconv.Itoa(oldID)):
 		// The installation no longer reaches acme/old.
 		w.WriteHeader(422)
 		io.WriteString(w, `{"message":"There is at least one repository that does not exist or is not accessible to the parent installation."}`)
@@ -440,17 +489,20 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		var repos []map[string]any
 		for _, name := range names {
-			repos = append(repos, map[string]any{"full_name": name, "html_url": "https://github.com/" + name})
+			repos = append(repos, map[string]any{"id": repoID(name), "full_name": name, "html_url": "https://github.com/" + name})
 		}
 		json.NewEncoder(w).Encode(map[string]any{"total_count": len(f.repos), "repositories": repos})
 		if f.repoAfter != nil {
 			f.repoAfter(f, page)
 		}
+	case r.Method == "GET" && r.URL.Path == widgets && f.readStatus != 0:
+		w.WriteHeader(f.readStatus)
+		io.WriteString(w, `{"message":"`+http.StatusText(f.readStatus)+`"}`)
 	case r.Method == "GET" && r.URL.Path == widgets:
-		io.WriteString(w, `{"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":
 		f.graphql(w, r, b)
-	case f.reposDown && strings.HasPrefix(r.URL.Path, "/repos/"):
+	case f.reposDown && (strings.HasPrefix(r.URL.Path, "/repos/") || strings.HasPrefix(r.URL.Path, "/repositories/")):
 		w.WriteHeader(502)
 		io.WriteString(w, `{"message":"Bad Gateway"}`)
 	case r.Method == "GET" && r.URL.Path == widgets+"/issues" && f.issuesDown:
@@ -473,6 +525,8 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && r.URL.Path == widgets+"/issues/7/labels":
 		f.labelled = append(f.labelled, string(b))
 		io.WriteString(w, `[{"name":"qory"}]`)
+	case r.Method == "DELETE" && r.URL.Path == widgets+"/issues/7/labels/qory":
+		io.WriteString(w, `[]`)
 	case r.Method == "POST" && r.URL.Path == widgets+"/issues/7/comments":
 		var c struct {
 			Body string `json:"body"`
@@ -533,8 +587,14 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]any{"state": m.state, "role": m.role, "organization": map[string]any{"login": "x", "id": m.org}, "user": map[string]any{"login": "x", "id": m.person}})
 		}
 	case strings.HasPrefix(r.URL.Path, "/repos/acme/moved/") || r.URL.Path == "/repos/acme/moved":
-		// acme/moved was renamed: GitHub redirects every request for it.
-		w.Header().Set("Location", "https://api.github.com/repositories/1"+strings.TrimPrefix(r.URL.Path, "/repos/acme/moved"))
+		// acme/moved was renamed: GitHub redirects every request for it by name.
+		w.Header().Set("Location", "https://api.github.com"+moved+strings.TrimPrefix(r.URL.Path, "/repos/acme/moved"))
+		w.WriteHeader(301)
+		io.WriteString(w, `{"message":"Moved Permanently"}`)
+	case strings.HasPrefix(r.URL.Path, moved+"/") || r.URL.Path == moved:
+		// A request by acme/moved's id is redirected too, as GitHub redirects a request for
+		// an issue that was transferred.
+		w.Header().Set("Location", "https://api.github.com/repositories/1"+strings.TrimPrefix(r.URL.Path, moved))
 		w.WriteHeader(301)
 		io.WriteString(w, `{"message":"Moved Permanently"}`)
 	default:
@@ -543,10 +603,11 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// graphql answers the listing of a repository's open issues by GraphQL's cursor:
-// acme/widgets's issues, open ones alone, first to a page after the cursor, which is
-// the issue's place in f.issues; acme/moved as GitHub names it since it was renamed;
-// and any other repository as one GraphQL cannot resolve. f.mu is held.
+// graphql answers the listing of a repository's open issues by GraphQL's cursor, the
+// repository named by owner/name and answered with its id, databaseId: acme/widgets's
+// issues, open ones alone, first to a page after the cursor, which is the issue's place
+// in f.issues; acme/moved as GitHub names it since it was renamed, with the same id; and
+// any other repository as one GraphQL cannot resolve. f.mu is held.
 func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 	var req struct {
 		Variables struct {
@@ -562,6 +623,7 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 		return
 	}
 	v := req.Variables
+	f.gqlAsked = append(f.gqlAsked, v.Owner+"/"+v.Name)
 	f.gqlPages++
 	page := f.gqlPages
 	if f.onPage != nil {
@@ -587,9 +649,10 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 		return
 	}
 	name := v.Owner + "/" + v.Name
-	switch name {
-	case "acme/widgets":
-	case "acme/moved":
+	id := repoID(name)
+	switch {
+	case name == "acme/widgets" && !f.gqlNotFound:
+	case name == "acme/moved":
 		name = "acme/renamed"
 	default:
 		io.WriteString(w, `{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","path":["repository"],"message":"Could not resolve to a Repository with the name '`+name+`'."}]}`)
@@ -615,7 +678,12 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 			end = "cursor:" + strconv.Itoa(i+1)
 		}
 	}
+	var dbID any = id
+	if name == "acme/widgets" && f.gqlIDSet {
+		dbID = f.gqlID
+	}
 	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
+		"databaseId":    dbID,
 		"nameWithOwner": name,
 		"url":           "https://github.com/" + name,
 		"issues": map[string]any{

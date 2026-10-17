@@ -29,12 +29,15 @@ func (t InstallationToken) String() string {
 func (t InstallationToken) GoString() string { return t.String() }
 
 // MintInstallationToken requests from GitHub a token for the installation the request
-// names, req.InstallationID, which must be set, limited to the request's repositories
-// and to its permissions, which must be set too, such as issues read: the calls the
-// adapter makes to GitHub, not a run's, go with it. Each permission is one a run's token may be
-// granted, [RunPermissions], read or write. The installation is checked with GitHub
-// first, as [Client.Mint] checks it, so a token is never one of another account's. It
-// keeps nothing: a caller that calls again before the expiry keeps the token itself.
+// names, req.InstallationID, which must be set, limited to the request's repositories,
+// named by owner/name or by id, and to its permissions, which must be set too, such as
+// issues read: the calls the adapter makes to GitHub, not a run's, go with it. Each
+// permission is one a run's token may be granted, [RunPermissions], read or write. The
+// installation is checked with GitHub first, as [Client.Mint] checks it, so a token is
+// never one of another account's: a repository named by owner/name must be the
+// installation's account's, and one named by id GitHub mints for only when the
+// installation reaches it, answering 422 otherwise. It keeps nothing: a caller that
+// calls again before the expiry keeps the token itself.
 func (c Client) MintInstallationToken(ctx context.Context, req Request) (InstallationToken, error) {
 	if err := CheckAPIURL(c.base()); err != nil {
 		return InstallationToken{}, err
@@ -48,12 +51,17 @@ func (c Client) MintInstallationToken(ctx context.Context, req Request) (Install
 	if req.InstallationID <= 0 {
 		return InstallationToken{}, errors.New("no installation; an installation token is one installation's")
 	}
-	if len(req.Repositories) == 0 {
+	if len(req.Repositories) == 0 && len(req.RepositoryIDs) == 0 {
 		return InstallationToken{}, errors.New("no repository")
 	}
 	for _, r := range req.Repositories {
 		if !ownerShape.MatchString(r.Owner) || !nameShape.MatchString(r.Name) || r.Name == "." || r.Name == ".." {
 			return InstallationToken{}, fmt.Errorf("%q is not owner/name", r.String())
+		}
+	}
+	for _, id := range req.RepositoryIDs {
+		if id <= 0 {
+			return InstallationToken{}, errors.New("a repository's id is not one")
 		}
 	}
 	if len(req.Permissions) == 0 {
@@ -102,8 +110,8 @@ var ErrMintRefused = errors.New("GitHub refuses to mint the installation token")
 var errNotTheInstallation = errors.New("the installation is not the App's installation on the repositories' owner")
 
 // mintFor mints the token req asks for, once its installation is checked: limited to
-// its repositories, or to none when it names none, and to its permissions. req is
-// checked already. A mint refused for good wraps [ErrMintRefused].
+// its repositories, by name and by id, or to none when it names none, and to its
+// permissions. req is checked already. A mint refused for good wraps [ErrMintRefused].
 func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, error) {
 	now := time.Now
 	if c.Now != nil {
@@ -130,6 +138,9 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 			names[i] = r.Name
 		}
 		body["repositories"] = names
+	}
+	if len(req.RepositoryIDs) > 0 {
+		body["repository_ids"] = req.RepositoryIDs
 	}
 	const minting = "minting the installation token"
 	if err := c.call(ctx, minting, http.MethodPost, "/app/installations/"+strconv.FormatInt(req.InstallationID, 10)+"/access_tokens", jwt, body, http.StatusCreated, &got); err != nil {

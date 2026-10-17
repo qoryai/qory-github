@@ -66,6 +66,14 @@ func TestLiveCursorListingSkipsNoIssue(t *testing.T) {
 	t.Logf("run %s in %s; the issues it creates are kept in %s", lv.run, lv.repo, lv.ledger)
 	t.Cleanup(lv.cleanup)
 	lv.save()
+	// The listing is for the repository's id, which GraphQL's answer must name.
+	var got struct {
+		ID int64 `json:"id"`
+	}
+	if err := lv.call(ctx, "reading the repository", http.MethodGet, "/repos/"+lv.repo.String(), nil, &got); err != nil || got.ID <= 0 {
+		t.Fatalf("reading the repository's id: %v", err)
+	}
+	lv.id = got.ID
 
 	const initial = 24
 	for range initial {
@@ -134,12 +142,21 @@ func TestLiveCursorListingSkipsNoIssue(t *testing.T) {
 		s := &sink{}
 		l := lv.lister()
 		l.Sink = s
-		if err := l.ListOpenIssuesComplete(ctx, lv.repo); err != nil {
+		if err := l.ListOpenIssuesComplete(ctx, lv.id, lv.repo); err != nil {
 			t.Fatal(err)
 		}
 		refs, parts := sentParts(s)
+		// The items' refs are the repository's id, which the collection's ref is, # and
+		// the issue's number.
+		coll := ""
+		if items := s.items(); len(items) > 0 {
+			coll = items[0].CollectionRef
+		}
+		if _, ok := ParseCollectionRef(coll); !ok {
+			t.Errorf("the collection's ref %q is not a repository's id", coll)
+		}
 		for _, is := range lv.issues() {
-			ref := lv.repo.String() + "#" + strconv.FormatInt(is.Number, 10)
+			ref := coll + "#" + strconv.FormatInt(is.Number, 10)
 			if got := slices.Contains(refs, ref); got != (is.State == "open") {
 				t.Errorf("%s, %s: sent %v", ref, is.State, got)
 			}
@@ -158,6 +175,7 @@ func TestLiveCursorListingSkipsNoIssue(t *testing.T) {
 type live struct {
 	t      *testing.T
 	repo   Repository
+	id     int64
 	token  string
 	p      *Pacer
 	run    string
@@ -545,7 +563,7 @@ func (lv *live) scenario(ctx context.Context, t *testing.T, name string, change 
 	before := lv.openNow(ctx, t)
 	l := lv.lister()
 	base := "/repos/" + lv.repo.String() + "/issues?sort=created&direction=asc&per_page=" + strconv.Itoa(livePageSize)
-	g := l.issuePager(lv.p, lv.repo, livePageSize)
+	g := l.issuePager(lv.p, lv.id, lv.repo, livePageSize)
 	s := &scene{t: t, lv: lv, touched: map[int64]bool{}, readings: []*reading{
 		{name: "graphql-cursor", pg: cursorPager{g}, seen: map[int64]int{}},
 		{name: "rest-all-states", pg: &restPager{l: l, p: lv.p, path: base + "&state=all"}, seen: map[int64]int{}},

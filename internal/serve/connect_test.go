@@ -772,7 +772,7 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 		t.Errorf("sent %s", sent[0].raw)
 	}
 	cols, _ := json.Marshal(sent[2].body["collections"])
-	if !strings.Contains(string(cols), `"ref":"acme/widgets"`) || !strings.Contains(string(cols), `"ref":"acme/gadgets"`) {
+	if !strings.Contains(string(cols), `"ref":"`+widgetsRef+`"`) || !strings.Contains(string(cols), `"ref":"`+gadgetsRef+`"`) {
 		t.Errorf("sent %s", sent[2].raw)
 	}
 	if n := rig.gh.listings(); n != 1 {
@@ -784,7 +784,7 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 		t.Errorf("waited %v", rig.waits)
 	}
 	rig.mu.Unlock()
-	if inst, ok, _ := reachOf(rig.st, "acme/widgets"); !ok || inst != 42 {
+	if inst, ok, _ := reachOf(rig.st, refOf("acme/widgets")); !ok || inst != 42 {
 		t.Errorf("the repository's installation is %d", inst)
 	}
 	// Two sign-ins: the first before the installation, the second that binds it.
@@ -1261,8 +1261,8 @@ func TestALinkThatIsFreeIsTakenEvenPastTheDeadline(t *testing.T) {
 func TestAReconnectOfALiveLinkListsAndFillsAgain(t *testing.T) {
 	rig := newConnectRig(t)
 	Link(rig.st, 42, testConnection, linkLive)
-	setReach(rig.st, "acme/widgets", 42)
-	linkCollection(rig.st, "acme/widgets")
+	setReach(rig.st, refOf("acme/widgets"), 42)
+	linkCollection(rig.st, refOf("acme/widgets"))
 	rig.gh.issues = []map[string]any{ghIssue(1, 0)}
 	if r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection); r.Outcome != outcomeLinked {
 		t.Errorf("%+v", r)
@@ -1279,12 +1279,12 @@ func TestAReconnectOfALiveLinkListsAndFillsAgain(t *testing.T) {
 func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 	rig := newConnectRig(t)
 	Link(rig.st, 42, testConnection, linkLive)
-	setReach(rig.st, "acme/widgets", 42)
-	linkCollection(rig.st, "acme/widgets")
+	setReach(rig.st, refOf("acme/widgets"), 42)
+	linkCollection(rig.st, refOf("acme/widgets"))
 	rig.gh.issues = []map[string]any{ghIssue(1, 0)}
 	// A fill under way for the collection holds its turn: a second refill leaves it to
 	// the first.
-	done, err := rig.adapter.waitTurn(context.Background(), "acme/widgets")
+	done, err := rig.adapter.waitTurn(context.Background(), refOf("acme/widgets"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1391,7 +1391,7 @@ func TestAConnectionHoldsOneInstallation(t *testing.T) {
 		if tc.minted {
 			keepPass(rig.st, testConnection, older.Unix(), time.Now())
 		}
-		setReach(rig.st, "acme/widgets", 42)
+		setReach(rig.st, refOf("acme/widgets"), 42)
 		rig.apiary.refuse = func(string, int) (int, string) { return tc.status, `{"error":"connection_unknown"}` }
 		if tc.unsigned {
 			rig.apiary.signer = newKey(t)
@@ -1410,7 +1410,7 @@ func TestAConnectionHoldsOneInstallation(t *testing.T) {
 			}
 			rig.held(t, 7, testConnection, linkPending, tc.pass.Unix())
 			rig.linked(t, 42, "", "")
-			if inst, ok, _ := reachOf(rig.st, "acme/widgets"); ok && inst == 42 {
+			if inst, ok, _ := reachOf(rig.st, refOf("acme/widgets")); ok && inst == 42 {
 				t.Errorf("%s: the replaced installation's repositories are kept", name)
 			}
 			if !strings.Contains(rig.log.String(), `"msg":"a newer pass for the connection replaces its pending link","connection":"`+testConnection+`","installation":42`) {
@@ -2568,7 +2568,7 @@ func TestAFirstListingIsReadOnceAndSentAgainFromThePartNotTaken(t *testing.T) {
 	}
 	rig.mu.Unlock()
 	rig.linked(t, 42, testConnection, linkLive)
-	if inst, ok, _ := reachOf(rig.st, "acme/repo100"); !ok || inst != 42 {
+	if inst, ok, _ := reachOf(rig.st, refOf("acme/repo100")); !ok || inst != 42 {
 		t.Errorf("the last part's repository's installation is %d", inst)
 	}
 }
@@ -2861,10 +2861,10 @@ func TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept(t *testing.T) {
 		}
 		first, _ := json.Marshal(sent[0].body["collections"])
 		last, _ := json.Marshal(sent[1].body["collections"])
-		if !strings.Contains(string(first), `"ref":"`+tc.removed+`"`) {
+		if !strings.Contains(string(first), `"ref":"`+refOf(tc.removed)+`"`) {
 			t.Errorf("%s: the try under way sent %s", tc.name, first)
 		}
-		if strings.Contains(string(last), tc.removed) || !strings.Contains(string(last), `"ref":"`+tc.kept+`"`) {
+		if strings.Contains(string(last), `"ref":"`+refOf(tc.removed)+`"`) || !strings.Contains(string(last), `"ref":"`+refOf(tc.kept)+`"`) {
 			t.Errorf("%s: the listing Qory Apiary took names %s, which the installation no longer reaches, or not %s: %s", tc.name, tc.removed, tc.kept, last)
 		}
 		if listingOf(sent[0])["id"] == listingOf(sent[1])["id"] {
