@@ -163,9 +163,9 @@ The private key goes to --key-file, which only you may read. setup never writes 
 file that exists, and never prints the key. GitHub hands the key out once: when the
 file cannot be written, the key goes beside it, and setup prints where.
 
-Then setup prints where to install the App, and the two settings to add to the
-starter's settings: app_id and private_key_file. Install the App on the one repository
-the starter's settings name as repository.`,
+Then setup prints where to install the App, and what to add to the starter's settings:
+app_id and private_key_file, and api_url when --api-url is given. Install the App on
+the one repository the starter's settings name as repository.`,
 	Example: `  qory-github-starter setup --key-file /etc/qory-github-starter/github-app.pem              # under your account
   qory-github-starter setup --org acme --key-file /etc/qory-github-starter/github-app.pem   # under the organisation acme`,
 }
