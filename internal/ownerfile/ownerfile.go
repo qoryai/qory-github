@@ -1,7 +1,7 @@
-// Package ownerfile opens the files and directories the program, qory-github or
-// qory-github-server, keeps a secret in, or reads one from: a private key, a webhook
-// secret, the local store. Each must be the user's that the program runs as, and grant
-// group and others no permission.
+// Package ownerfile opens the files and directories the program, qory-github,
+// qory-github-server or qory-github-starter, keeps a secret in, or reads one from: a
+// private key, a webhook secret, an access key's secret, the local store. Each must be
+// the user's that the program runs as, and grant group and others no permission.
 package ownerfile
 
 import (
@@ -17,7 +17,7 @@ import (
 
 // Program is the program's name, which an error about a file that belongs to another
 // user names: qory-github unless the program sets its name at start, as
-// qory-github-server does.
+// qory-github-server and qory-github-starter do.
 var Program = "qory-github"
 
 // Open opens the file at path with flag and, when it creates the file, perm, never

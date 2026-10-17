@@ -1,6 +1,7 @@
-// Package cli is what the programs qory-github and qory-github-server share on their
-// command lines: a command's help and how its flags are parsed, the one line an error is
-// written on, the program's version, and whether QORY_FEATURES switches on factory.
+// Package cli is what the programs qory-github, qory-github-server and
+// qory-github-starter share on their command lines: a command's help and how its flags
+// are parsed, the one line an error is written on, the program's version, and whether
+// QORY_FEATURES switches on factory.
 package cli
 
 import (
@@ -44,7 +45,9 @@ func ProgramVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 
 // Factory is whether the environment variable QORY_FEATURES switches on factory: the
 // program qory-github-server, with its commands serve, the webhook receiver, and
-// access-key, which enrols its access key for Qory Apiary, and setup's --public-url.
+// access-key, which enrols its access key for Qory Apiary; the program
+// qory-github-starter, with its command access-key, which enrols a node pool's access
+// key; and setup's --public-url.
 // Qory Apiary's factory is an opt-in feature of the same name, and the programs read the
 // variable by the rules Qory Apiary applies to the name of an opt-in feature:
 //
