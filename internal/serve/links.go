@@ -410,15 +410,14 @@ func present(_ []byte, err error) (bool, error) {
 // use nowhere yet, so no record keyed by a repository's owner/name is carried over.
 func collectionKey(ref string) string { return ref }
 
-// The moments of the links this process stores. A request for a collection, its items
-// or its disconnect, that Qory Apiary answers 409 collection_not_linked may have begun
-// before the change feed unlinked the collection and linked it again; its answer then
-// speaks of the unlink, and the link stored after it stands. So each link stored takes
-// the next moment from linkClock, kept in linkedAt by store and collection, and a
-// request notes the moment it began, [linkMoment]: [unlinkSince] unlinks only when no
-// link was stored after. A link from before the process started has no moment, and is
-// older than any request of the process. linkMu orders a link and an unlink of one
-// store.
+// The moments of the links this process stores. A request for a collection's items
+// that Qory Apiary answers 409 collection_not_linked may have begun before the change
+// feed unlinked the collection and linked it again; its answer then speaks of the
+// unlink, and the link stored after it stands. So each link stored takes the next
+// moment from linkClock, kept in linkedAt by store and collection, and a request notes
+// the moment it began, [linkMoment]: [unlinkSince] unlinks only when no link was stored
+// after. A link from before the process started has no moment, and is older than any
+// request of the process. linkMu orders a link and an unlink of one store.
 var (
 	linkClock atomic.Uint64
 	linkedAt  sync.Map // linkMark -> uint64

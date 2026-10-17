@@ -60,9 +60,9 @@ type ghRepoComment struct {
 // for an issue, until the next daily listing of open issues, which sends it when it is
 // open and, since that listing says it is complete unless it skipped an item, has
 // Qory Apiary close it when it is not. Each is read in at most 2,000 pages; a pull that
-// would read more fails, and so does one GitHub answers that the repository is gone or
-// moved, with an error that wraps [ErrRepositoryGone]. It stops at the first error, and
-// sends nothing more.
+// would read more fails, and so does one GitHub answers that the repository is deleted
+// or out of the App's reach, or whose request by the id GitHub redirects, with an error
+// that wraps [ErrRepositoryGone]. It stops at the first error, and sends nothing more.
 func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Time) (Repository, error) {
 	if repository <= 0 {
 		return Repository{}, errors.New("the repository's id is not one")
@@ -89,8 +89,9 @@ func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Ti
 
 // readRepository reads the repository whose id is repository, GET /repositories/{id}.
 // One GitHub answers is gone, deleted or out of the App's reach, as a 404 by its id
-// says, wraps [ErrRepositoryGone]: a rename or a transfer keeps the id, so it never
-// brings that answer.
+// says, wraps [ErrRepositoryGone]. A rename keeps the id and the App's reach, so it
+// never brings that answer; a transfer to an account the installation is not on takes
+// the repository out of the App's reach, and does.
 func (l Lister) readRepository(ctx context.Context, p *Pacer, repository int64) (ghRepo, error) {
 	repo := CollectionRef(repository)
 	var r ghRepo

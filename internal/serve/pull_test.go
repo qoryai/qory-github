@@ -323,11 +323,11 @@ func TestAPullListsByTheNameItReadOnce(t *testing.T) {
 // TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater pulls a collection whose
 // daily listing is due while GraphQL answers, for the name read by the id, a repository
 // whose id is another, one with no id, or NOT_FOUND, no repository by that name: what
-// changed is sent, the listing sends no part, and
-// the pull fails with an error that is no repository gone and keeps no time, so the
-// next round reads the name and lists again.
+// changed is sent, as events, the listing sends no part, and the pull fails with an
+// error that is no repository gone and keeps no time, so the next round reads the name
+// and lists again.
 func TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater(t *testing.T) {
-	for _, id := range []any{gadgetsID, nil, "not found"} {
+	for _, id := range []any{gadgetsRef, nil, "not found"} {
 		w, _, p, _ := pulling(t)
 		mark := pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)}
 		keepPulled(w.st, widgetsRef, mark)
@@ -343,6 +343,15 @@ func TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater(t *testing.T) {
 		}
 		if parts := listingParts(w); len(parts) != 0 {
 			t.Errorf("%v: listed %+v", id, parts)
+		}
+		if sent := w.apiary.sent(routeItems); len(sent) != 1 {
+			t.Errorf("%v: %d items requests, want what changed alone", id, len(sent))
+		} else {
+			var req contracts.SourceItems
+			json.Unmarshal(sent[0].raw, &req)
+			if req.Listing != nil || req.CollectionRef != widgetsRef || len(req.Items) != 1 || req.Items[0].Ref != itemOf("acme/widgets", 1) {
+				t.Errorf("%v: sent %s", id, sent[0].raw)
+			}
 		}
 		if m := markOf(t, w); m != mark {
 			t.Errorf("%v: kept %+v", id, m)
@@ -397,6 +406,82 @@ func listingParts(w *wired) []contracts.SourceItems {
 		}
 	}
 	return out
+}
+
+// TestATokenServesTheOneRepositoryItWasMintedFor pulls acme/widgets and then
+// acme/gadgets, two repositories the installation 42 reaches, while GitHub answers each
+// mint with a new token, and then pulls acme/widgets again. Each repository is minted a
+// token, with repository_ids its id alone, every request by a repository's id carries
+// the token minted for it and never the other's, and the second pull of acme/widgets
+// takes the token kept for it and mints none. The key serve keeps a token under names
+// the repository's id, so a token minted for one repository never serves another.
+func TestATokenServesTheOneRepositoryItWasMintedFor(t *testing.T) {
+	w, f, p, _ := pulling(t)
+	setReach(w.st, gadgetsRef, 42)
+	linkCollection(w.st, gadgetsRef)
+	last := pullStart.Add(-time.Hour)
+	keepPulled(w.st, widgetsRef, pullMark{Since: last, Listed: last})
+	keepPulled(w.st, gadgetsRef, pullMark{Since: last, Listed: last})
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	var mu sync.Mutex
+	var mints []string
+	// minted is the repository each token was minted for, by the token, and carried the
+	// tokens each repository's requests carried, by the repository's id.
+	minted := map[string]string{}
+	carried := map[string][]string{}
+	front := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens" {
+			b, _ := io.ReadAll(r.Body)
+			var body struct {
+				RepositoryIDs []int64 `json:"repository_ids"`
+			}
+			json.Unmarshal(b, &body)
+			mu.Lock()
+			mints = append(mints, string(b))
+			tok := "ghs_minted-" + strconv.Itoa(len(mints))
+			if len(body.RepositoryIDs) == 1 {
+				minted[tok] = strconv.FormatInt(body.RepositoryIDs[0], 10)
+			}
+			mu.Unlock()
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusCreated)
+			io.WriteString(rw, `{"token":"`+tok+`","expires_at":"2099-01-01T00:00:00Z"}`)
+			return
+		}
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/repositories/"); ok {
+			id, _, _ := strings.Cut(rest, "/")
+			mu.Lock()
+			carried[id] = append(carried[id], strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			mu.Unlock()
+		}
+		f.ServeHTTP(rw, r)
+	}))
+	t.Cleanup(front.Close)
+	w.adapter.GitHub = github.Client{API: front.URL}
+	for _, ref := range []string{widgetsRef, gadgetsRef, widgetsRef} {
+		if err := p.pull(context.Background(), ref, 42); err != nil {
+			t.Fatalf("pulling %s: %v", ref, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{
+		`{"permissions":{"issues":"read"},"repository_ids":[` + widgetsRef + `]}`,
+		`{"permissions":{"issues":"read"},"repository_ids":[` + gadgetsRef + `]}`,
+	}
+	if !slices.Equal(mints, want) {
+		t.Errorf("mints\n%s\nwant\n%s", strings.Join(mints, "\n"), strings.Join(want, "\n"))
+	}
+	for _, ref := range []string{widgetsRef, gadgetsRef} {
+		if len(carried[ref]) == 0 {
+			t.Errorf("no request by %s's id", ref)
+		}
+		for _, tok := range carried[ref] {
+			if minted[tok] != ref {
+				t.Errorf("a request by %s's id carried %q, minted for %q", ref, tok, minted[tok])
+			}
+		}
+	}
 }
 
 // TestTheFirstPullAfterAFillStartsFromTheFill links a collection through the feed, which
@@ -554,7 +639,7 @@ func TestAFailingCollectionDoesNotHoldAnother(t *testing.T) {
 	}
 	log := w.log.String()
 	if !strings.Contains(log, `"msg":"pulling the collection failed","collection":"`+widgetsRef+`"`) ||
-		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is gone, moved or out of the App's reach, and the next round tries again","collection":"`+refOf("acme/gone")+`"`) {
+		!strings.Contains(log, `"msg":"pulling the collection failed: GitHub answers it is deleted or out of the App's reach, or redirects a request by its id, and the next round tries again","collection":"`+refOf("acme/gone")+`"`) {
 		t.Errorf("the log %s", log)
 	}
 	if strings.Contains(log, ghToken) {

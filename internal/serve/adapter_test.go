@@ -905,6 +905,56 @@ func TestAStoreThatFailsToReadAnEndedConnectionsLinksIsLogged(t *testing.T) {
 	}
 }
 
+// TestCommentsAnsweredConnectionEndedOrSuspended has Qory Apiary answer comments on an
+// item of acme/widgets with a signed 409 connection_ended or connection_suspended:
+// ended drops the link of the installation linked to the connection and its
+// collections' records, as it does for any request of the connection, and suspended
+// changes nothing. Each is a refusal for good, and neither is taken for
+// collection_not_linked: no line says the comments are dropped for it. Another
+// connection's records stay.
+func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, code := range []string{codeConnectionEnded, codeConnectionSuspended} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		Link(w.st, 43, otherConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		setReach(w.st, refOf("other/thing"), 43)
+		linkCollection(w.st, widgetsRef)
+		linkCollection(w.st, refOf("other/thing"))
+		w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"` + code + `"}` }
+		err := w.client.Comments(context.Background(), comments)
+		if !IsPermanent(err) || !refusedAs(err, http.StatusConflict, code) {
+			t.Errorf("%s: err %v", code, err)
+		}
+		if n := len(w.apiary.sent(routeComments)); n != 1 {
+			t.Errorf("%s: %d comments requests", code, n)
+		}
+		ended := code == codeConnectionEnded
+		if ok, _ := Linked(w.st, 42); ok == ended {
+			t.Errorf("%s: linked %v", code, ok)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); ok == ended {
+			t.Errorf("%s: the collection linked %v", code, ok)
+		}
+		if _, ok, _ := reachOf(w.st, widgetsRef); ok == ended {
+			t.Errorf("%s: the repository's installation kept %v", code, ok)
+		}
+		if ok, _ := Linked(w.st, 43); !ok {
+			t.Errorf("%s: another connection's installation is unlinked", code)
+		}
+		if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+			t.Errorf("%s: another connection's collection is unlinked", code)
+		}
+		if strings.Contains(w.log.String(), "Qory Apiary answered collection_not_linked to the comments, so they are dropped") {
+			t.Errorf("%s: logged as collection_not_linked: %s", code, w.log.String())
+		}
+	}
+}
+
 // TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
 // answer a listing, an item and a disconnect 409 connection_ended or
 // connection_suspended: ended drops the link of the installation linked to the
@@ -1403,7 +1453,7 @@ func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 // complete listing, keeps no start, and fails with an error that passes, not for good
 // and not as a repository gone, so the change feed tries it again.
 func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
-	for _, id := range []any{gadgetsID, nil, "not found"} {
+	for _, id := range []any{gadgetsRef, nil, "not found"} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
@@ -1432,12 +1482,14 @@ func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
 }
 
 // TestAFillWhoseReadFailsSendsNothing fills acme/widgets while GitHub fails the read of
-// the repository by its id: a 404, which by the id says the repository is deleted or out
-// of the App's reach, since a rename or a transfer keeps the id, fails it for good as a
-// repository gone; a 500 fails it with an error that passes. Either way GraphQL is never
-// asked, nothing is sent and no start is kept.
+// the repository by its id: a 404 or a 410, which by the id says the repository is
+// deleted or out of the App's reach, as after a transfer to an account the installation
+// is not on, never after a rename, fails it for good as a repository gone, and says so;
+// a 500 fails it with an error that passes. Either way GraphQL is never asked, nothing
+// is sent and no start is kept.
 func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
-	for _, status := range []int{404, 500} {
+	const goneText = "the repository is deleted or out of the App's reach, or GitHub redirects a request by its id"
+	for _, status := range []int{404, 410, 500} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		Link(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
@@ -1445,8 +1497,8 @@ func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
 		w.gh.readStatus = status
 		err := w.adapter.fill(context.Background(), widgetsRef)
-		gone := status == 404
-		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone {
+		gone := status == 404 || status == 410
+		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone || strings.Contains(err.Error(), goneText) != gone {
 			t.Errorf("%d: err %v", status, err)
 		}
 		w.gh.mu.Lock()
@@ -1907,6 +1959,67 @@ func TestA409OnCommentsIsFinalForThatRequestOnly(t *testing.T) {
 	}
 	if ok, _ := collectionLinked(w.st, widgetsRef); ok {
 		t.Error("a 409 to items left the collection linked")
+	}
+}
+
+// TestAFillCarriesOnPastA409OnComments fills acme/widgets, 150 open issues in two
+// parts, while Qory Apiary answers the comments on issue 1, sent after the first part,
+// 409 collection_not_linked: the fill carries on, sends the comments on issue 101 and
+// the second part, which says the listing is complete, and passes; its mark is kept,
+// the collection stays linked, and the comments dropped are logged once.
+func TestAFillCarriesOnPastA409OnComments(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	for n := 1; n <= 150; n++ {
+		comments := 0
+		if n == 1 || n == 101 {
+			comments = 1
+			w.gh.comments[n] = []map[string]any{{
+				"id": 5000 + n, "html_url": "https://github.com/acme/widgets/issues/" + strconv.Itoa(n) + "#issuecomment-" + strconv.Itoa(5000+n), "body": "Same here.",
+				"user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+			}}
+		}
+		w.gh.issues = append(w.gh.issues, ghIssue(n, comments))
+	}
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeComments && n == 1 {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.fill(context.Background(), widgetsRef); err != nil {
+		t.Fatal(err)
+	}
+	var parts []contracts.Listing
+	items := 0
+	for _, r := range w.apiary.sent(routeItems) {
+		var req contracts.SourceItems
+		json.Unmarshal(r.raw, &req)
+		items += len(req.Items)
+		if req.Listing != nil {
+			parts = append(parts, *req.Listing)
+		}
+	}
+	if len(parts) != 2 || parts[0].Complete || !parts[1].Complete || items != 150 {
+		t.Errorf("%d items in parts %+v", items, parts)
+	}
+	var on []string
+	for _, r := range w.apiary.sent(routeComments) {
+		on = append(on, r.body["item_ref"].(string))
+	}
+	if want := []string{itemOf("acme/widgets", 1), itemOf("acme/widgets", 101)}; !slices.Equal(on, want) {
+		t.Errorf("comments sent on %v, want %v", on, want)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() || m.Listed.IsZero() {
+		t.Errorf("kept %+v", m)
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Error("a 409 to comments unlinked the collection")
+	}
+	if n := strings.Count(w.log.String(), "Qory Apiary answered collection_not_linked to the comments, so they are dropped"); n != 1 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
 	}
 }
 

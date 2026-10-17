@@ -290,6 +290,37 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	}
 }
 
+// TestARepositoryWithoutAnIDIsSkippedByItsName lists an installation's repositories,
+// one GitHub answers without an id and one with an id that is not positive, and checks
+// each is skipped and logged by its full_name, since no ref names it, the other sent,
+// and the listing not complete.
+func TestARepositoryWithoutAnIDIsSkippedByItsName(t *testing.T) {
+	f := &fakeIssues{}
+	f.repos = append(f.repos, repoJSON(widgetsID, "acme/widgets", "https://github.com/acme/widgets"))
+	f.repos = append(f.repos, map[string]any{"full_name": "acme/no-id", "html_url": "https://github.com/acme/no-id"})
+	f.repos = append(f.repos, repoJSON(-5, "acme/negative", "https://github.com/acme/negative"))
+	s := &sink{}
+	var logs []string
+	l := f.lister(t, s, &logs)
+	if err := l.ListRepositories(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.reqs) != 1 {
+		t.Fatalf("requests %+v", s.reqs)
+	}
+	got := s.reqs[0].(contracts.SourceCollections)
+	if len(got.Collections) != 1 || got.Collections[0].Ref != widgetsRef || got.Listing.Complete {
+		t.Errorf("collections %+v", got)
+	}
+	want := []string{
+		`skipped the collection of the repository "acme/no-id": GitHub answers it without an id, or with one that is not positive`,
+		`skipped the collection of the repository "acme/negative": GitHub answers it without an id, or with one that is not positive`,
+	}
+	if !reflect.DeepEqual(logs, want) {
+		t.Errorf("logged %q", logs)
+	}
+}
+
 func TestTheTargetsSystemIsGitHubsWebsite(t *testing.T) {
 	for api, want := range map[string]string{"": "github.com", "https://api.github.com": "github.com", "https://api.github.com/": "github.com", "http://127.0.0.1:8080": "127.0.0.1", "http://LocalHost:8080": "localhost", "http://[::1]:8080": "localhost"} {
 		if got := (Client{API: api}).WebHost(); got != want {
