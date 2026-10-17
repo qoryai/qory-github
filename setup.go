@@ -83,6 +83,9 @@ type Setup struct {
 	PublicURL         string
 	ClientSecretFile  string
 	WebhookSecretFile string
+	// Starter, when set, requests [StarterManifest] in place of [Manifest]: the App
+	// qory-github-starter's setup creates. PublicURL must then be empty.
+	Starter bool
 }
 
 // App is the App [Setup] created.
@@ -122,6 +125,23 @@ func Manifest(name, redirect string) map[string]any {
 		"public":              false,
 		"hook_attributes":     map[string]any{"url": "https://github.com/qoryai/qory-github", "active": false},
 		"default_permissions": map[string]string{"contents": "write", "pull_requests": "write", "metadata": "read"},
+		"default_events":      []string{},
+	}
+}
+
+// StarterManifest is the App [Setup] requests from GitHub with [Setup.Starter], the
+// App qory-github-starter's setup creates for [Actions]: private, with no webhook and no
+// events, as [Manifest] has none, allowed to write actions and to read metadata and
+// nothing else. An [Actions] narrows each installation token it mints all the same to
+// one repository, with actions write, or actions read to read a run.
+func StarterManifest(name, redirect string) map[string]any {
+	return map[string]any{
+		"name":                name,
+		"url":                 "https://github.com/qoryai/qory-github",
+		"redirect_url":        redirect,
+		"public":              false,
+		"hook_attributes":     map[string]any{"url": "https://github.com/qoryai/qory-github", "active": false},
+		"default_permissions": map[string]string{"actions": "write", "metadata": "read"},
 		"default_events":      []string{},
 	}
 }
@@ -238,7 +258,10 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	local := "http://" + ln.Addr().String()
 	m := Manifest(s.Name, local+"/callback")
-	if s.PublicURL != "" {
+	switch {
+	case s.Starter:
+		m = StarterManifest(s.Name, local+"/callback")
+	case s.PublicURL != "":
 		public, _ := CheckPublicURL(s.PublicURL)
 		serveManifest(m, public)
 	}
@@ -305,9 +328,13 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 
 // Check refuses what [Setup.Start] refuses before it listens, so a caller refuses it
 // before it asks anything: a web URL [CheckWebURL] refuses, an API [CheckAPIURL]
-// refuses, no key file or one that exists, and with [Setup.PublicURL] what
-// [Setup.checkConnect] refuses. It creates, listens on and opens nothing.
+// refuses, no key file or one that exists, [Setup.Starter] with [Setup.PublicURL], and
+// with [Setup.PublicURL] what [Setup.checkConnect] refuses. It creates, listens on and
+// opens nothing.
 func (s Setup) Check() error {
+	if s.Starter && s.PublicURL != "" {
+		return errors.New("the starter's App takes no public URL")
+	}
 	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
 		return err
 	}

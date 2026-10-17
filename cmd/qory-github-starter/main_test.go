@@ -144,13 +144,14 @@ const usageWithoutFactory = `usage:
   qory-github-starter <command> [flags]
 `
 
-// usageWithFactory is the usage with factory: the usage line and access-key, with no
-// description.
+// usageWithFactory is the usage with factory: the usage line, access-key and setup, with
+// no description.
 const usageWithFactory = `usage:
   qory-github-starter <command> [flags]
 
 commands:
   access-key   Enrol the node pool's access key with a code from Qory Apiary
+  setup        Create the starter's GitHub App and write its private key
 
 qory-github-starter <command> -h prints a command's help.
 `
@@ -158,13 +159,18 @@ qory-github-starter <command> -h prints a command's help.
 // TestTheProgramIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory,
 // the program knows no command: whatever it is run with, it prints the usage that lists
 // none and describes nothing, naming no hidden feature, command or what the program
-// does, on standard error, exits 2, and sends nothing.
+// does, on standard error, exits 2, sends nothing, opens no browser and writes no file.
 func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	f := newFakeApiary(t, poolEnrolled)
+	gh := newFakeSetupGitHub(t)
 	file := filepath.Join(t.TempDir(), "secret")
+	keyFile := filepath.Join(t.TempDir(), "github-app.pem")
+	saved := opener
+	opener = func(string) error { t.Error("the program opened the browser"); return nil }
+	defer func() { opener = saved }()
 	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
 		t.Setenv("QORY_FEATURES", features)
-		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"--help"}, {"help"}, {"serve"}, {"serve", "--settings", "/none.json"}, {"setup"}, {"template"},
+		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"--help"}, {"help"}, {"serve"}, {"serve", "--settings", "/none.json"}, {"setup"}, {"setup", "-h"}, {"setup", "--api-url", gh.url, "--key-file", keyFile, "--name", "qory-github-starter-test"}, {"template"},
 			{"access-key"}, {"access-key", "-h"}, {"access-key", "enrol", "-h"}, {"access-key", "enrol", "--secret-file", file, f.url, poolCode(f)}} {
 			var out, errs bytes.Buffer
 			code := run(context.Background(), args, &out, &errs)
@@ -181,17 +187,23 @@ func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	if n := f.requests.Load(); n != 0 {
 		t.Errorf("%d requests were sent", n)
 	}
+	if requests, _ := gh.sent(); len(requests) != 0 {
+		t.Errorf("GitHub was sent %q", requests)
+	}
 	if _, err := os.Lstat(file); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a secret file was written: %v", err)
+	}
+	if _, err := os.Lstat(keyFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a key file was written: %v", err)
 	}
 }
 
 // TestAccessKeyIsPresentWithFactory pins the usage with factory, which lists access-key
-// alone, access-key's help, and the error of a verb it does not know.
+// and setup, access-key's help, and the error of a verb it does not know.
 func TestAccessKeyIsPresentWithFactory(t *testing.T) {
 	for _, features := range []string{"factory", "observability, factory ", " factory,"} {
 		t.Setenv("QORY_FEATURES", features)
-		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"serve"}, {"setup"}, {"template"}} {
+		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"serve"}, {"template"}} {
 			var out, errs bytes.Buffer
 			if code := run(context.Background(), args, &out, &errs); code != 2 || errs.String() != usageWithFactory || out.Len() != 0 {
 				t.Errorf("QORY_FEATURES=%q %v: exit %d, usage:\n%s", features, args, code, errs.String())
