@@ -83,6 +83,9 @@ type Setup struct {
 	PublicURL         string
 	ClientSecretFile  string
 	WebhookSecretFile string
+	// Starter, when set, requests [StarterManifest] in place of [Manifest]: the App
+	// qory-github-starter's setup creates. PublicURL must then be empty.
+	Starter bool
 }
 
 // App is the App [Setup] created.
@@ -122,6 +125,23 @@ func Manifest(name, redirect string) map[string]any {
 		"public":              false,
 		"hook_attributes":     map[string]any{"url": "https://github.com/qoryai/qory-github", "active": false},
 		"default_permissions": map[string]string{"contents": "write", "pull_requests": "write", "metadata": "read"},
+		"default_events":      []string{},
+	}
+}
+
+// StarterManifest is the App [Setup] requests from GitHub with [Setup.Starter], the
+// App qory-github-starter's setup creates for [Actions]: private, with no webhook and no
+// events, as [Manifest] has none, allowed to write actions and to read metadata and
+// nothing else. An [Actions] narrows each installation token it mints all the same to
+// one repository, with actions write, or actions read to read a run.
+func StarterManifest(name, redirect string) map[string]any {
+	return map[string]any{
+		"name":                name,
+		"url":                 "https://github.com/qoryai/qory-github",
+		"redirect_url":        redirect,
+		"public":              false,
+		"hook_attributes":     map[string]any{"url": "https://github.com/qoryai/qory-github", "active": false},
+		"default_permissions": map[string]string{"actions": "write", "metadata": "read"},
 		"default_events":      []string{},
 	}
 }
@@ -208,9 +228,10 @@ func (c Client) Account(ctx context.Context, handle string) (login, kind string,
 
 var codeShape = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 
-// page is the local page that posts the manifest to GitHub as the manifest flow requires.
+// page is the local page that posts the manifest to GitHub as the manifest flow
+// requires; its title names the program, see [Setup.program].
 var page = template.Must(template.New("page").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github setup</title>
+<meta charset="utf-8"><title>{{.Program}} setup</title>
 <form id="f" method="post" action="{{.Action}}">
 <input type="hidden" name="manifest" value="{{.Manifest}}">
 <button type="submit">Create the GitHub App</button>
@@ -238,7 +259,10 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	local := "http://" + ln.Addr().String()
 	m := Manifest(s.Name, local+"/callback")
-	if s.PublicURL != "" {
+	switch {
+	case s.Starter:
+		m = StarterManifest(s.Name, local+"/callback")
+	case s.PublicURL != "":
 		public, _ := CheckPublicURL(s.PublicURL)
 		serveManifest(m, public)
 	}
@@ -249,14 +273,15 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	codes := make(chan string, 1)
 	host := ln.Addr().String()
+	program := s.program()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+pagePath, func(w http.ResponseWriter, _ *http.Request) {
-		page.Execute(w, map[string]string{"Action": action, "Manifest": string(manifest)})
+		page.Execute(w, map[string]string{"Program": program, "Action": action, "Manifest": string(manifest)})
 	})
 	mux.HandleFunc("GET /callback", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(state)) != 1 || !codeShape.MatchString(q.Get("code")) {
-			http.Error(w, "qory-github answers only GitHub's redirect containing the state it sent and a code", http.StatusBadRequest)
+			http.Error(w, program+" answers only GitHub's redirect containing the state it sent and a code", http.StatusBadRequest)
 			return
 		}
 		select {
@@ -270,7 +295,7 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	// origin that resolves a name it controls to loopback reaches nothing.
 	own := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != host {
-			http.Error(w, "qory-github answers only requests to "+host, http.StatusMisdirectedRequest)
+			http.Error(w, program+" answers only requests to "+host, http.StatusMisdirectedRequest)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -303,11 +328,24 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	return local + pagePath, done, nil
 }
 
+// program is the program whose setup s is, which its local page and answers name:
+// qory-github-starter with [Setup.Starter], and qory-github otherwise.
+func (s Setup) program() string {
+	if s.Starter {
+		return "qory-github-starter"
+	}
+	return "qory-github"
+}
+
 // Check refuses what [Setup.Start] refuses before it listens, so a caller refuses it
 // before it asks anything: a web URL [CheckWebURL] refuses, an API [CheckAPIURL]
-// refuses, no key file or one that exists, and with [Setup.PublicURL] what
-// [Setup.checkConnect] refuses. It creates, listens on and opens nothing.
+// refuses, no key file or one that exists, [Setup.Starter] with [Setup.PublicURL], and
+// with [Setup.PublicURL] what [Setup.checkConnect] refuses. It creates, listens on and
+// opens nothing.
 func (s Setup) Check() error {
+	if s.Starter && s.PublicURL != "" {
+		return errors.New("the starter's App takes no public URL")
+	}
 	if err := CheckWebURL(cmp.Or(s.Web, WebURL)); err != nil {
 		return err
 	}

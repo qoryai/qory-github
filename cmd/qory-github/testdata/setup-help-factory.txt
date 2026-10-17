@@ -1,0 +1,47 @@
+Create the GitHub App that qory-github mints access tokens with, and write its private
+key.
+
+setup opens GitHub in the browser with the App filled in: private, no webhook, contents
+and pull requests write, metadata read. You approve it there; nothing is created
+without you. setup waits ten minutes at most.
+
+With --public-url, the App is instead public, with a webhook at the public URL and
+/github/webhook, the events issues, issue_comment, repository, workflow_run,
+pull_request and push, and actions, checks, contents, issues and pull requests
+write, administration, members and metadata read. It is qory-github-server's App:
+setup then prints qory-github-server serve's settings in place of the declaration
+and the policy.
+Without --org, setup asks which GitHub account the App is for. Unless --name gives a
+name, setup suggests qory- and the account's handle, which you can change on
+GitHub's form.
+
+The private key goes to --key-file, which only you may read. setup never writes over a
+file that exists, and never prints the key. GitHub hands the key out once: when the
+file cannot be written, the key goes beside it, and setup prints where.
+
+Then setup prints where to install the App, the declaration for forager.yaml, and a
+policy that selects it.
+
+usage:
+  qory-github setup [--org ORG] [--name NAME] [--key-file FILE]
+
+flags:
+  -api-url string
+    	GitHub's API: https://api.github.com, or for a test http or https on a loopback host (default "https://api.github.com")
+  -key-file string
+    	where the private key is written (default ~/.config/qory/github-app.pem)
+  -name string
+    	the App's name (default qory-github- and six random hex digits, or with --public-url qory- and the account's handle)
+  -org string
+    	create the App under this organisation
+  -public-url string
+    	where qory-github-server serve is reached from outside, https: the App then gets serve's Connect, webhook, events and permissions, and its client secret and webhook secret are written beside the key
+  -web-url string
+    	GitHub's website: https://github.com, or for a test http or https on a loopback host (default "https://github.com")
+
+examples:
+  qory-github setup                                       # under your account
+  qory-github setup --org acme                            # under the organisation acme
+  qory-github setup --name qory-github-acme               # the App's name
+
+More: https://github.com/qoryai/qory-github/blob/main/README.md#setup

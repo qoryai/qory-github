@@ -526,6 +526,165 @@ func TestTheManifestWithAPublicURLIsTheAppServeNeeds(t *testing.T) {
 	}
 }
 
+// starterManifestWant is the starter's App, [StarterManifest], byte for byte, with the
+// redirect URL redirect: private, no webhook, no events, actions write and metadata read
+// and nothing else.
+func starterManifestWant(redirect string) string {
+	return `{"default_events":[],"default_permissions":{"actions":"write","metadata":"read"},"hook_attributes":{"active":false,"url":"https://github.com/qoryai/qory-github"},"name":"qory-github-starter-test","public":false,"redirect_url":"` + redirect + `","url":"https://github.com/qoryai/qory-github"}`
+}
+
+// TestTheStartersManifestIsTheStartersApp pins [StarterManifest] byte for byte.
+func TestTheStartersManifestIsTheStartersApp(t *testing.T) {
+	b, err := json.Marshal(StarterManifest("qory-github-starter-test", "http://127.0.0.1:1/callback"))
+	if want := starterManifestWant("http://127.0.0.1:1/callback"); err != nil || string(b) != want {
+		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+}
+
+// TestServeManifestIsAsItWas pins what [serveManifest] makes of [Manifest] byte for
+// byte, called as it is, beside [TestTheManifestWithAPublicURLIsTheAppServeNeeds], which
+// reads it on setup's page.
+func TestServeManifestIsAsItWas(t *testing.T) {
+	m := Manifest("qory-github-test", "http://127.0.0.1:1/callback")
+	serveManifest(m, "https://qory-github.example.com/base")
+	b, err := json.Marshal(m)
+	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
+		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
+		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
+		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/github/webhook"},` +
+		`"name":"qory-github-test","public":true,"redirect_url":"http://127.0.0.1:1/callback","request_oauth_on_install":false,` +
+		`"setup_on_update":true,"setup_url":"https://qory-github.example.com/base/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
+	if err != nil || string(b) != want {
+		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+}
+
+// TestSetupForTheStarterPostsTheStartersManifest runs setup with [Setup.Starter] and
+// pins the manifest its page posts, byte for byte, where it posts it, and that once the
+// App is approved its key is written and nothing else is kept or set on it.
+func TestSetupForTheStarterPostsTheStartersManifest(t *testing.T) {
+	f := &fakeGitHub{webhookSecret: "a-webhook-secret-github-made-0123"}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "app.pem")
+	s := Setup{Org: "acme", Name: "qory-github-starter-test", KeyFile: file, Web: "https://github.com", Client: serve(t, f), Wait: time.Minute, Starter: true}
+	local, wait, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, m := readPage(t, local)
+	b, _ := json.Marshal(m)
+	if want := starterManifestWant(origin(local) + "/callback"); string(b) != want {
+		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+	u, _ := url.Parse(action)
+	if u.Host != "github.com" || u.Path != "/organizations/acme/settings/apps/new" || u.Query().Get("state") == "" {
+		t.Errorf("the form posts to %s", action)
+	}
+	resp, err := http.Get(origin(local) + "/callback?state=" + u.Query().Get("state") + "&code=abc")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("the redirect answered %v %v", resp, err)
+	}
+	resp.Body.Close()
+	app, err := wait()
+	if err != nil || app.ID != 123456 || app.KeyFile != file || app.ClientSecretFile != "" || app.WebhookSecretFile != "" || app.ClientSecretErr != nil || app.WebhookSecretErr != nil {
+		t.Fatalf("app %+v, err %v", app, err)
+	}
+	if k, err := ReadKeyFile(file); err != nil || !k.Equal(key(t)) {
+		t.Errorf("the key file: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("the directory holds %v", entries)
+	}
+	if _, bodies := f.hookRequests(); len(bodies) != 0 {
+		t.Error("setup set a webhook secret on the starter's App")
+	}
+}
+
+// TestSetupForTheStarterTakesNoPublicURL pins that [Setup.Starter] with
+// [Setup.PublicURL] is refused before anything listens or opens.
+func TestSetupForTheStarterTakesNoPublicURL(t *testing.T) {
+	dir := t.TempDir()
+	s := serveSetup(dir, Client{API: unreachable(t)})
+	s.Starter = true
+	s.Open = func(string) error { t.Error("setup opened the page"); return nil }
+	if _, _, err := s.Start(context.Background()); err == nil || err.Error() != "the starter's App takes no public URL" {
+		t.Errorf("Start: %v", err)
+	}
+	if err := s.Check(); err == nil || err.Error() != "the starter's App takes no public URL" {
+		t.Errorf("Check: %v", err)
+	}
+}
+
+// pageAndAnswers runs s and returns setup's local page, byte for byte, its form's
+// action, and the bodies of the answers to a redirect without the state and to a
+// request for the page under another host than the listener's, and that address.
+func pageAndAnswers(t *testing.T, s Setup) (body, action, badRedirect, misdirected, host string) {
+	t.Helper()
+	local, wait, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wait()
+	get := func(u, host string, status int) string {
+		req, _ := http.NewRequest("GET", u, nil)
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != status {
+			t.Errorf("GET %s for %q answered %d, want %d", u, host, resp.StatusCode, status)
+		}
+		return string(b)
+	}
+	body = get(local, "", http.StatusOK)
+	action, _ = readPage(t, local)
+	u, _ := url.Parse(local)
+	return body, action, get(origin(local)+"/callback?code=abc&state=wrong", "", http.StatusBadRequest), get(local, "qory.attacker.test:"+u.Port(), http.StatusMisdirectedRequest), u.Host
+}
+
+// setupPage is setup's local page, byte for byte, for program, with the form's action
+// and the manifest's value as the page has them, escaped.
+func setupPage(program, action, manifest string) string {
+	return `<!doctype html>
+<meta charset="utf-8"><title>` + program + ` setup</title>
+<form id="f" method="post" action="` + action + `">
+<input type="hidden" name="manifest" value="` + manifest + `">
+<button type="submit">Create the GitHub App</button>
+</form>
+<script>document.getElementById("f").submit()</script>
+`
+}
+
+// TestSetupsPageAndAnswersNameTheProgram pins setup's local page and its answers to a
+// redirect without the state and to another host, byte for byte: without
+// [Setup.Starter] they name qory-github, as they did before qory-github-starter's
+// setup, and with it they name qory-github-starter.
+func TestSetupsPageAndAnswersNameTheProgram(t *testing.T) {
+	for _, tc := range []struct {
+		starter bool
+		program string
+	}{{false, "qory-github"}, {true, "qory-github-starter"}} {
+		s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: Client{API: unreachable(t)}, Wait: time.Millisecond, Starter: tc.starter}
+		body, _, bad, misdirected, host := pageAndAnswers(t, s)
+		action := regexp.MustCompile(`action="([^"]+)"`).FindStringSubmatch(body)
+		value := regexp.MustCompile(`name="manifest" value="([^"]+)"`).FindStringSubmatch(body)
+		if action == nil || value == nil || body != setupPage(tc.program, action[1], value[1]) {
+			t.Errorf("%s: the page is\n%s", tc.program, body)
+		}
+		if want := tc.program + " answers only GitHub's redirect containing the state it sent and a code\n"; bad != want {
+			t.Errorf("%s: a redirect without the state is answered %q, want %q", tc.program, bad, want)
+		}
+		if want := tc.program + " answers only requests to " + host + "\n"; misdirected != want {
+			t.Errorf("%s: another host is answered %q, want %q", tc.program, misdirected, want)
+		}
+	}
+}
+
 // serveSetup is a Setup with [Setup.PublicURL] whose files are in dir, reaching c.
 func serveSetup(dir string, c Client) Setup {
 	return Setup{KeyFile: filepath.Join(dir, "app.pem"), Web: "https://github.com", Client: c, PublicURL: "https://qory-github.example.com",

@@ -9,26 +9,21 @@ import (
 	"bufio"
 	"cmp"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/cli"
+	"github.com/qoryai/qory-github/internal/setupcmd"
 )
 
 func main() {
@@ -280,7 +275,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 		dir = filepath.Join(home, ".config", "qory")
 		*keyFile = filepath.Join(dir, "github-app.pem")
-		if err := checkKeyFile(*keyFile); err != nil {
+		if err := setupcmd.CheckKeyFile(*keyFile); err != nil {
 			return err
 		}
 	}
@@ -291,7 +286,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		// Without --org, setup asks which account the App is for, once every check
 		// setup makes before it creates anything has passed.
 		if *org == "" {
-			if err := checkKeyFile(s.KeyFile); err != nil {
+			if err := setupcmd.CheckKeyFile(s.KeyFile); err != nil {
 				return err
 			}
 			if err := s.Check(); err != nil {
@@ -317,7 +312,7 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if s.Name == "" {
 		// With --public-url the name GitHub's form is filled in with is qory- and the
 		// account's handle, which the person may change there.
-		s.Name = "qory-github-" + randomSuffix()
+		s.Name = "qory-github-" + setupcmd.RandomSuffix()
 		if public != "" {
 			s.Name = "qory-" + handle
 		}
@@ -402,21 +397,9 @@ func askAccount(ctx context.Context, c github.Client, stdout io.Writer) (string,
 
 // runSetup is setup past its flags, so a test drives it with a page opener the test supplies.
 func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
-	if err := checkKeyFile(s.KeyFile); err != nil {
-		return err
-	}
-	page, wait, err := s.Start(ctx)
+	app, abs, err := setupcmd.Create(ctx, s, stdout)
 	if err != nil {
 		return err
-	}
-	fmt.Fprintf(stdout, "Approve the App in the browser. If none opened, open %s\n", page)
-	app, err := wait()
-	if err != nil {
-		return err
-	}
-	abs, _ := filepath.Abs(app.KeyFile)
-	if app.Moved != nil {
-		fmt.Fprint(stdout, movedLine(abs, s.KeyFile, app.Moved))
 	}
 	// The App --public-url makes is qory-github-server's: it lacks the permissions a
 	// run's token needs, so no declaration is printed for it.
@@ -515,24 +498,6 @@ func webhookSecretFile(keyFile string) string {
 	return strings.TrimSuffix(keyFile, ".pem") + ".webhook-secret"
 }
 
-// movedLine is the line setup prints when the key is in abs, beside file, since file could
-// not be written, or was written and its sync failed, and why: the error of the
-// [*fs.PathError] that moved wraps, or "it exists".
-func movedLine(abs, file string, moved error) string {
-	what, why := "written", moved.Error()
-	var pe *fs.PathError
-	switch {
-	case errors.Is(moved, fs.ErrExist):
-		why = "it exists"
-	case errors.As(moved, &pe):
-		why = pe.Err.Error()
-		if pe.Op == "sync" {
-			what = "written or synced"
-		}
-	}
-	return fmt.Sprintf("\nThe key is in %s, since %s could not be %s: %s.\n", abs, file, what, why)
-}
-
 // declaration is what setup prints for the App: the integration as the machine's
 // configuration declares it, by its settings alone, and a run's policy that allows
 // GitHub's hosts and selects the credential qory expands the declaration into.
@@ -559,45 +524,6 @@ credentials:
 	return integrations, policy, nil
 }
 
-// checkKeyFile refuses a key file's path that the declaration cannot contain as it is
-// written: one that is not UTF-8, or that contains a control character, C0, DEL or C1.
-// It runs before setup creates a directory or the App, so nothing is created for a path
-// setup refuses.
-func checkKeyFile(p string) error {
-	p, err := filepath.Abs(p)
-	if err != nil {
-		return err
-	}
-	if !utf8.ValidString(p) {
-		return fmt.Errorf("the key file's path %q is not UTF-8; choose another with --key-file", p)
-	}
-	if strings.IndexFunc(p, unicode.IsControl) >= 0 {
-		return fmt.Errorf("the key file's path %q contains a control character; choose another with --key-file", p)
-	}
-	return nil
-}
-
-// browse opens a URL in the machine's browser. It never fails the setup: the URL is
-// printed as well.
 // opener opens setup's page in the machine's browser; a test replaces it, so it never
 // opens one.
-var opener = browse
-
-func browse(u string) error {
-	name := "xdg-open"
-	if runtime.GOOS == "darwin" {
-		name = "open"
-	}
-	cmd := exec.Command(name, u)
-	if err := cmd.Start(); err == nil {
-		go cmd.Wait()
-	}
-	return nil
-}
-
-// randomSuffix is six hex digits, so a default App name is likely free.
-func randomSuffix() string {
-	b := make([]byte, 3)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
-}
+var opener = setupcmd.Browse
