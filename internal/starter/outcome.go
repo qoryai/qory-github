@@ -68,8 +68,8 @@ func OutcomeOf(conclusion string) Outcome {
 // run.url of the configuration document Qory Apiary answers the key's signed GET of
 // /.well-known/qory-configuration with; the handover's answer does not carry it.
 // X-Qory-Contract-Version is Forager's revision. A State other than the three, a Reason
-// without a State or that is no code, and a runURL or a runID outside its form are
-// refused before anything is sent. Each try is built anew, with a later time. The
+// without a State or that is no code, a runURL or a runID outside its form, and a runURL
+// that holds qak_ or qrk_ are refused before anything is sent. Each try is built anew, with a later time. The
 // answer is a signed 200 whose body run-outcome-answer.schema.json accepts, a member it
 // does not define ignored. A refusal is a [*Refusal]: [ErrOutcomeGiven],
 // [ErrRunNotFound] or [ErrRateLimited]; the same outcome again is answered the signed
@@ -79,7 +79,9 @@ func (a *Apiary) PostOutcome(ctx context.Context, runURL, runID string, o Outcom
 	switch {
 	case !runIDShape.MatchString(runID):
 		return errors.New("the outcome: the run id is not a UUID in the canonical lower-case form")
-	case !runURLShape.MatchString(runURL) || accesskey.ContainsSecret(runURL):
+	case accesskey.ContainsSecret(runURL):
+		return errors.New(what + ": the run endpoint holds what looks like a secret, qak_ or qrk_, so nothing is sent")
+	case !runURLShape.MatchString(runURL):
 		return errors.New(what + ": the run endpoint is not https, or http to a loopback address, with no query, no fragment and no trailing slash")
 	case o.State != "" && o.State != StateSucceeded && o.State != StateFailed && o.State != StateCancelled:
 		return errors.New(what + ": the state is not succeeded, failed or cancelled")

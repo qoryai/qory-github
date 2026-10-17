@@ -96,21 +96,21 @@ func TestNoSecretLeaks(t *testing.T) {
 		var errs []error
 		if strings.Contains(rep.body, `"lease_until"`) {
 			c, ok, err := a.Claim(ctx, 0)
-			if rep.body == claim && (!ok || c.WorkItem.Title != titleMarker) {
+			if rep.body == claim && (!ok || c.WorkItem.Title.Value() != titleMarker) {
 				t.Fatal("the signed claim that holds the title is not used, so the test proves nothing of a result")
 			}
 			errs = append(errs, err)
 			a.Log.Info("claimed", "claim", c)
-			shown = append(shown, fmt.Sprint(c), fmt.Sprintf("%+v %#v %q", c, c, c))
+			shown = append(shown, fmt.Sprint(c), fmt.Sprintf("%+v %#v %q", c, c, c), fmt.Sprintf("%+v %#v", struct{ c Claimed }{c}, struct{ c Claimed }{c}))
 		} else {
 			h, err := a.Handover(ctx, testDispatch, testRun)
-			if i == 0 && (err != nil || h.RunKey != runKeyMarker || !strings.Contains(string(h.Inputs), inputsMarker)) {
+			if i == 0 && (err != nil || h.RunKey.Value() != runKeyMarker || !strings.Contains(h.Inputs.Value(), inputsMarker)) {
 				t.Fatal("the signed handover that holds the markers is not used, so the test proves nothing of a result")
 			}
 			errs = append(errs, err)
 			a.Log.Info("handed over", "handover", h)
 			js, _ := json.Marshal(h)
-			shown = append(shown, fmt.Sprint(h), fmt.Sprintf("%+v %#v %q", h, h, h), string(js))
+			shown = append(shown, fmt.Sprint(h), fmt.Sprintf("%+v %#v %q", h, h, h), string(js), fmt.Sprintf("%+v %#v", struct{ h Handed }{h}, struct{ h Handed }{h}))
 		}
 		errs = append(errs, a.Release(ctx, testDispatch, "the job could not start", true))
 		for _, err := range errs {

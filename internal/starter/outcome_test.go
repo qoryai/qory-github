@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,16 +166,21 @@ func TestOutcomeRefused(t *testing.T) {
 	a := f.client(&sleeps{}, nil)
 	run := f.srv.URL + "/v1/runs"
 	for name, err := range map[string]error{
-		"a state it does not know":     a.PostOutcome(ctx, run, testRun, Outcome{State: "stopped"}),
-		"a reason with no state":       a.PostOutcome(ctx, run, testRun, Outcome{Reason: "why"}),
-		"a reason that is no code":     a.PostOutcome(ctx, run, testRun, Outcome{State: StateFailed, Reason: "Not A Code"}),
-		"a run id":                     a.PostOutcome(ctx, run, "../x", Outcome{}),
-		"a run endpoint with a query":  a.PostOutcome(ctx, run+"?x=1", testRun, Outcome{}),
-		"a plain http run endpoint":    a.PostOutcome(ctx, "http://example.com/v1/runs", testRun, Outcome{}),
-		"a run endpoint with a secret": a.PostOutcome(ctx, run+"/qrk_x", testRun, Outcome{}),
+		"a state it does not know":    a.PostOutcome(ctx, run, testRun, Outcome{State: "stopped"}),
+		"a reason with no state":      a.PostOutcome(ctx, run, testRun, Outcome{Reason: "why"}),
+		"a reason that is no code":    a.PostOutcome(ctx, run, testRun, Outcome{State: StateFailed, Reason: "Not A Code"}),
+		"a run id":                    a.PostOutcome(ctx, run, "../x", Outcome{}),
+		"a run endpoint with a query": a.PostOutcome(ctx, run+"?x=1", testRun, Outcome{}),
+		"a plain http run endpoint":   a.PostOutcome(ctx, "http://example.com/v1/runs", testRun, Outcome{}),
 	} {
 		if err == nil {
 			t.Errorf("%s: the outcome is sent", name)
+		}
+	}
+	for _, u := range []string{run + "/qrk_x", run + "/QAK_x", "https://qrk_x.example.com/v1/runs"} {
+		err := a.PostOutcome(ctx, u, testRun, Outcome{})
+		if err == nil || !strings.Contains(err.Error(), "holds what looks like a secret, qak_ or qrk_, so nothing is sent") || strings.Contains(err.Error(), "not https") {
+			t.Errorf("a run endpoint that holds a secret is not refused as one: %v", err)
 		}
 	}
 	if len(f.requests()) != 0 {

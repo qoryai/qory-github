@@ -44,14 +44,17 @@ type seen struct {
 	replayed  bool
 }
 
-// reply is what the fake answers one request with: its status and body, and whether
-// it is left unsigned or signed under a key other than the pinned one.
+// reply is what the fake answers one request with: its status and body, whether it
+// is left unsigned or signed under a key other than the pinned one, whether its
+// signature header is sent twice, and where it redirects to.
 type reply struct {
-	status     int
-	body       string
-	unsigned   bool
-	wrongKey   bool
-	retryAfter string
+	status       int
+	body         string
+	unsigned     bool
+	wrongKey     bool
+	retryAfter   string
+	dupSignature bool
+	location     string
 }
 
 // fake is Qory Apiary as the starter reaches it. It verifies each request's signature
@@ -119,7 +122,14 @@ func (f *fake) serve(w http.ResponseWriter, r *http.Request) {
 		if rep.wrongKey {
 			k = f.other
 		}
-		w.Header().Set(accesskey.HeaderSignature, k.SignAnswer(accesskey.Answer{Status: rep.status, RequestSignature: sig, Body: []byte(rep.body)}))
+		signature := k.SignAnswer(accesskey.Answer{Status: rep.status, RequestSignature: sig, Body: []byte(rep.body)})
+		w.Header().Set(accesskey.HeaderSignature, signature)
+		if rep.dupSignature {
+			w.Header().Add(accesskey.HeaderSignature, signature)
+		}
+	}
+	if rep.location != "" {
+		w.Header().Set("Location", rep.location)
 	}
 	if rep.body != "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -300,7 +310,10 @@ func TestAnswerFixtures(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &want); err != nil {
 			t.Fatal(err)
 		}
-		if got.ClaimAnswer != want {
+		w := got.WorkItem
+		if got.DispatchID != want.DispatchID || got.RunID != want.RunID || got.PoolID != want.PoolID || got.LeaseUntil != want.LeaseUntil ||
+			got.Step != want.Step || got.Access != want.Access || got.Target != want.Target ||
+			w.ID != want.WorkItem.ID || w.URL != want.WorkItem.URL || w.Title.Value() != want.WorkItem.Title {
 			t.Errorf("the claim is not the fixture's")
 		}
 	})
@@ -318,10 +331,17 @@ func TestAnswerFixtures(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &want); err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(got.Inputs, want.Inputs) {
+		if got.Inputs.Value() != string(want.Inputs) {
 			t.Error("the inputs are not the answer's bytes")
 		}
-		if got.RunID != testRun || got.RunKey != want.RunKey || got.Step != "explore" || got.WorkItem != want.WorkItem || got.Target != want.Target {
+		doc := got.Document()
+		if !bytes.Equal(doc.Inputs, want.Inputs) {
+			t.Error("the document's inputs are not the answer's bytes")
+		}
+		w := want.HandoverAnswer
+		if doc.Version != w.Version || doc.Revision != w.Revision || doc.RunID != w.RunID || doc.RunKey != w.RunKey || doc.Step != w.Step ||
+			doc.Access != w.Access || doc.Target != w.Target || doc.WorkItem != w.WorkItem ||
+			got.RunKey.Value() != w.RunKey || got.WorkItem.Title.Value() != w.WorkItem.Title {
 			t.Error("the handover is not the fixture's")
 		}
 	})
@@ -386,7 +406,7 @@ func TestInvalidFixtures(t *testing.T) {
 			case strings.HasPrefix(name, "handover-answer-"):
 				f := newFake(t, func(int, seen) reply { return reply{status: http.StatusOK, body: body} })
 				got, err := f.client(&sleeps{}, nil).Handover(ctx, testDispatch, testRun)
-				if !errors.Is(err, ErrAnswerUnusable) || got.RunKey != "" {
+				if !errors.Is(err, ErrAnswerUnusable) || got.RunKey.Value() != "" {
 					t.Errorf("the answer is used: %v", err)
 				}
 			default:
@@ -397,41 +417,79 @@ func TestInvalidFixtures(t *testing.T) {
 }
 
 // sentinels are every refusal a later step may act on.
+// sentinels are every refusal a later step may act on.
 var sentinels = []error{ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited, ErrOutcomeGiven, ErrRunNotFound}
 
-// TestRefusals answers each request with each signed refusal its schema gives, in the
-// schema's order, and checks the error matches that refusal alone, after one try; and
-// that a refusal another request's schema gives, or a code with another status, matches
-// none.
+// refusalCodes are every signed refusal code the tests answer with, each with its
+// status and the error that names it, written out from refusal.schema.json and Forager's
+// README rather than read from the client.
+var refusalCodes = []struct {
+	status int
+	code   string
+	err    error
+}{
+	{403, "forbidden", ErrForbidden},
+	{410, "gone", ErrGone},
+	{409, "handed_over", ErrHandedOver},
+	{409, "lease_expired", ErrLeaseExpired},
+	{409, "not_dispatched", ErrNotDispatched},
+	{409, "no_gateway", ErrNoGateway},
+	{429, "rate_limited", ErrRateLimited},
+	{409, "outcome_given", ErrOutcomeGiven},
+	{404, "not_found", ErrRunNotFound},
+}
+
+// givenCodes are the codes each request's schema gives, in the order the control plane
+// decides them, written out from claim.schema.json, dispatched.schema.json,
+// handover.schema.json, release.schema.json and Forager's run-outcome.schema.json, with
+// refusal.schema.json's 429 last.
+var givenCodes = map[string][]string{
+	"claim":      {"forbidden", "no_gateway", "rate_limited"},
+	"dispatched": {"forbidden", "gone", "lease_expired", "rate_limited"},
+	"handover":   {"forbidden", "gone", "handed_over", "lease_expired", "not_dispatched", "no_gateway", "rate_limited"},
+	"release":    {"forbidden", "gone", "lease_expired", "rate_limited"},
+	"outcome":    {"not_found", "outcome_given", "rate_limited"},
+}
+
+// TestRefusals answers each request with each signed refusal code in [refusalCodes],
+// and checks the error matches that code's refusal exactly when [givenCodes] lists the
+// code for the request, matches no other refusal, and comes after one try. It checks
+// the client's table holds the lists in their order, and that a code with another
+// status, or a refusal body refusal.schema.json refuses, matches none.
 func TestRefusals(t *testing.T) {
 	ctx := context.Background()
-	send := map[kind]func(a *Apiary) error{
-		kindClaim:      func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err },
-		kindDispatched: func(a *Apiary) error { return a.Dispatched(ctx, testDispatch, nil) },
-		kindHandover:   func(a *Apiary) error { _, err := a.Handover(ctx, testDispatch, testRun); return err },
-		kindRelease:    func(a *Apiary) error { return a.Release(ctx, testDispatch, "gone", false) },
-		kindOutcome: func(a *Apiary) error {
+	send := map[string]func(a *Apiary) error{
+		"claim":      func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err },
+		"dispatched": func(a *Apiary) error { return a.Dispatched(ctx, testDispatch, nil) },
+		"handover":   func(a *Apiary) error { _, err := a.Handover(ctx, testDispatch, testRun); return err },
+		"release":    func(a *Apiary) error { return a.Release(ctx, testDispatch, "gone", false) },
+		"outcome": func(a *Apiary) error {
 			return a.PostOutcome(ctx, a.URL+"/v1/runs", testRun, Outcome{State: StateFailed})
 		},
 	}
-	// The order handover.schema.json gives; release.schema.json follows it.
-	if want := []error{ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited}; !slices.Equal(refusalsOf[kindHandover], want) {
-		t.Error("the handover's refusals are not in handover.schema.json's order")
+	kinds := map[string]kind{"claim": kindClaim, "dispatched": kindDispatched, "handover": kindHandover, "release": kindRelease, "outcome": kindOutcome}
+	for name, want := range givenCodes {
+		var got []string
+		for _, e := range refusalsOf[kinds[name]] {
+			got = append(got, codeOf[e].code)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("the client gives the %s %v, not %v", name, got, want)
+		}
 	}
-	for k, fn := range send {
-		for _, want := range sentinels {
-			c := codeOf[want]
-			t.Run(fmt.Sprintf("%d %d %s", k, c.status, c.code), func(t *testing.T) {
+	for name, fn := range send {
+		for _, c := range refusalCodes {
+			t.Run(fmt.Sprintf("%s %d %s", name, c.status, c.code), func(t *testing.T) {
 				f := newFake(t, func(int, seen) reply {
 					return reply{status: c.status, body: `{"error":"` + c.code + `"}`, retryAfter: "7"}
 				})
 				err := fn(f.client(&sleeps{}, nil))
-				given := slices.Contains(refusalsOf[k], want)
-				if errors.Is(err, want) != given {
-					t.Errorf("errors.Is(%v, %v) is %v", err, want, !given)
+				given := slices.Contains(givenCodes[name], c.code)
+				if errors.Is(err, c.err) != given {
+					t.Errorf("errors.Is(%v, %v) is %v", err, c.err, !given)
 				}
 				for _, other := range sentinels {
-					if other != want && errors.Is(err, other) {
+					if other != c.err && errors.Is(err, other) {
 						t.Errorf("%v matches %v too", err, other)
 					}
 				}
@@ -439,10 +497,10 @@ func TestRefusals(t *testing.T) {
 				if !errors.As(err, &r) || r.Status != c.status || r.Code != c.code || !r.Signed {
 					t.Errorf("the error is not the signed refusal: %v", err)
 				}
-				if errors.Is(err, ErrUnsigned) {
-					t.Error("a signed refusal is ErrUnsigned")
+				if errors.Is(err, ErrUnsigned) || errors.Is(err, ErrTooLarge) {
+					t.Error("a signed refusal is ErrUnsigned or ErrTooLarge")
 				}
-				if want == ErrRateLimited && given && r.RetryAfter != 7*time.Second {
+				if c.code == "rate_limited" && r.RetryAfter != 7*time.Second {
 					t.Errorf("Retry-After is %s, not 7s", r.RetryAfter)
 				}
 				if n := len(f.requests()); n != 1 {
@@ -453,7 +511,7 @@ func TestRefusals(t *testing.T) {
 	}
 	t.Run("a code with another status", func(t *testing.T) {
 		f := newFake(t, func(int, seen) reply { return reply{status: http.StatusConflict, body: `{"error":"gone"}`} })
-		err := send[kindHandover](f.client(&sleeps{}, nil))
+		err := send["handover"](f.client(&sleeps{}, nil))
 		for _, s := range sentinels {
 			if errors.Is(err, s) {
 				t.Errorf("409 gone matches %v", s)
@@ -464,7 +522,7 @@ func TestRefusals(t *testing.T) {
 		f := newFake(t, func(int, seen) reply {
 			return reply{status: http.StatusConflict, body: `{"error":"handed_over","extra":1}`}
 		})
-		err := send[kindHandover](f.client(&sleeps{}, nil))
+		err := send["handover"](f.client(&sleeps{}, nil))
 		var r *Refusal
 		if errors.Is(err, ErrHandedOver) || !errors.As(err, &r) || r.Code != "" {
 			t.Errorf("a refusal with a member refusal.schema.json does not define is read: %v", err)
@@ -474,7 +532,7 @@ func TestRefusals(t *testing.T) {
 		for name, want := range map[string]error{"handed-over.json": ErrHandedOver, "no-gateway.json": ErrNoGateway} {
 			body := fixture(t, "refusal/"+name)
 			f := newFake(t, func(int, seen) reply { return reply{status: http.StatusConflict, body: body} })
-			if err := send[kindHandover](f.client(&sleeps{}, nil)); !errors.Is(err, want) {
+			if err := send["handover"](f.client(&sleeps{}, nil)); !errors.Is(err, want) {
 				t.Errorf("%s: %v is not %v", name, err, want)
 			}
 		}
@@ -483,7 +541,7 @@ func TestRefusals(t *testing.T) {
 
 // TestUnusable answers a claim and a handover with answers that break the contract and
 // checks nothing in them is returned: a wrong revision, an unknown member, a member
-// twice, an answer over its bound, a run or a node pool other than the one asked, and
+// twice, a revision with a fraction, a run or a node pool other than the one asked, and
 // inputs over their bound. Each is refused at once, after one try.
 func TestUnusable(t *testing.T) {
 	ctx := context.Background()
@@ -508,7 +566,6 @@ func TestUnusable(t *testing.T) {
 		{"unknown member", edit(claim, func(m map[string]any) { m["extra"] = true }), edit(handover, func(m map[string]any) { m["extra"] = true })},
 		{"member twice", strings.Replace(claim, `"version": 1,`, `"version": 1, "version": 1,`, 1), strings.Replace(handover, `"version": 1,`, `"version": 1, "version": 1,`, 1)},
 		{"revision with a fraction", strings.Replace(claim, `"revision": 1`, `"revision": 1.5`, 1), strings.Replace(handover, `"revision": 1`, `"revision": 1.5`, 1)},
-		{"over its bound", edit(claim, func(m map[string]any) { m["pad"] = strings.Repeat("x", maxClaimAnswer) }), edit(handover, func(m map[string]any) { m["pad"] = strings.Repeat("x", contracts.MaxHandoverAnswer) })},
 		{"another run or pool", edit(claim, func(m map[string]any) { m["pool_id"] = "np_0000000000000000" }), edit(handover, func(m map[string]any) { m["run_id"] = otherRun })},
 		{"inputs over their bound", "", bigInputs},
 	}
@@ -519,7 +576,7 @@ func TestUnusable(t *testing.T) {
 				a := f.client(&sleeps{}, nil)
 				a.PoolID = testPool
 				got, ok, err := a.Claim(ctx, 0)
-				if !errors.Is(err, ErrAnswerUnusable) || ok || got.DispatchID != "" || got.WorkItem.Title != "" {
+				if !errors.Is(err, ErrAnswerUnusable) || ok || got.DispatchID != "" || got.WorkItem.Title.Value() != "" {
 					t.Errorf("the claim's answer is used: %v", err)
 				}
 				if len(f.requests()) != 1 {
@@ -528,7 +585,7 @@ func TestUnusable(t *testing.T) {
 			}
 			f := newFake(t, func(int, seen) reply { return reply{status: http.StatusOK, body: c.handover} })
 			got, err := f.client(&sleeps{}, nil).Handover(ctx, testDispatch, testRun)
-			if !errors.Is(err, ErrAnswerUnusable) || got.RunKey != "" || got.Inputs != nil {
+			if !errors.Is(err, ErrAnswerUnusable) || got.RunKey.Value() != "" || got.Inputs.Value() != "" {
 				t.Errorf("the handover's answer is used: %v", err)
 			}
 		})
@@ -548,7 +605,7 @@ func TestBadSignature(t *testing.T) {
 		f := newFake(t, func(int, seen) reply { return rep })
 		sl := &sleeps{}
 		got, err := f.client(sl, nil).Handover(ctx, testDispatch, testRun)
-		if !errors.Is(err, ErrUnsigned) || got.RunKey != "" {
+		if !errors.Is(err, ErrUnsigned) || got.RunKey.Value() != "" {
 			t.Fatalf("an answer not signed under the pin is used: %v", err)
 		}
 		checkBuiltAnew(t, f.requests(), tries)
@@ -635,22 +692,6 @@ func TestUnsignedRetried(t *testing.T) {
 			t.Errorf("not one line per try sent again:\n%s", logs.String())
 		}
 	})
-	t.Run("a replay is sent again with a later time", func(t *testing.T) {
-		// Two dispatched within the same second build the same bytes; the fake answers
-		// the second's signature, one it has seen, with the 401, and the try after it
-		// is built anew.
-		f := newFake(t, ok204)
-		a := f.client(&sleeps{}, nil)
-		for range 2 {
-			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
-				t.Fatalf("the request failed: %v", err)
-			}
-		}
-		reqs := f.requests()
-		if len(reqs) != 3 || !reqs[1].replayed || reqs[2].replayed {
-			t.Fatalf("the replay is not sent again built anew: %d requests", len(reqs))
-		}
-	})
 	t.Run("a server error is sent again", func(t *testing.T) {
 		f := newFake(t, func(n int, _ seen) reply {
 			if n == 1 {
@@ -714,28 +755,318 @@ func TestRefusedBeforeSending(t *testing.T) {
 	}
 }
 
-// TestShown checks a Claimed and a Handed print, log and marshal as their ids alone.
+// TestShown checks a Claimed and a Handed print, log and marshal without the run key,
+// the inputs or the title, at the top level, behind a pointer and in an unexported
+// field fmt cannot call methods on, and that Value and Document give them back.
 func TestShown(t *testing.T) {
-	var claim contracts.ClaimAnswer
-	var handover contracts.HandoverAnswer
-	if err := json.Unmarshal([]byte(fixture(t, "claim-answer/explore.json")), &claim); err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+	claimBody, handoverBody := fixture(t, "claim-answer/explore.json"), fixture(t, "handover-answer/explore.json")
+	f := newFake(t, func(n int, _ seen) reply {
+		if n == 1 {
+			return reply{status: http.StatusOK, body: claimBody}
+		}
+		return reply{status: http.StatusOK, body: handoverBody}
+	})
+	a := f.client(&sleeps{}, nil)
+	c, ok, err := a.Claim(ctx, 0)
+	if err != nil || !ok {
+		t.Fatalf("the claim failed: %v", err)
 	}
-	if err := json.Unmarshal([]byte(fixture(t, "handover-answer/explore.json")), &handover); err != nil {
-		t.Fatal(err)
+	h, err := a.Handover(ctx, testDispatch, testRun)
+	if err != nil {
+		t.Fatalf("the handover failed: %v", err)
+	}
+	if !strings.HasPrefix(h.RunKey.Value(), "qrk_") || !strings.Contains(h.Inputs.Value(), "cart page") ||
+		c.WorkItem.Title.Value() != "Checkout fails on an empty cart" || h.Document().RunKey != h.RunKey.Value() {
+		t.Fatal("Value or Document does not give the value back")
 	}
 	var logs bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	for _, v := range []any{Claimed{claim}, Handed{handover}, &Claimed{claim}, &Handed{handover}} {
-		log.Info("shown", "v", v)
+	jsonLog := slog.New(slog.NewJSONHandler(&logs, nil))
+	textLog := slog.New(slog.NewTextHandler(&logs, nil))
+	for _, v := range []any{c, h, &c, &h, struct{ h Handed }{h}, struct{ c Claimed }{c}, []Handed{h}, map[string]Handed{"h": h}, h.RunKey, h.Inputs, c.WorkItem} {
+		jsonLog.Info("shown", "v", v)
+		textLog.Info("shown", "v", v)
 		js, _ := json.Marshal(v)
-		for _, s := range []string{fmt.Sprint(v), fmt.Sprintf("%+v", v), fmt.Sprintf("%#v", v), fmt.Sprintf("%s", v), fmt.Sprintf("%q", v), string(js), logs.String()} {
-			if strings.Contains(s, "qrk_") || strings.Contains(s, "Checkout fails") || strings.Contains(s, "cart page") {
+		for _, s := range []string{fmt.Sprint(v), fmt.Sprintf("%+v", v), fmt.Sprintf("%#v", v), fmt.Sprintf("%s", v), fmt.Sprintf("%q", v), fmt.Sprintf("%x", v), string(js), logs.String()} {
+			if strings.Contains(strings.ToLower(s), "qrk_") || strings.Contains(s, "Checkout fails") || strings.Contains(s, "cart page") {
 				t.Errorf("%T shows a run key, a title or the inputs", v)
 			}
-			if !strings.Contains(s, testRun) {
-				t.Errorf("%T does not show its run", v)
-			}
 		}
+	}
+}
+
+// padTo is the JSON object doc with white space after its opening brace, so that it is
+// size bytes in all.
+func padTo(t *testing.T, doc string, size int) string {
+	t.Helper()
+	if len(doc) > size || doc[0] != '{' {
+		t.Fatal("the document cannot be padded to that size")
+	}
+	return "{" + strings.Repeat(" ", size-len(doc)) + doc[1:]
+}
+
+// TestTooLarge answers with answers one byte over their bound, an unsigned 200, 502 and
+// 401 and a signed 200, and checks each is a try that failed: sent again, built anew,
+// up to every try, then ErrTooLarge, whose text says the answer was refused for its size
+// before its signature was read.
+func TestTooLarge(t *testing.T) {
+	ctx := context.Background()
+	claim := fixture(t, "claim-answer/explore.json")
+	big := padTo(t, `{"error":"bad_gateway"}`, maxAnswer+1)
+	cases := []struct {
+		name string
+		rep  reply
+		send func(a *Apiary) error
+	}{
+		{"unsigned 200", reply{status: http.StatusOK, body: padTo(t, claim, maxClaimAnswer+1), unsigned: true}, func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err }},
+		{"signed 200", reply{status: http.StatusOK, body: padTo(t, claim, maxClaimAnswer+1)}, func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err }},
+		{"unsigned 502", reply{status: http.StatusBadGateway, body: big, unsigned: true}, func(a *Apiary) error { return a.Dispatched(ctx, testDispatch, nil) }},
+		{"unsigned 401", reply{status: http.StatusUnauthorized, body: big, unsigned: true}, func(a *Apiary) error { return a.Release(ctx, testDispatch, "gone", false) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t, func(int, seen) reply { return c.rep })
+			var logs bytes.Buffer
+			err := c.send(f.client(&sleeps{}, &logs))
+			var r *Refusal
+			if !errors.Is(err, ErrTooLarge) || errors.Is(err, ErrUnsigned) || errors.Is(err, ErrAnswerUnusable) || !errors.As(err, &r) || r.Status != c.rep.status {
+				t.Fatalf("not ErrTooLarge alone: %v", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "refused before its signature was read") || strings.Contains(msg, "not signed") || strings.Contains(msg, "Qory Apiary answered") {
+				t.Errorf("the error's text is not true: %v", err)
+			}
+			checkBuiltAnew(t, f.requests(), tries)
+			if strings.Count(logs.String(), "larger than its bound") != tries-1 {
+				t.Errorf("not one line per try sent again:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestBounds checks each bound at its edge: an answer of exactly its bound is used and
+// one byte more is not, for a claim's 200, a handover's 200 and a refusal; a handover's
+// answer between 64 KiB and 1 MiB is used; and inputs of exactly contracts.MaxInputs
+// bytes, compacted, are used and one byte more are not.
+func TestBounds(t *testing.T) {
+	ctx := context.Background()
+	claim, handover := fixture(t, "claim-answer/explore.json"), fixture(t, "handover-answer/explore.json")
+	answer := func(rep reply) *Apiary {
+		return newFake(t, func(int, seen) reply { return rep }).client(&sleeps{}, nil)
+	}
+	claimOf := func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err }
+	handoverOf := func(a *Apiary) error { _, err := a.Handover(ctx, testDispatch, testRun); return err }
+	for _, c := range []struct {
+		name string
+		body string
+		edge bool
+		send func(a *Apiary) error
+	}{
+		{"a claim of its bound", padTo(t, claim, maxClaimAnswer), true, claimOf},
+		{"a handover of 100 KiB", padTo(t, handover, 100<<10), false, handoverOf},
+		{"a handover of its bound", padTo(t, handover, contracts.MaxHandoverAnswer), true, handoverOf},
+	} {
+		if err := c.send(answer(reply{status: http.StatusOK, body: c.body})); err != nil {
+			t.Errorf("%s is not used: %v", c.name, err)
+		}
+		if err := c.send(answer(reply{status: http.StatusOK, body: " " + c.body})); c.edge && !errors.Is(err, ErrTooLarge) {
+			t.Errorf("%s and a byte is used: %v", c.name, err)
+		}
+	}
+	refusal := padTo(t, `{"error":"handed_over"}`, maxAnswer)
+	if err := handoverOf(answer(reply{status: http.StatusConflict, body: refusal})); !errors.Is(err, ErrHandedOver) {
+		t.Errorf("a refusal of its bound is not read: %v", err)
+	}
+	if err := handoverOf(answer(reply{status: http.StatusConflict, body: " " + refusal})); !errors.Is(err, ErrTooLarge) {
+		t.Errorf("a refusal of its bound and a byte is read: %v", err)
+	}
+	inputs := func(n int) string {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(handover), &m); err != nil {
+			t.Fatal(err)
+		}
+		// {"f":"…","version":1} is 20 bytes and the filler, compacted.
+		m["inputs"] = map[string]any{"version": 1, "f": strings.Repeat("x", n-20)}
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
+	if err := handoverOf(answer(reply{status: http.StatusOK, body: inputs(contracts.MaxInputs)})); err != nil {
+		t.Errorf("inputs of their bound are not used: %v", err)
+	}
+	if err := handoverOf(answer(reply{status: http.StatusOK, body: inputs(contracts.MaxInputs + 1)})); !errors.Is(err, ErrAnswerUnusable) {
+		t.Errorf("inputs of their bound and a byte are used: %v", err)
+	}
+}
+
+// TestTimesAcrossCalls checks two identical calls within one second, and identical
+// calls at once, each send a time of their own, later than the last, so no two requests
+// are the same bytes.
+func TestTimesAcrossCalls(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(t, ok204)
+	a := f.client(&sleeps{}, nil)
+	for range 2 {
+		if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+			t.Fatalf("the request failed: %v", err)
+		}
+	}
+	checkBuiltAnew(t, f.requests(), 2)
+
+	f = newFake(t, ok204)
+	a = f.client(&sleeps{}, nil)
+	const n = 8
+	var wg sync.WaitGroup
+	for range n {
+		wg.Go(func() {
+			if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+				t.Errorf("the request failed: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	reqs := f.requests()
+	times, sigs := map[string]bool{}, map[string]bool{}
+	for _, r := range reqs {
+		var doc struct {
+			Time string `json:"time"`
+		}
+		_ = json.Unmarshal(r.body, &doc)
+		if r.replayed || times[doc.Time] || sigs[r.signature] {
+			t.Error("two requests at once share a time or a signature")
+		}
+		times[doc.Time], sigs[r.signature] = true, true
+	}
+	if len(reqs) != n {
+		t.Errorf("%d requests, not %d", len(reqs), n)
+	}
+}
+
+// TestCancel cancels the context while a claim waits for its answer, and checks the
+// error is the context's, after one try, with no line logged and no wait.
+func TestCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newFake(t, ok204)
+	var hits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		_, _ = io.ReadAll(r.Body)
+		cancel()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	var logs bytes.Buffer
+	sl := &sleeps{}
+	a := f.client(sl, &logs)
+	a.URL = srv.URL
+	_, _, err := a.Claim(ctx, 25)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("not the context's error: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if logs.Len() != 0 || len(sl.waits()) != 0 || hits != 1 {
+		t.Errorf("a cancelled claim logs, waits or sends again: %d requests\n%s", hits, logs.String())
+	}
+}
+
+// TestNoRedirect answers with a redirect and checks it is not followed: the place it
+// points to gets no request, and the unsigned 302 is a try that failed.
+func TestNoRedirect(t *testing.T) {
+	var hits int
+	var mu sync.Mutex
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer elsewhere.Close()
+	f := newFake(t, func(int, seen) reply {
+		return reply{status: http.StatusFound, location: elsewhere.URL + "/v1/pools/claim", unsigned: true}
+	})
+	_, _, err := f.client(&sleeps{}, nil).Claim(context.Background(), 0)
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 0 || !errors.Is(err, ErrUnsigned) {
+		t.Errorf("the redirect is followed: %d requests elsewhere, %v", hits, err)
+	}
+}
+
+// TestSignatureHeaderTwice answers with its valid signature sent twice, and checks the
+// answer is never used.
+func TestSignatureHeaderTwice(t *testing.T) {
+	f := newFake(t, func(int, seen) reply { return reply{status: http.StatusNoContent, dupSignature: true} })
+	if err := f.client(&sleeps{}, nil).Dispatched(context.Background(), testDispatch, nil); !errors.Is(err, ErrUnsigned) {
+		t.Errorf("an answer with its signature header twice is used: %v", err)
+	}
+}
+
+// TestUnexpected2xx answers each request with a signed 2xx its schema does not give,
+// and checks it is ErrAnswerUnusable, after one try.
+func TestUnexpected2xx(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name   string
+		status int
+		body   string
+		send   func(a *Apiary) error
+	}{
+		{"claim 202", http.StatusAccepted, "", func(a *Apiary) error { _, _, err := a.Claim(ctx, 0); return err }},
+		{"dispatched 200", http.StatusOK, "{}", func(a *Apiary) error { return a.Dispatched(ctx, testDispatch, nil) }},
+		{"release 202", http.StatusAccepted, "", func(a *Apiary) error { return a.Release(ctx, testDispatch, "gone", true) }},
+		{"handover 204", http.StatusNoContent, "", func(a *Apiary) error { _, err := a.Handover(ctx, testDispatch, testRun); return err }},
+		{"outcome 204", http.StatusNoContent, "", func(a *Apiary) error {
+			return a.PostOutcome(ctx, a.URL+"/v1/runs", testRun, Outcome{})
+		}},
+	} {
+		f := newFake(t, func(int, seen) reply { return reply{status: c.status, body: c.body} })
+		if err := c.send(f.client(&sleeps{}, nil)); !errors.Is(err, ErrAnswerUnusable) || len(f.requests()) != 1 {
+			t.Errorf("%s: not refused at once: %v", c.name, err)
+		}
+	}
+}
+
+// deadlines is a transport that records how long each request has before its
+// deadline.
+type deadlines struct {
+	mu   sync.Mutex
+	left []time.Duration
+}
+
+func (d *deadlines) RoundTrip(r *http.Request) (*http.Response, error) {
+	left := time.Duration(-1)
+	if dl, ok := r.Context().Deadline(); ok {
+		left = time.Until(dl)
+	}
+	d.mu.Lock()
+	d.left = append(d.left, left)
+	d.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestTimeouts checks a claim has longer than the 25 seconds Qory Apiary may hold it,
+// and longer than any other request, and that another request has requestTimeout.
+func TestTimeouts(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(t, ok204)
+	d := &deadlines{}
+	a := f.client(&sleeps{}, nil)
+	a.HTTP = &http.Client{Transport: d}
+	if _, _, err := a.Claim(ctx, 25); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Dispatched(ctx, testDispatch, nil); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.left) != 2 || d.left[0] <= requestTimeout || d.left[0] <= 25*time.Second || d.left[1] > requestTimeout || d.left[1] < requestTimeout-5*time.Second {
+		t.Errorf("the time left to the claim and to dispatched are %v", d.left)
 	}
 }

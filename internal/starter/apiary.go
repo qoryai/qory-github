@@ -41,8 +41,9 @@ const (
 // can be claimed, so claimTimeout is longer than requestTimeout. A claim's 200 is read
 // up to maxClaimAnswer, far more than its members' limits add up to; a handover's 200
 // up to contracts.MaxHandoverAnswer, the contract's bound; every other answer, a
-// refusal, a 204 or an outcome's 200, up to maxAnswer. A larger answer is refused
-// before its status or its signature is read, and nothing in it is used.
+// refusal, a 204 or an outcome's 200, up to maxAnswer. A larger answer, whatever its
+// status, is refused before its signature is read, nothing in it is used, and the
+// request is sent again, built anew, as for an answer not signed.
 const (
 	requestTimeout = 30 * time.Second
 	claimTimeout   = 40 * time.Second
@@ -83,8 +84,8 @@ var (
 	// ErrHandedOver is a handover's signed 409 handed_over: the run was handed over
 	// before, through this or another dispatch.
 	ErrHandedOver = errors.New("409 handed_over")
-	// ErrLeaseExpired is the signed 409 lease_expired: the dispatch is stale, and the
-	// starter stops the job it started for it.
+	// ErrLeaseExpired is the signed 409 lease_expired: the dispatch is stale. The
+	// contract asks the starter to stop the job it started for that dispatch.
 	ErrLeaseExpired = errors.New("409 lease_expired")
 	// ErrNotDispatched is a handover's signed 409 not_dispatched: the handover came
 	// before dispatched.
@@ -103,17 +104,23 @@ var (
 	// ErrRunNotFound is an outcome's signed 404 not_found: a run the key's node pool did
 	// not register, or whose record is gone.
 	ErrRunNotFound = errors.New("404 not_found")
-	// ErrUnsigned is an answer not signed under the pin, still so after every try: a 401,
-	// always unsigned, a 413, 415 or 400 bad_request decided before the signature, or
-	// any other answer that does not verify. It changes no state. A 401 never means the
-	// access key is revoked.
+	// ErrUnsigned is an answer within its bound that is not signed under the pin, still
+	// so after every try: a 401, always unsigned, a 413, 415 or 400 bad_request decided
+	// before the signature, or any other answer that does not verify. It changes no
+	// state. A 401 never means the access key is revoked. An answer over its bound is
+	// [ErrTooLarge] instead, a 401 among them.
 	ErrUnsigned = errors.New("an answer not signed under a key of apiary_public_key")
+	// ErrTooLarge is an answer larger than its bound, whatever its status, still so after
+	// every try: it is refused for its size before its signature is read, so nothing
+	// says whether Qory Apiary sent it, and it changes no state.
+	ErrTooLarge = errors.New("an answer refused for its size before its signature was read")
 	// ErrUnreachable is Qory Apiary out of reach after every try: no answer.
 	ErrUnreachable = errors.New("Qory Apiary could not be reached")
-	// ErrAnswerUnusable is a signed answer that breaks the contract: larger than its
-	// bound, not one JSON document, against its schema, of another revision, or for
-	// another node pool or run than the one asked. Nothing in it is used, and the request
-	// is not sent again, since Qory Apiary acted on it.
+	// ErrAnswerUnusable is a signed answer within its bound that breaks the contract: a
+	// status the request's schema does not give, a body that is not one JSON document,
+	// that breaks its schema, that names another revision, that is for another node pool
+	// or run than the one asked, or whose inputs are over their bound. Nothing in it is
+	// used, and the request is not sent again, since Qory Apiary acted on it.
 	ErrAnswerUnusable = errors.New("Qory Apiary's answer breaks the contract, so nothing in it is used")
 )
 
@@ -156,11 +163,12 @@ var refusalsOf = map[kind][]error{
 	kindOutcome:    {ErrRunNotFound, ErrOutcomeGiven, ErrRateLimited},
 }
 
-// Refusal is Qory Apiary's answer to a request that is not the one wanted: its status,
-// whether it was signed under the pin, and the code of a signed one's body. errors.Is
-// matches it against [ErrForbidden] and the other refusals by its request, its status
-// and its code, and against [ErrUnsigned] when it is not signed. Its text names the
-// request, the status and the code, never a body, a header or a secret.
+// Refusal is an answer to a request that is not the one wanted: its status, whether it
+// was signed under the pin or refused for its size first, and the code of a signed
+// one's body. errors.Is matches it against [ErrForbidden] and the other refusals by its
+// request, its status and its code, against [ErrUnsigned] when it is within its bound
+// and not signed, and against [ErrTooLarge] when it is over its bound. Its text names
+// the request, the status and the code, never a body, a header or a secret.
 type Refusal struct {
 	// What is the request, as an error names it: "the claim", "the handover of dp_…".
 	What string
@@ -175,12 +183,18 @@ type Refusal struct {
 	// RetryAfter is the wait a signed 429 asks for, from a second to an hour; 0
 	// otherwise.
 	RetryAfter time.Duration
+	// TooLarge is whether the answer was over its bound, Limit bytes, and so refused
+	// before its signature was read.
+	TooLarge bool
+	Limit    int64
 
 	kind kind
 }
 
 func (r *Refusal) Error() string {
 	switch {
+	case r.TooLarge:
+		return fmt.Sprintf("%s: the answer, %d, is larger than %d bytes, so it was refused before its signature was read", r.What, r.Status, r.Limit)
 	case !r.Signed && r.Status == http.StatusUnauthorized:
 		return r.What + ": Qory Apiary answered 401 unauthorized, which is never taken as the access key revoked"
 	case !r.Signed:
@@ -193,11 +207,15 @@ func (r *Refusal) Error() string {
 	return fmt.Sprintf("%s: Qory Apiary answered %d %s", r.What, r.Status, r.Code)
 }
 
-// Is reports whether the refusal is target: [ErrUnsigned] for an answer not signed, or a
-// signed refusal the request's schema gives, with its status and its code.
+// Is reports whether the refusal is target: [ErrTooLarge] for an answer over its bound,
+// [ErrUnsigned] for one within it that is not signed, or a signed refusal the request's
+// schema gives, with its status and its code.
 func (r *Refusal) Is(target error) bool {
-	if target == ErrUnsigned {
-		return !r.Signed
+	switch target {
+	case ErrTooLarge:
+		return r.TooLarge
+	case ErrUnsigned:
+		return !r.Signed && !r.TooLarge
 	}
 	c, ok := codeOf[target]
 	return ok && r.Signed && r.Status == c.status && r.Code == c.code && slices.Contains(refusalsOf[r.kind], target)
@@ -206,11 +224,14 @@ func (r *Refusal) Is(target error) bool {
 // Apiary is the starter's client of Qory Apiary's provisioner contract, provisioner/v1,
 // and of Forager's run outcome. Each request is signed with the node pool's access key
 // as forager/accesskey signs one, and each answer is checked under the pin, then
-// against its schema and its revision, before anything in it is used. A request that
-// fails is built anew for each try, with a later time and so a new signature: the same
-// bytes are never sent twice. No redirect is followed. Nothing it logs or returns holds
-// the access key's secret, a run key, a handover's inputs or a work item's title. It is
-// safe for concurrent use.
+// against its schema and its revision, before anything in it is used. Every request it
+// sends, a try sent again or another call, has a time later than the last request's,
+// by a second at least, and so a new signature: the same bytes are never sent twice.
+// So the times run ahead of the clock while it sends more than one request a second.
+// No redirect is followed. No error it returns and no line it logs holds the access
+// key's secret, a run key, a handover's inputs or a work item's title; a [Claimed] or a
+// [Handed] prints, logs and marshals without them. It is safe for concurrent use, and is
+// used by its pointer.
 type Apiary struct {
 	// URL is Qory Apiary's origin, without a trailing slash, as [Settings.ApiaryURL].
 	URL string
@@ -222,8 +243,9 @@ type Apiary struct {
 	// InstanceID is the starter's instance id, i_ and 22 characters, signed into every
 	// request.
 	InstanceID string
-	// PoolID is the node pool the settings name, or "": a claim then names none, and an
-	// answer for another node pool is refused.
+	// PoolID is the node pool the settings name. When it is set, a claim names it, and a
+	// claim's answer for another node pool is refused. When it is "", a claim names no
+	// node pool, and the answer's node pool is compared with nothing.
 	PoolID string
 	// HTTP is the client; nil is one with no other setting. Its timeout is set per
 	// request, and no redirect is followed.
@@ -234,6 +256,23 @@ type Apiary struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 	// Log takes a line for each try sent again; nil logs nothing.
 	Log *slog.Logger
+
+	// mu guards last, the time of the last request sent.
+	mu   sync.Mutex
+	last time.Time
+}
+
+// nextTime is a request's time: the clock's, in whole seconds, or a second after the
+// last request's when the clock is not later than it.
+func (a *Apiary) nextTime() time.Time {
+	t := a.now().UTC().Truncate(time.Second)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !t.After(a.last) {
+		t = a.last.Add(time.Second)
+	}
+	a.last = t
+	return t
 }
 
 func (a *Apiary) now() time.Time {
@@ -257,77 +296,92 @@ func (a *Apiary) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// hiddenText is how a [Hidden] value prints, logs and marshals.
+const hiddenText = "[hidden]"
+
+// Hidden is a value that stays out of logs and errors: a run key, a handover's inputs or
+// a work item's title. It prints, logs and marshals as [hidden], whatever the verb and
+// however deep it sits in another value, even in a field fmt cannot call its methods
+// on: it holds the value behind a pointer, which fmt prints as an address below the top
+// level. Value is the value itself; the zero Hidden is "".
+type Hidden struct{ p *string }
+
+// hide is s, hidden.
+func hide(s string) Hidden { return Hidden{&s} }
+
+// Value is the hidden value.
+func (h Hidden) Value() string {
+	if h.p == nil {
+		return ""
+	}
+	return *h.p
+}
+
+// String is [hidden].
+func (h Hidden) String() string { return hiddenText }
+
+// GoString is [hidden].
+func (h Hidden) GoString() string { return hiddenText }
+
+// Format writes [hidden] for every verb.
+func (h Hidden) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, hiddenText) }
+
+// LogValue is [hidden].
+func (h Hidden) LogValue() slog.Value { return slog.StringValue(hiddenText) }
+
+// MarshalJSON is [hidden], as a JSON string.
+func (h Hidden) MarshalJSON() ([]byte, error) { return json.Marshal(hiddenText) }
+
+// WorkItem is the work item a run is for, definitions.schema.json's work_item: its
+// public id, its page in Qory Apiary, and its title, hidden.
+type WorkItem struct {
+	ID    string
+	URL   string
+	Title Hidden
+}
+
 // Claimed is a claim's answer, claim-answer.schema.json, checked: signed under the pin,
-// of the schema, of the revision sent and, when the settings name one, of their node
-// pool. It prints, logs and marshals as its ids alone, never the work item's title; the
-// document is its ClaimAnswer.
-type Claimed struct{ contracts.ClaimAnswer }
-
-// shownClaim is what a [Claimed] shows of itself.
-type shownClaim struct {
-	DispatchID string `json:"dispatch_id"`
-	RunID      string `json:"run_id"`
-	PoolID     string `json:"pool_id"`
-	LeaseUntil string `json:"lease_until"`
-	Step       string `json:"step"`
-	WorkItemID string `json:"work_item_id"`
+// of the schema and of the revision sent, and, when the settings name a node pool, of
+// that node pool. The work item's title is [Hidden].
+type Claimed struct {
+	DispatchID string
+	RunID      string
+	PoolID     string
+	LeaseUntil string
+	Step       string
+	Access     string
+	Target     contracts.Target
+	WorkItem   WorkItem
 }
-
-func (c Claimed) shown() shownClaim {
-	return shownClaim{c.DispatchID, c.RunID, c.PoolID, c.LeaseUntil, c.Step, c.WorkItem.ID}
-}
-
-// String is the claim's ids.
-func (c Claimed) String() string {
-	return fmt.Sprintf("dispatch %s of run %s, node pool %s, step %s, work item %s, lease until %s", c.DispatchID, c.RunID, c.PoolID, c.Step, c.WorkItem.ID, c.LeaseUntil)
-}
-
-// GoString is [Claimed.String].
-func (c Claimed) GoString() string { return c.String() }
-
-// Format writes [Claimed.String] for every verb.
-func (c Claimed) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.String()) }
-
-// LogValue is the claim's ids.
-func (c Claimed) LogValue() slog.Value {
-	s := c.shown()
-	return slog.GroupValue(slog.String("dispatch_id", s.DispatchID), slog.String("run_id", s.RunID), slog.String("pool_id", s.PoolID),
-		slog.String("lease_until", s.LeaseUntil), slog.String("step", s.Step), slog.String("work_item_id", s.WorkItemID))
-}
-
-// MarshalJSON is the claim's ids.
-func (c Claimed) MarshalJSON() ([]byte, error) { return json.Marshal(c.shown()) }
 
 // Handed is a handover's answer, handover-answer.schema.json, checked: signed under the
-// pin, of the schema and its bounds, of the revision sent, and for the claimed run. It
-// holds the run key: it prints, logs and marshals as its run's id and step alone,
-// never the run key, the inputs or the work item's title. The document, which the job
-// alone is given, is its HandoverAnswer.
-type Handed struct{ contracts.HandoverAnswer }
-
-// String is the run's id and step.
-func (h Handed) String() string {
-	return fmt.Sprintf("handover of run %s, step %s, work item %s", h.RunID, h.Step, h.WorkItem.ID)
+// pin, of the schema and its bounds, of the revision sent, and for the claimed run. The
+// run key, the inputs, as the answer's bytes, and the work item's title are [Hidden];
+// [Handed.Document] is the answer whole, for the job it is passed to.
+type Handed struct {
+	RunID    string
+	RunKey   Hidden
+	Step     string
+	Access   string
+	Target   contracts.Target
+	WorkItem WorkItem
+	Inputs   Hidden
 }
 
-// GoString is [Handed.String].
-func (h Handed) GoString() string { return h.String() }
-
-// Format writes [Handed.String] for every verb.
-func (h Handed) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, h.String()) }
-
-// LogValue is the run's id and step.
-func (h Handed) LogValue() slog.Value {
-	return slog.GroupValue(slog.String("run_id", h.RunID), slog.String("step", h.Step), slog.String("work_item_id", h.WorkItem.ID))
+// Document is the handover's answer as the contract's document, run key, inputs and
+// title in the clear.
+func (h Handed) Document() contracts.HandoverAnswer {
+	return contracts.HandoverAnswer{
+		Version: 1, Revision: contracts.ProvisionerRevision, RunID: h.RunID, RunKey: h.RunKey.Value(),
+		Step: h.Step, Access: h.Access, Target: h.Target,
+		WorkItem: contracts.WorkItem{ID: h.WorkItem.ID, URL: h.WorkItem.URL, Title: h.WorkItem.Title.Value()},
+		Inputs:   json.RawMessage(h.Inputs.Value()),
+	}
 }
 
-// MarshalJSON is the run's id and step.
-func (h Handed) MarshalJSON() ([]byte, error) {
-	return json.Marshal(struct {
-		RunID      string `json:"run_id"`
-		Step       string `json:"step"`
-		WorkItemID string `json:"work_item_id"`
-	}{h.RunID, h.Step, h.WorkItem.ID})
+// workItemOf is the contract's work item, its title hidden.
+func workItemOf(w contracts.WorkItem) WorkItem {
+	return WorkItem{ID: w.ID, URL: w.URL, Title: hide(w.Title)}
 }
 
 // Claim sends POST /v1/pools/claim, claim.schema.json, with waitSeconds, 0 to 25, and
@@ -364,13 +418,16 @@ func (a *Apiary) Claim(ctx context.Context, waitSeconds int) (claimed Claimed, o
 	case a.PoolID != "" && doc.PoolID != a.PoolID:
 		return Claimed{}, false, unusable(what, fmt.Sprintf("it is for the node pool %s, not %s", doc.PoolID, a.PoolID))
 	}
-	return Claimed{doc}, true, nil
+	return Claimed{
+		DispatchID: doc.DispatchID, RunID: doc.RunID, PoolID: doc.PoolID, LeaseUntil: doc.LeaseUntil,
+		Step: doc.Step, Access: doc.Access, Target: doc.Target, WorkItem: workItemOf(doc.WorkItem),
+	}, true, nil
 }
 
 // Dispatched sends POST /v1/dispatches/<dispatchID>/dispatched, dispatched.schema.json:
 // the starter started the job, which external names when it is not nil. A signed 204 is
 // the answer. A refusal is a [*Refusal]: [ErrForbidden], [ErrGone], [ErrLeaseExpired],
-// on which the starter stops the job, or [ErrRateLimited].
+// on which the contract asks the starter to stop the job, or [ErrRateLimited].
 func (a *Apiary) Dispatched(ctx context.Context, dispatchID string, external *contracts.External) error {
 	return a.toDispatch(ctx, "dispatched of "+dispatchID, kindDispatched, dispatchID, "dispatched", "dispatched.schema.json", func(t string) any {
 		return contracts.Dispatched{Version: 1, Time: t, External: external}
@@ -444,7 +501,10 @@ func (a *Apiary) Handover(ctx context.Context, dispatchID, runID string) (Handed
 	case json.Compact(&inputs, doc.Inputs) != nil || inputs.Len() > contracts.MaxInputs:
 		return Handed{}, unusable(what, fmt.Sprintf("its inputs are larger than %d bytes", contracts.MaxInputs))
 	}
-	return Handed{doc}, nil
+	return Handed{
+		RunID: doc.RunID, RunKey: hide(doc.RunKey), Step: doc.Step, Access: doc.Access, Target: doc.Target,
+		WorkItem: workItemOf(doc.WorkItem), Inputs: hide(string(doc.Inputs)),
+	}, nil
 }
 
 // request is one request of the starter's: what it is, as an error names it, which
@@ -464,31 +524,28 @@ type request struct {
 }
 
 // answer is an answer to one request: its status, its body, whether its signature
-// verified under the pin, and its Retry-After.
+// verified under the pin, its Retry-After, and whether it was over its bound, limit
+// bytes, in which case neither its body nor its signature is read.
 type answer struct {
 	status     int
 	body       []byte
 	signed     bool
 	retryAfter string
+	tooLarge   bool
+	limit      int64
 }
 
 // do sends req until Qory Apiary answers a signed status below 500, up to [tries]
-// tries. Each try is built anew: its time is later than the last try's, by a second at
-// least, so its bytes and its signature are new. A try that fails is no answer, an
-// answer not signed under the pin, whatever its status, a 429 among them, or a signed
-// server error: it changes nothing, and it is sent again after a wait that doubles
-// from [firstWait]. After the last try, the failure is the error. An answer larger than
-// its bound is [ErrAnswerUnusable], at once.
+// tries. Each try is built anew with [Apiary.nextTime], so its bytes and its signature
+// are new. A try that fails is no answer, an answer over its bound, whatever its
+// status, an answer not signed under the pin, whatever its status, a 429 among them,
+// or a signed server error: it changes nothing, and it is sent again after a wait that
+// doubles from [firstWait]. After the last try, the failure is the error. Once ctx is
+// done, its error is the error, and nothing more is logged or sent.
 func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
-	var last time.Time
 	wait := firstWait
 	for try := 1; ; try++ {
-		t := a.now().UTC().Truncate(time.Second)
-		if !t.After(last) && !last.IsZero() {
-			t = last.Add(time.Second)
-		}
-		last = t
-		b, err := a.build(req, t)
+		b, err := a.build(req, a.nextTime())
 		if err != nil {
 			return nil, err
 		}
@@ -497,11 +554,13 @@ func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 		var line string
 		var attrs []any
 		switch {
-		case errors.Is(err, ErrAnswerUnusable):
-			return nil, err
 		case err != nil:
 			failure, line = err, "Qory Apiary could not be reached, so the request is sent again, built anew"
 			attrs = []any{slog.String("error", err.Error())}
+		case ans.tooLarge:
+			failure = &Refusal{What: req.what, Status: ans.status, TooLarge: true, Limit: ans.limit, kind: req.kind}
+			line = "the answer is larger than its bound, so it is refused before its signature is read and the request is sent again, built anew"
+			attrs = []any{slog.Int("status", ans.status), slog.Int64("limit", ans.limit)}
 		case !ans.signed:
 			failure = &Refusal{What: req.what, Status: ans.status, kind: req.kind}
 			line = "Qory Apiary's answer is not signed under a key of apiary_public_key, so the request is sent again, built anew"
@@ -515,6 +574,9 @@ func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 			attrs = []any{slog.Int("status", ans.status)}
 		default:
 			return ans, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%s: %w", req.what, err)
 		}
 		if try == tries {
 			return nil, failure
@@ -556,10 +618,10 @@ func (a *Apiary) build(req request, t time.Time) ([]byte, error) {
 }
 
 // send signs one POST of body to req.url and sends it, then reads the answer: a 200's
-// body up to req.max, any other up to [maxAnswer], and a larger one is
-// [ErrAnswerUnusable]. A 401 is never signed; any other answer is checked under the pin,
-// bound to this request's signature. An error is no answer; it names the request and
-// never a header, a body or a secret.
+// body up to req.max, any other up to [maxAnswer]. A larger answer, whatever its status,
+// is marked too large, and neither its body nor its signature is read. A 401 is never
+// signed; any other answer is checked under the pin, bound to this request's signature.
+// An error is no answer; it names the request and never a header, a body or a secret.
 func (a *Apiary) send(ctx context.Context, req request, body []byte) (*answer, error) {
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, req.url, bytes.NewReader(body))
 	if err != nil {
@@ -600,7 +662,7 @@ func (a *Apiary) send(ctx context.Context, req request, body []byte) (*answer, e
 		return nil, fmt.Errorf("%s: %w: its answer could not be read", req.what, ErrUnreachable)
 	}
 	if int64(len(b)) > limit {
-		return nil, unusable(req.what, fmt.Sprintf("its %d is larger than %d bytes", resp.StatusCode, limit))
+		return &answer{status: resp.StatusCode, tooLarge: true, limit: limit}, nil
 	}
 	ans := &answer{status: resp.StatusCode, body: b, retryAfter: resp.Header.Get("Retry-After")}
 	if resp.StatusCode == http.StatusUnauthorized {
