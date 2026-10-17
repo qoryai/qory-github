@@ -43,18 +43,20 @@ func init() {
 	ownerfile.Program = "qory-github-server"
 }
 
-// usage is what the program prints when it is run without a command it knows. Its
-// commands are listed only where QORY_FEATURES names factory, see [cli.Factory].
+// usage is what the program prints when it is run without a command it knows. Where
+// QORY_FEATURES does not name factory, see [cli.Factory], it is the usage line alone:
+// work behind a feature that is off is described nowhere a person sees. The
+// description and the commands are printed only where it names factory.
 func usage() string {
-	head := `qory-github-server connects a GitHub App to Qory Apiary: it takes the App's webhook
-deliveries and writes on GitHub what Qory Apiary's change feed says.
-
-usage:
+	line := `usage:
   qory-github-server <command> [flags]`
 	if !cli.Factory() {
-		return head
+		return line
 	}
-	return head + `
+	return `qory-github-server connects a GitHub App to Qory Apiary: it takes the App's webhook
+deliveries and writes on GitHub what Qory Apiary's change feed says.
+
+` + line + `
 
 commands:
   serve        ` + serveHelp.Short + `
