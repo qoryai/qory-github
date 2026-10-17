@@ -64,6 +64,10 @@ type Kind struct {
 	// IDMember is the last member of the settings enrol prints, the id of what the key
 	// is enrolled in: adapter_id or pool_id.
 	IDMember string
+	// KindWords is whether the error of a key Qory Apiary enrolled for another kind
+	// names that kind in words, "for a node nd_…", rather than by its node_kind, "in
+	// the node nd_…".
+	KindWords bool
 	// UserAgent is the User-Agent of the enrolment request.
 	UserAgent string
 }
@@ -250,9 +254,14 @@ func enrol(ctx context.Context, k Kind, s Seams, args []string, stdout, stderr i
 
 // notItsKind is the error of a key Qory Apiary enrolled as the access key id in the
 // node of kind and id node, which is not of the program's kind, so its secret is not
-// kept.
+// kept. With [Kind.KindWords] it names the kind as the refusal of a code of that kind
+// does, see codeKindNames.
 func (k Kind) notItsKind(id, kind, node, fingerprint string) error {
-	return fmt.Errorf("Qory Apiary enrolled the key as %s in the %s %s, which is not %s: the code was not made on %s; no secret was written: have %s revoke the key %s, and enrol with a code made on %s", id, kind, node, k.ANoun, k.Tab, k.Admin, fingerprint, k.TabIn)
+	where := "in the " + kind + " " + node
+	if what, ok := codeKindNames[kind]; ok && k.KindWords {
+		where = "for " + what + " " + node
+	}
+	return fmt.Errorf("Qory Apiary enrolled the key as %s %s, which is not %s: the code was not made on %s; no secret was written: have %s revoke the key %s, and enrol with a code made on %s", id, where, k.ANoun, k.Tab, k.Admin, fingerprint, k.TabIn)
 }
 
 // CheckServer takes Qory Apiary's origin, as accesskey's enrolment posts to it: an https

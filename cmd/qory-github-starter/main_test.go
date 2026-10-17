@@ -134,11 +134,9 @@ func noLeak(t *testing.T, key *accesskey.Key, code string, outputs ...string) {
 	}
 }
 
-// usageWithoutFactory is the usage without factory, which lists no command.
-const usageWithoutFactory = `qory-github-starter serves a node pool of Qory Apiary with GitHub Actions: it claims
-the pool's runs and starts a workflow run for each.
-
-usage:
+// usageWithoutFactory is the usage without factory: the usage line alone, with no
+// description and no command.
+const usageWithoutFactory = `usage:
   qory-github-starter <command> [flags]
 `
 
@@ -157,8 +155,8 @@ qory-github-starter <command> -h prints a command's help.
 
 // TestTheProgramIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory,
 // the program knows no command: whatever it is run with, it prints the usage that lists
-// none and names no hidden feature or command, on standard error, exits 2, and sends
-// nothing.
+// none and describes nothing, naming no hidden feature, command or what the program
+// does, on standard error, exits 2, and sends nothing.
 func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	f := newFakeApiary(t, poolEnrolled)
 	file := filepath.Join(t.TempDir(), "secret")
@@ -171,7 +169,7 @@ func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 			if code != 2 || errs.String() != usageWithoutFactory || out.Len() != 0 {
 				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q", features, args, code, errs.String())
 			}
-			for _, hidden := range []string{"factory", "access-key", "enrol", "settings", "setup", "template"} {
+			for _, hidden := range []string{"factory", "access-key", "enrol", "settings", "setup", "template", "serve", "Qory Apiary", "node pool", "GitHub", "Actions", "claim", "workflow", "run for each"} {
 				if strings.Contains(errs.String(), hidden) {
 					t.Errorf("QORY_FEATURES=%q %v: the usage names %s", features, args, hidden)
 				}
@@ -321,7 +319,11 @@ func TestEnrolKeepsNoSecretOfAnotherKindOrARefusal(t *testing.T) {
 		want  string
 	}{
 		"an integration's key for a pool's code": {reply{status: http.StatusCreated, kind: "adapter", nodeID: "na_0123456789abcdef"},
-			"Qory Apiary enrolled the key as ak_0123456789abcdef in the adapter na_0123456789abcdef, which is not a node pool: the code was not made on the node pool's Access key tab; no secret was written: have a workspace admin of Qory Apiary revoke the key {fp}, and enrol with a code made on the node pool's Access key tab"},
+			"Qory Apiary enrolled the key as ak_0123456789abcdef for an integration na_0123456789abcdef, which is not a node pool: the code was not made on the node pool's Access key tab; no secret was written: have a workspace admin of Qory Apiary revoke the key {fp}, and enrol with a code made on the node pool's Access key tab\n"},
+		"a node's key for a pool's code": {reply{status: http.StatusCreated, kind: "node", nodeID: "nd_0123456789abcdef"},
+			"Qory Apiary enrolled the key as ak_0123456789abcdef for a node nd_0123456789abcdef, which is not a node pool: the code was not made on the node pool's Access key tab; no secret was written: have a workspace admin of Qory Apiary revoke the key {fp}, and enrol with a code made on the node pool's Access key tab\n"},
+		"a gateway's key for a pool's code": {reply{status: http.StatusCreated, kind: "gateway", nodeID: "ng_0123456789abcdef"},
+			"Qory Apiary enrolled the key as ak_0123456789abcdef for a gateway ng_0123456789abcdef, which is not a node pool: the code was not made on the node pool's Access key tab; no secret was written: have a workspace admin of Qory Apiary revoke the key {fp}, and enrol with a code made on the node pool's Access key tab\n"},
 		"two keys held": {reply{status: http.StatusConflict, refusal: "key_limit"},
 			"the node pool already holds two keys: have a workspace admin of Qory Apiary revoke one, then run the same command again within the code's 15 minutes"},
 		"a used code": {reply{status: http.StatusUnauthorized}, "the server at {server} answered 401: "},
