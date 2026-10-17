@@ -62,7 +62,7 @@ func newWired(t *testing.T, dir string) *wired {
 		w.slept = append(w.slept, d)
 		return nil
 	}
-	w.adapter = &Adapter{Store: st, GitHub: github.Client{API: w.gh.srv.URL}, AppID: "1", Key: appKey(), Slug: testSlug, Sink: w.client, Log: logger, openRepository: openRepoOf}
+	w.adapter = &Adapter{Store: st, GitHub: github.Client{API: w.gh.srv.URL}, AppID: "1", Key: appKey(), Slug: testSlug, Sink: w.client, Log: logger}
 	w.client.Ended = w.adapter.forgetEnded(w.client.Ended)
 	hs := &Handlers{}
 	w.adapter.Register(hs)
@@ -1347,37 +1347,113 @@ func TestATakeInAndAnUndoReachGitHubByTheRepositoryID(t *testing.T) {
 	}
 }
 
-// TestAFillWhoseRepositoryHasNoNameFailsForGood fills a linked collection, directly and
-// from the feed, with no way to name its repository for GraphQL's listing, as serve
-// has it: each fails for good, errOpenByID, the feed's entry is passed, and GitHub is
-// asked nothing.
-func TestAFillWhoseRepositoryHasNoNameFailsForGood(t *testing.T) {
+// reachedGitHub are the requests GitHub was asked, but for the App's and its token's,
+// under /app/, in order.
+func reachedGitHub(f *fakeGitHub) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, r := range f.requests {
+		if !strings.Contains(r, " /app/") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestAFillReadsTheNameByTheIDAndListsByIt fills acme/widgets by its ref, the
+// repository's id: it reads the repository by that id, GET /repositories/{id}, and then
+// asks GraphQL for the name that read gave, and nothing else, with one token minted for
+// the repository's id; the listing is sent and complete, and the fill's start kept.
+func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	Link(w.st, 42, testConnection, linkLive)
-	w.adapter.openRepository = nil
 	setReach(w.st, widgetsRef, 42)
 	linkCollection(w.st, widgetsRef)
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
-	err := w.adapter.fill(context.Background(), widgetsRef)
-	if !IsPermanent(err) || !errors.Is(err, errOpenByID) {
-		t.Errorf("err %v", err)
-	}
-	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: gadgetsRef, Status: "linked"})
-	setReach(w.st, gadgetsRef, 42)
-	if err := w.feed.step(context.Background()); err != nil {
+	if err := w.adapter.fill(context.Background(), widgetsRef); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" || !strings.Contains(w.log.String(), errOpenByID.Error()) {
-		t.Errorf("the cursor %q; the log %s", c, w.log.String())
+	want := []string{"GET /repositories/" + widgetsRef, "POST /graphql"}
+	if got := reachedGitHub(w.gh); !slices.Equal(got, want) {
+		t.Errorf("GitHub was asked %v, want %v", got, want)
 	}
 	w.gh.mu.Lock()
-	asked := slices.Clone(w.gh.requests)
+	asked, mints := slices.Clone(w.gh.gqlAsked), slices.Clone(w.gh.mints)
 	w.gh.mu.Unlock()
-	if len(asked) != 0 || len(w.apiary.sent(routeItems)) != 0 {
-		t.Errorf("GitHub was asked %v; %d items requests", asked, len(w.apiary.sent(routeItems)))
+	if !slices.Equal(asked, []string{"acme/widgets"}) {
+		t.Errorf("GraphQL was asked for %v", asked)
 	}
-	if m, _ := pulledOf(w.st, widgetsRef); !m.Since.IsZero() {
-		t.Errorf("kept %+v", m)
+	if !slices.Equal(mints, []string{`{"permissions":{"issues":"read"},"repository_ids":[` + widgetsRef + `]}`}) {
+		t.Errorf("mints %v", mints)
+	}
+	sent := w.apiary.sent(routeItems)
+	if len(sent) != 1 || sent[0].body["collection_ref"] != widgetsRef || !strings.Contains(string(sent[0].raw), `"complete":true`) {
+		t.Errorf("sent %+v", sent)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() {
+		t.Error("the fill's start is not kept")
+	}
+}
+
+// TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain fills acme/widgets while GraphQL
+// answers, for the name read by the id, a repository whose id is another, as when the
+// name came to name another repository between the two requests, or no id: the fill
+// sends nothing, no item and no complete listing, keeps no start, and fails with an
+// error that passes, not for good and not as a repository gone, so the change feed tries
+// it again.
+func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
+	for _, id := range []any{gadgetsID, nil} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		w.gh.issues = []map[string]any{ghIssue(1, 0)}
+		w.gh.gqlIDSet, w.gh.gqlID = true, id
+		err := w.adapter.fill(context.Background(), widgetsRef)
+		if err == nil || IsPermanent(err) || errors.Is(err, github.ErrRepositoryGone) {
+			t.Errorf("%v: err %v", id, err)
+		}
+		if n := len(w.apiary.sent(routeItems)); n != 0 {
+			t.Errorf("%v: %d items requests", id, n)
+		}
+		if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+			t.Errorf("%v: kept %+v", id, m)
+		}
+		want := []string{"GET /repositories/" + widgetsRef, "POST /graphql"}
+		if got := reachedGitHub(w.gh); !slices.Equal(got, want) {
+			t.Errorf("%v: GitHub was asked %v, want %v", id, got, want)
+		}
+	}
+}
+
+// TestAFillWhoseReadFailsSendsNothing fills acme/widgets while GitHub fails the read of
+// the repository by its id: a 404, which by the id says the repository is deleted or out
+// of the App's reach, since a rename or a transfer keeps the id, fails it for good as a
+// repository gone; a 500 fails it with an error that passes. Either way GraphQL is never
+// asked, nothing is sent and no start is kept.
+func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
+	for _, status := range []int{404, 500} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		Link(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		w.gh.issues = []map[string]any{ghIssue(1, 0)}
+		w.gh.readStatus = status
+		err := w.adapter.fill(context.Background(), widgetsRef)
+		gone := status == 404
+		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone {
+			t.Errorf("%d: err %v", status, err)
+		}
+		w.gh.mu.Lock()
+		pages := w.gh.gqlPages
+		w.gh.mu.Unlock()
+		if pages != 0 || len(w.apiary.sent(routeItems)) != 0 {
+			t.Errorf("%d: GraphQL asked %d times; %d items requests", status, pages, len(w.apiary.sent(routeItems)))
+		}
+		if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+			t.Errorf("%d: kept %+v", status, m)
+		}
 	}
 }
 

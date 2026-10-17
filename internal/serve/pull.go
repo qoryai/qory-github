@@ -541,11 +541,13 @@ func (p *puller) forgetGone(installations []int64, targets map[int64][]pullTarge
 // complete; one that fails on the comments of its last part's items has sent that part
 // already, complete, since comments are no part of complete. Either way its start is
 // not kept, so the next pull lists again. A repository with no open issue sends one
-// part without items that says the listing is complete. The listing names the
-// repository by owner/name, which the collection's ref, the repository's id, does not
-// carry, so a listing whose repository [Adapter.openRepository] does not name fails,
-// [errOpenByID], before it asks GitHub, and the pull's start is not kept. What changed
-// is read through the repository's id, which needs no name.
+// part without items that says the listing is complete. What changed is read through
+// the repository's id, which needs no name. The listing is GraphQL's, which names a
+// repository by owner/name: it takes the name the read of what changed got in the same
+// run, and only a pull that read no change, its collection's first, reads the name
+// first, [github.Lister.ReadRepository]; the name is kept nowhere. A listing that finds
+// the name naming another repository by then fails without sending anything, and its
+// start is not kept, so the next pull reads the name again and lists again.
 func (p *puller) pull(ctx context.Context, ref string, installation int64) error {
 	a := p.adapter
 	id, err := repositoryID(ref)
@@ -576,17 +578,24 @@ func (p *puller) pull(ctx context.Context, ref string, installation int64) error
 		LogCut: a.logCut,
 	}
 	next := pullMark{Since: start, Listed: mark.Listed}
+	// repo is the repository's owner/name as the read of what changed got it, which the
+	// listing of open issues takes, or zero when that read did not run or GitHub's name
+	// is not owner/name, and the listing reads it first.
+	var repo github.Repository
 	if !mark.Since.IsZero() {
-		if err := a.forgetOn401(installation, l.ListChanged(ctx, id, mark.Since.Add(-pullOverlap))); err != nil {
+		repo, err = l.ListChanged(ctx, id, mark.Since.Add(-pullOverlap))
+		if err := a.forgetOn401(installation, err); err != nil {
 			return err
 		}
 	}
 	if mark.Since.IsZero() || mark.Listed.IsZero() || start.Sub(mark.Listed) >= listEvery {
-		repo, err := a.openRepo(ref)
-		if err != nil {
-			return err
+		if repo == (github.Repository{}) {
+			repo, err = l.ReadRepository(ctx, id)
+			if err := a.forgetOn401(installation, err); err != nil {
+				return err
+			}
 		}
-		if err := a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, repo)); err != nil {
+		if err := a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, id, repo)); err != nil {
 			return err
 		}
 		next.Listed = start

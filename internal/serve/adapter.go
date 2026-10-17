@@ -44,14 +44,6 @@ type Adapter struct {
 	// Log takes what is skipped or failed; nil logs nothing.
 	Log *slog.Logger
 
-	// openRepository is the repository, owner/name, whose open issues a fill or the
-	// daily listing of the collection ref reads, or false. That listing is GraphQL's,
-	// [github.Lister.ListOpenIssuesComplete], which names a repository by owner/name or
-	// by its node id and never by the id a collection's ref is, and how serve learns
-	// either for a ref is not decided yet: nil, as serve has it, fails the fill and the
-	// listing for good before any request to GitHub, [errOpenByID]. A test sets it.
-	openRepository func(ref string) (github.Repository, bool)
-
 	mu     sync.Mutex
 	pacers map[int64]*github.Pacer
 	tokens map[string]github.InstallationToken
@@ -908,16 +900,18 @@ var errNoInstallation = errors.New("no installation is known to reach the reposi
 // answers is gone or moved, [github.ErrRepositoryGone], or for which GitHub refuses to
 // mint a token for good, [github.ErrMintRefused], fails for good, so the change feed
 // passes it. It waits for a pull of the collection that runs, and once it has sent
-// everything, the next pull reads what changed from when it began. The listing names the
-// repository by owner/name, which the collection's ref, the repository's id, does not
-// carry, so a fill whose repository [Adapter.openRepository] does not name fails for
-// good, [errOpenByID], before the store is read or GitHub is asked.
+// everything, the next pull reads what changed from when it began. The listing is
+// GraphQL's, which names a repository by owner/name, so the fill first reads that name
+// by the collection's ref, the repository's id, [github.Lister.ReadRepository], and
+// keeps it nowhere: a 404 there says the repository is deleted or out of the App's
+// reach, since a rename or a transfer keeps its id, and fails for good as
+// [github.ErrRepositoryGone]; any other failure of that read fails the fill as a failure
+// of the listing would, to be tried again. A listing that finds the name naming
+// another repository by then, as a rename or a transfer that lands between the two
+// requests makes it, fails without sending anything, to be tried again, which reads
+// the name again.
 func (a *Adapter) fill(ctx context.Context, ref string) error {
 	id, err := repositoryID(ref)
-	if err != nil {
-		return Permanent(err)
-	}
-	repo, err := a.openRepo(ref)
 	if err != nil {
 		return Permanent(err)
 	}
@@ -943,7 +937,11 @@ func (a *Adapter) fill(ctx context.Context, ref string) error {
 		Logf:   a.logf,
 		LogCut: a.logCut,
 	}
-	err = a.forgetOn401(installation, l.ListOpenIssuesComplete(ctx, repo))
+	repo, err := l.ReadRepository(ctx, id)
+	if err == nil {
+		err = l.ListOpenIssuesComplete(ctx, id, repo)
+	}
+	err = a.forgetOn401(installation, err)
 	if errors.Is(err, github.ErrRepositoryGone) || errors.Is(err, github.ErrMintRefused) {
 		return Permanent(err)
 	}
@@ -992,21 +990,4 @@ func repositoryID(ref string) (int64, error) {
 		return 0, errors.New("the collection's ref is not a repository's id")
 	}
 	return id, nil
-}
-
-// errOpenByID fails a fill, and the daily listing of a collection's open issues, whose
-// repository the adapter knows by its id alone, see [Adapter.openRepository].
-var errOpenByID = errors.New("listing a repository's open issues by its id is not built: GraphQL names a repository by owner/name or by its node id")
-
-// openRepo is the repository, owner/name, whose open issues are listed for the
-// collection ref, see [Adapter.openRepository], or [errOpenByID].
-func (a *Adapter) openRepo(ref string) (github.Repository, error) {
-	if a.openRepository == nil {
-		return github.Repository{}, errOpenByID
-	}
-	repo, ok := a.openRepository(ref)
-	if !ok {
-		return github.Repository{}, errOpenByID
-	}
-	return repo, nil
 }

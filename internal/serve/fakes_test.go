@@ -154,12 +154,8 @@ const (
 	movedID    = 1296272
 )
 
-// knownIDs are the fake's repositories' ids by owner/name, in lower case; refNames are
-// the names of the ids [repoID] gave, by ref, which [openRepoOf] reads.
-var (
-	knownIDs = map[string]int64{"acme/widgets": widgetsID, "acme/gadgets": gadgetsID, "acme/old": oldID, "acme/moved": movedID, "acme/gone": 1296273}
-	refNames sync.Map // ref -> owner/name
-)
+// knownIDs are the fake's repositories' ids by owner/name, in lower case.
+var knownIDs = map[string]int64{"acme/widgets": widgetsID, "acme/gadgets": gadgetsID, "acme/old": oldID, "acme/moved": movedID, "acme/gone": 1296273}
 
 // repoID is the id the fake gives the repository name, owner/name, in any case: one of
 // knownIDs, or else one made from the name, the same each time, past the known ones.
@@ -171,7 +167,6 @@ func repoID(name string) int64 {
 		io.WriteString(h, lower)
 		id = 2_000_000_000 + int64(h.Sum32())
 	}
-	refNames.LoadOrStore(strconv.FormatInt(id, 10), lower)
 	return id
 }
 
@@ -180,18 +175,6 @@ func refOf(name string) string { return strconv.FormatInt(repoID(name), 10) }
 
 // itemOf is the item ref of the issue n of the repository name.
 func itemOf(name string, n int) string { return refOf(name) + "#" + strconv.Itoa(n) }
-
-// openRepoOf is the repository, owner/name, of a collection ref the fake gave, for
-// [Adapter.openRepository]: how serve learns the name for the GraphQL listing is not
-// decided, so the tests name it.
-func openRepoOf(ref string) (github.Repository, bool) {
-	name, ok := refNames.Load(ref)
-	if !ok {
-		return github.Repository{}, false
-	}
-	owner, repo, _ := strings.Cut(name.(string), "/")
-	return github.Repository{Owner: owner, Name: repo}, true
-}
 
 // widgetsItem is a request that sends one item of acme/widgets, as the contract takes it.
 func widgetsItem() contracts.SourceItems {
@@ -393,6 +376,15 @@ type fakeGitHub struct {
 	gqlFail   string
 	onPage    func(page int, r *http.Request)
 	gqlPages  int
+	// readStatus, when set, answers the read of acme/widgets by its id, GET
+	// /repositories/{id}, with that status and no repository. gqlIDSet makes GraphQL
+	// answer gqlID as acme/widgets's databaseId, nil for none, or another repository's
+	// id, as when the name came to name another repository after it was read.
+	readStatus int
+	gqlIDSet   bool
+	gqlID      any
+	// gqlAsked is the owner/name each GraphQL request named, in order.
+	gqlAsked []string
 	// person is the person signed in with Connect; userInstallations are the
 	// installations the person reaches, which GitHub lists one on each page; and
 	// memberships are the person's memberships of organisations, by login. userDown
@@ -500,6 +492,9 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.repoAfter != nil {
 			f.repoAfter(f, page)
 		}
+	case r.Method == "GET" && r.URL.Path == widgets && f.readStatus != 0:
+		w.WriteHeader(f.readStatus)
+		io.WriteString(w, `{"message":"`+http.StatusText(f.readStatus)+`"}`)
 	case r.Method == "GET" && r.URL.Path == widgets:
 		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":
@@ -625,6 +620,7 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 		return
 	}
 	v := req.Variables
+	f.gqlAsked = append(f.gqlAsked, v.Owner+"/"+v.Name)
 	f.gqlPages++
 	page := f.gqlPages
 	if f.onPage != nil {
@@ -679,8 +675,12 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request, b []byte) {
 			end = "cursor:" + strconv.Itoa(i+1)
 		}
 	}
+	var dbID any = id
+	if name == "acme/widgets" && f.gqlIDSet {
+		dbID = f.gqlID
+	}
 	json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{
-		"databaseId":    id,
+		"databaseId":    dbID,
 		"nameWithOwner": name,
 		"url":           "https://github.com/" + name,
 		"issues": map[string]any{

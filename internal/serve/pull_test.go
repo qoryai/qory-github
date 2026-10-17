@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -265,45 +266,81 @@ func TestTheLastGoodTimeMovesOnlyOnSuccess(t *testing.T) {
 	}
 }
 
-// TestAPullReadsWhatChangedByIDAndListsNothingWithoutAName pulls a collection with no
-// way to name its repository for GraphQL's listing, as serve has it: what changed is
-// read through the repository's id alone, and sent; a listing of open issues that is
-// due fails, errOpenByID, before GitHub is asked for it, and keeps no time, whether
-// what changed was read before it or the collection has no pull kept.
-func TestAPullReadsWhatChangedByIDAndListsNothingWithoutAName(t *testing.T) {
+// pathsOf are the requests' methods and paths, without their queries, but for the
+// App's and its token's, under /app/, in order.
+func (f *pullGitHub) pathsOf() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, r := range f.requests {
+		if p, _, _ := strings.Cut(r, "?"); !strings.Contains(p, " /app/") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// TestAPullListsByTheNameItReadOnce pulls a collection whose daily listing is due: the
+// read of what changed reads the repository by its id once, and the listing asks
+// GraphQL for the name that read gave, with no second read; and a pull of a collection
+// with no pull kept, which reads no change, reads the repository by its id once and then
+// lists. No request names the repository by owner/name.
+func TestAPullListsByTheNameItReadOnce(t *testing.T) {
 	w, f, p, _ := pulling(t)
-	w.adapter.openRepository = nil
 	last := pullStart.Add(-time.Hour)
-	keepPulled(w.st, widgetsRef, pullMark{Since: last, Listed: last})
+	keepPulled(w.st, widgetsRef, pullMark{Since: last, Listed: pullStart.Add(-25 * time.Hour)})
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
 	if err := p.pull(context.Background(), widgetsRef, 42); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.asked("/repositories/"+widgetsRef+"/issues")) != 1 || len(f.asked("/graphql")) != 0 || len(w.apiary.sent(routeItems)) != 1 {
-		t.Errorf("asked %v; %d items requests", f.requests, len(w.apiary.sent(routeItems)))
+	repo := "/repositories/" + widgetsRef
+	want := []string{"GET " + repo, "GET " + repo + "/issues", "GET " + repo + "/issues/comments", "POST /graphql"}
+	if got := f.pathsOf(); !slices.Equal(got, want) {
+		t.Errorf("GitHub was asked %v, want %v", got, want)
 	}
-	for _, r := range f.requests {
-		if strings.Contains(r, "/repos/") {
-			t.Errorf("asked by owner/name: %s", r)
-		}
-	}
-	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(last) {
+	if m := markOf(t, w); !m.Since.Equal(pullStart) || !m.Listed.Equal(pullStart) {
 		t.Errorf("kept %+v", m)
 	}
 
-	for _, mark := range []pullMark{{Since: pullStart, Listed: pullStart.Add(-25 * time.Hour)}, {}} {
+	w.st.Delete(nsPulls, widgetsRef)
+	f.mu.Lock()
+	f.requests = nil
+	f.mu.Unlock()
+	if err := p.pull(context.Background(), widgetsRef, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.pathsOf(), []string{"GET " + repo, "POST /graphql"}; !slices.Equal(got, want) {
+		t.Errorf("a first pull asked %v, want %v", got, want)
+	}
+	w.gh.mu.Lock()
+	asked := slices.Clone(w.gh.gqlAsked)
+	w.gh.mu.Unlock()
+	if !slices.Equal(asked, []string{"acme/widgets", "acme/widgets"}) {
+		t.Errorf("GraphQL was asked for %v", asked)
+	}
+}
+
+// TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater pulls a collection whose
+// daily listing is due while GraphQL answers, for the name read by the id, a repository
+// whose id is another, or no id: what changed is sent, the listing sends no part, and
+// the pull fails with an error that is no repository gone and keeps no time, so the
+// next round reads the name and lists again.
+func TestAPullWhoseNameNamesAnotherRepositoryListsAgainLater(t *testing.T) {
+	for _, id := range []any{gadgetsID, nil} {
+		w, _, p, _ := pulling(t)
+		mark := pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-25 * time.Hour)}
 		keepPulled(w.st, widgetsRef, mark)
-		if mark == (pullMark{}) {
-			w.st.Delete(nsPulls, widgetsRef)
+		w.gh.issues = []map[string]any{ghIssue(1, 0)}
+		w.gh.gqlIDSet, w.gh.gqlID = true, id
+		err := p.pull(context.Background(), widgetsRef, 42)
+		if err == nil || errors.Is(err, github.ErrRepositoryGone) {
+			t.Errorf("%v: err %v", id, err)
 		}
-		if err := p.pull(context.Background(), widgetsRef, 42); !errors.Is(err, errOpenByID) {
-			t.Errorf("%+v: err %v", mark, err)
-		}
-		if len(f.asked("/graphql")) != 0 {
-			t.Errorf("%+v: GraphQL asked", mark)
+		if parts := listingParts(w); len(parts) != 0 {
+			t.Errorf("%v: listed %+v", id, parts)
 		}
 		if m := markOf(t, w); m != mark {
-			t.Errorf("%+v: kept %+v", mark, m)
+			t.Errorf("%v: kept %+v", id, m)
 		}
 	}
 }

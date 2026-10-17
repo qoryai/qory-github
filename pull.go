@@ -33,7 +33,10 @@ type ghRepoComment struct {
 // the repository's issues that changed. Unlike [Lister.ListOpenIssuesComplete], it sends
 // a closed issue too, with its state and its reason, so Qory Apiary learns of a close
 // whose webhook it missed. Each request reaches the repository through its id,
-// /repositories/{id}, so the collection's ref, which is that id, is all it needs.
+// /repositories/{id}, so the collection's ref, which is that id, is all it needs. It
+// returns the repository's owner/name as its first request read it, which a listing
+// of open issues in the same run takes, see [Lister.ListOpenIssuesComplete], or a zero
+// Repository when GitHub's name for it is not owner/name.
 //
 // Every request is an event's, an upsert: none is a listing's part and none says it is
 // complete, so Qory Apiary closes and drops nothing for it. Items go in requests of at
@@ -60,29 +63,77 @@ type ghRepoComment struct {
 // would read more fails, and so does one GitHub answers that the repository is gone or
 // moved, with an error that wraps [ErrRepositoryGone]. It stops at the first error, and
 // sends nothing more.
-func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Time) error {
+func (l Lister) ListChanged(ctx context.Context, repository int64, since time.Time) (Repository, error) {
 	if repository <= 0 {
-		return errors.New("the repository's id is not one")
+		return Repository{}, errors.New("the repository's id is not one")
 	}
 	if l.Sink == nil || l.Token == nil || l.Slug == "" {
-		return errors.New("the lister has no sink, no token or no App slug")
+		return Repository{}, errors.New("the lister has no sink, no token or no App slug")
 	}
 	p := l.pacerOr()
+	r, err := l.readRepository(ctx, p, repository)
+	if err != nil {
+		return Repository{}, err
+	}
+	name, _ := nameOf(r)
+	repo := CollectionRef(repository)
+	coll := collectionOf(r)
+	if why := checkCollection(coll); why != "" {
+		return name, fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
+	}
+	if err := l.changedIssues(ctx, p, r, since); err != nil {
+		return name, err
+	}
+	return name, l.changedComments(ctx, p, coll, since)
+}
+
+// readRepository reads the repository whose id is repository, GET /repositories/{id}.
+// One GitHub answers is gone, deleted or out of the App's reach, as a 404 by its id
+// says, wraps [ErrRepositoryGone]: a rename or a transfer keeps the id, so it never
+// brings that answer.
+func (l Lister) readRepository(ctx context.Context, p *Pacer, repository int64) (ghRepo, error) {
 	repo := CollectionRef(repository)
 	var r ghRepo
 	if _, err := l.get(ctx, p, "reading the repository "+repo, "/repositories/"+repo, &r); err != nil {
-		return repositoryGone(err)
+		return ghRepo{}, repositoryGone(err)
 	}
 	// The repository GitHub answers for /repositories/{id} is the one whose id it is.
 	r.ID = repository
-	coll := collectionOf(r)
-	if why := checkCollection(coll); why != "" {
-		return fmt.Errorf("the repository %s cannot be a collection: %s", repo, why)
+	return r, nil
+}
+
+// nameOf is the repository's owner/name as GitHub names it, its full_name, or false
+// when that is not owner/name by GitHub's rules for owners and names.
+func nameOf(r ghRepo) (Repository, bool) {
+	owner, name, ok := strings.Cut(r.FullName, "/")
+	if !ok || !ownerShape.MatchString(owner) || !nameShape.MatchString(name) || name == "." || name == ".." {
+		return Repository{}, false
 	}
-	if err := l.changedIssues(ctx, p, r, since); err != nil {
-		return err
+	return Repository{Owner: owner, Name: name}, true
+}
+
+// ReadRepository reads the owner/name of the repository whose id is repository, GET
+// /repositories/{id}, for a listing of its open issues, which GraphQL addresses by
+// owner/name, see [Lister.ListOpenIssuesComplete]; a pull that read what changed in the
+// same run has it already, from [Lister.ListChanged]. A repository GitHub answers is
+// gone, as a 404 by its id says, wraps [ErrRepositoryGone]; any other failure is the
+// request's error, and a name that is not owner/name is refused. Nothing is kept.
+func (l Lister) ReadRepository(ctx context.Context, repository int64) (Repository, error) {
+	if repository <= 0 {
+		return Repository{}, errors.New("the repository's id is not one")
 	}
-	return l.changedComments(ctx, p, coll, since)
+	if l.Token == nil {
+		return Repository{}, errors.New("the lister has no token")
+	}
+	r, err := l.readRepository(ctx, l.pacerOr(), repository)
+	if err != nil {
+		return Repository{}, err
+	}
+	name, ok := nameOf(r)
+	if !ok {
+		return Repository{}, fmt.Errorf("reading the repository %s: GitHub's name for it is not owner/name", CollectionRef(repository))
+	}
+	return name, nil
 }
 
 // changedPages reads, oldest change first, what the listing at base, a path and a query
