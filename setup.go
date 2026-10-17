@@ -228,9 +228,10 @@ func (c Client) Account(ctx context.Context, handle string) (login, kind string,
 
 var codeShape = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 
-// page is the local page that posts the manifest to GitHub as the manifest flow requires.
+// page is the local page that posts the manifest to GitHub as the manifest flow
+// requires; its title names the program, see [Setup.program].
 var page = template.Must(template.New("page").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github setup</title>
+<meta charset="utf-8"><title>{{.Program}} setup</title>
 <form id="f" method="post" action="{{.Action}}">
 <input type="hidden" name="manifest" value="{{.Manifest}}">
 <button type="submit">Create the GitHub App</button>
@@ -272,14 +273,15 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	}
 	codes := make(chan string, 1)
 	host := ln.Addr().String()
+	program := s.program()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+pagePath, func(w http.ResponseWriter, _ *http.Request) {
-		page.Execute(w, map[string]string{"Action": action, "Manifest": string(manifest)})
+		page.Execute(w, map[string]string{"Program": program, "Action": action, "Manifest": string(manifest)})
 	})
 	mux.HandleFunc("GET /callback", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(state)) != 1 || !codeShape.MatchString(q.Get("code")) {
-			http.Error(w, "qory-github answers only GitHub's redirect containing the state it sent and a code", http.StatusBadRequest)
+			http.Error(w, program+" answers only GitHub's redirect containing the state it sent and a code", http.StatusBadRequest)
 			return
 		}
 		select {
@@ -293,7 +295,7 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 	// origin that resolves a name it controls to loopback reaches nothing.
 	own := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host != host {
-			http.Error(w, "qory-github answers only requests to "+host, http.StatusMisdirectedRequest)
+			http.Error(w, program+" answers only requests to "+host, http.StatusMisdirectedRequest)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -324,6 +326,15 @@ func (s Setup) Start(ctx context.Context) (string, func() (*App, error), error) 
 		}
 	}
 	return local + pagePath, done, nil
+}
+
+// program is the program whose setup s is, which its local page and answers name:
+// qory-github-starter with [Setup.Starter], and qory-github otherwise.
+func (s Setup) program() string {
+	if s.Starter {
+		return "qory-github-starter"
+	}
+	return "qory-github"
 }
 
 // Check refuses what [Setup.Start] refuses before it listens, so a caller refuses it

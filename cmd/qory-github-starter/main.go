@@ -163,9 +163,9 @@ The private key goes to --key-file, which only you may read. setup never writes 
 file that exists, and never prints the key. GitHub hands the key out once: when the
 file cannot be written, the key goes beside it, and setup prints where.
 
-Then setup prints where to install the App, and the settings to add to the starter's
-settings: app_id and private_key_file. Install the App on the one repository the
-starter's settings name as repository.`,
+Then setup prints where to install the App, and the two settings to add to the
+starter's settings: app_id and private_key_file. Install the App on the one repository
+the starter's settings name as repository.`,
 	Example: `  qory-github-starter setup --key-file /etc/qory-github-starter/github-app.pem              # under your account
   qory-github-starter setup --org acme --key-file /etc/qory-github-starter/github-app.pem   # under the organisation acme`,
 }
@@ -204,17 +204,27 @@ func setup(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if s.Name == "" {
 		s.Name = "qory-github-starter-" + setupcmd.RandomSuffix()
 	}
-	return runSetup(ctx, s, stdout)
+	// api_url is printed with the settings only when --api-url is given.
+	apiURL := ""
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "api-url" {
+			apiURL = *api
+		}
+	})
+	return setupRunner(ctx, s, apiURL, stdout)
 }
 
+// setupRunner is [runSetup], which a test replaces to read what setup hands it.
+var setupRunner = runSetup
+
 // runSetup is setup past its flags, so a test drives it with a page opener the test
-// supplies.
-func runSetup(ctx context.Context, s github.Setup, stdout io.Writer) error {
+// supplies. apiURL, when set, is the --api-url given, which the settings printed hold.
+func runSetup(ctx context.Context, s github.Setup, apiURL string, stdout io.Writer) error {
 	app, abs, err := setupcmd.Create(ctx, s, stdout)
 	if err != nil {
 		return err
 	}
-	settings, err := setupSettings(app.ID, abs)
+	settings, err := setupSettings(app.ID, abs, apiURL)
 	if err != nil {
 		return err
 	}
@@ -224,19 +234,26 @@ The App %d (%s) is created, and its private key is in %s.
 Install it on the one repository the starter's settings name as repository:
   %s
 
-Then add these settings to the starter's settings:
+Then add these to the starter's settings:
 
 %s`, app.ID, app.Slug, abs, app.InstallURL(s.Web), settings)
 	return err
 }
 
-// setupSettings is what setup prints for the starter's settings: app_id and
-// private_key_file, one per line, as they go into the settings' JSON object, with no
-// braces around them.
-func setupSettings(appID int64, keyFile string) (string, error) {
+// setupSettings is what setup prints for the starter's settings: app_id,
+// private_key_file and, when apiURL is set, api_url, one per line, as they go into the
+// settings' JSON object, with no braces around them.
+func setupSettings(appID int64, keyFile, apiURL string) (string, error) {
 	path, err := json.Marshal(keyFile)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("  \"app_id\": %d,\n  \"private_key_file\": %s\n", appID, path), nil
+	if apiURL == "" {
+		return fmt.Sprintf("  \"app_id\": %d,\n  \"private_key_file\": %s\n", appID, path), nil
+	}
+	api, err := json.Marshal(apiURL)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("  \"app_id\": %d,\n  \"private_key_file\": %s,\n  \"api_url\": %s\n", appID, path, api), nil
 }

@@ -47,7 +47,8 @@ func ProgramVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 // program qory-github-server, with its commands serve, the webhook receiver, and
 // access-key, which enrols its access key for Qory Apiary; the program
 // qory-github-starter, with its commands access-key, which enrols a node pool's access
-// key, and setup, which creates the starter's App; and setup's --public-url.
+// key, and setup, which creates the starter's App; and --public-url of qory-github's
+// setup.
 // Qory Apiary's factory is an opt-in feature of the same name, and the programs read the
 // variable by the rules Qory Apiary applies to the name of an opt-in feature:
 //

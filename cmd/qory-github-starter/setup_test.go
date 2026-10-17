@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/starter"
 )
 
@@ -153,10 +154,11 @@ The App 123456 (qory-github-starter-test) is created, and its private key is in 
 Install it on the one repository the starter's settings name as repository:
   https://github.com/apps/qory-github-starter-test/installations/new
 
-Then add these settings to the starter's settings:
+Then add these to the starter's settings:
 
   "app_id": 123456,
-  "private_key_file": ` + string(fileJSON) + `
+  "private_key_file": ` + string(fileJSON) + `,
+  "api_url": "` + f.url + `"
 `
 	if printed != want {
 		t.Errorf("setup prints\n%s\nwant\n%s", printed, want)
@@ -178,7 +180,7 @@ Then add these settings to the starter's settings:
 
 	// The settings printed, with the starter's other fields, are settings the starter
 	// reads, and the key file is one it reads.
-	_, members, _ := strings.Cut(printed, "settings:\n\n")
+	_, members, _ := strings.Cut(printed, "the starter's settings:\n\n")
 	settings := filepath.Join(t.TempDir(), "starter.json")
 	doc := `{"apiary_url": "https://apiary.example.com", "access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/etc/qory-github-starter/access-key-secret",
   "apiary_public_key": [{"alg": "ed25519", "public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],
@@ -189,7 +191,7 @@ Then add these settings to the starter's settings:
 		t.Fatal(err)
 	}
 	s, err := starter.ReadSettings(settings)
-	if err != nil || s.AppID != "123456" || s.PrivateKeyFile != file {
+	if err != nil || s.AppID != "123456" || s.PrivateKeyFile != file || s.APIURL != f.url {
 		t.Fatalf("the starter's settings: %+v, %v", s, err)
 	}
 	if k, err := starter.ReadPrivateKey(s.PrivateKeyFile); err != nil || !k.Equal(f.key) {
@@ -276,9 +278,9 @@ The private key goes to --key-file, which only you may read. setup never writes 
 file that exists, and never prints the key. GitHub hands the key out once: when the
 file cannot be written, the key goes beside it, and setup prints where.
 
-Then setup prints where to install the App, and the settings to add to the starter's
-settings: app_id and private_key_file. Install the App on the one repository the
-starter's settings name as repository.
+Then setup prints where to install the App, and the two settings to add to the
+starter's settings: app_id and private_key_file. Install the App on the one repository
+the starter's settings name as repository.
 
 usage:
   qory-github-starter setup --key-file FILE [--org ORG] [--name NAME]
@@ -312,5 +314,106 @@ func TestSetupHelpIsPinned(t *testing.T) {
 		if code := run(context.Background(), args, &out, &errs); code != 2 || out.Len() != 0 || errs.String() != setupHelpText {
 			t.Errorf("%q: exit %d, stderr\n%s\nwant\n%s", args, code, errs.String(), setupHelpText)
 		}
+	}
+}
+
+// TestSetupPrintsAPIURLOnlyWhenItIsGiven pins that setup hands the settings it prints
+// the --api-url given, and none without it, and what it prints for each: app_id and
+// private_key_file, and api_url only when it is given, with the value given.
+func TestSetupPrintsAPIURLOnlyWhenItIsGiven(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	saved := setupRunner
+	defer func() { setupRunner = saved }()
+	for _, tc := range []struct {
+		args       []string
+		api, given string
+	}{
+		{nil, "https://api.github.com", ""},
+		{[]string{"--api-url", "https://api.github.com/"}, "https://api.github.com/", "https://api.github.com/"},
+		{[]string{"--api-url", "http://127.0.0.1:1"}, "http://127.0.0.1:1", "http://127.0.0.1:1"},
+	} {
+		var api, given string
+		ran := false
+		setupRunner = func(_ context.Context, s github.Setup, apiURL string, _ io.Writer) error {
+			ran, api, given = true, s.Client.API, apiURL
+			return nil
+		}
+		var out, errs bytes.Buffer
+		code := run(context.Background(), append([]string{"setup", "--key-file", filepath.Join(t.TempDir(), "github-app.pem")}, tc.args...), &out, &errs)
+		if code != 0 || !ran || api != tc.api || given != tc.given {
+			t.Errorf("%q: exit %d, %q, ran %v, the API %q, the api_url printed %q", tc.args, code, errs.String(), ran, api, given)
+		}
+	}
+	setupRunner = saved
+
+	// Without --api-url the settings printed are app_id and private_key_file alone.
+	f := newFakeSetupGitHub(t)
+	file := filepath.Join(t.TempDir(), "github-app.pem")
+	open := func(local string) error { _, _, err := approveSetup(local); return err }
+	s := github.Setup{Name: "qory-github-starter-test", KeyFile: file, Web: "https://github.com", Client: gitHub(f.url), Open: open, Starter: true}
+	var out bytes.Buffer
+	if err := runSetup(context.Background(), s, "", &out); err != nil {
+		t.Fatal(err)
+	}
+	fileJSON, _ := json.Marshal(file)
+	if _, printed, _ := strings.Cut(out.String(), "\n"); !strings.HasSuffix(printed, `
+Then add these to the starter's settings:
+
+  "app_id": 123456,
+  "private_key_file": `+string(fileJSON)+`
+`) {
+		t.Errorf("setup prints\n%s", out.String())
+	}
+}
+
+// TestSetupPrintsWhereAMovedKeyIs runs setup whole with a key file that appears once the
+// page is open, and pins what it prints: the line that says where the key is instead
+// and why, and the settings with that file as private_key_file.
+func TestSetupPrintsWhereAMovedKeyIs(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	f := newFakeSetupGitHub(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "github-app.pem")
+	saved := opener
+	defer func() { opener = saved }()
+	opener = func(local string) error {
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			return err
+		}
+		_, _, err := approveSetup(local)
+		return err
+	}
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"setup", "--api-url", f.url, "--key-file", file, "--name", "qory-github-starter-test"}, &out, &errs); code != 0 || errs.Len() != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errs.String())
+	}
+	_, printed, _ := strings.Cut(out.String(), "\n")
+	beside := regexp.MustCompile(`^\nThe key is in (\S+), since `).FindStringSubmatch(printed)
+	if beside == nil || !regexp.MustCompile(`^`+regexp.QuoteMeta(file)+`\.[0-9a-f]{16}$`).MatchString(beside[1]) {
+		t.Fatalf("setup prints\n%s", out.String())
+	}
+	besideJSON, _ := json.Marshal(beside[1])
+	want := `
+The key is in ` + beside[1] + `, since ` + file + ` could not be written: it exists.
+
+The App 123456 (qory-github-starter-test) is created, and its private key is in ` + beside[1] + `.
+
+Install it on the one repository the starter's settings name as repository:
+  https://github.com/apps/qory-github-starter-test/installations/new
+
+Then add these to the starter's settings:
+
+  "app_id": 123456,
+  "private_key_file": ` + string(besideJSON) + `,
+  "api_url": "` + f.url + `"
+`
+	if printed != want {
+		t.Errorf("setup prints\n%s\nwant\n%s", printed, want)
+	}
+	if k, err := starter.ReadPrivateKey(beside[1]); err != nil || !k.Equal(f.key) {
+		t.Errorf("the key beside the file does not read back: %v", err)
+	}
+	if b, err := os.ReadFile(file); err != nil || len(b) != 0 {
+		t.Errorf("the file that appeared was written over: %d bytes, %v", len(b), err)
 	}
 }
