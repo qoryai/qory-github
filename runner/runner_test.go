@@ -20,10 +20,13 @@ var valid = Values{
 	HarnessRef: strings.Repeat("0123456789", 4),
 }
 
-// The lines of the run step the plan pins byte for byte, and its prompt.
+// The lines of the run step the tests pin byte for byte: the mkdir and qory run lines
+// as the plan has them, the key's branch of the pipe, the line that writes the inputs
+// and spoils the key when any command of the pipe fails, the key's jq aside, which
+// writes nothing when it fails, and the end of the group.
 const (
 	mkdirLine = `mkdir "$RUNNER_TEMP/in"`
-	jqLine    = `jq -se 'if length == 1 and (.[0] | type) == "object" then .[0].inputs | objects else empty end' > "$RUNNER_TEMP/in/inputs.json"`
+	jqLine    = `jq -se 'if length == 1 and (.[0] | type) == "object" then .[0].inputs | objects else empty end' > "$RUNNER_TEMP/in/inputs.json" || { printf '\n!' >&3; exit 1; }`
 	teeLine   = `tee >(jq -sje 'if length == 1 and (.[0] | type) == "object" and (.[0].inputs | type) == "object" then .[0].run_key | strings else empty end' >&3) |`
 	groupLine = `} 3>&1 1>&2 |`
 	qoryLine  = `qory run claude --home "$RUNNER_TEMP/homes" --run-key-fd 0 --wall docker --image "$AGENT_IMAGE" --mount "$RUNNER_TEMP/in:ro" --timeout 12m -- --max-turns 40 --add-dir "$RUNNER_TEMP/in" -p "Explore the ticket described in $RUNNER_TEMP/in/inputs.json, following the explore-an-item skill. End with the explore v1 JSON document alone as your final response."`
@@ -221,6 +224,20 @@ func TestNoExpressionInARun(t *testing.T) {
 // the same jq and judge what they read by the same rules. Neither call prints
 // anything of the answer, since each ends in empty, not error. Without a run key, qory
 // refuses it before anything starts.
+//
+// When any command of the pipe fails, the key's jq aside, the handover, its curl, the
+// jq before it, the tee or the inputs' jq, a write of the inputs file that fails or a
+// file bash cannot open among them, pipefail makes the pipe's status non-zero, and the
+// group writes a line end and ! to descriptor 3 before it exits. The key's jq runs in
+// a process substitution, whose status pipefail does not see, so its failure writes no
+// spoiler; it writes nothing when it fails, and qory refuses what it then reads. qory
+// reads its standard input to the end, which comes only once every holder of
+// descriptor 3 has closed it, the group included, so the ! always arrives before the
+// end, wherever it falls beside the run key. qory trims white space around what it
+// read and parses the rest as a run key, which never holds a !, so it refuses it
+// before anything starts, whatever else arrived, and names the rule it breaks, never
+// the value. A spoiler of white space alone would be trimmed away and leave the key
+// good, so the ! is what spoils it.
 func TestTheRunLines(t *testing.T) {
 	script := runs(t, parse(t, filled(t)))[2]
 	ls := lines(script)
