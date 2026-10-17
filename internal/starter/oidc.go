@@ -97,15 +97,15 @@ type Claims struct {
 	Expiry time.Time
 }
 
-// Refusal is a token's refusal: the check that failed, and never the token or a
+// TokenRefusal is a token's refusal: the check that failed, and never the token or a
 // claim's value.
-type Refusal struct {
+type TokenRefusal struct {
 	reason string
 	err    error
 }
 
 // Error says which check refused the token.
-func (r *Refusal) Error() string {
+func (r *TokenRefusal) Error() string {
 	if r.err != nil {
 		return "the token is refused: check " + r.reason + " failed: " + r.err.Error()
 	}
@@ -114,12 +114,12 @@ func (r *Refusal) Error() string {
 
 // Unwrap is why the keys could not be fetched, for the checks discovery and jwks, or
 // nil.
-func (r *Refusal) Unwrap() error { return r.err }
+func (r *TokenRefusal) Unwrap() error { return r.err }
 
 // Reason is the check that refused err, such as aud, run_id or signature, or empty
-// when err is not a [Refusal].
+// when err is not a [TokenRefusal].
 func Reason(err error) string {
-	var r *Refusal
+	var r *TokenRefusal
 	if errors.As(err, &r) {
 		return r.reason
 	}
@@ -127,7 +127,7 @@ func Reason(err error) string {
 }
 
 // refuse is the refusal of the check reason.
-func refuse(reason string) error { return &Refusal{reason: reason} }
+func refuse(reason string) error { return &TokenRefusal{reason: reason} }
 
 // errExpect is the error of an Expect that is missing a field: the starter's fault,
 // not the token's.
@@ -172,7 +172,7 @@ func newVerifier(issuer string, transport http.RoundTripper, now func() time.Tim
 
 // Verify verifies the job's token raw, a compact JWS, against the run want: its form,
 // its header, its RS256 signature under the issuer's key its kid names, and its claims.
-// A failed check is a [Refusal] whose [Reason] names it.
+// A failed check is a [TokenRefusal] whose [Reason] names it.
 func (v *Verifier) Verify(ctx context.Context, raw string, want Expect) (Claims, error) {
 	if want.Audience == "" || want.Repository == "" || want.RepositoryID <= 0 || want.Workflow == "" ||
 		want.Ref == "" || want.RunID <= 0 || want.LeaseUntil.IsZero() {
@@ -461,7 +461,7 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 			case <-done:
 				continue
 			case <-ctx.Done():
-				return nil, &Refusal{reason: "jwks", err: ctx.Err()}
+				return nil, &TokenRefusal{reason: "jwks", err: ctx.Err()}
 			}
 		}
 		if !v.attempted.IsZero() && now.Sub(v.attempted) < refetchInterval {
@@ -501,26 +501,26 @@ func (v *Verifier) fetch(ctx context.Context) (map[string]*rsa.PublicKey, error)
 	defer cancel()
 	b, err := v.get(ctx, v.issuer+"/.well-known/openid-configuration", maxDiscovery)
 	if err != nil {
-		return nil, &Refusal{reason: "discovery", err: err}
+		return nil, &TokenRefusal{reason: "discovery", err: err}
 	}
 	doc, err := strictObject(b)
 	if err != nil {
-		return nil, &Refusal{reason: "discovery", err: err}
+		return nil, &TokenRefusal{reason: "discovery", err: err}
 	}
 	if iss, ok := str(doc, "issuer"); !ok || iss != v.issuer {
-		return nil, &Refusal{reason: "discovery", err: errors.New("the openid-configuration names another issuer")}
+		return nil, &TokenRefusal{reason: "discovery", err: errors.New("the openid-configuration names another issuer")}
 	}
 	jwksURI, ok := str(doc, "jwks_uri")
 	if !ok || !sameHost(jwksURI, v.issuer) {
-		return nil, &Refusal{reason: "discovery", err: errors.New("the openid-configuration's jwks_uri is not https on the issuer's host")}
+		return nil, &TokenRefusal{reason: "discovery", err: errors.New("the openid-configuration's jwks_uri is not https on the issuer's host")}
 	}
 	b, err = v.get(ctx, jwksURI, maxJWKS)
 	if err != nil {
-		return nil, &Refusal{reason: "jwks", err: err}
+		return nil, &TokenRefusal{reason: "jwks", err: err}
 	}
 	keys, err := parseJWKS(b)
 	if err != nil {
-		return nil, &Refusal{reason: "jwks", err: err}
+		return nil, &TokenRefusal{reason: "jwks", err: err}
 	}
 	return keys, nil
 }
