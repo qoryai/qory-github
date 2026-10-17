@@ -1,7 +1,9 @@
-// Package starter holds qory-github-starter's settings: Qory Apiary's fields, the
-// starter's listen, public_url and state_dir, and the GitHub App, repository and
-// workflow they name, read and checked, the readers of the files they name, and the
-// verifier of the GitHub Actions OIDC token a run's job presents.
+// Package starter is qory-github-starter's work: its settings, Qory Apiary's fields,
+// the starter's listen, public_url and state_dir, and the GitHub App, repository and
+// workflow they name, read and checked, and the readers of the files they name; the
+// verifier of the GitHub Actions OIDC token a run's job presents; the signed client of
+// Qory Apiary; and [Run], which claims runs, starts a job for each, passes each job its
+// run key through the pass-through, and watches the job to its end.
 package starter
 
 import (

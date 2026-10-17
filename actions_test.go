@@ -682,3 +682,97 @@ func TestAnActionsIsSafeForConcurrentUse(t *testing.T) {
 		t.Errorf("%s", s)
 	}
 }
+
+// findAnswer answers FindRepository's requests: the installation's lookup with
+// installation, and the repository's read with status and body.
+func findAnswer(installation string, status int, body string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/installation") {
+			io.WriteString(w, installation)
+			return
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}
+}
+
+// TestFindRepositoryNamesTheRepositoryAsGitHubDoes finds a repository whose full_name
+// GitHub writes in another case, and checks the installation's lookup with the App's
+// token, the mint for that repository alone with metadata read, and the read.
+func TestFindRepositoryNamesTheRepositoryAsGitHubDoes(t *testing.T) {
+	f := &fakeActions{answer: findAnswer(`{"id":7}`, 200, `{"id":42,"full_name":"Example-Org/Runner"}`)}
+	a := serveActions(t, f)
+	got, err := a.FindRepository(context.Background(), Repository{Owner: "example-org", Name: "runner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (ActionsRepository{Installation: 7, ID: 42, FullName: "Example-Org/Runner"}); got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	if len(f.mints) != 1 || strings.TrimSpace(f.mints[0]) != `{"permissions":{"metadata":"read"},"repositories":["runner"]}` {
+		t.Errorf("the mints asked for %q", f.mints)
+	}
+	if len(f.requests) != 2 || f.requests[0].path != "/repos/example-org/runner/installation" || f.requests[1].path != "/repos/example-org/runner" {
+		t.Fatalf("the requests were %+v", f.requests)
+	}
+	if auth := f.requests[0].header.Get("Authorization"); !strings.HasPrefix(auth, "Bearer ") || auth == "Bearer "+actionsToken {
+		t.Errorf("the installation's lookup is not made with the App's token")
+	}
+	checkHeaders(t, f.requests[1], false)
+}
+
+// TestFindRepositoryRefusesWhatIsNotTheRepository refuses another repository's
+// full_name, an id that is not one, a redirect, a 404 and an installation without an id,
+// each classed, and never says the token.
+func TestFindRepositoryRefusesWhatIsNotTheRepository(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		installation string
+		status       int
+		body         string
+		want         error
+	}{
+		{"another repository", `{"id":7}`, 200, `{"id":42,"full_name":"example-org/runner2"}`, ErrActionsRefused},
+		{"no id", `{"id":7}`, 200, `{"full_name":"example-org/runner"}`, ErrActionsRefused},
+		{"not a name", `{"id":7}`, 200, `{"id":42,"full_name":"example-org/runner/x"}`, ErrActionsRefused},
+		{"moved", `{"id":7}`, 301, `{"message":"Moved Permanently"}`, ErrActionsGone},
+		{"not found", `{"id":7}`, 404, `{"message":"Not Found"}`, ErrActionsGone},
+		{"no installation", `{}`, 200, `{"id":42,"full_name":"example-org/runner"}`, ErrActionsTransient},
+		{"server error", `{"id":7}`, 502, `{"message":"Bad Gateway"}`, ErrActionsTransient},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeActions{answer: findAnswer(c.installation, c.status, c.body)}
+			a := serveActions(t, f)
+			_, err := a.FindRepository(context.Background(), Repository{Owner: "example-org", Name: "runner"})
+			if !errors.Is(err, c.want) {
+				t.Fatalf("got %v, want %v", err, c.want)
+			}
+			if strings.Contains(err.Error(), actionsToken) {
+				t.Errorf("the error says the token")
+			}
+		})
+	}
+	t.Run("installation not found", func(t *testing.T) {
+		f := &fakeActions{answer: func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(404)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		}}
+		a := serveActions(t, f)
+		if _, err := a.FindRepository(context.Background(), Repository{Owner: "example-org", Name: "runner"}); !errors.Is(err, ErrActionsGone) {
+			t.Fatalf("got %v", err)
+		}
+		if len(f.mints) != 0 {
+			t.Errorf("a token was minted")
+		}
+	})
+	t.Run("not owner/name", func(t *testing.T) {
+		f := &fakeActions{}
+		a := serveActions(t, f)
+		if _, err := a.FindRepository(context.Background(), Repository{Owner: "-x", Name: "runner"}); !errors.Is(err, ErrActionsInvalid) {
+			t.Fatalf("got %v", err)
+		}
+		if f.all != 0 {
+			t.Errorf("%d requests were sent", f.all)
+		}
+	})
+}
