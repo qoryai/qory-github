@@ -1,0 +1,75 @@
+# The runner template, as qory-github-starter template prints it for the runner
+# repository __REPOSITORY__.
+#
+# Commit it to that repository as .github/workflows/qory-explore.yml, on the branch or
+# tag the starter's settings name as ref, with workflow set to qory-explore.yml, and
+# protect that ref, so that only a reviewed change reaches it: the starter hands a run
+# key only to a job of this workflow at that ref. The starter dispatches the workflow
+# with one input, dispatch_id, and never commits it.
+name: qory explore
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_id:
+        description: The dispatch's id, which qory-github-starter sends
+        required: true
+        type: string
+permissions:
+  id-token: write
+jobs:
+  explore:
+    if: github.repository == '__REPOSITORY__'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DISPATCH_ID: "${{ inputs.dispatch_id }}"
+      STARTER_URL: "__PUBLIC_URL__"
+      AGENT_IMAGE: "__AGENT_IMAGE__"
+      HARNESS_REF: "__HARNESS_REF__"
+    steps:
+      - name: Install qory 0.13.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) arch=amd64 sum=955e977bb0d2f4217d8892a424da6d54309df9bfaa6de0fcc17cc8e2daf10ed6 ;;
+            ARM64) arch=arm64 sum=74ac91bc4c4fd42717f067d44ec6377c44c039ec18b20eec75c70bb0073212be ;;
+            *) echo "qory 0.13.0 has no release for the runner's architecture, $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          mkdir "$RUNNER_TEMP/qory"
+          curl --fail --silent --show-error --location --proto =https --proto-redir =https --output "$RUNNER_TEMP/qory.tar.gz" "https://github.com/qoryai/qory/releases/download/v0.13.0/qory_0.13.0_linux_$arch.tar.gz"
+          echo "$sum  $RUNNER_TEMP/qory.tar.gz" | sha256sum --check --strict --quiet
+          tar -xzf "$RUNNER_TEMP/qory.tar.gz" -C "$RUNNER_TEMP/qory" qory
+          echo "$RUNNER_TEMP/qory" >> "$GITHUB_PATH"
+      - name: Compose the explore-an-item harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$HARNESS_REF" =~ ^([0-9a-f]{40}|v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "HARNESS_REF is neither a commit id nor a release tag" >&2; exit 1; }
+          mkdir "$RUNNER_TEMP/stack" "$RUNNER_TEMP/work"
+          cat > "$RUNNER_TEMP/stack/qory-stack.yaml" <<EOF
+          apiVersion: qory.dev/v1alpha1
+          name: explore
+          modules:
+            - name: explore-an-item
+              source: {git: https://github.com/qoryai/qory-github, ref: $HARNESS_REF, path: harness/explore-an-item}
+          EOF
+          git init --quiet "$RUNNER_TEMP/work"
+          cd "$RUNNER_TEMP/work"
+          qory harness compose -f "$RUNNER_TEMP/stack/qory-stack.yaml" --runtime claude --home "$RUNNER_TEMP/homes"
+      - name: Explore the ticket
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DISPATCH_ID" =~ ^dp_[0-9a-hjkmnp-tv-z]{16}$ ]] || { echo "dispatch_id is not a dispatch's id" >&2; exit 1; }
+          mkdir "$RUNNER_TEMP/in"
+          cd "$RUNNER_TEMP/work"
+          {
+            printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+              curl --fail --silent --show-error --proto =https --header @- --get --data-urlencode "audience=$STARTER_URL" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+              jq -re '.value | strings | "Authorization: Bearer " + .' |
+              curl --fail --silent --show-error --proto =https --request POST --header @- "$STARTER_URL/v1/dispatches/$DISPATCH_ID/handover" |
+              tee >(jq -je .run_key >&3) |
+              jq '.inputs' > "$RUNNER_TEMP/in/inputs.json"
+          } 3>&1 1>&2 |
+            qory run claude --home "$RUNNER_TEMP/homes" --run-key-fd 0 --wall docker --image "$AGENT_IMAGE" --mount "$RUNNER_TEMP/in:ro" --timeout 12m -- --max-turns 40 --add-dir "$RUNNER_TEMP/in" -p "Explore the ticket described in $RUNNER_TEMP/in/inputs.json, following the explore-an-item skill. End with the explore v1 JSON document alone as your final response."

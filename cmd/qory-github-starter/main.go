@@ -1,6 +1,7 @@
 // Command qory-github-starter is the program for a node pool of Qory Apiary. Its
 // commands are `qory-github-starter access-key enrol`, which enrols the node pool's
-// access key, and `qory-github-starter setup`, which creates the starter's GitHub App.
+// access key, `qory-github-starter setup`, which creates the starter's GitHub App, and
+// `qory-github-starter template`, which prints the runner template.
 //
 // The whole program is switched on by QORY_FEATURES alone, see [cli.Factory]: without
 // factory it knows no command, and prints a usage that lists none.
@@ -24,6 +25,7 @@ import (
 	"github.com/qoryai/qory-github/internal/enrol"
 	"github.com/qoryai/qory-github/internal/ownerfile"
 	"github.com/qoryai/qory-github/internal/setupcmd"
+	"github.com/qoryai/qory-github/runner"
 )
 
 func main() {
@@ -65,6 +67,7 @@ func usage() string {
 commands:
   access-key   ` + accessKeyHelp.Short + `
   setup        ` + setupHelp.Short + `
+  template     ` + templateHelp.Short + `
 
 qory-github-starter <command> -h prints a command's help.`
 }
@@ -134,6 +137,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		err = enrol.AccessKey(ctx, poolKind(), enrol.Seams{GenerateKey: generateKey, Hostname: hostname, RemoveProbe: removeProbe}, args[1:], stdout, stderr)
 	case "setup":
 		err = setup(ctx, args[1:], stdout, stderr)
+	case "template":
+		err = template(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage())
 		return 2
@@ -256,4 +261,56 @@ func setupSettings(appID int64, keyFile, apiURL string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("  \"app_id\": %d,\n  \"private_key_file\": %s,\n  \"api_url\": %s\n", appID, path, api), nil
+}
+
+// templateHelp is the help of template, which has no section on qory-github's page: the
+// command is switched on by QORY_FEATURES alone, see [cli.Factory].
+var templateHelp = cli.Help{
+	Short: "Print the runner template to commit to the runner repository",
+	Use:   "qory-github-starter template --public-url URL --repository OWNER/NAME --agent-image NAME@sha256:DIGEST --harness-ref REF",
+	Long: `Print the runner template, a GitHub Actions workflow, filled in with the values given.
+
+Commit it to the runner repository as .github/workflows/qory-explore.yml, on the
+branch or tag the starter's settings name as ref, with workflow set to
+qory-explore.yml, and protect that ref, so that only a reviewed change reaches it: the
+starter hands a run key only to a job of this workflow at that ref. The starter never
+commits it.
+
+The job runs only in the repository --repository names. It installs qory 0.13.0,
+checked by its SHA-256, composes the harness harness/explore-an-item of qory-github at
+--harness-ref, asks the starter at --public-url for its run with the job's GitHub
+Actions OIDC token, and runs the agent walled in a Docker container, in the image
+--agent-image names, for at most 12 minutes; the job stops after 15.
+
+--public-url and --repository are the starter's settings' public_url and repository.`,
+	Example: `  qory-github-starter template --public-url https://starter.example.com --repository acme/qory-runner --agent-image "registry.example.com/qory-agent@sha256:$digest" --harness-ref "$commit" > qory-explore.yml`,
+}
+
+// template prints the runner template, see [runner.Fill], filled in with the values its
+// flags give, and nothing else, so its standard output can go to a file as it is.
+func template(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("template", flag.ContinueOnError)
+	publicURL := fs.String("public-url", "", "where the starter is reached from outside, its settings' public_url (required)")
+	repository := fs.String("repository", "", "the runner repository, owner/name, its settings' repository (required)")
+	agentImage := fs.String("agent-image", "", "the image the agent runs in, pinned by its digest: NAME@sha256:DIGEST (required)")
+	harnessRef := fs.String("harness-ref", "", "the commit id or release tag of qory-github whose harness/explore-an-item the job composes (required)")
+	if err := templateHelp.Parse(fs, args, stderr); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("template takes no arguments")
+	}
+	for _, f := range []struct{ name, value string }{
+		{"--public-url", *publicURL}, {"--repository", *repository}, {"--agent-image", *agentImage}, {"--harness-ref", *harnessRef},
+	} {
+		if f.value == "" {
+			return errors.New(f.name + " is required")
+		}
+	}
+	filled, err := runner.Fill(runner.Values{PublicURL: *publicURL, Repository: *repository, AgentImage: *agentImage, HarnessRef: *harnessRef})
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(stdout, filled)
+	return err
 }
