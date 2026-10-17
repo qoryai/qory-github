@@ -956,13 +956,18 @@ func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
 }
 
 // TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
-// answer a listing, an item and a disconnect 409 connection_ended or
-// connection_suspended: ended drops the link of the installation linked to the
-// connection and its collections' records, and only that connection's; suspended
-// changes nothing. Each is a refusal for good, sent again on the periodic check.
+// answer a listing and an item 409 connection_ended or connection_suspended, and a
+// disconnect 409 connection_suspended: ended drops the link of the installation linked
+// to the connection and its collections' records, and only that connection's; suspended
+// changes nothing. Each is a refusal for good, sent again on the periodic check. A
+// disconnect is never answered connection_ended: the contract answers a ref with no live
+// collection with the signed 204, and of the 409s only connection_suspended applies.
 func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing.T) {
 	for _, code := range []string{"connection_ended", "connection_suspended"} {
 		for _, send := range []string{"listing", "items", "disconnect"} {
+			if code == "connection_ended" && send == "disconnect" {
+				continue
+			}
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
 			Link(w.st, 42, testConnection, linkLive)
 			Link(w.st, 43, otherConnection, linkLive)

@@ -169,7 +169,9 @@ func (l Lister) issuePager(p *Pacer, id int64, repo Repository, first int) *issu
 // page is never taken for the repository's. Neither error wraps [ErrRepositoryGone]:
 // the read by the id is what says the repository is gone, as it says for a transfer to
 // an account the installation is not on, and never for a rename, and a later listing,
-// which reads the name again, may list it.
+// which reads the name again, may list it. When no token for the repository is kept,
+// the mint of one, which names the repository by its id, fails first, wrapping
+// [ErrMintRefused], before that read runs.
 func (g *issuePager) next(ctx context.Context) (ghRepo, []ghIssue, bool, error) {
 	if g.done {
 		return g.r, nil, false, nil
