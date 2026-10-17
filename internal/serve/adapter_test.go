@@ -2970,14 +2970,15 @@ func TestRepositoryDeliveriesOfAnInstallationNotLinked(t *testing.T) {
 	}
 }
 
-// TestARepositoryTransferredToALinkedInstallationMovesItsCollection transfers
+// TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection transfers
 // octo-org/widgets, which serve listed for the installation 9, to acme, whose
 // installation 42 is linked to another connection: GitHub sends transferred to 42 alone,
 // with the repository as acme/widgets, by the same id. The installation 42 is listed
-// again, with a token minted after the change, naming the collection by the same ref
-// under its connection, the repository becomes 42's, the first listings kept for both
-// installations are dropped, and nothing is disconnected.
-func TestARepositoryTransferredToALinkedInstallationMovesItsCollection(t *testing.T) {
+// again, with a token minted after the change, naming the repository by the same ref
+// under 42's connection, the repository becomes 42's, the first listings kept for both
+// installations are dropped, and serve sends no disconnect: Qory Apiary ends the
+// collection under the previous connection itself when the listing names the ref.
+func TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	Link(w.st, 42, testConnection, linkLive)
 	Link(w.st, 9, otherConnection, linkLive)

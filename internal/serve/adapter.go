@@ -810,10 +810,12 @@ func (a *Adapter) installationRepositories(ctx context.Context, d Delivery) erro
 //
 //   - deleted: a repository serve listed for the installation, see [reachOf], is
 //     disconnected and its records dropped, see [Adapter.dropRepository]; any other is
-//     logged and changes nothing. GitHub's docs say an App is not sent deleted, so a
-//     deleted repository mostly reaches serve as installation_repositories removed, or
-//     as a fill or a pull GitHub answers it is gone; a deleted that arrives is handled
-//     all the same.
+//     logged and changes nothing. GitHub's docs say an App is not sent deleted. A
+//     deleted repository is left out of the installation's next listing of its
+//     repositories, the pull round's among them, and a listing GitHub answers with one
+//     page, none skipped, is complete, so Qory Apiary disconnects the collection it
+//     leaves out, see [github.Lister.ListRepositories]; a fill or a pull of it fails as
+//     gone. A deleted that arrives is handled all the same.
 //   - created: the installation's tokens and first listings kept, see
 //     [Adapter.sendFirst], are dropped, as installation_repositories drops them, and its
 //     repositories are listed again, the new one among them.
@@ -856,9 +858,12 @@ func (a *Adapter) repository(ctx context.Context, d Delivery) error {
 // or not. GitHub sends it only to the installation on the account the repository was
 // transferred to, with the repository as it is now, by the same id, which is its
 // collection's ref. When that installation is linked, its tokens and first listings
-// kept are dropped and its repositories are listed again, as for created: the listing
-// names the collection by the same ref, so Qory Apiary moves it to the installation's
-// connection, and the repository's installation becomes this one. The first listings
+// kept are dropped and its repositories are listed again, as for created, and the
+// repository's installation becomes this one. The listing names the repository by the
+// same ref under this installation's connection, which is not the connection of the
+// installation serve listed it for before, since a connection holds one installation:
+// Qory Apiary ends the collection under the previous connection, as a disconnect would,
+// and makes a new one under this one, which a person links again. The first listings
 // kept for the installation serve listed it for before, if another, are dropped too, so
 // none of them names the repository as that installation's again. When the
 // installation is not linked, the repository's collection is disconnected under the
