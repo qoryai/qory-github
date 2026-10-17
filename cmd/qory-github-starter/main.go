@@ -1,7 +1,5 @@
-// Command qory-github-starter serves a node pool of Qory Apiary with GitHub Actions: it
-// claims the pool's runs and starts a workflow run for each.
-// `qory-github-starter access-key enrol` enrols the access key, a node pool's, it signs
-// its requests to Qory Apiary with. The commands that claim and start runs come later.
+// Command qory-github-starter is the program for a node pool of Qory Apiary. Its one
+// command, `qory-github-starter access-key enrol`, enrols the node pool's access key.
 //
 // The whole program is switched on by QORY_FEATURES alone, see [cli.Factory]: without
 // factory it knows no command, and prints a usage that lists none.
@@ -42,20 +40,17 @@ func init() {
 	ownerfile.Program = "qory-github-starter"
 }
 
-// usage is what the program prints when it is run without a command it knows. Where
-// QORY_FEATURES does not name factory, see [cli.Factory], it is the usage line alone:
-// work behind a feature that is off is described nowhere a person sees. The
-// description and the commands are printed only where it names factory.
+// usage is what the program prints when it is run without a command it knows: the
+// usage line, and, where QORY_FEATURES names factory, see [cli.Factory], the commands.
+// Work behind a feature that is off is described nowhere a person sees. The program has
+// no description yet: it comes with a later command.
 func usage() string {
 	line := `usage:
   qory-github-starter <command> [flags]`
 	if !cli.Factory() {
 		return line
 	}
-	return `qory-github-starter serves a node pool of Qory Apiary with GitHub Actions: it claims
-the pool's runs and starts a workflow run for each.
-
-` + line + `
+	return line + `
 
 commands:
   access-key   ` + accessKeyHelp.Short + `
@@ -72,7 +67,7 @@ var accessKeyHelp = cli.Help{
 	Use:   "qory-github-starter access-key enrol --secret-file FILE [--] SERVER CODE",
 	Long: `Enrol a new access key for this node pool with an enrolment code a workspace admin
 of Qory Apiary created on the node pool's Access key tab. The code is valid for 15
-minutes and used once. One qory-github-starter serves one node pool.
+minutes and used once. The key enrol makes is the node pool's access key.
 
 qory-github-starter makes the key, prints its fingerprint and sends Qory Apiary, at
 SERVER, the public key. Qory Apiary's signed answer gives the key its id and lists
@@ -105,11 +100,13 @@ func poolKind() enrol.Kind {
 	}
 }
 
-// enrol's test seams, see [enrol.Seams]: the key it makes, and the access key's name,
-// from this machine's host name.
+// enrol's test seams, see [enrol.Seams]: the key it makes; the access key's name, from
+// this machine's host name; and how the probe of the secret file's directory is
+// removed.
 var (
 	generateKey = accesskey.Generate
 	hostname    = os.Hostname
+	removeProbe = os.Remove
 )
 
 // run is the command, with its streams, so a test runs it whole. It returns the exit
@@ -123,7 +120,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	var err error
 	switch args[0] {
 	case "access-key":
-		err = enrol.AccessKey(ctx, poolKind(), enrol.Seams{GenerateKey: generateKey, Hostname: hostname}, args[1:], stdout, stderr)
+		err = enrol.AccessKey(ctx, poolKind(), enrol.Seams{GenerateKey: generateKey, Hostname: hostname, RemoveProbe: removeProbe}, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usage())
 		return 2

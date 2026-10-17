@@ -34,7 +34,6 @@ import (
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/qory-github/internal/cli"
-	"github.com/qoryai/qory-github/internal/ownerfile"
 )
 
 // Kind is what one program's access-key enrol takes, and the words its lines and errors
@@ -536,21 +535,10 @@ type SecretFile interface {
 }
 
 // CreateSecretFile creates the file a secret is written to, 0600, and only where no
-// file exists, never through a symbolic link, and checks what it created as
-// [ownerfile.Check] checks a file: a regular file of the user the program runs as that
-// grants group and others no permission. A file it created and then refuses is removed.
+// file exists.
 func CreateSecretFile(path string) (SecretFile, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, err
-	}
-	info, err := f.Stat()
-	if err == nil {
-		err = ownerfile.Check(info, "the secret file "+path)
-	}
-	if err != nil {
-		f.Close()
-		os.Remove(path)
 		return nil, err
 	}
 	return f, nil

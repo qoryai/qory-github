@@ -1,5 +1,6 @@
-// Package starter is qory-github-starter's: the settings it serves a node pool of Qory
-// Apiary with, which start GitHub Actions workflow runs for the pool's runs.
+// Package starter holds qory-github-starter's settings: Qory Apiary's fields, the
+// starter's listen, public_url and state_dir, and the GitHub App, repository and
+// workflow they name, read and checked, and the readers of the files they name.
 package starter
 
 import (
@@ -24,7 +25,7 @@ import (
 	"github.com/qoryai/qory-github/internal/ownerfile"
 )
 
-// Settings are what the starter runs with: one JSON document in a file. A secret is
+// Settings are the starter's settings: one JSON document in a file. A secret is
 // never in them: each is in a file they name, which only its owner may read.
 type Settings struct {
 	// ApiaryURL is Qory Apiary's origin, https, or for a test http on a loopback host:
@@ -34,8 +35,8 @@ type Settings struct {
 	// characters, which access-key enrol prints.
 	AccessKeyID string
 	// AccessKeySecretFile is a file that contains the access key's secret, qak_ and
-	// 43 characters, read with [ReadAccessKeySecret]. One node pool's key serves one
-	// starter.
+	// 43 characters, read with [ReadAccessKeySecret]: the node pool's key, which
+	// access-key enrol writes.
 	AccessKeySecretFile string
 	// ApiaryPublicKey is the pin: Qory Apiary's public keys, a list of {"alg":
 	// "ed25519", "public_key": "<base64url>"}, which every answer of Qory Apiary is

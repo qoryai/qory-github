@@ -140,11 +140,9 @@ const usageWithoutFactory = `usage:
   qory-github-starter <command> [flags]
 `
 
-// usageWithFactory is the usage with factory, which lists access-key.
-const usageWithFactory = `qory-github-starter serves a node pool of Qory Apiary with GitHub Actions: it claims
-the pool's runs and starts a workflow run for each.
-
-usage:
+// usageWithFactory is the usage with factory: the usage line and access-key, with no
+// description.
+const usageWithFactory = `usage:
   qory-github-starter <command> [flags]
 
 commands:
@@ -279,6 +277,12 @@ func TestEnrolWritesTheSecretAndPrintsTheSettings(t *testing.T) {
 // made or anything is sent.
 func TestEnrolRefusesEveryOtherKindBeforeAnyRequest(t *testing.T) {
 	f := newFakeApiary(t, poolEnrolled)
+	defer func(r func(string) error) { removeProbe = r }(removeProbe)
+	probed := 0
+	removeProbe = func(p string) error {
+		probed++
+		return os.Remove(p)
+	}
 	for prefix, what := range map[string]string{
 		accesskey.CodePrefixNode:    "a node",
 		accesskey.CodePrefixGateway: "a gateway",
@@ -305,8 +309,12 @@ func TestEnrolRefusesEveryOtherKindBeforeAnyRequest(t *testing.T) {
 	if want := "qory-github-starter access-key: the code is not an enrolment code: qecp_, 26 characters, then a dot and a fingerprint, as Qory Apiary shows it\n"; status != 1 || errs != want || made != nil {
 		t.Errorf("exit %d, stdout %q, stderr %q", status, out, errs)
 	}
-	if n := f.requests.Load(); n != 0 {
-		t.Errorf("%d requests were sent", n)
+	if n := f.requests.Load(); n != 0 || probed != 0 {
+		t.Errorf("%d requests were sent and %d probes made", n, probed)
+	}
+	// A pool's code is taken, and its directory probed once.
+	if status, _, errs, _ := enrolRun(t, "--secret-file", filepath.Join(t.TempDir(), "secret"), f.url, poolCode(f)); status != 0 || probed != 1 {
+		t.Errorf("a pool's code: exit %d, %d probes, stderr %q", status, probed, errs)
 	}
 }
 
