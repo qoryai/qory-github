@@ -278,6 +278,13 @@ func (a *apiReply) err(what string) error {
 // refuses an answer larger than [maxAnswer] having read at most one byte more, and its
 // error begins with what and never says the request, its path, its header or its body.
 func (c Client) send(ctx context.Context, p *Pacer, listing bool, what, method, path, tok string, body any) (*apiReply, error) {
+	return c.sendBounded(ctx, p, listing, what, method, path, tok, body, maxAnswer)
+}
+
+// sendBounded is [Client.send] with largest the largest answer it reads, in bytes, in
+// place of [maxAnswer]: an answer larger than largest is refused, having read at most
+// one byte more.
+func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, method, path, tok string, body any, largest int) (*apiReply, error) {
 	base := c.base()
 	if err := CheckAPIURL(base); err != nil {
 		return nil, err
@@ -327,12 +334,12 @@ func (c Client) send(ctx context.Context, p *Pacer, listing bool, what, method, 
 		return nil, err
 	}
 	defer resp.Body.Close()
-	a, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
+	a, err := io.ReadAll(io.LimitReader(resp.Body, int64(largest)+1))
 	if err != nil {
 		return nil, fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))
 	}
-	if len(a) > maxAnswer {
-		return nil, fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, maxAnswer)
+	if len(a) > largest {
+		return nil, fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, largest)
 	}
 	return &apiReply{status: resp.StatusCode, header: resp.Header, body: a}, nil
 }
