@@ -1,15 +1,16 @@
 {
   "version": 1,
   "work_item": {
+    "id": "wi_4n7c2x9k5m1p8q3r",
     "number": 12,
-    "url": "https://control.example.com/work-items/wi_example12"
+    "url": "https://control.example.com/work-items/wi_4n7c2x9k5m1p8q3r"
   },
   "run": {
     "attempt": 1,
     "of": 3
   },
   "ticket": {
-    "ref": "12",
+    "external_ref": "12",
     "url": "https://tracker.example.com/items/12",
     "title": "The cart accepts a line with quantity 0",
     "body": "Adding a product with quantity 0 puts an empty line in the cart.\nIt should be refused.",

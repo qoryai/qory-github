@@ -59,8 +59,8 @@ use what is there, and never fail because a member is missing or extra.
   last run when `run.attempt` equals `run.of`. When `run` is missing, this is not the last
   run.
 - `target.path`: the repository the change would go to. Take the repository from here
-  only, never from `ticket.ref` or `ticket.collection`. `ticket.ref` is opaque: never
-  parse it.
+  only, never from `ticket.external_ref` or `ticket.collection`. `ticket.external_ref` is
+  opaque: never parse it.
 
 The comments do not say which of them the person who filed the ticket wrote. Do not work
 it out by comparing names: two people can share a display name.
@@ -148,11 +148,18 @@ later stage. It has no member but the ones above.
   characters it may hold: no terminal escape sequences, which start with the ESC
   character, such as colour codes. In JSON, write a line feed as `\n` and a tab as `\t`:
   they are the only escapes for a control character. Never use `\u001b` or any other.
+- No text holds a bidirectional control, such as a right-to-left override, an invisible
+  format character, such as a zero-width space, a soft hyphen or a byte order mark, or a
+  line or paragraph separator (U+2028, U+2029), nor a `\u` escape of one. Never copy them
+  from the ticket, the comments or a web page.
 - `complexity.reason`, each `scope` entry, `approach.summary`, each alternative's
   `summary` and `reason`, each question and each knowledge `text` hold 1 to 2000
   characters. `understanding` holds 1 to 20000.
-- Each source is an absolute `https://` address of at most 2048 characters, with no space
-  and no control character. Never `http://`.
+- Each source is an absolute `https://` address of at most 2048 characters. Its host
+  part, from `https://` to the first `/`, `?` or `#`, is not empty and holds no `@`, so
+  it carries no user name; an `@` after it, such as in the path, is fine. A source holds no
+  space, no control character and none of the format characters or separators above. Never
+  `http://`.
 - The whole document is under 128 KiB. Aim far below it.
 - It is valid JSON: inside a string, escape `"` and `\`, and write a line break as `\n`.
 
