@@ -144,14 +144,15 @@ const usageWithoutFactory = `usage:
   qory-github-starter <command> [flags]
 `
 
-// usageWithFactory is the usage with factory: the usage line, access-key and setup, with
-// no description.
+// usageWithFactory is the usage with factory: the usage line, access-key, setup and
+// template, with no description.
 const usageWithFactory = `usage:
   qory-github-starter <command> [flags]
 
 commands:
   access-key   Enrol the node pool's access key with a code from Qory Apiary
   setup        Create the starter's GitHub App and write its private key
+  template     Print the runner template to commit to the runner repository
 
 qory-github-starter <command> -h prints a command's help.
 `
@@ -170,7 +171,7 @@ func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	defer func() { opener = saved }()
 	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
 		t.Setenv("QORY_FEATURES", features)
-		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"--help"}, {"help"}, {"serve"}, {"serve", "--settings", "/none.json"}, {"setup"}, {"setup", "-h"}, {"setup", "--api-url", gh.url, "--key-file", keyFile, "--name", "qory-github-starter-test"}, {"template"},
+		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"--help"}, {"help"}, {"serve"}, {"serve", "--settings", "/none.json"}, {"setup"}, {"setup", "-h"}, {"setup", "--api-url", gh.url, "--key-file", keyFile, "--name", "qory-github-starter-test"}, {"template"}, {"template", "-h"}, append([]string{"template"}, templateArgs...),
 			{"access-key"}, {"access-key", "-h"}, {"access-key", "enrol", "-h"}, {"access-key", "enrol", "--secret-file", file, f.url, poolCode(f)}} {
 			var out, errs bytes.Buffer
 			code := run(context.Background(), args, &out, &errs)
@@ -198,12 +199,12 @@ func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	}
 }
 
-// TestAccessKeyIsPresentWithFactory pins the usage with factory, which lists access-key
-// and setup, access-key's help, and the error of a verb it does not know.
+// TestAccessKeyIsPresentWithFactory pins the usage with factory, which lists access-key,
+// setup and template, access-key's help, and the error of a verb it does not know.
 func TestAccessKeyIsPresentWithFactory(t *testing.T) {
 	for _, features := range []string{"factory", "observability, factory ", " factory,"} {
 		t.Setenv("QORY_FEATURES", features)
-		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"serve"}, {"template"}} {
+		for _, args := range [][]string{nil, {"bogus"}, {"-h"}, {"serve"}} {
 			var out, errs bytes.Buffer
 			if code := run(context.Background(), args, &out, &errs); code != 2 || errs.String() != usageWithFactory || out.Len() != 0 {
 				t.Errorf("QORY_FEATURES=%q %v: exit %d, usage:\n%s", features, args, code, errs.String())
