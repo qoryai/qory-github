@@ -32,8 +32,9 @@ const (
 	routeDispatches = "/v1/dispatches/"
 	// headerContractVersion carries the revision of the contract a request implements:
 	// contracts.ProvisionerRevision on the provisioner contract's requests, Forager's
-	// revision on a run's outcome. The signature does not cover it; the answers whose
-	// content the revision bounds name it in their signed body.
+	// revision on a run's outcome and on the GET of the configuration document. The
+	// signature does not cover it; the answers whose content the revision bounds name it
+	// in their signed body.
 	headerContractVersion = "X-Qory-Contract-Version"
 	userAgent             = "qory-github-starter"
 )
@@ -41,10 +42,11 @@ const (
 // The bounds of Qory Apiary's answers. A claim is held up to 25 seconds while no run
 // can be claimed, so claimTimeout is longer than requestTimeout. A claim's 200 is read
 // up to maxClaimAnswer, far more than its members' limits add up to; a handover's 200
-// up to contracts.MaxHandoverAnswer, the contract's bound; every other answer, a
-// refusal, a 204 or an outcome's 200, up to maxAnswer. A larger answer, whatever its
-// status, is refused before its signature is read, nothing in it is used, and the
-// request is sent again, built anew, as for an answer not signed.
+// up to contracts.MaxHandoverAnswer, the contract's bound; the configuration document's
+// 200 up to server.MaxDocument, the bound Forager's client reads it to; every other
+// answer, a refusal, a 204 or an outcome's 200, up to maxAnswer. A larger answer,
+// whatever its status, is refused before its signature is read, nothing in it is used,
+// and the request is sent again, built anew, as for an answer not signed.
 const (
 	requestTimeout = 30 * time.Second
 	claimTimeout   = 40 * time.Second
@@ -74,7 +76,8 @@ var (
 // the [*Refusal] a request returns. A signed refusal matches only for the request whose
 // schema gives it, with its status and its code: provisioner/v1 claim.schema.json,
 // dispatched.schema.json, handover.schema.json and release.schema.json, and Forager's
-// run-outcome.schema.json.
+// run-outcome.schema.json; the GET of Forager's configuration document matches the 429
+// alone.
 var (
 	// ErrForbidden is the signed 403 forbidden: a request outside the key's rights, a
 	// claim's pool_id that is not the key's node pool, or a dispatch that is unknown or
@@ -120,8 +123,10 @@ var (
 	// ErrAnswerUnusable is a signed answer within its bound that breaks the contract: a
 	// success status the request's schema does not give, a body that is not one JSON
 	// document, that breaks its schema, that names another revision, that is for another
-	// node pool or run than the one asked, or whose inputs are over their bound. Nothing
-	// in it is used, and the request is not sent again, since Qory Apiary acted on it.
+	// node pool or run than the one asked, or whose inputs are over their bound; a
+	// configuration document without X-Qory-Configuration, or whose run endpoint is not
+	// one the starter posts to. Nothing in it is used, and the request is not sent again,
+	// since Qory Apiary acted on it.
 	ErrAnswerUnusable = errors.New("Qory Apiary's answer breaks the contract, so nothing in it is used")
 )
 
@@ -150,18 +155,23 @@ const (
 	kindHandover
 	kindRelease
 	kindOutcome
+	kindConfiguration
 )
 
 // refusalsOf are the signed refusals each request's schema gives, in the order the
 // control plane decides them: handover.schema.json's for a handover, and its order for
 // a release; dispatched's 403 before its 410 and its 410 before its 409. Each request
-// may also be answered 429, refusal.schema.json.
+// may also be answered 429, refusal.schema.json. The GET of the configuration document
+// is given only the 429 a later step acts on; its signed 400s, bad_request and
+// unsupported_contract_version, and a signed 404 are refusals that match none.
 var refusalsOf = map[kind][]error{
 	kindClaim:      {ErrForbidden, ErrNoGateway, ErrRateLimited},
 	kindDispatched: {ErrForbidden, ErrGone, ErrLeaseExpired, ErrRateLimited},
 	kindHandover:   {ErrForbidden, ErrGone, ErrHandedOver, ErrLeaseExpired, ErrNotDispatched, ErrNoGateway, ErrRateLimited},
 	kindRelease:    {ErrForbidden, ErrGone, ErrLeaseExpired, ErrRateLimited},
 	kindOutcome:    {ErrRunNotFound, ErrOutcomeGiven, ErrRateLimited},
+	// The GET of the configuration document.
+	kindConfiguration: {ErrRateLimited},
 }
 
 // Refusal is an answer to a request that is not the one wanted: its status, whether it
@@ -223,19 +233,21 @@ func (r *Refusal) Is(target error) bool {
 }
 
 // Apiary is the starter's client of Qory Apiary's provisioner contract, provisioner/v1,
-// and of Forager's run outcome. Each request is signed with the node pool's access key
-// as forager/accesskey signs one, and each answer is checked under the pin, then
-// against its schema and its revision, before anything in it is used. A request's time
-// is the clock's, in whole seconds, and never ahead of it. A request with the same
-// method, URL and body but its time as one sent within the clock's current second, a
-// try sent again or an identical call, waits for the clock's next second first, so
-// within one Apiary value, while the clock does not step back, the same bytes are never
-// sent twice; a distinct request does not wait. After the clock steps back, a request
-// may repeat the bytes of one sent before. A provisioner/v1 request that does is
-// answered by Qory Apiary with the unsigned 401 for a replay, and the try is sent again,
-// built anew, which may repeat bytes again if the clock steps back again; a run's
-// outcome that does is answered with the answer the server stored for those bytes, see
-// [Apiary.PostOutcome]. No redirect is followed. No error
+// and of Forager's configuration document and run outcome. Each request is signed with
+// the node pool's access key as forager/accesskey signs one, and each answer is checked
+// under the pin, then against its schema and its revision, before anything in it is
+// used. A request's time, a POST's time member or a GET's X-Qory-Timestamp, is the
+// clock's, in whole seconds, and never ahead of it. A request with the same method, URL
+// and body but its time as one sent within the clock's current second, a try sent again
+// or an identical call, waits for the clock's next second first, so within one Apiary
+// value, while the clock does not step back, the same bytes are never sent twice; a
+// distinct request does not wait. After the clock steps back, a request may repeat the
+// bytes of one sent before. A provisioner/v1 request that does is answered by Qory
+// Apiary with the unsigned 401 for a replay, and the try is sent again, built anew,
+// which may repeat bytes again if the clock steps back again; a run's outcome that does
+// is answered with the answer the server stored for those bytes, see
+// [Apiary.PostOutcome]; a GET of the configuration document that does reads the
+// document again. No redirect is followed. No error
 // it returns and no line it logs holds the access key's secret, a run key, a handover's
 // inputs or a work item's title; a [Claimed] or a [Handed] prints, logs and marshals
 // without them. It is safe for concurrent use, and is used by its pointer.
@@ -564,7 +576,8 @@ func (a *Apiary) Handover(ctx context.Context, dispatchID, runID string) (Handed
 // request is one request of the starter's: what it is, as an error names it, which
 // refusals apply, where it goes, the revision it implements, the schema its body is
 // checked against before it is sent, the bound of its answer's 200, its timeout, and
-// its body with the time set.
+// its body with the time set. A request with get set is a GET with no body and no
+// schema, its time the X-Qory-Timestamp it is signed with; any other is a POST.
 type request struct {
 	what     string
 	kind     kind
@@ -572,21 +585,32 @@ type request struct {
 	revision int
 	schema   string
 	foreign  bool
+	get      bool
 	max      int64
 	timeout  time.Duration
 	body     func(time string) any
 }
 
+// method is the request's HTTP method.
+func (r request) method() string {
+	if r.get {
+		return http.MethodGet
+	}
+	return http.MethodPost
+}
+
 // answer is an answer to one request: its status, its body, whether its signature
-// verified under the pin, its Retry-After, and whether it was over its bound, limit
-// bytes, in which case neither its body nor its signature is read.
+// verified under the pin, its Retry-After, the X-Qory-Configuration of an answer that
+// verified, and whether it was over its bound, limit bytes, in which case neither its
+// body nor its signature is read.
 type answer struct {
-	status     int
-	body       []byte
-	signed     bool
-	retryAfter string
-	tooLarge   bool
-	limit      int64
+	status        int
+	body          []byte
+	signed        bool
+	retryAfter    string
+	configuration string
+	tooLarge      bool
+	limit         int64
 }
 
 // do sends req until Qory Apiary answers a signed status below 500, up to [tries]
@@ -597,11 +621,14 @@ type answer struct {
 // that doubles from [firstWait]. After the last try, the failure is the error. Once ctx
 // is done, its error is the error, and nothing more is logged or sent.
 func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
-	b, err := json.Marshal(req.body(""))
-	if err != nil {
-		return nil, fmt.Errorf("%s: the request could not be made", req.what)
+	var b []byte
+	if !req.get {
+		var err error
+		if b, err = json.Marshal(req.body("")); err != nil {
+			return nil, fmt.Errorf("%s: the request could not be made", req.what)
+		}
 	}
-	id := http.MethodPost + " " + req.url + "\n" + string(b)
+	id := req.method() + " " + req.url + "\n" + string(b)
 	if accesskey.ContainsSecret(id) {
 		return nil, fmt.Errorf("%s: the request holds what looks like a secret, qak_ or qrk_, so it is not sent", req.what)
 	}
@@ -615,7 +642,7 @@ func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 		if err != nil {
 			return nil, err
 		}
-		ans, err := a.send(ctx, req, b)
+		ans, err := a.send(ctx, req, b, t)
 		var failure error
 		var line string
 		var attrs []any
@@ -658,9 +685,12 @@ func (a *Apiary) do(ctx context.Context, req request) (*answer, error) {
 }
 
 // build is req's body with the time t, checked against its schema and for what looks
-// like a secret before it is sent. Its error names the request and the schema, never a
-// value.
+// like a secret before it is sent; a GET has none. Its error names the request and the
+// schema, never a value.
 func (a *Apiary) build(req request, t time.Time) ([]byte, error) {
+	if req.get {
+		return nil, nil
+	}
 	b, err := json.Marshal(req.body(contracts.FormatTime(t)))
 	if err != nil {
 		return nil, fmt.Errorf("%s: the request could not be made", req.what)
@@ -683,21 +713,33 @@ func (a *Apiary) build(req request, t time.Time) ([]byte, error) {
 	return b, nil
 }
 
-// send signs one POST of body to req.url and sends it, then reads the answer: a 200's
-// body up to req.max, any other up to [maxAnswer]. A larger answer, whatever its status,
-// is marked too large, and neither its body nor its signature is read. A 401 is never
-// signed; any other answer is checked under the pin, bound to this request's signature.
-// An error is no answer; it names the request and never a header, a body or a secret.
-func (a *Apiary) send(ctx context.Context, req request, body []byte) (*answer, error) {
-	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, req.url, bytes.NewReader(body))
+// send signs one request to req.url and sends it, a POST of body or a GET whose
+// X-Qory-Timestamp, signed with it, is t, then reads the answer: a 200's body up to
+// req.max, any other up to [maxAnswer]. A larger answer, whatever its status, is marked
+// too large, and neither its body nor its signature is read. A 401 is never signed; any
+// other answer is checked under the pin, bound to this request's signature. An error is
+// no answer; it names the request and never a header, a body or a secret.
+func (a *Apiary) send(ctx context.Context, req request, body []byte, t time.Time) (*answer, error) {
+	var content io.Reader
+	if !req.get {
+		content = bytes.NewReader(body)
+	}
+	hr, err := http.NewRequestWithContext(ctx, req.method(), req.url, content)
 	if err != nil {
 		return nil, fmt.Errorf("%s: the request could not be made", req.what)
 	}
-	sig, err := a.Key.SignRequest(accesskey.Request{AccessKeyID: a.KeyID, InstanceID: a.InstanceID, Method: http.MethodPost, Target: hr.URL.RequestURI(), Body: body})
+	signed := accesskey.Request{AccessKeyID: a.KeyID, InstanceID: a.InstanceID, Method: req.method(), Target: hr.URL.RequestURI()}
+	if req.get {
+		signed.Timestamp = accesskey.Timestamp(t)
+		hr.Header.Set(accesskey.HeaderTimestamp, signed.Timestamp)
+	} else {
+		signed.Body = body
+		hr.Header.Set("Content-Type", "application/json")
+	}
+	sig, err := a.Key.SignRequest(signed)
 	if err != nil {
 		return nil, fmt.Errorf("%s: the request could not be signed", req.what)
 	}
-	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set("User-Agent", userAgent)
 	hr.Header.Set(accesskey.HeaderAccessKeyID, a.KeyID)
 	hr.Header.Set(accesskey.HeaderInstanceID, a.InstanceID)
@@ -742,14 +784,17 @@ func (a *Apiary) send(ctx context.Context, req request, body []byte) (*answer, e
 	conf, ok2 := one(accesskey.HeaderConfiguration)
 	run, ok3 := one(accesskey.HeaderRunConfiguration)
 	ans.signed = ok1 && ok2 && ok3 && a.Pin.VerifyAnswer(accesskey.Answer{Status: resp.StatusCode, RequestSignature: sig, Body: b, Configuration: conf, RunConfiguration: run}, signature)
+	if ans.signed {
+		ans.configuration = conf
+	}
 	return ans, nil
 }
 
 // refused is the [*Refusal] of a signed answer that is not the one wanted. Its code is
 // read only from a body that is one JSON document refusal.schema.json accepts, or, for
-// an outcome, a coded refusal of Forager's, {"error": "<code>", "names": [...]}; any
-// other body, and a code that holds qak_ or qrk_, names no code. A 429's Retry-After is
-// read from a second to an hour.
+// an outcome and the configuration document, a coded refusal of Forager's,
+// {"error": "<code>", "names": [...]}; any other body, and a code that holds qak_ or
+// qrk_, names no code. A 429's Retry-After is read from a second to an hour.
 func (a *Apiary) refused(what string, k kind, ans *answer) error {
 	r := &Refusal{What: what, Status: ans.status, Signed: ans.signed, kind: k}
 	if ans.status >= 200 && ans.status < 300 {
@@ -758,7 +803,7 @@ func (a *Apiary) refused(what string, k kind, ans *answer) error {
 	var doc struct {
 		Error string `json:"error"`
 	}
-	if k == kindOutcome {
+	if k == kindOutcome || k == kindConfiguration {
 		if rr := accesskey.ReadRefusal(ans.status, ans.body); rr != nil {
 			r.Code = rr.Code
 		}
@@ -793,8 +838,9 @@ func retryAfter(v string, now time.Time) time.Duration {
 }
 
 // readAnswer reads body, a signed answer's, into out: one JSON document with valid
-// UTF-8 and no member twice in any object, which the schema name accepts. Its error
-// names the schema, never a value of body.
+// UTF-8 and no member twice in any object, which the schema name accepts. With out nil
+// it checks body and reads it into nothing. Its error names the schema, never a value
+// of body.
 func readAnswer(compile func(string) (*jsonschema.Schema, error), name string, body []byte, out any) error {
 	if !jsontext.Value(body).IsValid() {
 		return errors.New("it is not one JSON document with valid UTF-8 and no member twice")
@@ -806,6 +852,9 @@ func readAnswer(compile func(string) (*jsonschema.Schema, error), name string, b
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
 	if err != nil || s.Validate(doc) != nil {
 		return fmt.Errorf("it breaks %s", name)
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("it breaks %s", name)
