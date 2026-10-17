@@ -449,8 +449,9 @@ func unlinkCollection(st *store.Store, ref string) error {
 }
 
 // unlinkSince marks the collection not linked, as Qory Apiary's answer to a request
-// that began at the moment began says, unless a link was stored after that moment, and
-// says whether it did.
+// that began at the moment began says, or as serve's drop of the repository's records
+// that began then does, unless a link was stored after that moment, and says whether it
+// did.
 func unlinkSince(st *store.Store, ref string, began uint64) (bool, error) {
 	linkMu.Lock()
 	defer linkMu.Unlock()
