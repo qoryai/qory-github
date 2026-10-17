@@ -36,11 +36,9 @@ func keyFile(t *testing.T) (string, []byte) {
 	return file, b
 }
 
-// usageWithoutFactory is the usage without factory, which lists no command.
-const usageWithoutFactory = `qory-github-server connects a GitHub App to Qory Apiary: it takes the App's webhook
-deliveries and writes on GitHub what Qory Apiary's change feed says.
-
-usage:
+// usageWithoutFactory is the usage without factory: the usage line alone, with no
+// description and no command.
+const usageWithoutFactory = `usage:
   qory-github-server <command> [flags]
 `
 
@@ -60,7 +58,8 @@ qory-github-server <command> -h prints a command's help.
 
 // TestTheProgramIsAbsentWithoutFactory pins that, unless QORY_FEATURES names factory,
 // the program knows no command: whatever it is run with, it prints the usage that lists
-// none, on standard error, and exits 2.
+// none and describes nothing, naming no hidden feature, command or what the program
+// does, on standard error, and exits 2.
 func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 	for _, features := range []string{"", " ", "all", "all-security", "all-security,factory", " all-factory", "factory2", "observability,security", "factory,all", "factory, all-security"} {
 		t.Setenv("QORY_FEATURES", features)
@@ -68,6 +67,11 @@ func TestTheProgramIsAbsentWithoutFactory(t *testing.T) {
 			var out, errs bytes.Buffer
 			if code := run(context.Background(), args, &out, &errs); code != 2 || errs.String() != usageWithoutFactory || out.Len() != 0 {
 				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q", features, args, code, errs.String())
+			}
+			for _, hidden := range []string{"factory", "serve ", "access-key", "connects", "GitHub App", "Qory Apiary", "webhook", "deliveries", "change feed"} {
+				if strings.Contains(errs.String(), hidden) {
+					t.Errorf("QORY_FEATURES=%q %v: the usage names %s", features, args, hidden)
+				}
 			}
 		}
 	}
