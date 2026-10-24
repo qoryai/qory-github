@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -248,24 +251,225 @@ func TestAppOfRefusesWhatServeDoesNotUpload(t *testing.T) {
 	}
 }
 
-// TestAnUploadTriesThePinsNextKey pins that an upload Qory Apiary refuses with 400,
-// as it refuses one sealed to a key it does not hold, is sealed again to the pin's next
-// key, and that a pin of one key Qory Apiary does not hold makes one try, which fails.
-func TestAnUploadTriesThePinsNextKey(t *testing.T) {
+// sealedTo are the server keys the fake's uploads were sealed to, in order, and their
+// encs.
+func sealedTo(f *fakeApiary) (keys, encs []string) {
+	for _, r := range f.sent(routeSecrets) {
+		sealed, _ := r.body["sealed"].(map[string]any)
+		k, _ := sealed["server_key"].(string)
+		e, _ := sealed["enc"].(string)
+		keys, encs = append(keys, k), append(encs, e)
+	}
+	return keys, encs
+}
+
+// TestAnUnknownServerKeyMovesTheUploadToTheNextKey pins that a signed 400
+// unknown_server_key, Qory Apiary's answer to a seal to a key it does not hold, has the
+// upload sealed again, anew, to the pin's next key not tried yet, until one is
+// accepted; that the next upload starts from the key that verified the latest signed
+// answer; and that an upload fails once every key is tried.
+func TestAnUnknownServerKeyMovesTheUploadToTheNextKey(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	api := testApiary(t, f, access)
+	x, y := newKey(t), newKey(t)
+	api.Pin = append(append(pinOf(x), pinOf(y)...), pinOf(f.server)...)
+	p, _ := setupApp().plaintext()
+	ctx := context.Background()
+	if err := api.UploadSecrets(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	keys, encs := sealedTo(f)
+	want := []string{x.PublicKey().String(), y.PublicKey().String(), f.server.PublicKey().String()}
+	if !slices.Equal(keys, want) || len(f.uploaded()) != 1 || len(slices.Compact(slices.Clone(encs))) != 3 {
+		t.Errorf("sealed to %v with %d encs apart, %d opened; want %v, each anew", keys, len(slices.Compact(slices.Clone(encs))), len(f.uploaded()), want)
+	}
+	// Each refusal was signed with the server's key, so the next upload starts there.
+	if err := api.UploadSecrets(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if keys, _ := sealedTo(f); len(keys) != 4 || keys[3] != f.server.PublicKey().String() || len(f.uploaded()) != 2 {
+		t.Errorf("the next upload is sealed to %v, want the server's key alone", keys[3:])
+	}
+	// Qory Apiary holds none of the keys now: the upload is sealed to each once, the
+	// latest answer's signer first, and fails.
+	f.mu.Lock()
+	f.refuse = func(route string, _ int) (int, string) {
+		if route == routeSecrets {
+			return http.StatusBadRequest, `{"error":"unknown_server_key"}`
+		}
+		return 0, ""
+	}
+	f.mu.Unlock()
+	err := api.UploadSecrets(ctx, p)
+	all := []string{f.server.PublicKey().String(), x.PublicKey().String(), y.PublicKey().String()}
+	if keys, _ := sealedTo(f); !refusedAs(err, http.StatusBadRequest, codeUnknownServerKey) || !slices.Equal(keys[4:], all) || len(f.uploaded()) != 2 {
+		t.Errorf("with no key Qory Apiary holds: %v, sealed to %v, want %v", err, keys[4:], all)
+	}
+}
+
+// TestAnInvalidRequestKeepsTheUploadsKey pins that a signed 400 invalid_request
+// changes no key: the upload fails after one try.
+func TestAnInvalidRequestKeepsTheUploadsKey(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	api := testApiary(t, f, access)
+	api.Pin = append(pinOf(f.server), pinOf(newKey(t))...)
+	f.mu.Lock()
+	f.refuse = func(route string, _ int) (int, string) {
+		if route == routeSecrets {
+			return http.StatusBadRequest, `{"error":"invalid_request"}`
+		}
+		return 0, ""
+	}
+	f.mu.Unlock()
+	p, _ := setupApp().plaintext()
+	err := api.UploadSecrets(context.Background(), p)
+	if keys, _ := sealedTo(f); !refusedAs(err, http.StatusBadRequest, codeInvalidRequest) || !slices.Equal(keys, []string{f.server.PublicKey().String()}) {
+		t.Errorf("%v, sealed to %v; want one try", err, keys)
+	}
+}
+
+// TestAnUploadSealsFirstToTheKeyThatSignedLast pins the order of the keys an upload is
+// sealed to: the key that verified Qory Apiary's latest signed answer first, so one
+// upload is enough when it comes second in the pin; without a signed answer yet, the
+// pin's order.
+func TestAnUploadSealsFirstToTheKeyThatSignedLast(t *testing.T) {
 	access := newKey(t)
 	f := newFakeApiary(t, access)
 	api := testApiary(t, f, access)
 	api.Pin = append(pinOf(newKey(t)), pinOf(f.server)...)
+	if _, err := api.Secrets(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	p, _ := setupApp().plaintext()
 	if err := api.UploadSecrets(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(f.sent(routeSecrets)); n != 2 || len(f.uploaded()) != 1 {
-		t.Errorf("%d uploads, %d opened", n, len(f.uploaded()))
+	sent := f.sent(routeSecrets)
+	if len(sent) != 1 || len(f.uploaded()) != 1 {
+		t.Fatalf("%d uploads, %d opened, want 1 of each", len(sent), len(f.uploaded()))
 	}
-	api.Pin = pinOf(newKey(t))
-	if err := api.UploadSecrets(context.Background(), p); err == nil || len(f.sent(routeSecrets)) != 3 || len(f.uploaded()) != 1 {
-		t.Errorf("err %v after %d uploads", err, len(f.sent(routeSecrets)))
+	if sealed, _ := sent[0].body["sealed"].(map[string]any); sealed["server_key"] != f.server.PublicKey().String() {
+		t.Errorf("the upload is sealed to %v, want the key that signed the latest answer", sealed["server_key"])
+	}
+}
+
+// TestSealOrder pins [sealOrder]: the latest answer's signer first, the others in the
+// pin's order; the pin's order when no answer was signed yet, or when the signer is not
+// in the pin, as after a re-enrolment with another pin.
+func TestSealOrder(t *testing.T) {
+	a, b, c := newKey(t).PublicKey(), newKey(t).PublicKey(), newKey(t).PublicKey()
+	keys := []accesskey.PublicKey{a, b, c}
+	api := &Apiary{}
+	if got := sealOrder(keys, api); !slices.Equal(got, keys) {
+		t.Errorf("with no signer: %v", got)
+	}
+	api.signer, api.signerKnown = c, true
+	if got := sealOrder(keys, api); !slices.Equal(got, []accesskey.PublicKey{c, a, b}) || !slices.Equal(keys, []accesskey.PublicKey{a, b, c}) {
+		t.Errorf("with the third key as signer: %v, and the pin is %v", got, keys)
+	}
+	api.signer = newKey(t).PublicKey()
+	if got := sealOrder(keys, api); !slices.Equal(got, keys) {
+		t.Errorf("with a signer not in the pin: %v", got)
+	}
+}
+
+// getTimestamps are the X-Qory-Timestamps of the fake's GETs, in the order they came.
+func getTimestamps(f *fakeApiary) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, r := range f.requests {
+		if r.method == http.MethodGet {
+			out = append(out, r.timestamp)
+		}
+	}
+	return out
+}
+
+// secondsFrom are the Unix seconds of at, at+1 and so on, n of them, in decimal.
+func secondsFrom(at time.Time, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = strconv.FormatInt(at.Unix()+int64(i), 10)
+	}
+	return out
+}
+
+// TestGETsInOneSecondHaveLaterTimestamps pins that GETs in one second, to
+// /v1/adapter/secrets and to /v1/grants, each carry a timestamp a second later than
+// the GET before, whatever its target, and wait for that second: Qory Apiary refuses a
+// signature it has seen, and the contract wants each GET of an instance to carry a
+// later timestamp than the one before it.
+func TestGETsInOneSecondHaveLaterTimestamps(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	api := testApiary(t, f, access)
+	now := time.Now().Truncate(time.Second).Add(400 * time.Millisecond)
+	var waits []time.Duration
+	api.Now = func() time.Time { return now }
+	api.Sleep = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}
+	ctx := context.Background()
+	if _, err := api.Secrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.Grants(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.Secrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := getTimestamps(f), secondsFrom(now, 3); !slices.Equal(got, want) {
+		t.Errorf("the GETs carry the timestamps %v, want %v", got, want)
+	}
+	if !slices.Equal(waits, []time.Duration{600 * time.Millisecond, 1600 * time.Millisecond}) {
+		t.Errorf("waited %v, want 600ms and 1.6s, until each GET's second", waits)
+	}
+}
+
+// TestARestartKeepsTheLatestGETsTimestamp pins that the latest GET's timestamp is
+// kept in the store, so a client started again on the store never sends a GET at or
+// before that second, even with its clock behind it; and that a store it cannot read
+// stops the GET before it is sent.
+func TestARestartKeepsTheLatestGETsTimestamp(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	dir := filepath.Join(t.TempDir(), "state")
+	st := openStore(t, dir)
+	now := time.Now().Truncate(time.Second).Add(400 * time.Millisecond)
+	started := func() *Apiary {
+		api := testApiary(t, f, access)
+		api.Now = func() time.Time { return now }
+		api.Sleep = func(context.Context, time.Duration) error { return nil }
+		api.lastGet = storeLastGet{st}
+		return api
+	}
+	ctx := context.Background()
+	if _, err := started().Secrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := started().Grants(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := st.Get(nsAdapter, keyLastGet); err != nil || string(b) != secondsFrom(now, 2)[1] {
+		t.Errorf("the store keeps %q %v, want the second GET's timestamp", b, err)
+	}
+	now = now.Add(-time.Minute)
+	if _, err := started().Secrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := getTimestamps(f), secondsFrom(now.Add(time.Minute), 3); !slices.Equal(got, want) {
+		t.Errorf("the GETs carry the timestamps %v, want %v", got, want)
+	}
+	if err := st.Put(nsAdapter, keyLastGet, []byte("soon"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := started().Secrets(ctx); err == nil || len(getTimestamps(f)) != 3 {
+		t.Errorf("a GET was sent with no timestamp to follow: %v", err)
 	}
 }
 

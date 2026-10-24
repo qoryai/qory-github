@@ -371,7 +371,7 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 		Answered:     answeredIn(st, log),
 		ConnectionOf: func(ref string) string { c, _ := connectionOf(st, ref); return c },
 		PullsAlone:   !s.publicAddress(),
-		creds:        r.creds, refused: refused,
+		creds:        r.creds, refused: refused, lastGet: storeLastGet{st},
 	}
 	if r.re != nil {
 		// A new enrolment stops what declares the adapter, drops what the store holds

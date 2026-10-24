@@ -85,6 +85,8 @@ type apiaryRequest struct {
 	signature      string
 	// keyID is the access key id the request was signed with.
 	keyID string
+	// timestamp is a GET's X-Qory-Timestamp.
+	timestamp string
 }
 
 // fakeApiary is Qory Apiary as the adapter reaches it. It verifies every request's
@@ -327,7 +329,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"error":"unauthorized"}`)
 		return
 	}
-	got := apiaryRequest{method: r.Method, target: r.URL.RequestURI(), instance: req.InstanceID, raw: b, signature: sig, keyID: req.AccessKeyID}
+	got := apiaryRequest{method: r.Method, target: r.URL.RequestURI(), instance: req.InstanceID, raw: b, signature: sig, keyID: req.AccessKeyID, timestamp: req.Timestamp}
 	if r.Method == http.MethodPost {
 		if err := json.Unmarshal(b, &got.body); err != nil {
 			f.t.Errorf("%s: the body is not JSON: %v", r.URL.Path, err)
@@ -377,8 +379,8 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == routeSecrets && r.Method == http.MethodGet:
 		body = f.sealedSecrets(signer, req.AccessKeyID)
 	case r.URL.Path == routeSecrets && !refused:
-		if !f.openUpload(b, req.AccessKeyID) {
-			status, body = http.StatusBadRequest, `{"error":"invalid_request"}`
+		if code := f.openUpload(b, req.AccessKeyID); code != "" {
+			status, body = http.StatusBadRequest, `{"error":"`+code+`"}`
 		}
 	case r.URL.Path == routeGrants && r.Method == http.MethodGet:
 		body = f.grantsAnswer()
@@ -589,30 +591,34 @@ func sealTo(t *testing.T, pub accesskey.PublicKey, pt, info, aad []byte) (string
 
 // openUpload opens the upload b, signed with the access key keyID, with the server
 // key, as Qory Apiary does: info from sealed.server_key, aad from the adapter of the
-// last enrolment and keyID. An upload sealed to another key than the server's, or one that does not open
-// or holds no plaintext the contract takes, is refused; an accepted one replaces the
-// secrets the fake stores.
-func (f *fakeApiary) openUpload(b []byte, keyID string) bool {
+// last enrolment and keyID. It returns the refusal's code: unknown_server_key for an
+// upload sealed to another key than the server's, invalid_request for one that does
+// not open or has no plaintext the contract takes, and "" for an accepted one, which
+// replaces the secrets the fake stores.
+func (f *fakeApiary) openUpload(b []byte, keyID string) string {
 	var doc contracts.AdapterSecrets
-	if err := json.Unmarshal(b, &doc); err != nil || doc.Sealed.ServerKey != f.server.PublicKey().String() {
-		return false
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return codeInvalidRequest
+	}
+	if doc.Sealed.ServerKey != f.server.PublicKey().String() {
+		return codeUnknownServerKey
 	}
 	f.mu.Lock()
 	node := cmp.Or(f.node, testAdapterID)
 	f.mu.Unlock()
 	pt, err := openSealedWith(f.server, doc.Sealed.Enc, doc.Sealed.CT, contracts.SecretsUploadInfo(doc.Sealed.ServerKey), contracts.SecretsAAD(node, keyID))
 	if err != nil {
-		return false
+		return codeInvalidRequest
 	}
 	var p contracts.AdapterSecretsPlaintext
 	if err := json.Unmarshal(pt, &p); err != nil || p.Version != contracts.Version || p.Check() != nil {
-		return false
+		return codeInvalidRequest
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = p.Secrets
 	f.uploads = append(f.uploads, p)
-	return true
+	return ""
 }
 
 // openSealedWith opens enc and ct, in base64url, with key's X25519 form, info and aad.

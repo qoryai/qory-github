@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
@@ -18,6 +19,10 @@ import (
 // routeSecrets is where serve stores its secrets in Qory Apiary, POST, and reads them
 // back, GET: contracts' adapter-secrets.schema.json and adapter-secrets-answer.schema.json.
 const routeSecrets = "/v1/adapter/secrets"
+
+// codeUnknownServerKey is Qory Apiary's refusal, 400, of an upload sealed to a server
+// key it does not hold.
+const codeUnknownServerKey = "unknown_server_key"
 
 // maxSecretsAnswer is the most bytes of an answer to GET /v1/adapter/secrets that serve
 // reads: 16 secrets of 16384 bytes each, sealed and in base64url, fit in it.
@@ -33,8 +38,9 @@ func sealSuite() (hpke.KEM, hpke.KDF, hpke.AEAD) {
 }
 
 // sealToServer seals pt to the server key server of Qory Apiary, as
-// adapter-secrets.schema.json says: to the key's X25519 form, with a fresh ephemeral
-// key, info [contracts.SecretsUploadInfo] of the key as the pin writes it, and aad
+// adapter-secrets.schema.json says: to the key's X25519 form, which
+// [accesskey.PublicKey.X25519] returns, with a fresh ephemeral key, info
+// [contracts.SecretsUploadInfo] of the key as the pin writes it, and aad
 // [contracts.SecretsAAD] of the adapter id and the access key id that signs the
 // request. An error never contains pt.
 func sealToServer(pt []byte, server accesskey.PublicKey, adapterID, keyID string) (contracts.SealedToServer, error) {
@@ -103,10 +109,14 @@ func (a *Apiary) current() enrolment {
 
 // UploadSecrets sends POST /v1/adapter/secrets: the secrets p, which replace every
 // secret Qory Apiary stores for the adapter, sealed to a server key of the pin, see
-// [sealToServer]. The pin may list more than one key, and Qory Apiary answers 400 to
-// an upload sealed to a key it does not hold, so a 400 is sent again sealed to the
-// pin's next key, until a key is accepted or none is left. One enrolment signs every
-// request and is in every seal's aad. An error never contains a value.
+// [sealToServer]. As adapter-secrets.schema.json:5 says, each upload is sealed first to
+// the pinned key that verified the latest signed answer serve received before it,
+// since Qory Apiary holds that key's private half, see [sealOrder]. Only a signed 400
+// unknown_server_key, Qory Apiary's answer to a seal to a key it does not hold, makes
+// serve seal the upload again, anew, to the next pinned key it has not tried for this
+// upload; once every key is tried, the upload fails. No other refusal changes the key,
+// 400 invalid_request among them. One enrolment signs every request and is in every
+// seal's aad. An error never contains a value.
 func (a *Apiary) UploadSecrets(ctx context.Context, p contracts.AdapterSecretsPlaintext) error {
 	const what = "storing the GitHub App in Qory Apiary"
 	if err := p.Check(); err != nil {
@@ -118,7 +128,7 @@ func (a *Apiary) UploadSecrets(ctx context.Context, p contracts.AdapterSecretsPl
 	}
 	defer clear(pt)
 	e := a.current()
-	keys := e.pin.Keys()
+	keys := sealOrder(e.pin.Keys(), a)
 	if len(keys) == 0 {
 		return Permanent(fmt.Errorf("%s: the pin lists no key to seal the secrets to", what))
 	}
@@ -130,11 +140,23 @@ func (a *Apiary) UploadSecrets(ctx context.Context, p contracts.AdapterSecretsPl
 		err = a.postWith(ctx, &e, what, routeSecrets, "", "", func(t string) any {
 			return contracts.AdapterSecrets{Version: contracts.Version, Time: t, Sealed: sealed}
 		})
-		if !refusedAs(err, http.StatusBadRequest, "") || server == keys[len(keys)-1] {
+		if !refusedAs(err, http.StatusBadRequest, codeUnknownServerKey) || server == keys[len(keys)-1] {
 			return err
 		}
 	}
 	return nil
+}
+
+// sealOrder is keys with the key that verified Qory Apiary's latest signed answer
+// first, when keys contain it, and the others in the pin's order, as
+// adapter-secrets.schema.json:5 orders them.
+func sealOrder(keys []accesskey.PublicKey, a *Apiary) []accesskey.PublicKey {
+	signer, ok := a.lastSigner()
+	i := slices.Index(keys, signer)
+	if !ok || i <= 0 {
+		return keys
+	}
+	return append([]accesskey.PublicKey{signer}, slices.Delete(slices.Clone(keys), i, i+1)...)
 }
 
 // Secrets reads the secrets Qory Apiary stores for the adapter, GET

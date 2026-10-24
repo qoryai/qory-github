@@ -19,6 +19,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/store"
 )
 
 // The routes of Qory Apiary's adapter API, the header that names the contract's
@@ -186,9 +187,100 @@ type Apiary struct {
 	creds   *credentials
 	refused func()
 
-	// mu guards changesSent, when the last request for the change feed was sent.
+	// lastGet, when set, keeps the X-Qory-Timestamp of the latest GET across a
+	// restart, see [Apiary.getTime]; nil keeps it in memory alone.
+	lastGet lastGetStore
+
+	// mu guards changesSent, when the last request for the change feed was sent, and
+	// signer, the pin's key that verified the latest signed answer, see
+	// [Apiary.UploadSecrets].
 	mu          sync.Mutex
 	changesSent time.Time
+	signer      accesskey.PublicKey
+	signerKnown bool
+
+	// getMu guards getSecond, the X-Qory-Timestamp of the latest GET in Unix seconds,
+	// and getLoaded, whether getSecond was read from lastGet yet.
+	getMu     sync.Mutex
+	getSecond int64
+	getLoaded bool
+}
+
+// lastGetStore keeps the X-Qory-Timestamp of the latest GET in Unix seconds: load
+// returns it, 0 when none is kept, and save replaces it.
+type lastGetStore interface {
+	load() (int64, error)
+	save(second int64) error
+}
+
+// storeLastGet is a [lastGetStore] in the store, the adapter namespace's key
+// last_get_timestamp. It belongs to the instance, as the instance id does, so a
+// re-enrolment keeps it.
+type storeLastGet struct{ st *store.Store }
+
+const keyLastGet = "last_get_timestamp"
+
+func (s storeLastGet) load() (int64, error) {
+	b, err := s.st.Get(nsAdapter, keyLastGet)
+	if errors.Is(err, store.ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	sec, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil || sec < 0 {
+		return 0, errors.New("the store's last GET timestamp is not a number of seconds")
+	}
+	return sec, nil
+}
+
+func (s storeLastGet) save(second int64) error {
+	return s.st.Put(nsAdapter, keyLastGet, []byte(strconv.FormatInt(second, 10)), 0)
+}
+
+// lastSigner is the pin's key that verified Qory Apiary's latest signed answer, and
+// whether one did.
+func (a *Apiary) lastSigner() (accesskey.PublicKey, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.signer, a.signerKnown
+}
+
+// getTime is the time a GET signs in its X-Qory-Timestamp: a second later than the
+// latest GET's at least, whatever its target. The contract wants each GET of one
+// instance to carry a later timestamp than the GET before it, definitions.schema.json:
+// Qory Apiary refuses a signature it has seen, and an answer is bound to the GET's
+// signature. The latest second is kept in lastGet before the GET is sent, so after a
+// restart no GET carries that second or an earlier one. When the clock has not
+// passed the latest GET's second, getTime waits for the next second. GETs take their
+// seconds one at a time, in the order they ask.
+func (a *Apiary) getTime(ctx context.Context) (time.Time, error) {
+	a.getMu.Lock()
+	defer a.getMu.Unlock()
+	if !a.getLoaded && a.lastGet != nil {
+		sec, err := a.lastGet.load()
+		if err != nil {
+			return time.Time{}, fmt.Errorf("reading the latest GET's timestamp from the store: %w", err)
+		}
+		a.getSecond = max(a.getSecond, sec)
+	}
+	a.getLoaded = true
+	now := a.now()
+	sec := max(now.Unix(), a.getSecond+1)
+	if a.lastGet != nil {
+		if err := a.lastGet.save(sec); err != nil {
+			return time.Time{}, fmt.Errorf("keeping the GET's timestamp in the store: %w", err)
+		}
+	}
+	a.getSecond = sec
+	at := time.Unix(sec, 0)
+	if wait := at.Sub(now); wait > 0 {
+		if err := a.sleep(ctx, wait); err != nil {
+			return time.Time{}, err
+		}
+	}
+	return at, nil
 }
 
 // lastChanges is when the last request for the change feed was sent, a 429's retry
@@ -453,8 +545,8 @@ type answer struct {
 
 // send signs one request and sends it, then reads the answer, max bytes at most, and
 // checks its signature under the pin, bound to this request's signature. A GET carries
-// and signs X-Qory-Timestamp; a POST's signature covers its body. A 401 is never
-// signed. An error is no answer; it begins with what and never says a header, the
+// and signs X-Qory-Timestamp, later than the GET before it, see [Apiary.getTime]; a
+// POST's signature covers its body. A 401 is never signed. An error is no answer; it begins with what and never says a header, the
 // body or a secret. Qory Apiary out of reach, or its answer unread, is an [Outage].
 func (a *Apiary) send(ctx context.Context, what, method, target string, body []byte, max int64, timeout time.Duration) (*answer, error) {
 	return a.sendWith(ctx, a.current(), what, method, target, body, max, timeout)
@@ -477,7 +569,11 @@ func (a *Apiary) sendWith(ctx context.Context, e enrolment, what, method, target
 		signed.Body = body
 		req.Header.Set("Content-Type", "application/json")
 	} else {
-		signed.Timestamp = accesskey.Timestamp(a.now())
+		at, err := a.getTime(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", what, err)
+		}
+		signed.Timestamp = accesskey.Timestamp(at)
 		req.Header.Set(accesskey.HeaderTimestamp, signed.Timestamp)
 	}
 	sig, err := key.SignRequest(signed)
@@ -522,7 +618,18 @@ func (a *Apiary) sendWith(ctx context.Context, e enrolment, what, method, target
 	signature, ok1 := one(accesskey.HeaderSignature)
 	conf, ok2 := one(accesskey.HeaderConfiguration)
 	run, ok3 := one(accesskey.HeaderRunConfiguration)
-	ans.signed = ok1 && ok2 && ok3 && pin.VerifyAnswer(accesskey.Answer{Status: resp.StatusCode, RequestSignature: sig, Body: b, Configuration: conf, RunConfiguration: run}, signature)
+	if ok1 && ok2 && ok3 {
+		signedAnswer := accesskey.Answer{Status: resp.StatusCode, RequestSignature: sig, Body: b, Configuration: conf, RunConfiguration: run}
+		for _, k := range pin.Keys() {
+			if k.VerifyAnswer(signedAnswer, signature) {
+				ans.signed = true
+				a.mu.Lock()
+				a.signer, a.signerKnown = k, true
+				a.mu.Unlock()
+				break
+			}
+		}
+	}
 	return ans, nil
 }
 
