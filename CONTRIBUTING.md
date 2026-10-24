@@ -77,8 +77,8 @@ columns.
 A release is a tag on a branch named after it, `v0.1.0`, opened as one pull request. That
 branch adds the release's section to `CHANGELOG.md`, `[X.Y.Z] - YYYY-MM-DD` with the day
 the tag lands; a fix that goes to `main` outside a release branch goes under
-`[Unreleased]` until the next one. The tag's workflow publishes the program's archives and
-`checksums.txt`, by the rule every integration follows
+`[Unreleased]` until the next one. The tag's workflow publishes the program's archives,
+`description.json`, and `checksums.txt`, by the rule every integration follows
 ([§Release rule](https://github.com/qoryai/integrations#release-rule)).
 
 Commit messages state what changed and why it was needed, in the imperative.
