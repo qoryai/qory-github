@@ -71,7 +71,7 @@
       "program": "qory-github-server",
       "setup": {
         "command": "qory-github-server serve --settings /etc/qory-github/serve.json",
-        "help": "Leave the App out of the settings: Set up in Qory Apiary then opens the server's setup page. It asks which GitHub account the App is for, an organisation or a user, and opens GitHub with the App filled in, named qory- and that account's handle, which you can change."
+        "help": "Leave the App out of the settings: Set up in Qory Apiary opens the server's setup page. It asks which GitHub account the App is for and who can install it: only that account, or any account. Then GitHub opens with the App filled in, named qory- and that account's handle, which you can change."
       },
       "start": "qory-github-server serve --settings /etc/qory-github/serve.json",
       "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",

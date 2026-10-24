@@ -59,8 +59,10 @@ type setupGitHub struct {
 	hookSecrets       []string
 	cookies           []string
 	convHold, convGot chan struct{}
-	// appChecks counts the checks of the App at start, GET /app.
+	// appChecks counts the checks of the App at start, GET /app, and lookups the
+	// lookups of an account, GET /users/<login>.
 	appChecks int
+	lookups   int
 }
 
 func newSetupGitHub(t *testing.T) *setupGitHub {
@@ -83,6 +85,7 @@ func (g *setupGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/users/"):
 		login := strings.TrimPrefix(r.URL.Path, "/users/")
 		g.mu.Lock()
+		g.lookups++
 		kind, ok := g.accounts[strings.ToLower(login)]
 		g.mu.Unlock()
 		if !ok {
@@ -151,6 +154,12 @@ func (g *setupGitHub) checks() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.appChecks
+}
+
+func (g *setupGitHub) looked() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lookups
 }
 
 func (g *setupGitHub) converted() []string {
@@ -275,10 +284,18 @@ func (rig *setupRig) begin(pass string) (jar, string) {
 	return j, m[1]
 }
 
-// account posts the account form, and returns the manifest page's action and manifest.
+// account posts the account form for a private App, and returns the manifest page's
+// action and manifest.
 func (rig *setupRig) account(j jar, token, handle string) (*httptest.ResponseRecorder, string, map[string]any) {
 	rig.t.Helper()
-	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}})
+	return rig.accountAs(j, token, handle, installPrivate)
+}
+
+// accountAs posts the account form with install, and returns the manifest page's
+// action and manifest.
+func (rig *setupRig) accountAs(j jar, token, handle, install string) (*httptest.ResponseRecorder, string, map[string]any) {
+	rig.t.Helper()
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}, "install": {install}})
 	a, m := formAction.FindStringSubmatch(w.Body.String()), manifestVal.FindStringSubmatch(w.Body.String())
 	if w.Code != http.StatusOK || a == nil || m == nil {
 		rig.t.Fatalf("the account answered %d %s", w.Code, w.Body)
@@ -301,16 +318,21 @@ func stateOf(t *testing.T, action string) string {
 }
 
 // TestTheSetupFlowKeepsTheAppGitHubCreated runs the App setup whole for an
-// organisation, and for a user, against the fake GitHub: every page, its headers and
+// organisation's public App, and for a user's private App, against the fake GitHub:
+// every page, its headers and
 // its sentences, the manifest it posts and where, the App kept as GitHub's answer
 // says it, the cookie at each step, and the lines it logs, none of which, nor any
 // answer, holds the pass, the code, a cookie or a secret.
 func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 	for _, tc := range []struct {
-		handle, org string
-		signIn      bool
-	}{{"Acme", "acme", false}, {"alice", "", true}} {
+		handle, org, install, owner, ownerKind, end string
+		signIn                                      bool
+	}{
+		{"Acme", "acme", installPublic, "acme", github.AccountOrganization, "Organisations install it with Install in Qory Apiary.", false},
+		{"alice", "", installPrivate, "alice", github.AccountUser, "Only alice can install it, with Install in Qory Apiary.", true},
+	} {
 		rig := newSetupRig(t, true)
+		rig.gh.owner, rig.gh.ownerKind = tc.owner, tc.ownerKind
 		pass := rig.pass()
 		j := jar{}
 		w := rig.do(j, http.MethodGet, "/setup?state="+pass, nil)
@@ -330,7 +352,7 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 			t.Errorf("the account form's policy is %q", csp)
 		}
 		token := tokenField.FindStringSubmatch(body)[1]
-		w, action, manifest := rig.account(j, token, tc.handle)
+		w, action, manifest := rig.accountAs(j, token, tc.handle, tc.install)
 		body = w.Body.String()
 		login := strings.ToLower(tc.handle)
 		if !strings.Contains(body, "<p>GitHub opens with the App filled in, named qory-"+login+"; you can change the name there.</p>") || !strings.Contains(body, ">Create the GitHub App</button>") {
@@ -350,12 +372,13 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 		}
 		hook, _ := manifest["hook_attributes"].(map[string]any)
 		if manifest["name"] != "qory-"+login || manifest["redirect_url"] != "https://qory-github.example.com/setup/created" ||
-			hook["url"] != "https://qory-github.example.com/v1/events" || hook["active"] != true || manifest["setup_url"] != "https://qory-github.example.com/v1/connect/return" {
+			hook["url"] != "https://qory-github.example.com/v1/events" || hook["active"] != true || manifest["setup_url"] != "https://qory-github.example.com/v1/connect/return" ||
+			manifest["public"] != (tc.install == installPublic) {
 			t.Errorf("the manifest is %v", manifest)
 		}
 		w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
 		body = w.Body.String()
-		if w.Code != http.StatusOK || !strings.Contains(body, "<p>The GitHub App "+setupSlug+" is set up. Organisations install it with Install in Qory Apiary.</p>") ||
+		if w.Code != http.StatusOK || !strings.Contains(body, "<p>The GitHub App "+setupSlug+" is set up. "+tc.end+"</p>") ||
 			!strings.Contains(body, `<a href="https://apiary.example.com">Back to Qory Apiary</a>`) || strings.Contains(body, "webhooks") {
 			t.Errorf("the end answered %d %s", w.Code, body)
 		}
@@ -379,7 +402,7 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 			t.Errorf("the conversions: %v", c)
 		}
 		loaded, err := loadApp(rig.dir)
-		if err != nil || loaded.numericID != setupAppID || loaded.slug != setupSlug || loaded.owner != "acme" || loaded.ownerKind != github.AccountOrganization ||
+		if err != nil || loaded.numericID != setupAppID || loaded.slug != setupSlug || loaded.owner != tc.owner || loaded.ownerKind != tc.ownerKind ||
 			string(loaded.webhookSecret) != string(kept.webhookSecret) || !loaded.confirmed || !loaded.webhookActive {
 			t.Errorf("the App kept is %+v, %v", loaded, err)
 		}
@@ -642,12 +665,106 @@ func TestAnUnknownAccountShowsTheFormAgain(t *testing.T) {
 	rig := newSetupRig(t, true)
 	j, token := rig.begin(rig.pass())
 	for _, handle := range []string{"nobody", "not a handle", strings.Repeat("a", 40)} {
-		w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}})
+		w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}, "install": {installPrivate}})
 		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>GitHub has no account by that name.</p>") || !strings.Contains(w.Body.String(), token) {
 			t.Errorf("%q answered %d %s", handle, w.Code, w.Body)
 		}
 	}
 	rig.account(j, token, "acme")
+}
+
+// The account form's question and its two options, as the page shows them, with the
+// private App's option selected and with the public App's.
+const (
+	installQuestion = "<fieldset>\n<legend>Who can install the App</legend>\n"
+	privateOption   = `<label><input type="radio" name="install" value="private" required checked> Only this account (private)</label>`
+	publicOption    = `<label><input type="radio" name="install" value="public"> Any GitHub account (public)</label>`
+	privateOff      = `<label><input type="radio" name="install" value="private" required> Only this account (private)</label>`
+	publicOn        = `<label><input type="radio" name="install" value="public" checked> Any GitHub account (public)</label>`
+	chooseLine      = "<p>Choose who can install the App: only this account, or any GitHub account.</p>"
+)
+
+// TestTheAccountFormAsksWhoCanInstallTheApp pins the form's question, in a fieldset
+// with its legend, after the account field and before the button, its two options
+// with the private App's selected, and that a form shown again for an unknown account
+// keeps the public App's option selected when it was chosen.
+func TestTheAccountFormAsksWhoCanInstallTheApp(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	body := rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String()
+	field := strings.Index(body, `name="account"`)
+	question := strings.Index(body, installQuestion+privateOption+"\n"+publicOption+"\n</fieldset>")
+	button := strings.Index(body, ">Continue</button>")
+	if field < 0 || question < field || button < question {
+		t.Errorf("the account form: %s", body)
+	}
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {"nobody"}, "install": {installPublic}})
+	body = w.Body.String()
+	if w.Code != http.StatusOK || !strings.Contains(body, "<p>GitHub has no account by that name.</p>") || !strings.Contains(body, privateOff) || !strings.Contains(body, publicOn) {
+		t.Errorf("the form again answered %d %s", w.Code, body)
+	}
+}
+
+// TestTheChoiceSetsWhetherTheAppIsPublic pins that the private App's option posts a
+// manifest with public false, and the public App's one with public true.
+func TestTheChoiceSetsWhetherTheAppIsPublic(t *testing.T) {
+	for install, want := range map[string]bool{installPrivate: false, installPublic: true} {
+		rig := newSetupRig(t, true)
+		j, token := rig.begin(rig.pass())
+		_, _, manifest := rig.accountAs(j, token, "acme", install)
+		if got, ok := manifest["public"].(bool); !ok || got != want {
+			t.Errorf("%s: the manifest's public is %v", install, manifest["public"])
+		}
+	}
+}
+
+// TestAMissingOrUnknownChoiceShowsTheFormAgain pins that a form whose install is not
+// exactly one of its two values shows the form again, with the line that says what to
+// do and the private App's option selected, without looking the account up with
+// GitHub, and that the flow goes on.
+func TestAMissingOrUnknownChoiceShowsTheFormAgain(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	for _, install := range [][]string{nil, {""}, {"Private"}, {"true"}, {"private "}, {installPrivate, installPublic}, {installPublic, installPublic}} {
+		form := url.Values{"token": {token}, "account": {"acme"}}
+		if install != nil {
+			form["install"] = install
+		}
+		w := rig.do(j, http.MethodPost, "/setup/continue", form)
+		body := w.Body.String()
+		if w.Code != http.StatusOK || !strings.Contains(body, chooseLine) || !strings.Contains(body, privateOption) || !strings.Contains(body, token) || strings.Contains(body, `name="manifest"`) {
+			t.Errorf("%q answered %d %s", install, w.Code, body)
+		}
+	}
+	if n := rig.gh.looked(); n != 0 {
+		t.Errorf("the account was looked up on GitHub %d times", n)
+	}
+	rig.account(j, token, "acme")
+}
+
+// TestTheChoiceChangesOnlyWithTheAccountForm pins that the choice is kept in the
+// session by the account form alone: GitHub's redirect with install=public and
+// public=true added to its query keeps the private App's end page, and a second post
+// of the form with another choice gives a new state, so GitHub's redirect for the
+// first manifest page is refused without an exchange.
+func TestTheChoiceChangesOnlyWithTheAccountForm(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	_, first, _ := rig.account(j, token, "acme")
+	_, second, manifest := rig.accountAs(j, token, "acme", installPublic)
+	if manifest["public"] != true || stateOf(t, first) == stateOf(t, second) {
+		t.Errorf("the second post: %s %v", second, manifest)
+	}
+	w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, first), nil)
+	if w.Code != http.StatusBadRequest || len(rig.gh.converted()) != 0 {
+		t.Errorf("the first page's redirect answered %d %s", w.Code, w.Body)
+	}
+	j, token = rig.begin(rig.pass())
+	_, action, _ := rig.account(j, token, "acme")
+	w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action)+"&install=public&public=true", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>The GitHub App "+setupSlug+" is set up. Only acme can install it, with Install in Qory Apiary.</p>") {
+		t.Errorf("the redirect answered %d %s", w.Code, w.Body)
+	}
 }
 
 // TestAWrongStateOrCodeIsRefusedWithoutAnExchange pins that GitHub's redirect needs the

@@ -96,8 +96,8 @@ func (a App) InstallURL(web string) string {
 
 // Manifest is the App Setup requests from GitHub: private, with no webhook, allowed to
 // read and write repository contents and pull requests and to read metadata, which is
-// the most a run's token can then be granted. [ServeManifest] changes it to the public
-// App serve needs.
+// the most a run's token can then be granted. [ServeManifest] changes it to the App
+// serve needs.
 func Manifest(name, redirect string) map[string]any {
 	return map[string]any{
 		"name":                name,
@@ -124,17 +124,19 @@ const (
 )
 
 // serveManifest changes the manifest m to the App serve needs, under serve's public
-// URL publicURL: public, so it can be installed on an account other than its owner's;
-// what Connect needs, see [ConnectManifest]; a webhook, active, at [WebhookPath], for
-// the events issues, issue_comment, repository, workflow_run, pull_request and push;
-// and, in place of those [Manifest] sets, the permissions metadata read, issues write, members read,
-// contents write, pull_requests write, actions write, checks write and administration
-// read, which an installation approves once, when it is made. Each installation token
-// serve mints is narrowed to its step all the same, see [Client.MintListingToken] and
-// [Client.MintInstallationToken].
-func serveManifest(m map[string]any, publicURL string) {
+// URL publicURL: public when public is set, so any GitHub account can install it, and
+// otherwise private, so GitHub lets only the account that owns the App install it, and
+// Connect links only that account's installation, which a self-hosted organisation
+// wants; what Connect needs, see [ConnectManifest]; a webhook, active, at
+// [WebhookPath], for the events issues, issue_comment, repository, workflow_run,
+// pull_request and push; and, in place of those [Manifest] sets, the permissions
+// metadata read, issues write, members read, contents write, pull_requests write,
+// actions write, checks write and administration read, which an installation approves
+// once, when it is made. Each installation token serve mints is narrowed to its step
+// all the same, see [Client.MintListingToken] and [Client.MintInstallationToken].
+func serveManifest(m map[string]any, publicURL string, public bool) {
 	ConnectManifest(m, publicURL)
-	m["public"] = true
+	m["public"] = public
 	m["hook_attributes"] = map[string]any{"url": publicURL + WebhookPath, "active": true}
 	m["default_events"] = []string{"issues", "issue_comment", "repository", "workflow_run", "pull_request", "push"}
 	m["default_permissions"] = map[string]string{
@@ -145,13 +147,14 @@ func serveManifest(m map[string]any, publicURL string) {
 
 // ServeManifest is the App serve's App setup requests from GitHub: [Manifest] named
 // name, with GitHub's redirect to redirect, changed to the App serve needs under its
-// public URL publicURL, see [serveManifest]. Without active, its webhook is inactive at
+// public URL publicURL, see [serveManifest]: public only when public is set, which the
+// instance admin picks on the setup page. Without active, its webhook is inactive at
 // the address [Manifest] gives a webhook, since GitHub cannot reach publicURL: GitHub
 // then sends the App no deliveries until a person sets the webhook's address and turns
 // it on, on the App's settings page; the API cannot turn it on.
-func ServeManifest(name, redirect, publicURL string, active bool) map[string]any {
+func ServeManifest(name, redirect, publicURL string, public, active bool) map[string]any {
 	m := Manifest(name, redirect)
-	serveManifest(m, publicURL)
+	serveManifest(m, publicURL, public)
 	if !active {
 		m["hook_attributes"] = Manifest(name, redirect)["hook_attributes"]
 	}

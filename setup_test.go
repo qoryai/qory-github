@@ -500,11 +500,12 @@ func TestTheManifestIsAsItWas(t *testing.T) {
 }
 
 // TestServeManifestIsAsItWas pins what [serveManifest] makes of [Manifest] byte for
-// byte: public, Connect's URLs, no description, a webhook that is active at serve's
-// webhook path, its events and its permissions.
+// byte: public when it is asked to be, Connect's URLs, no description, a webhook that
+// is active at serve's webhook path, its events and its permissions; and private, the
+// rest the same, when it is not.
 func TestServeManifestIsAsItWas(t *testing.T) {
 	m := Manifest("qory-github-test", "http://127.0.0.1:1/callback")
-	serveManifest(m, "https://qory-github.example.com/base")
+	serveManifest(m, "https://qory-github.example.com/base", true)
 	b, err := json.Marshal(m)
 	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
 		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
@@ -514,6 +515,12 @@ func TestServeManifestIsAsItWas(t *testing.T) {
 		`"setup_on_update":true,"setup_url":"https://qory-github.example.com/base/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
 	if err != nil || string(b) != want {
 		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+	m = Manifest("qory-github-test", "http://127.0.0.1:1/callback")
+	serveManifest(m, "https://qory-github.example.com/base", false)
+	b, err = json.Marshal(m)
+	if want := strings.Replace(want, `"public":true`, `"public":false`, 1); err != nil || string(b) != want {
+		t.Errorf("the private manifest is\n%s\nwant\n%s", b, want)
 	}
 }
 

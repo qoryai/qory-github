@@ -41,13 +41,19 @@ import (
 //     answers 303 too, to <public_url>/setup/refused, which shows the page a
 //     short-lived cookie names.
 //  2. GET /setup/continue shows the form that asks for the GitHub account the App is
-//     for, an organisation or a user, with the session's form token.
-//  3. POST /setup/continue, with the session's cookie and its form token, looks the
-//     account up with GitHub, see [github.Client.Account], and answers the page that
-//     posts the App's manifest to GitHub, [github.ServeManifest], named qory- and the
-//     account's login, with a new state, which GitHub's redirect returns. The page
-//     posts itself with its one script, which the page's Content-Security-Policy
-//     allows by its SHA-256, and its button does where the script does not run.
+//     for, an organisation or a user, and who can install the App: only that account,
+//     a private App, which the form selects first, or any GitHub account, a public
+//     App. The form carries the session's form token.
+//  3. POST /setup/continue, with the session's cookie and its form token, takes the
+//     choice only as one of its two values, looks the account up with GitHub, see
+//     [github.Client.Account], keeps the account and the choice in the session, and
+//     answers the page that posts the App's manifest to GitHub,
+//     [github.ServeManifest], named qory- and the account's login, private or public
+//     as chosen, with a new state, which GitHub's redirect returns. A later POST
+//     replaces the account, the choice and the state, so GitHub's redirect for an
+//     earlier page is refused. The page posts itself with its one script, which the
+//     page's Content-Security-Policy allows by its SHA-256, and its button does where
+//     the script does not run.
 //  4. GET /setup/created?code=...&state=..., GitHub's redirect once the admin pressed
 //     Create on GitHub, needs the session's cookie and state, and that the session is
 //     still the flow pointer's. Under the lock, it checks again that no App is kept and
@@ -128,12 +134,17 @@ const (
 	keyFlow = "flow"
 	// maxAccountForm is the most bytes the account form's body may hold.
 	maxAccountForm = 4 << 10
+	// installPrivate and installPublic are the two values of the account form's
+	// field install: the App is private, or public.
+	installPrivate = "private"
+	installPublic  = "public"
 )
 
 // setupSession is what the store keeps of a setup session: when it expires, in Unix
 // nanoseconds; the nonce of the pass that started it, and when that pass expires, in
 // Unix seconds; the form token the account form carries; and, once the account is
-// known, its login and kind, and the state GitHub's redirect must return.
+// known, its login and kind, whether the App is public, and the state GitHub's redirect
+// must return.
 type setupSession struct {
 	Expires int64  `json:"expires"`
 	Nonce   string `json:"nonce"`
@@ -141,6 +152,7 @@ type setupSession struct {
 	Token   string `json:"form_token"`
 	Login   string `json:"login,omitempty"`
 	Kind    string `json:"kind,omitempty"`
+	Public  bool   `json:"public,omitempty"`
 	State   string `json:"state,omitempty"`
 }
 
@@ -402,13 +414,15 @@ func (a *appSetup) flowSession(w http.ResponseWriter, r *http.Request) (string, 
 // the account form.
 func (a *appSetup) proceed(w http.ResponseWriter, r *http.Request, _ url.Values) {
 	if _, s, ok := a.flowSession(w, r); ok {
-		a.accountPage(w, s.Token, "")
+		a.accountPage(w, s.Token, "", false)
 	}
 }
 
 // account is POST /setup/continue, the account form: with the session's form token,
-// it looks the account up with GitHub, shows the form again when GitHub has none by
-// that name, and otherwise answers the page that posts the App's manifest to GitHub.
+// it shows the form again when install is not exactly one of its two values, before
+// any call to GitHub; it looks the account up with GitHub, shows the form again when
+// GitHub has none by that name, and otherwise keeps the account and the choice in the
+// session and answers the page that posts the App's manifest to GitHub.
 func (a *appSetup) account(w http.ResponseWriter, r *http.Request) {
 	id, s, ok := a.flowSession(w, r)
 	if !ok {
@@ -417,22 +431,28 @@ func (a *appSetup) account(w http.ResponseWriter, r *http.Request) {
 	form, err := readForm(w, r)
 	token, _ := one(form, "token")
 	handle, _ := one(form, "account")
+	install, _ := one(form, "install")
 	if err != nil || subtle.ConstantTimeCompare([]byte(token), []byte(s.Token)) != 1 {
 		a.refuse(w, r, setupRefuseForm, "")
 		return
 	}
+	if install != installPrivate && install != installPublic {
+		a.accountPage(w, s.Token, "Choose who can install the App: only this account, or any GitHub account.", false)
+		return
+	}
+	public := install == installPublic
 	ctx, cancel := context.WithTimeout(r.Context(), connectBound)
 	defer cancel()
 	login, kind, err := a.GitHub.Account(ctx, strings.TrimSpace(handle))
 	if errors.Is(err, github.ErrNoAccount) {
-		a.accountPage(w, s.Token, "GitHub has no account by that name.")
+		a.accountPage(w, s.Token, "GitHub has no account by that name.", public)
 		return
 	}
 	if err != nil {
 		a.failed(w, r, id, "account", err)
 		return
 	}
-	s.Login, s.Kind, s.State = login, kind, randomID()
+	s.Login, s.Kind, s.Public, s.State = login, kind, public, randomID()
 	if err := a.save(id, s); err != nil {
 		a.failed(w, r, id, "session", err)
 		return
@@ -508,7 +528,7 @@ func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values)
 	if a.setUp != nil {
 		a.setUp(kept)
 	}
-	a.donePage(w, kept.slug)
+	a.donePage(w, kept, s.Public)
 }
 
 // keep checks the App conv, as GitHub answered the code's exchange, and keeps it in
@@ -658,27 +678,42 @@ func plainPage(w http.ResponseWriter, status int, line string) {
 	io.WriteString(w, line+"\n")
 }
 
-// accountPageHTML is the account form, which posts the account's handle and the
-// session's form token to /setup/continue.
+// accountPageHTML is the account form, which posts the account's handle, who can
+// install the App, and the session's form token to /setup/continue.
 var accountPageHTML = template.Must(template.New("account").Parse(`<!doctype html>
 <meta charset="utf-8"><title>qory-github</title>
 <h1>{{.Heading}}</h1>
 {{if .Line}}<p>{{.Line}}</p>
 {{end}}<form method="post" action="{{.Action}}">
 <label>{{.Label}} <input name="account" required maxlength="39" autocomplete="off"></label>
+<fieldset>
+<legend>{{.Question}}</legend>
+<label><input type="radio" name="install" value="` + installPrivate + `" required{{if not .Public}} checked{{end}}> {{.Private}}</label>
+<label><input type="radio" name="install" value="` + installPublic + `"{{if .Public}} checked{{end}}> {{.Any}}</label>
+</fieldset>
 <input type="hidden" name="token" value="{{.Token}}">
 <button type="submit">{{.Button}}</button>
 </form>
 `))
 
-// accountPage answers the account form, with line above it when it is set.
-func (a *appSetup) accountPage(w http.ResponseWriter, token, line string) {
+// accountForm is what [accountPageHTML] shows. Public selects the public App's option
+// in place of the private App's.
+type accountForm struct {
+	Heading, Line, Action, Label, Question, Private, Any, Token, Button string
+	Public                                                              bool
+}
+
+// accountPage answers the account form, with line above it when it is set, and the
+// public App's option selected when public is set.
+func (a *appSetup) accountPage(w http.ResponseWriter, token, line string, public bool) {
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	accountPageHTML.Execute(w, map[string]string{
-		"Heading": "Set up the GitHub App", "Line": line, "Action": a.base + "/continue",
-		"Label": "GitHub account for the App, an organisation or a user", "Token": token, "Button": "Continue",
+	accountPageHTML.Execute(w, accountForm{
+		Heading: "Set up the GitHub App", Line: line, Action: a.base + "/continue",
+		Label:    "GitHub account for the App, an organisation or a user",
+		Question: "Who can install the App", Private: "Only this account (private)", Any: "Any GitHub account (public)",
+		Public: public, Token: token, Button: "Continue",
 	})
 }
 
@@ -704,12 +739,12 @@ var submitScriptHash = func() string {
 }()
 
 // manifestPage answers the page that posts the manifest of the App, named qory- and the
-// login of the account s names, to GitHub, with s's state, to be created under the
-// account: an organisation's, or, for a user, the person signed in on GitHub, whom the
-// page asks to be that user.
+// login of the account s names, public when s says so, to GitHub, with s's state, to be
+// created under the account: an organisation's, or, for a user, the person signed in on
+// GitHub, whom the page asks to be that user.
 func (a *appSetup) manifestPage(w http.ResponseWriter, s setupSession) {
 	web := a.GitHub.Web()
-	manifest, _ := json.Marshal(github.ServeManifest("qory-"+s.Login, a.PublicURL+setupPath+"/created", a.PublicURL, a.Active))
+	manifest, _ := json.Marshal(github.ServeManifest("qory-"+s.Login, a.PublicURL+setupPath+"/created", a.PublicURL, s.Public, a.Active))
 	signIn := ""
 	if s.Kind == github.AccountUser {
 		signIn = "Sign in to GitHub as " + s.Login + " to create the App."
@@ -733,9 +768,15 @@ var donePageHTML = template.Must(template.New("done").Parse(`<!doctype html>
 {{end}}<p><a href="{{.Target}}">{{.Link}}</a></p>
 `))
 
-// donePage answers the page that says the App slug is set up, and, when its webhook is
+// donePage answers the page that says the App k is set up and who can install it, as
+// the account form chose: any organisation when public is set, and otherwise only the
+// account that owns it, GitHub's rule for a private App; and, when its webhook is
 // inactive, that GitHub sends it none.
-func (a *appSetup) donePage(w http.ResponseWriter, slug string) {
+func (a *appSetup) donePage(w http.ResponseWriter, k *app, public bool) {
+	line := "The GitHub App " + k.slug + " is set up. Only " + k.owner + " can install it, with Install in Qory Apiary."
+	if public {
+		line = "The GitHub App " + k.slug + " is set up. Organisations install it with Install in Qory Apiary."
+	}
 	pulls := ""
 	if !a.Active {
 		pulls = "GitHub sends this App no webhooks: changes on GitHub arrive with each pull."
@@ -743,7 +784,7 @@ func (a *appSetup) donePage(w http.ResponseWriter, slug string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	donePageHTML.Execute(w, map[string]string{
-		"Line":   "The GitHub App " + slug + " is set up. Organisations install it with Install in Qory Apiary.",
+		"Line":   line,
 		"Pulls":  pulls,
 		"Target": a.ApiaryPublicURL, "Link": "Back to Qory Apiary",
 	})

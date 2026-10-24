@@ -11,16 +11,21 @@ import (
 )
 
 // TestServeManifestMakesTheWebhookInactiveWithoutAPublicAddress pins [ServeManifest]:
-// with active, the App serveManifest makes of Manifest; without it, the same App with
-// its webhook inactive at the address Manifest gives a webhook.
+// with active, the App serveManifest makes of Manifest, public or private as asked;
+// without it, the same App with its webhook inactive at the address Manifest gives a
+// webhook.
 func TestServeManifestMakesTheWebhookInactiveWithoutAPublicAddress(t *testing.T) {
-	want := Manifest("qory-acme", "https://qory-github.example.com/setup/created")
-	serveManifest(want, "https://qory-github.example.com")
-	got, _ := json.Marshal(ServeManifest("qory-acme", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", true))
-	if w, _ := json.Marshal(want); string(got) != string(w) {
-		t.Errorf("active: %s\nwant %s", got, w)
+	for _, public := range []bool{true, false} {
+		want := Manifest("qory-acme", "https://qory-github.example.com/setup/created")
+		serveManifest(want, "https://qory-github.example.com", public)
+		got := ServeManifest("qory-acme", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", public, true)
+		if a, b := mustJSON(got), mustJSON(want); a != b || got["public"] != public {
+			t.Errorf("active, public %v: %s\nwant %s", public, a, b)
+		}
 	}
-	m := ServeManifest("qory-acme", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", false)
+	want := Manifest("qory-acme", "https://qory-github.example.com/setup/created")
+	serveManifest(want, "https://qory-github.example.com", true)
+	m := ServeManifest("qory-acme", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", true, false)
 	hook, _ := json.Marshal(m["hook_attributes"])
 	if string(hook) != `{"active":false,"url":"https://github.com/qoryai/qory-github"}` {
 		t.Errorf("inactive: the webhook is %s", hook)

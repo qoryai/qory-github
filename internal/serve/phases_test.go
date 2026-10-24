@@ -329,7 +329,7 @@ func setUpThrough(t *testing.T, apiary *fakeApiary, addr string) (string, *http.
 	if token == nil {
 		t.Fatalf("the form %s", body)
 	}
-	_, body = fetch(t, j, http.MethodPost, addr, "/setup/continue", strings.NewReader(url.Values{"token": {token[1]}, "account": {"acme"}}.Encode()), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
+	_, body = fetch(t, j, http.MethodPost, addr, "/setup/continue", strings.NewReader(url.Values{"token": {token[1]}, "account": {"acme"}, "install": {installPrivate}}.Encode()), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
 	action := formAction.FindStringSubmatch(body)
 	if action == nil {
 		t.Fatalf("the manifest page %s", body)
