@@ -536,8 +536,9 @@ func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values)
 // qory-github setup takes one, and no larger than serve reads back from the state
 // directory, the line break keepApp writes at its end counted; its slug, client id and
 // client secret must be ones serve takes and reads back from the state directory; a
-// webhook secret in the answer must be one serve's receiver takes; and neither its key nor a secret may hold what looks like an access key secret or a
-// run key. An error never holds a secret. When GitHub made the App no webhook secret,
+// webhook secret in the answer must be one serve's receiver takes; and neither its key
+// nor a secret may hold what looks like an access key secret or a run key. An error
+// never holds a secret. When GitHub made the App no webhook secret,
 // keep makes one and sets it on the App's webhook; when GitHub does not confirm it,
 // the App is kept all the same, its webhook secret not confirmed, which serve sets
 // again at its next start, see [Run]. The account that owns the App is GitHub's

@@ -151,8 +151,8 @@ func Dir(path, what string) error {
 }
 
 // given is err with the path of the [fs.PathError] it is, if it is one, set back to path
-// as the instance admin gave it, since the call it failed was handed path without its
-// trailing slashes.
+// as the person who runs the program gave it, since the call it failed was handed path
+// without its trailing slashes.
 func given(err error, path string) error {
 	var pe *fs.PathError
 	if errors.As(err, &pe) {
