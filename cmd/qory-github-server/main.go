@@ -87,7 +87,7 @@ public_url followed by /v1/connect: Qory Apiary sends a person there who connect
 App's installation. /health answers 200 from the first moment.
 
 With call_url set, serve also takes Qory Apiary's calls at /v1/calls/: a credential
-for a run, the repository an address names, and a file at a version. serve checks
+for a run, the repository at an address, and a file at a version. serve checks
 each call's signature against the Qory Apiary keys it pinned at enrolment. Set
 call_url to the address Qory Apiary sends the calls to: public_url followed by
 /v1/calls/, such as https://github.example.com/v1/calls/. Without call_url, serve

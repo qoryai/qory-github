@@ -34,23 +34,23 @@ import (
 const callsPath = "/v1/calls/"
 
 // callWindow is how far a call's time may be from serve's clock, either way: a call
-// whose time is further is answered with the unsigned 401.
+// whose time is further gets the unsigned 401.
 const callWindow = 300 * time.Second
 
 // maxCallsAtOnce is how many calls serve holds at once, each with a body of
-// [contracts.MaxRequest] bytes at most. A call beyond it is answered with an unsigned
-// 503 before its body is read, so a sender with no key holds 64 MiB at most.
+// [contracts.MaxRequest] bytes at most. A call beyond it gets an unsigned 503 before
+// its body is read, so a sender with no key takes up 64 MiB at most.
 const maxCallsAtOnce = 64
 
 // nsCallSignatures is the store's namespace of the signatures of the calls serve
 // accepted, by the signature's 64 bytes in hexadecimal, each kept until the call's time
 // is more than [callWindow] behind serve's clock: a call whose signature is there is a
-// replay, answered with the unsigned 401, before and after a restart.
+// replay, which gets the unsigned 401, before and after a restart.
 const nsCallSignatures = "call_signatures"
 
 // The refusal codes of a call, refusal.schema.json's. codeMethodNotAllowed,
 // codePayloadTooLarge, codeBusy and codeNotFound are serve's, for what the contract
-// names no code for: a method other than POST, a body over [contracts.MaxRequest], a
+// has no code for: a method other than POST, a body over [contracts.MaxRequest], a
 // call beyond [maxCallsAtOnce], and a path no call has.
 const (
 	codeUnauthorized               = "unauthorized"
@@ -103,7 +103,7 @@ func (g storeGrants) reaches(installation, repository int64) (bool, error) {
 	return err == nil && ok && id == installation, err
 }
 
-// Calls answers Qory Apiary's calls at [callsPath]: run-credential, resolve and read,
+// Calls serves Qory Apiary's calls at [callsPath]: run-credential, resolve and read,
 // each a POST signed with a key of the pin, see [Calls.ServeHTTP]. Each answer is signed
 // with the adapter's access key. A grant_ref is an installation's id in decimal, and a
 // resource_ref a repository's id in decimal, as a collection's ref is.
@@ -118,14 +118,14 @@ type Calls struct {
 	// AppID and Key are the App's id and private key, which mint installation tokens.
 	AppID string
 	Key   *rsa.PrivateKey
-	// InstanceID is serve's instance id, which a call names in X-Qory-Instance-Id.
+	// InstanceID is serve's instance id, which a call has in X-Qory-Instance-Id.
 	InstanceID string
 	// Log takes one line for each call; nil logs nothing. No line has a token, a key or
 	// a body.
 	Log *slog.Logger
 
 	// creds are the enrolment: the pin a call is checked under, the adapter's id it
-	// names, and the access key an answer is signed with.
+	// contains, and the access key an answer is signed with.
 	creds *credentials
 	// listingToken is the installation's token that reads which repositories it reaches,
 	// such as [Adapter.token] keeps, with which a resolve reads a repository's id.
@@ -182,7 +182,7 @@ func (c *Calls) Route(next http.Handler) http.Handler {
 	})
 }
 
-// ServeHTTP answers one call. It answers, unsigned:
+// ServeHTTP serves one call. It returns, unsigned:
 //
 //   - 405 method_not_allowed to a method other than POST;
 //   - 503 busy when [maxCallsAtOnce] calls are held;
@@ -313,7 +313,7 @@ func callTime(body []byte) (time.Time, bool) {
 	return passExpiry(doc.Time)
 }
 
-// callName is a call's path for a line: the path of a call serve answers, or "other",
+// callName is a call's path for a line: the path of a call serve serves, or "other",
 // so a sender with no key writes nothing of its choice in the log.
 func callName(path string) string {
 	switch path {
@@ -323,7 +323,7 @@ func callName(path string) string {
 	return "other"
 }
 
-// unsigned answers status with the refusal code, unsigned, and logs it, once each
+// unsigned writes status with the refusal code, unsigned, and logs it, once each
 // [refusalEvery] at most.
 func (c *Calls) unsigned(w http.ResponseWriter, path string, status int, code string) {
 	if ok, dropped := c.refusals.allow(); ok {
@@ -337,7 +337,7 @@ func (c *Calls) unsigned(w http.ResponseWriter, path string, status int, code st
 	writeCall(w, status, b)
 }
 
-// signed answers status with answer as JSON, signed with e's access key over
+// signed writes status with answer as JSON, signed with e's access key over
 // [contracts.CallAnswer], bound to the call's signature sig, and logs the call's path,
 // the status and, for a refusal, its code.
 func (c *Calls) signed(w http.ResponseWriter, e enrolment, sig, path string, status int, answer any) {
@@ -450,14 +450,14 @@ func jsonRules(body []byte) error {
 	}
 }
 
-// installationOf is the installation a grant_ref names: a positive id in decimal, as
+// installationOf is the installation of a grant_ref: a positive id in decimal, as
 // strconv writes it.
 func installationOf(ref string) (int64, bool) {
 	id, err := strconv.ParseInt(ref, 10, 64)
 	return id, err == nil && id > 0 && strconv.FormatInt(id, 10) == ref
 }
 
-// repositoryOf is the repository a resource_ref names: a positive id in decimal, as
+// repositoryOf is the repository of a resource_ref: a positive id in decimal, as
 // strconv writes it.
 func repositoryOf(ref string) (int64, bool) { return installationOf(ref) }
 
@@ -475,21 +475,31 @@ func runPermissions(purpose, access string) map[string]string {
 	return map[string]string{"contents": "read", "metadata": "read", "pull_requests": "read"}
 }
 
-// runCredential answers the call run-credential, run-credential.schema.json, made at at:
-// a token GitHub mints for the installation grant_ref names, limited to the repositories
-// the resources name and to [runPermissions]. It refuses, in this order: 409
+// runCredential serves the call run-credential, run-credential.schema.json, made at at:
+// a token GitHub mints for the installation of grant_ref, limited to the repositories
+// of the resources and to [runPermissions]. It returns, in this order: 409
 // grant_unknown for a grant_ref that is not an installation linked to Qory Apiary, or
-// one GitHub answers it has no more; 403 resource_not_covered for a resource that is
-// not a repository the installation reaches, with a line that names the resource; 403
-// access_not_granted when GitHub refuses the permissions for those repositories, as for
-// an installation that does not grant them, or the installation is suspended; and 503
-// source_unavailable when GitHub fails otherwise. The answer's apply has, for work,
-// github.com with basic and the username x-access-token on the repositories' git paths
-// and api.github.com with bearer on their API paths, as [github.Uses] says; for a
-// harness, the github.com item alone.
+// one GitHub has no more; 403 resource_not_covered for a resource that is not a
+// repository the installation reaches, with a line that contains the resource; 403
+// access_not_granted when GitHub returns 422 for the permissions on those
+// repositories, as for an installation that does not grant them, or the installation
+// is suspended; and 503 source_unavailable when GitHub fails otherwise. The answer's
+// apply has, for work, github.com with basic and the username x-access-token on the
+// repositories' git paths and api.github.com with bearer on their API paths, as
+// [github.Uses] returns them; for a harness, the github.com item alone.
 func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (int, any) {
 	var req contracts.RunCredential
 	if !decodeCall("run-credential.schema.json", body, &req) {
+		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
+	}
+	return c.runCredentialFor(ctx, req, at)
+}
+
+// runCredentialFor is [Calls.runCredential] for the decoded call req. At GitHub, a
+// mint that lists no repository covers every repository of the installation, so a call
+// with no resources gets 400 invalid_request here, beside the schema's minItems.
+func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredential, at time.Time) (int, any) {
+	if len(req.Resources) == 0 {
 		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
 	}
 	installation, ok := installationOf(req.GrantRef)
@@ -506,11 +516,14 @@ func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (i
 	}
 	t, err := c.GitHub.MintInstallationToken(ctx, github.Request{AppID: c.AppID, Key: c.Key, InstallationID: installation, RepositoryIDs: ids, Permissions: runPermissions(req.Purpose, req.Access)})
 	switch {
-	case errors.Is(err, github.ErrRepositoryRefused), errors.Is(err, github.ErrSuspended):
-		c.log().Info("GitHub refused the run credential's token", slog.Int64("installation", installation), slog.String("error", err.Error()))
+	case errors.Is(err, github.ErrRepositoryRefused):
+		c.log().Info("minting the run credential's token failed: GitHub returned 422", slog.Int64("installation", installation), slog.String("error", err.Error()))
+		return http.StatusForbidden, contracts.Refusal{Error: codeAccessNotGranted}
+	case errors.Is(err, github.ErrSuspended):
+		c.log().Info("minting the run credential's token failed: the installation is suspended", slog.Int64("installation", installation))
 		return http.StatusForbidden, contracts.Refusal{Error: codeAccessNotGranted}
 	case errors.Is(err, github.ErrMintRefused):
-		c.log().Info("GitHub refused the run credential's token for the installation", slog.Int64("installation", installation), slog.String("error", err.Error()))
+		c.log().Info("minting the run credential's token failed for good, so the grant counts as unknown", slog.Int64("installation", installation), slog.String("error", err.Error()))
 		return http.StatusConflict, contracts.Refusal{Error: codeGrantUnknown}
 	case err != nil:
 		c.log().Warn("minting the run credential's token", slog.Int64("installation", installation), slog.String("error", err.Error()))
@@ -561,7 +574,7 @@ func (c *Calls) held(ok bool, installation int64) (int, any) {
 }
 
 // covered is 0 when ref is a repository the installation reaches; else 403
-// resource_not_covered, with a line that names ref, or 503 source_unavailable when the
+// resource_not_covered, with a line that contains ref, or 503 source_unavailable when the
 // store fails.
 func (c *Calls) covered(installation int64, ref string) (int, any) {
 	id, ok := repositoryOf(ref)
@@ -574,13 +587,13 @@ func (c *Calls) covered(installation int64, ref string) (int, any) {
 		}
 	}
 	if !reaches {
-		c.log().Info("the call names a resource that is not a repository the installation reaches", slog.Int64("installation", installation), slog.String("resource", ref))
+		c.log().Info("a resource of the call is not a repository the installation reaches", slog.Int64("installation", installation), slog.String("resource", ref))
 		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	}
 	return 0, nil
 }
 
-// resolve answers the call resolve, resolve.schema.json: for each address, the
+// resolve serves the call resolve, resolve.schema.json: for each address, the
 // installation and the repository that cover it, see [Calls.resolveOne], in the call's
 // order.
 func (c *Calls) resolve(ctx context.Context, body []byte) (int, any) {
@@ -595,7 +608,7 @@ func (c *Calls) resolve(ctx context.Context, body []byte) (int, any) {
 	return http.StatusOK, answer
 }
 
-// githubAddress is the repository an address names, https://github.com/<owner>/<name>
+// githubAddress is the repository at an address, https://github.com/<owner>/<name>
 // with or without .git after the name, or false for any other form, the form
 // git@github.com:<owner>/<name> among them.
 func githubAddress(address string) (github.Repository, bool) {
@@ -611,10 +624,10 @@ func githubAddress(address string) (github.Repository, bool) {
 }
 
 // resolveOne is the result for one address: the installation of the App on the
-// repository's owner, as GitHub answers it, whose account's login is the owner's
+// repository's owner, as GitHub returns it, whose account's login is the owner's
 // without regard to case, that is linked to Qory Apiary, and that reaches the
 // repository, read by its name with the installation's listing token. Any other
-// address, one GitHub fails to answer for among them, is covered: false.
+// address, one GitHub returns no installation for among them, is covered: false.
 func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
 	covered := false
 	notCovered := contracts.Resolved{Address: address, Covered: &covered}
@@ -654,12 +667,12 @@ func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolv
 	return contracts.Resolved{Address: address, GrantRef: strconv.FormatInt(installation, 10), ResourceRef: github.CollectionRef(id)}
 }
 
-// read answers the call read, read.schema.json: the file at path in the repository
-// resource_ref names, at the commit at names, read with a token that reads that
-// repository's contents alone, see [Calls.readToken]. It refuses, in this order: 409
+// read serves the call read, read.schema.json: the file at path in the repository of
+// resource_ref, at the commit of at, read with a token that reads that repository's
+// contents alone, see [Calls.readToken]. It returns, in this order: 409
 // grant_unknown and 403 resource_not_covered as [Calls.runCredential] does; 404
 // version_not_found when GitHub has no commit, branch or tag by at; 409
-// document_not_text for a path that holds no UTF-8 text file of at most
+// document_not_text for a path that is not a UTF-8 text file of at most
 // [contracts.ReadContentMaxBytes] bytes without a NUL; and 503 source_unavailable when
 // GitHub fails otherwise. A path the commit has no file at is found: false.
 func (c *Calls) read(ctx context.Context, body []byte) (int, any) {

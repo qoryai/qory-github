@@ -329,7 +329,7 @@ func TestTheFeedReadsTheCopyAtStart(t *testing.T) {
 func TestACallServesOnlyAnInstallationTheCopyHolds(t *testing.T) {
 	rig := newCallsRig(t)
 	send := func() callAnswer {
-		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, callBody(runCredential("42", []string{widgetsRef}, "read", "work")))
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef}, "read", "work")))
 	}
 	if err := replaceGrants(rig.st, nil); err != nil {
 		t.Fatal(err)

@@ -163,12 +163,16 @@ type callsRig struct {
 	access *accesskey.Key
 	log    *syncBuffer
 	srv    *httptest.Server
+	// base is the time the rig's call bodies count back from, and bodies counts
+	// them, see [callsRig.callBody].
+	base   time.Time
+	bodies atomic.Int64
 }
 
 func newCallsRig(t *testing.T) *callsRig {
 	t.Helper()
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rig := &callsRig{st: st, gh: newCallsGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}}
+	rig := &callsRig{st: st, gh: newCallsGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}, base: time.Now()}
 	if err := grantedLink(st, 42, testConnection, linkLive); err != nil {
 		t.Fatal(err)
 	}
@@ -270,14 +274,14 @@ func cmpOr(a, b string) string {
 	return b
 }
 
-// callBodies counts the bodies callBody builds.
-var callBodies atomic.Int64
-
-// callBody is a call's body: the members given, and a time within the last 200 seconds,
-// a second earlier for each body built before it, so two bodies built within a second
-// differ, and so do their signatures: the same body sent twice is a replay.
-func callBody(members string) string {
-	return callBodyAt(time.Now().Add(-time.Duration(callBodies.Add(1)%200)*time.Second), members)
+// callBody is a call's body: the members given, and a time a second earlier than the
+// body built before it in the rig, counted from the rig's time base. No two bodies of
+// one rig share a time, so no two share a signature by accident: the same body sent
+// twice is a replay. A rig builds fewer than 250 bodies, so each time is within the
+// 300 seconds a call may be off the clock.
+func (rig *callsRig) callBody(members string) string {
+	n := rig.bodies.Add(1)
+	return callBodyAt(rig.base.Add(-time.Duration(n)*time.Second), members)
 }
 
 func callBodyAt(at time.Time, members string) string {
@@ -331,16 +335,16 @@ const widgetsAddress = `"addresses":["https://github.com/acme/widgets"]`
 func TestACallIsCheckedBeforeItIsAnswered(t *testing.T) {
 	rig := newCallsRig(t)
 	resolve := signedCall{path: contracts.ResolvePath}
-	checkAnswer(t, rig.send(t, resolve, callBody(widgetsAddress)), 200, "resolve-answer.schema.json", "")
+	checkAnswer(t, rig.send(t, resolve, rig.callBody(widgetsAddress)), 200, "resolve-answer.schema.json", "")
 
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
-		got := rig.send(t, signedCall{path: contracts.ResolvePath, method: method}, callBody(widgetsAddress))
+		got := rig.send(t, signedCall{path: contracts.ResolvePath, method: method}, rig.callBody(widgetsAddress))
 		checkUnsigned(t, method, got, http.StatusMethodNotAllowed, codeMethodNotAllowed)
 		if got.header.Get("Allow") != http.MethodPost {
 			t.Errorf("%s: Allow is %q", method, got.header.Get("Allow"))
 		}
 	}
-	large := callBody(`"addresses":["https://github.com/acme/` + strings.Repeat("a", contracts.MaxRequest) + `"]`)
+	large := rig.callBody(`"addresses":["https://github.com/acme/` + strings.Repeat("a", contracts.MaxRequest) + `"]`)
 	checkUnsigned(t, "a body over 1 MiB", rig.send(t, resolve, large), http.StatusRequestEntityTooLarge, codePayloadTooLarge)
 	// A body sent in chunks, with no Content-Length, is cut at the limit as it arrives.
 	m, _ := contracts.Call{AdapterID: testAdapterID, InstanceID: testInstance, Method: "POST", Path: contracts.ResolvePath, Body: []byte(large)}.Message()
@@ -365,7 +369,7 @@ func TestACallIsCheckedBeforeItIsAnswered(t *testing.T) {
 		"with another adapter id than it was signed": {path: contracts.ResolvePath, edit: func(h http.Header) { h.Set(contracts.HeaderAdapterID, "na_fedcba9876543210") }},
 		"without the instance id":                    {path: contracts.ResolvePath, edit: func(h http.Header) { h.Del(accesskey.HeaderInstanceID) }},
 	} {
-		checkUnsigned(t, name, rig.send(t, c, callBody(widgetsAddress)), http.StatusUnauthorized, codeUnauthorized)
+		checkUnsigned(t, name, rig.send(t, c, rig.callBody(widgetsAddress)), http.StatusUnauthorized, codeUnauthorized)
 	}
 	for _, off := range []time.Duration{-301 * time.Second, 301 * time.Second, -time.Hour} {
 		checkUnsigned(t, "a time "+off.String()+" from the clock", rig.send(t, resolve, callBodyAt(time.Now().Add(off), widgetsAddress)), http.StatusUnauthorized, codeUnauthorized)
@@ -373,7 +377,7 @@ func TestACallIsCheckedBeforeItIsAnswered(t *testing.T) {
 	checkAnswer(t, rig.send(t, resolve, callBodyAt(time.Now().Add(-250*time.Second), widgetsAddress)), 200, "resolve-answer.schema.json", "")
 
 	// The same call again is a replay, whose signature serve kept.
-	body := callBody(`"addresses":["https://github.com/acme/gadgets"]`)
+	body := rig.callBody(`"addresses":["https://github.com/acme/gadgets"]`)
 	checkAnswer(t, rig.send(t, resolve, body), 200, "resolve-answer.schema.json", "")
 	checkUnsigned(t, "a replay", rig.send(t, resolve, body), http.StatusUnauthorized, codeUnauthorized)
 
@@ -384,26 +388,26 @@ func TestACallIsCheckedBeforeItIsAnswered(t *testing.T) {
 		"X-Qory-Contract-Version 1.0":  func(h http.Header) { h.Set(headerContractVersion, "1.0") },
 		"X-Qory-Contract-Version sent": func(h http.Header) { h.Add(headerContractVersion, "1") },
 	} {
-		got := rig.send(t, signedCall{path: contracts.ResolvePath, edit: edit}, callBody(widgetsAddress))
+		got := rig.send(t, signedCall{path: contracts.ResolvePath, edit: edit}, rig.callBody(widgetsAddress))
 		t.Run(name, func(t *testing.T) {
 			checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeUnsupportedContractVersion)
 		})
 	}
 	for name, body := range map[string]string{
-		"a member the schema does not define": callBody(widgetsAddress + `,"extra":1`),
-		"a member twice":                      callBody(widgetsAddress + `,` + widgetsAddress),
-		"the version twice":                   callBody(widgetsAddress + `,"version":1`),
-		"a version with a fraction":           strings.Replace(callBody(widgetsAddress), `"version":1`, `"version":1.0`, 1),
+		"a member the schema does not define": rig.callBody(widgetsAddress + `,"extra":1`),
+		"a member twice":                      rig.callBody(widgetsAddress + `,` + widgetsAddress),
+		"the version twice":                   rig.callBody(widgetsAddress + `,"version":1`),
+		"a version with a fraction":           strings.Replace(rig.callBody(widgetsAddress), `"version":1`, `"version":1.0`, 1),
 		"no time":                             `{"version":1,` + widgetsAddress + `}`,
 		"a time with a fraction of a second":  `{"version":1,"time":"` + time.Now().UTC().Format("2006-01-02T15:04:05.000Z") + `",` + widgetsAddress + `}`,
-		"no addresses":                        callBody(`"addresses":[]`),
-		"a value after the body":              callBody(widgetsAddress) + `{}`,
+		"no addresses":                        rig.callBody(`"addresses":[]`),
+		"a value after the body":              rig.callBody(widgetsAddress) + `{}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			checkAnswer(t, rig.send(t, resolve, body), http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
 		})
 	}
-	checkAnswer(t, rig.send(t, signedCall{path: "credentials"}, callBody(widgetsAddress)), http.StatusNotFound, "refusal.schema.json", codeNotFound)
+	checkAnswer(t, rig.send(t, signedCall{path: "credentials"}, rig.callBody(widgetsAddress)), http.StatusNotFound, "refusal.schema.json", codeNotFound)
 	if !strings.Contains(rig.log.String(), `"msg":"call answered without a signature","call":"resolve","status":401`) {
 		t.Errorf("no line for a 401: %s", rig.log.String())
 	}
@@ -417,9 +421,9 @@ func TestCallsBeyondTheBoundAreAnswered503(t *testing.T) {
 	for range maxCallsAtOnce {
 		rig.calls.slots <- struct{}{}
 	}
-	checkUnsigned(t, "a call beyond the bound", rig.send(t, signedCall{path: contracts.ResolvePath}, callBody(widgetsAddress)), http.StatusServiceUnavailable, codeBusy)
+	checkUnsigned(t, "a call beyond the bound", rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(widgetsAddress)), http.StatusServiceUnavailable, codeBusy)
 	<-rig.calls.slots
-	checkAnswer(t, rig.send(t, signedCall{path: contracts.ResolvePath}, callBody(widgetsAddress)), 200, "resolve-answer.schema.json", "")
+	checkAnswer(t, rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(widgetsAddress)), 200, "resolve-answer.schema.json", "")
 }
 
 // runCredential is a run-credential call's members.
@@ -440,7 +444,7 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 	} {
 		t.Run(access, func(t *testing.T) {
 			rig := newCallsRig(t)
-			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, callBody(runCredential("42", []string{widgetsRef, gadgetsRef}, access, "work")))
+			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef, gadgetsRef}, access, "work")))
 			checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
 			mints := rig.gh.mintsSoFar()
 			if want := `{"permissions":` + perms + `,"repository_ids":[` + widgetsRef + `,` + gadgetsRef + `]}`; len(mints) != 1 || mints[0] != want {
@@ -467,7 +471,7 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 func TestARunCredentialForAHarnessReadsContentsOnGitHubAlone(t *testing.T) {
 	for _, access := range []string{"read", "write"} {
 		rig := newCallsRig(t)
-		got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, callBody(runCredential("42", []string{widgetsRef}, access, "harness")))
+		got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef}, access, "harness")))
 		checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
 		if mints := rig.gh.mintsSoFar(); len(mints) != 1 || mints[0] != `{"permissions":{"contents":"read"},"repository_ids":[`+widgetsRef+`]}` {
 			t.Errorf("%s: minted %q", access, mints)
@@ -483,6 +487,25 @@ func TestARunCredentialForAHarnessReadsContentsOnGitHubAlone(t *testing.T) {
 	}
 }
 
+// TestARunCredentialWithNoResourcesMintsNothing pins that a run-credential call with an
+// empty resources list gets 400 invalid_request and mints nothing: through the route,
+// where the schema refuses it, and past the schema, where the code refuses it, since a
+// mint that lists no repository covers every repository of the installation.
+func TestARunCredentialWithNoResourcesMintsNothing(t *testing.T) {
+	rig := newCallsRig(t)
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{}, "read", "work")))
+	checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
+	for _, resources := range [][]string{nil, {}} {
+		status, answer := rig.calls.runCredentialFor(context.Background(), contracts.RunCredential{Version: 1, GrantRef: "42", Resources: resources, Access: "read", Purpose: "work"}, time.Now())
+		if refusal, _ := answer.(contracts.Refusal); status != http.StatusBadRequest || refusal.Error != codeInvalidRequest {
+			t.Errorf("resources %#v: answered %d %v", resources, status, answer)
+		}
+	}
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Errorf("minted %q for a call with no resources", mints)
+	}
+}
+
 // TestARunCredentialIsRefusedInTheContractsOrder pins the refusals of a run credential:
 // 409 grant_unknown for a grant_ref that is not a linked installation, or that GitHub
 // answers it has no more; 403 resource_not_covered for a repository the installation
@@ -492,7 +515,7 @@ func TestARunCredentialForAHarnessReadsContentsOnGitHubAlone(t *testing.T) {
 func TestARunCredentialIsRefusedInTheContractsOrder(t *testing.T) {
 	rig := newCallsRig(t)
 	send := func(grant string, resources ...string) callAnswer {
-		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, callBody(runCredential(grant, resources, "write", "work")))
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential(grant, resources, "write", "work")))
 	}
 	for _, grant := range []string{"7", "042", "+42", "0", "-42", "acme", "9223372036854775808"} {
 		checkAnswer(t, send(grant, widgetsRef), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
@@ -549,7 +572,7 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 		"https://github.com/acme/widgets?x=1",
 	}
 	b, _ := json.Marshal(addresses)
-	got := rig.send(t, signedCall{path: contracts.ResolvePath}, callBody(`"addresses":`+string(b)))
+	got := rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(`"addresses":`+string(b)))
 	checkAnswer(t, got, 200, "resolve-answer.schema.json", "")
 	var ans contracts.ResolveAnswer
 	json.Unmarshal(got.body, &ans)
@@ -573,14 +596,14 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 	if err := dropReach(rig.st, gadgetsRef, 42); err != nil {
 		t.Fatal(err)
 	}
-	got = rig.send(t, signedCall{path: contracts.ResolvePath}, callBody(`"addresses":["https://github.com/acme/gadgets"]`))
+	got = rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(`"addresses":["https://github.com/acme/gadgets"]`))
 	if !strings.Contains(string(got.body), `"covered":false`) {
 		t.Errorf("a repository the installation does not reach: %s", shown(got.body))
 	}
 	if err := Unlink(rig.st, 42); err != nil {
 		t.Fatal(err)
 	}
-	got = rig.send(t, signedCall{path: contracts.ResolvePath}, callBody(widgetsAddress))
+	got = rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(widgetsAddress))
 	if !strings.Contains(string(got.body), `"covered":false`) {
 		t.Errorf("an installation not linked: %s", shown(got.body))
 	}
@@ -600,7 +623,7 @@ func read(grant, resource, path, at string) string {
 func TestReadReadsAFileAtAVersion(t *testing.T) {
 	rig := newCallsRig(t)
 	send := func(members string) callAnswer {
-		return rig.send(t, signedCall{path: contracts.ReadPath}, callBody(members))
+		return rig.send(t, signedCall{path: contracts.ReadPath}, rig.callBody(members))
 	}
 	for _, at := range []string{"main", "v1.0", widgetsCommit} {
 		got := send(read("42", widgetsRef, "README.md", at))
@@ -728,7 +751,7 @@ func TestRunServesCallsOnlyWithCallURL(t *testing.T) {
 		}()
 		at := <-addr
 		eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
-		resp, err := http.Post("http://"+at.String()+callsPath+contracts.ResolvePath, "application/json", strings.NewReader(callBody(widgetsAddress)))
+		resp, err := http.Post("http://"+at.String()+callsPath+contracts.ResolvePath, "application/json", strings.NewReader(callBodyAt(time.Now(), widgetsAddress)))
 		if err != nil {
 			t.Fatal(err)
 		}

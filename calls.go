@@ -17,19 +17,19 @@ import (
 	"unicode/utf8"
 )
 
-// ErrNotInstalled is the error of [Client.RepositoryInstallation] when GitHub answers 404
-// or a redirect: the App has no installation that reaches the repository by that
+// ErrNotInstalled is the error of [Client.RepositoryInstallation] when GitHub returns
+// 404 or a redirect: the App has no installation that reaches the repository by that
 // owner/name, or the name moved.
-var ErrNotInstalled = errors.New("GitHub answers that the App has no installation on the repository")
+var ErrNotInstalled = errors.New("GitHub has no installation of the App on the repository")
 
-// ErrVersionNotFound is the error of [Client.CommitAt] when GitHub answers that the
-// repository has no commit, branch or tag by the name asked for: 404, 409 for an empty
-// repository, or 422.
-var ErrVersionNotFound = errors.New("GitHub answers that the repository has no such commit, branch or tag")
+// ErrVersionNotFound is the error of [Client.CommitAt] when GitHub returns 404, 409 for
+// an empty repository, or 422: the repository has no commit, branch or tag by the name
+// asked for.
+var ErrVersionNotFound = errors.New("the repository has no such commit, branch or tag on GitHub")
 
-// ErrNotText is the error of [Client.ReadDocument] for a path that holds a directory, a
+// ErrNotText is the error of [Client.ReadDocument] for a path that is a directory, a
 // submodule or a symbolic link, or a file larger than the limit, not UTF-8, or with a NUL.
-var ErrNotText = errors.New("the path holds no UTF-8 text file within the limit")
+var ErrNotText = errors.New("the path is not a UTF-8 text file within the limit")
 
 // shaShape is a commit's id as GitHub writes it: 40 lower-case hexadecimal digits, or 64
 // in a repository that uses SHA-256.
@@ -39,9 +39,9 @@ var shaShape = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 // puts a file's content in the answer, in base64, only for a file of 1 MB at most.
 const maxDocumentAnswer = 2 << 20
 
-// RepositoryInstallation asks GitHub, with the App's token, which installation of the App
-// reaches the repository by owner/name, GET /repos/{owner}/{repo}/installation, and
-// returns its id and its account's login. A 404 or a redirect is [ErrNotInstalled]. The
+// RepositoryInstallation reads from GitHub, with the App's token, the installation of
+// the App that reaches the repository by owner/name, GET
+// /repos/{owner}/{repo}/installation, and returns its id and its account's login. A 404 or a redirect is [ErrNotInstalled]. The
 // redirect is never followed.
 func (c Client) RepositoryInstallation(ctx context.Context, appID string, key *rsa.PrivateKey, repo Repository) (int64, string, error) {
 	const what = "finding the App's installation on a repository"
@@ -98,9 +98,9 @@ func (c Client) RepositoryID(ctx context.Context, token string, repo Repository)
 	return r.ID, name, nil
 }
 
-// CommitAt reads the commit that at names in the repository whose id is repository, with
-// an installation token: at is a commit's id, a branch or a tag. It asks for the newest
-// commit of the history at that name, GET /repositories/{id}/commits?sha={at}&per_page=1,
+// CommitAt reads the commit that at is or points to in the repository whose id is
+// repository, with an installation token: at is a commit's id, a branch or a tag. It
+// reads the newest commit of the history at that name, GET /repositories/{id}/commits?sha={at}&per_page=1,
 // and returns its id. A 404, a 409 or a 422, or an empty list, is [ErrVersionNotFound].
 func (c Client) CommitAt(ctx context.Context, token string, repository int64, at string) (string, error) {
 	const what = "reading the commit of a version"
@@ -128,7 +128,7 @@ func (c Client) CommitAt(ctx context.Context, token string, repository int64, at
 
 // ReadDocument reads the file at path in the repository whose id is repository, at the
 // commit commit, with an installation token: GET /repositories/{id}/contents/{path}. It
-// returns the file's text, or false when GitHub answers 404, as for a path the commit has
+// returns the file's text, or false when GitHub returns 404, as for a path the commit has
 // no file at. A directory, a submodule, a symbolic link GitHub does not resolve to a file,
 // a file larger than max bytes, and content that is not UTF-8 or has a NUL are
 // [ErrNotText]. path is parts joined by /, none empty, . or ..; each part is escaped.

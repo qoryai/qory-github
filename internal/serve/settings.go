@@ -53,8 +53,8 @@ type Settings struct {
 	// 2037 characters at most. Qory Apiary sends a person to connect GitHub to
 	// PublicURL/v1/connect, and an instance admin to set the App up to
 	// PublicURL/setup. The bound keeps both addresses within the contract's 2048
-	// characters. serve answers /v1/connect, /setup, /v1/events and /health at the
-	// root of its listener, so the proxy in front passes each path on unchanged.
+	// characters. serve serves /v1/connect, /setup, /v1/events and /health at the
+	// root of PublicURL's host, so the proxy in front must pass each path on unchanged.
 	PublicURL string
 	// AccessKeyID is the adapter's access key's id in Qory Apiary, ak_ and 16
 	// characters.

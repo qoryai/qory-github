@@ -46,7 +46,7 @@ change what the program does, and notes it under Upgrading.
   Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
   to `public_url` followed by `/v1/calls/`, such as
   `https://github.example.com/v1/calls/`. The calls are a credential for a run, the
-  repository that an address `https://github.com/<owner>/<name>` names, and a file of a
+  repository at an address `https://github.com/<owner>/<name>`, and a file of a
   repository at a branch, a tag or a commit. serve checks each call's signature against
   the Qory Apiary keys it pinned at enrolment, and signs each answer with its access
   key. A run's credential covers only the repositories the call lists. For work, it
