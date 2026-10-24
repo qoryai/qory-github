@@ -24,6 +24,16 @@ change what the program does, and notes it under Upgrading.
 - The setup page of `qory-github-server serve` has a choice of who can install the
   GitHub App: only the account it is for (private), selected first, or any GitHub
   account (public). GitHub lets only the account that owns a private App install it.
+- With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
+  Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. The calls are a
+  credential for a run, the repository that an address `https://github.com/<owner>/<name>`
+  names, and a file of a repository at a branch, a tag or a commit. serve checks each
+  call's signature against the Qory Apiary keys it pinned at enrolment, and signs each
+  answer with its access key. A run's credential covers only the repositories the call
+  lists. For work, it reads contents and pull requests with access `read`, and writes
+  both with access `write`. For a harness, it reads contents, and only on `github.com`.
+- The source role of the description has `credential_scope` `resource`: one credential
+  covers only the repositories a call lists.
 
 ### Changed
 

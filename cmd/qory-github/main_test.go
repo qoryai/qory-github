@@ -483,8 +483,11 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+2 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+2, source)
+	if len(source) != len(members)+3 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+3, source)
+	}
+	if source["credential_scope"] != "resource" {
+		t.Errorf("the source role's credential_scope is %v, want resource: one credential covers the repositories the run-credential call lists", source["credential_scope"])
 	}
 	if noun, _ := source["item_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "issue" || noun["other"] != "issues" {
 		t.Errorf("the source role's item_noun is %v, want issue and issues", source["item_noun"])

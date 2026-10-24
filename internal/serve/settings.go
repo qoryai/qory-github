@@ -15,10 +15,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
 )
 
@@ -104,6 +106,12 @@ type Settings struct {
 	// false makes that App's webhook inactive, and serve declares to Qory Apiary that it
 	// learns of changes on GitHub by pulling, see [Settings.publicAddress].
 	PublicAddress *bool
+	// CallURL is where Qory Apiary sends its calls to serve, https, with no query and no
+	// fragment, its path ending with /, such as
+	// https://qory.example.com/adapters/github/v1/calls/. The proxy in front of serve
+	// sends each call to serve's listener at /v1/calls/ followed by the call's path. It
+	// may be left out: serve then declares no call_url, and answers no call.
+	CallURL string
 
 	// env is whether the settings come from the environment, so an error names a
 	// setting by its variable.
@@ -140,11 +148,12 @@ func (v SecretValue) LogValue() slog.Value { return slog.StringValue(v.String())
 
 // fields are the settings' fields, in the order an error lists the missing ones. A
 // field that is added later is added here and in [settingsOf]'s switch.
-var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "client_id", "client_secret_file", "enrolment_code_file", "public_address"}
+var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "client_id", "client_secret_file", "enrolment_code_file", "public_address", "call_url"}
 
 // required are the fields the settings always give. api_url may be left out for
-// GitHub's API, apiary_public_url for apiary_url, enrolment_code_file, which has no
-// default, and public_address for true; the others are in a group, see [groups].
+// GitHub's API, apiary_public_url for apiary_url, enrolment_code_file and call_url,
+// which have no default, and public_address for true; the others are in a group, see
+// [groups].
 var required = []string{"listen", "state_dir", "apiary_url", "public_url"}
 
 // secretFields are the fields that name a file that holds a secret, which the
@@ -324,8 +333,8 @@ var adapterIDShape = regexp.MustCompile(`^na_[0-9a-hjkmnp-tv-z]{16}$`)
 // ReadSettings reads the settings file at path, one JSON object with nothing after it
 // but white space. listen, state_dir, apiary_url and public_url are required. api_url
 // may be left out for GitHub's API, apiary_public_url for apiary_url,
-// enrolment_code_file, and public_address, a JSON boolean, for true. The App's fields,
-// app_id, app_slug, client_id, private_key_file, webhook_secret_file and
+// enrolment_code_file, call_url, and public_address, a JSON boolean, for true. The
+// App's fields, app_id, app_slug, client_id, private_key_file, webhook_secret_file and
 // client_secret_file, are given all or none, and so are the enrolment's,
 // access_key_id, access_key_secret_file, apiary_public_key and adapter_id. Run refuses
 // settings that give no enrolment when the state directory holds none and
@@ -582,6 +591,10 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 				err = errors.New("is neither true nor false")
 			}
 			s.PublicAddress = &b
+		case "call_url":
+			if s.CallURL, err = text(raw); err == nil {
+				err = checkCallURL(s.CallURL)
+			}
 		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("%s are invalid: %s: %w", src.what(), src.pointer(name), err)
@@ -694,6 +707,32 @@ func checkPublicURL(s string) (string, error) {
 		return "", fmt.Errorf("is longer than %d characters", maxPublicURL)
 	}
 	return u, err
+}
+
+// callURLShape is the contract's pattern for a URL, definitions.schema.json's url, which
+// adapter.schema.json's call_url refers to.
+var callURLShape = sync.OnceValue(func() *regexp.Regexp {
+	doc, err := contracts.Document("definitions.schema.json")
+	if err != nil {
+		panic(err)
+	}
+	defs, _ := doc.(map[string]any)["$defs"].(map[string]any)
+	u, _ := defs["url"].(map[string]any)
+	pattern, _ := u["pattern"].(string)
+	return regexp.MustCompile(pattern)
+})
+
+// errCallURL is the error of a call_url the contract refuses. It quotes nothing.
+var errCallURL = errors.New("is not an https URL with no query and no fragment whose path ends with /, at most 2048 characters")
+
+// checkCallURL takes call_url as adapter.schema.json takes it: an https URL of at most
+// 2048 characters, as the contract writes one, with no query and no fragment, whose path
+// ends with /. One that holds what looks like a secret is refused too.
+func checkCallURL(s string) error {
+	if accesskey.ContainsSecret(s) || len(s) > 2048 || strings.ContainsAny(s, "?#") || !strings.HasSuffix(s, "/") || !callURLShape().MatchString(s) {
+		return errCallURL
+	}
+	return nil
 }
 
 // pin is the apiary_public_key field: Qory Apiary's public keys, as

@@ -85,6 +85,14 @@ serve also answers the connect page at /v1/connect, which a browser reaches at
 public_url followed by /v1/connect: Qory Apiary sends a person there who connects the
 App's installation. /health answers 200 from the first moment.
 
+With call_url set, serve also takes Qory Apiary's calls at /v1/calls/: a credential
+for a run, the repository an address names, and a file at a version. serve checks
+each call's signature against the Qory Apiary keys it pinned at enrolment. Set
+call_url to the address Qory Apiary sends the calls to: https, with no query and no
+fragment, its path ending with /, such as
+https://qory.example.com/adapters/github/v1/calls/. The proxy in front sends each call
+on to /v1/calls/ at serve's root. Without call_url, serve takes no call.
+
 The settings come from a file or from the environment, never both. With --settings,
 they are one JSON document in FILE: app_id, private_key_file, webhook_secret_file,
 listen, state_dir, app_slug, apiary_url, public_url, access_key_id,

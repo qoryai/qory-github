@@ -151,7 +151,8 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 //     nothing is pulled, since nothing can be linked without an App. Once the setup
 //     keeps an App, serve goes on to serve without a restart, and declares the adapter
 //     again at once, without setup_url, after the declaration with it has ended.
-//   - Serving: the webhook receiver and, beside it, the connect page, see [Connect].
+//   - Serving: the webhook receiver and, beside it, the connect page, see [Connect],
+//     and, with call_url set, Qory Apiary's calls, see [Calls].
 //     It reads Qory Apiary's change feed, after it declares the adapter, without
 //     setup_url, until it stops, and pulls from GitHub what the webhooks missed, see
 //     [puller]. The App setup refuses every setup pass.
@@ -294,6 +295,8 @@ type runner struct {
 	rc      *Receiver
 	connect *Connect
 	adapter *Adapter
+	// calls answers Qory Apiary's calls, nil when call_url is not set.
+	calls *Calls
 	// confirmCancel and confirmed are the setting again of a kept App's webhook
 	// secret, see [runner.confirm], which the stop cancels and waits for.
 	confirmCancel context.CancelFunc
@@ -500,6 +503,9 @@ loop:
 		r.rc.stopLog()
 		r.adapter.stopLog()
 	}
+	if r.calls != nil {
+		r.calls.stopLog()
+	}
 	r.apiary.init()
 	r.apiary.unauthorized.stop()
 	r.limited.full.stop()
@@ -578,7 +584,8 @@ func (r *runner) declareForSetup() func() {
 }
 
 // serveApp serves with the App a: it starts the adapter, the webhook receiver, the
-// connect page and the handlers' worker, puts the serving phase in place, and makes
+// connect page, Qory Apiary's calls when call_url is set, see [Calls], and the
+// handlers' worker, puts the serving phase in place, and makes
 // start the change feed's reader and the pull, which declare the adapter without
 // setup_url first. serve declares that it sends changes as they happen only with
 // public_address true and a's webhook active; a kept App whose webhook was created
@@ -610,8 +617,22 @@ func (r *runner) serveApp(a *app, atStart bool) {
 		PublicURL: s.PublicURL, ApiaryPublicURL: cmp.Or(s.ApiaryPublicURL, s.ApiaryURL), Log: log, creds: r.creds,
 	}
 	r.adapter, r.worker, r.rc, r.connect = adapter, worker, rc, connect
+	next := connect.Route(rc.Mux())
+	// With call_url set, serve answers Qory Apiary's calls and declares where; without
+	// it, no call route answers, and the declaration has no call_url.
+	if s.CallURL != "" {
+		r.calls = &Calls{
+			Store: st, Grants: storeGrants{st}, GitHub: github.Client{API: s.APIURL}, AppID: a.id, Key: a.key, InstanceID: r.instance, Log: log, creds: r.creds,
+			listingToken: func(ctx context.Context, installation int64) (string, error) {
+				return adapter.token(ctx, installation, 0, "")
+			},
+			refusalEvery: r.opts.refusalEvery,
+		}
+		next = r.calls.Route(next)
+		r.apiary.CallURL = s.CallURL
+	}
 	worker.Start()
-	r.router.set(&phase{health: healthServing, setup: r.setup, next: connect.Route(rc.Mux())})
+	r.router.set(&phase{health: healthServing, setup: r.setup, next: next})
 	log.Info("serving", slog.String("address", r.limited.Addr().String()), slog.String("path", WebhookPath))
 	r.start = func() func() {
 		if r.opts.feedStarts != nil {

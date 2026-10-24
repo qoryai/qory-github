@@ -78,6 +78,10 @@ type SourceRole struct {
 	Connect        string     `json:"connect"`
 	Access         string     `json:"access"`
 	Disconnect     string     `json:"disconnect"`
+	// CredentialScope is how far one credential the adapter answers to Qory Apiary's
+	// run-credential call reaches: resource, the repositories the call lists and no
+	// other.
+	CredentialScope string `json:"credential_scope,omitempty"`
 }
 
 // Noun is the source's words for one thing, One, and for more than one, Other, which
