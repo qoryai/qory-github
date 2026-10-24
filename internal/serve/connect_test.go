@@ -1021,7 +1021,7 @@ func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 // another connection that is live: refused, grant_taken, and the link stays.
 func TestALiveLinkIsNotTakenByAnotherConnection(t *testing.T) {
 	rig := newConnectRig(t)
-	Link(rig.st, 42, otherConnection, linkLive)
+	grantedLink(rig.st, 42, otherConnection, linkLive)
 	r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection)
 	if r.Outcome != outcomeRefused || r.Reason != reasonGrantTaken {
 		t.Errorf("%+v", r)
@@ -1060,7 +1060,7 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 		if tc.unsigned {
 			rig.apiary.signer = newKey(t)
 		}
-		Link(rig.st, 42, otherConnection, linkPending)
+		grantedLink(rig.st, 42, otherConnection, linkPending)
 		listing := make(chan struct{})
 		rig.apiary.refuse = func(route string, n int) (int, string) {
 			if route != routeCollections {
@@ -1247,7 +1247,7 @@ func TestALinkThatIsFreeIsTakenEvenPastTheDeadline(t *testing.T) {
 // the installation is listed and its linked collections filled again.
 func TestAReconnectOfALiveLinkListsAndFillsAgain(t *testing.T) {
 	rig := newConnectRig(t)
-	Link(rig.st, 42, testConnection, linkLive)
+	grantedLink(rig.st, 42, testConnection, linkLive)
 	setReach(rig.st, refOf("acme/widgets"), 42)
 	linkCollection(rig.st, refOf("acme/widgets"))
 	rig.gh.issues = []map[string]any{ghIssue(1, 0)}
@@ -1265,7 +1265,7 @@ func TestAReconnectOfALiveLinkListsAndFillsAgain(t *testing.T) {
 
 func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 	rig := newConnectRig(t)
-	Link(rig.st, 42, testConnection, linkLive)
+	grantedLink(rig.st, 42, testConnection, linkLive)
 	setReach(rig.st, refOf("acme/widgets"), 42)
 	linkCollection(rig.st, refOf("acme/widgets"))
 	rig.gh.issues = []map[string]any{ghIssue(1, 0)}
@@ -1304,7 +1304,7 @@ func TestNoRefillStartsAfterTheStopAndOneRunsForEachCollection(t *testing.T) {
 func TestTheRecordOfAnInstallationNotLinkedExpiresAndGoesWithItsDeletion(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.deliver(t, "installation", guid1, map[string]any{"action": "created", "installation": map[string]any{"id": 42}})
-	Link(rig.st, 42, testConnection, linkLive)
+	grantedLink(rig.st, 42, testConnection, linkLive)
 	// A linked installation's deletion drops the record too.
 	rig.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
 	if _, err := rig.st.Get(nsUnlinked, "42"); err == nil {
@@ -1374,7 +1374,7 @@ func TestAConnectionHoldsOneInstallation(t *testing.T) {
 		"pending, a newer pass, its return minted": {linkPending, newer, true, 403, false, true},
 	} {
 		rig := newConnectRig(t)
-		putLink(rig.st, 42, link{Connection: testConnection, State: tc.state, Pass: older.Unix(), Return: time.Now().Add(returnFor).Unix()})
+		grantedPutLink(rig.st, 42, link{Connection: testConnection, State: tc.state, Pass: older.Unix(), Return: time.Now().Add(returnFor).Unix()})
 		if tc.minted {
 			keepPass(rig.st, testConnection, older.Unix(), time.Now())
 		}
@@ -1491,7 +1491,7 @@ func TestTwoPassesForOneConnectionLinkOneInstallation(t *testing.T) {
 // linked to the new connection while Qory Apiary took the other's listing.
 func TestAListingInFlightIsNotOvertakenByAConnect(t *testing.T) {
 	rig := newConnectRig(t)
-	Link(rig.st, 42, otherConnection, linkPending)
+	grantedLink(rig.st, 42, otherConnection, linkPending)
 	arrived, release, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	rig.adapter.lockWaits = func(installation int64) {
@@ -1550,7 +1550,7 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 	forbid := func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	replace := func(t *testing.T) *connectRig {
 		rig := newConnectRig(t)
-		putLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		grantedPutLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 		rig.apiary.refuse = forbid
 		if r := rig.backTo(t, rig.browser(t).connect(rig.pass(), "42"), testConnection); r.Outcome != outcomeLinked {
 			t.Fatalf("%+v", r)
@@ -1700,12 +1700,12 @@ func TestABusyLinkIsWaitedForBriefly(t *testing.T) {
 // of the link it makes live.
 func TestALiveAnswerChangesOnlyTheLinkOfItsConnection(t *testing.T) {
 	rig := newConnectRig(t)
-	Link(rig.st, 42, otherConnection, linkPending)
+	grantedLink(rig.st, 42, otherConnection, linkPending)
 	if err := goLive(rig.st, 42, testConnection); err != nil {
 		t.Fatal(err)
 	}
 	rig.linked(t, 42, otherConnection, linkPending)
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: 1234})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: 1234})
 	if err := goLive(rig.st, 42, testConnection); err != nil {
 		t.Fatal(err)
 	}
@@ -1905,7 +1905,7 @@ func TestAFirstListingEndsWithTheLastListing(t *testing.T) {
 		}
 		rig.clock = &pullClock{t: time.Now().Truncate(time.Second)}
 		rig.adapter.now, rig.c.now = rig.clock.now, rig.clock.now
-		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Unix()})
+		grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: rig.clock.now().Unix()})
 		rig.c.listSoon(42, testConnection, false)
 		sum := func() (s time.Duration) {
 			rig.mu.Lock()
@@ -2101,7 +2101,7 @@ func TestAReConnectUnderANewerPassRaisesTheLinksPass(t *testing.T) {
 	}
 	rig.linked(t, 9, "", "")
 	// A live link's pass is raised too.
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkLive, Pass: p2.Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkLive, Pass: p2.Unix()})
 	p3 := now.Add(12 * time.Minute)
 	if r := rig.backTo(t, rig.browser(t).connect(rig.passAt(testConnection, p3), "42"), testConnection); r.Outcome != outcomeLinked {
 		t.Fatalf("%+v", r)
@@ -2122,7 +2122,7 @@ func TestALockHeldPastLinkWaitGoesBackSourceUnavailable(t *testing.T) {
 		twoOrgs(rig, &made)
 		rig.c.linkWait = 50 * time.Millisecond
 		now := time.Now().Truncate(time.Second)
-		putLink(rig.st, 9, link{Connection: testConnection, State: linkPending, Pass: now.Add(5 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
+		grantedPutLink(rig.st, 9, link{Connection: testConnection, State: linkPending, Pass: now.Add(5 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
 		unlock, err := rig.adapter.lockInstallation(context.Background(), held)
 		if err != nil {
 			t.Fatal(err)
@@ -2182,7 +2182,7 @@ func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 	}
 	// What a connect writes holding the lock.
 	installMu.Lock()
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
 	installMu.Unlock()
 	unlock()
 	<-done
@@ -2199,7 +2199,7 @@ func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 func TestAFirstListingAnswered403ForbiddenIsSentAgain(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"forbidden"}` }
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	eventually(t, "three waits", func() bool { rig.mu.Lock(); defer rig.mu.Unlock(); return len(rig.waits) >= 3 })
 	rig.c.stop()
@@ -2277,7 +2277,7 @@ func TestAConnectionLinkedAgainIsNotListedAsReplaced(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	now := time.Now()
-	putLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Pass: now.Add(10 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: otherConnection, State: linkPending, Pass: now.Add(10 * time.Minute).Unix(), Return: now.Add(returnFor).Unix()})
 	keepReplaced(rig.st, 42, link{Connection: otherConnection, Return: now.Add(-returnFor - returnSkew - time.Minute).Unix()})
 	p := &puller{adapter: rig.adapter, store: rig.st, log: rig.adapter.Log, sleep: func(context.Context, time.Duration) error { return nil }, jitter: func(time.Duration) time.Duration { return 0 }}
 	p.listReplaced(context.Background())
@@ -2315,7 +2315,7 @@ func TestTheLastListingsMomentIsTheLinks(t *testing.T) {
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	clock := &pullClock{t: time.Now().Truncate(time.Second)}
 	rig.adapter.now, rig.c.now = clock.now, clock.now
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
 	gate, gated := make(chan struct{}), make(chan struct{})
 	var mu sync.Mutex
 	var waits []time.Duration
@@ -2337,7 +2337,7 @@ func TestTheLastListingsMomentIsTheLinks(t *testing.T) {
 	installMu.Lock()
 	l, _, _ := linkOf(rig.st, 42)
 	l.Return = moved.Unix()
-	putLink(rig.st, 42, l)
+	grantedPutLink(rig.st, 42, l)
 	installMu.Unlock()
 	close(gate)
 	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
@@ -2361,7 +2361,7 @@ func TestTheLastListingsMomentIsTheLinks(t *testing.T) {
 func TestA409ConnectionEndedToAFirstListingDropsTheLink(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"connection_ended"}` }
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	eventually(t, "the link dropped", func() bool { ok, _ := Linked(rig.st, 42); return !ok })
 	rig.c.stop()
@@ -2524,7 +2524,7 @@ func TestAFirstListingIsReadOnceAndSentAgainFromThePartNotTaken(t *testing.T) {
 		}
 		return 0, ""
 	}
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	// Each part keeps each of its collections' installations in the store first, which
 	// takes a while.
@@ -2582,7 +2582,7 @@ func TestAFirstListing403ConnectionUnknownAfterAPartTakenIsSentAgainFromPart1(t 
 		}
 		return 0, ""
 	}
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	for deadline := time.Now().Add(time.Minute); rig.adapter.keptFirsts() != 0 || len(rig.apiary.sent(routeCollections)) < 4; time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -2633,7 +2633,7 @@ func TestAFirstListingGitHubFailsMidwayKeepsNothingAndReadsAgain(t *testing.T) {
 		rig.gh.mu.Unlock()
 		return nil
 	}
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	eventually(t, "live", func() bool { l, _, _ := linkOf(rig.st, 42); return l.State == linkLive })
 	eventually(t, "the parts kept forgotten", func() bool { return rig.adapter.keptFirsts() == 0 })
@@ -2723,7 +2723,7 @@ func TestAFirstListingKeptIsForgottenWithItsLink(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		}
-		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
+		grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Pass: time.Now().Add(5 * time.Minute).Unix(), Return: time.Now().Add(returnFor).Unix()})
 		rig.c.listSoon(42, testConnection, false)
 		<-gated
 		if tc.during != nil {
@@ -2776,7 +2776,7 @@ func TestAFirstListingKeptIsForgottenAtTheLastListing(t *testing.T) {
 	rig.apiary.refuse = func(string, int) (int, string) { return 500, `{"error":"internal"}` }
 	clock := &pullClock{t: time.Now().Truncate(time.Second)}
 	rig.adapter.now, rig.c.now = clock.now, clock.now
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: clock.now().Unix()})
 	var mu sync.Mutex
 	var kept []int
 	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
@@ -2846,7 +2846,7 @@ func TestARepositoryRemovedWhileAFirstListingIsReadIsNotKept(t *testing.T) {
 			}
 			return 0, ""
 		}
-		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 		rig.c.listSoon(42, testConnection, false)
 		eventually(t, tc.name+": live", func() bool { l, _, _ := linkOf(rig.st, 42); return l.State == linkLive })
 		rig.c.stop()
@@ -2904,7 +2904,7 @@ func TestAPendingLinkDeletedBetweenItsTriesLeavesNothingOfItInMemory(t *testing.
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	rig.c.listSoon(42, testConnection, false)
 	<-gated
 	if !rig.adapter.keptFirst(42, testConnection) {

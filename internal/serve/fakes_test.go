@@ -126,6 +126,9 @@ type fakeApiary struct {
 	// node is the adapter id of the last enrolment, which a seal of secrets binds to,
 	// testAdapterID before any.
 	node string
+	// grants is the fake's copy of the adapter's grants, the connection of each by its
+	// grant_ref, which GET /v1/grants answers and each report it takes adds to.
+	grants map[string]string
 
 	mu       sync.Mutex
 	requests []apiaryRequest
@@ -189,6 +192,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 
 		routeConnectionsDisconnect: "connections-disconnect.schema.json",
 		routeSecrets:               "adapter-secrets.schema.json",
+		routeGrants:                "grant.schema.json",
 	} {
 		s, err := contracts.Compile(name)
 		if err != nil {
@@ -341,7 +345,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	hold := f.hold
 	f.mu.Unlock()
-	if hold && r.Method == http.MethodGet {
+	if hold && r.Method == http.MethodGet && r.URL.Path == routeChanges {
 		f.mu.Lock()
 		f.requests = append(f.requests, got)
 		f.mu.Unlock()
@@ -376,6 +380,12 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !f.openUpload(b, req.AccessKeyID) {
 			status, body = http.StatusBadRequest, `{"error":"invalid_request"}`
 		}
+	case r.URL.Path == routeGrants && r.Method == http.MethodGet:
+		body = f.grantsAnswer()
+	case r.URL.Path == routeGrants && !refused:
+		var g contracts.Grant
+		json.Unmarshal(b, &g)
+		f.grant(g.GrantRef, g.ConnectionID)
 	}
 	if refuseGet != nil && r.Method == http.MethodGet {
 		if s, b := refuseGet(n); s != 0 {
@@ -625,6 +635,36 @@ func openSealedWith(key *accesskey.Key, enc, ct string, info, aad []byte) ([]byt
 		return nil, err
 	}
 	return r.Open(aad, c)
+}
+
+// grant adds to the fake's copy that connection holds the grant ref.
+func (f *fakeApiary) grant(ref, connection string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.grants == nil {
+		f.grants = map[string]string{}
+	}
+	f.grants[ref] = connection
+}
+
+// ungrant drops the grant ref from the fake's copy.
+func (f *fakeApiary) ungrant(ref string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.grants, ref)
+}
+
+// grantsAnswer is the body of the answer to GET /v1/grants: the fake's copy, as
+// grants.schema.json says.
+func (f *fakeApiary) grantsAnswer() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	list := []map[string]string{}
+	for ref, connection := range f.grants {
+		list = append(list, map[string]string{"connection_id": connection, "grant_ref": ref})
+	}
+	b, _ := json.Marshal(map[string]any{"version": contracts.Version, "revision": contracts.Revision, "grants": list})
+	return string(b)
 }
 
 // count is how many requests the fake received.
@@ -1360,4 +1400,23 @@ func (a *Adapter) keptFirst(installation int64, connection string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.firsts[firstKey{installation, connection}] != nil
+}
+
+// grantedLink links the installation to the connection, in state, as [Link] does, and
+// keeps in the store's copy of Qory Apiary's grants that the connection holds its
+// grant, so its deliveries are handled, see [granted].
+func grantedLink(st *store.Store, installation int64, connection, state string) error {
+	if err := Link(st, installation, connection, state); err != nil {
+		return err
+	}
+	return putGrant(st, installation, connection)
+}
+
+// grantedPutLink keeps the installation's link l, as [putLink] does, and the grant of
+// l's connection in the store's copy, see [grantedLink].
+func grantedPutLink(st *store.Store, installation int64, l link) error {
+	if err := putLink(st, installation, l); err != nil {
+		return err
+	}
+	return putGrant(st, installation, l.Connection)
 }

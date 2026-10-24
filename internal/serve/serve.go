@@ -640,7 +640,7 @@ func (r *runner) serveApp(a *app, atStart bool) {
 	if handlers == nil {
 		handlers = &Handlers{}
 		adapter.Register(handlers)
-		linked = func(id int64) (bool, error) { return Linked(st, id) }
+		linked = func(id int64) (bool, error) { return granted(st, id, adapter.clock()) }
 	}
 	worker := &Worker{Store: st, Handlers: handlers, Log: log}
 	rc := &Receiver{Secret: a.webhookSecret, Store: st, Log: log, Stored: worker.Notify, Handlers: handlers, Linked: linked, refusalEvery: r.opts.refusalEvery}

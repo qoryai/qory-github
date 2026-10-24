@@ -58,6 +58,10 @@ type feed struct {
 		down   time.Time
 	}
 
+	// grantsRead is whether the page being applied has read Qory Apiary's copy of the
+	// grants already, see [feed.apply].
+	grantsRead bool
+
 	once    sync.Once
 	unknown *throttle
 }
@@ -87,7 +91,9 @@ func (f *feed) unknownLog() *throttle {
 }
 
 // run declares the adapter, without setup_url, since a feed is read only once an App
-// is in use, then reads the feed until ctx is done. Qory Apiary holds a
+// is in use, then reads Qory Apiary's copy of the grants, see [Adapter.syncGrants],
+// then reads the feed until ctx is done. A declaration or a read of the grants that
+// fails is tried again after a wait that doubles. Qory Apiary holds a
 // read while nothing follows the cursor, so the next read follows each answer as soon
 // as feedFloor has passed since the last request for the feed was sent; an error waits
 // longer, a wait that doubles. The cursor is kept in the store, and moves only once
@@ -128,6 +134,20 @@ func (f *feed) run(ctx context.Context) {
 			break
 		}
 		if ctx.Err() != nil || !fail("declaring the adapter to Qory Apiary", err) {
+			return
+		}
+	}
+	backoff = feedFirstBackoff
+	for ctx.Err() == nil {
+		err := f.adapter.syncGrants(ctx)
+		if err == nil {
+			break
+		}
+		if IsPermanent(err) {
+			f.log.Error("reading the grants from Qory Apiary failed, and is passed", slog.String("error", err.Error()))
+			break
+		}
+		if ctx.Err() != nil || !fail("reading the grants from Qory Apiary", err) {
 			return
 		}
 	}
@@ -180,7 +200,7 @@ func known(ch contracts.Change) bool {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
 		return ch.Status == github.StatusTakenIn || ch.Status == github.StatusUndone
-	case contracts.ChangeCollection:
+	case contracts.ChangeCollection, contracts.ChangeGrant:
 		return ch.Status == "linked" || ch.Status == "unlinked"
 	case contracts.ChangeSync:
 		return true
@@ -226,6 +246,7 @@ func (f *feed) step(ctx context.Context) error {
 		}
 	}
 	f.feedUp(string(cursor))
+	f.grantsRead = false
 	for i, ch := range page.Changes {
 		if f.failing.passed[i] {
 			continue
@@ -293,7 +314,10 @@ func (f *feed) failedFor(index int) time.Duration {
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for
 // good. A collection's entry whose ref is not a repository's id fails for good, before the
-// store is written.
+// store is written. A grant's entry, linked or unlinked, reads Qory Apiary's copy of the
+// grants again, once for each page, see [Adapter.syncGrants]: the copy wins, so the
+// entries after the first of a page find it read; one whose grant_ref is not an
+// installation's id, or whose connection_id is not a connection's, fails for good.
 func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
@@ -314,6 +338,18 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 		case "unlinked":
 			return unlinkCollection(f.store, ch.CollectionRef)
 		}
+	case contracts.ChangeGrant:
+		if !installationShape.MatchString(ch.GrantRef) || !connectionShape.MatchString(ch.ConnectionID) {
+			return Permanent(errors.New("the grant's entry has no installation's id as grant_ref, or no connection's id"))
+		}
+		if f.grantsRead {
+			return nil
+		}
+		if err := f.adapter.syncGrants(ctx); err != nil {
+			return err
+		}
+		f.grantsRead = true
+		return nil
 	case contracts.ChangeSync:
 		interval := defaultSyncInterval
 		if ch.Interval != nil {

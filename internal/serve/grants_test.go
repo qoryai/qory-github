@@ -1,0 +1,322 @@
+package serve
+
+import (
+	"context"
+	"net/http"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/qoryai/integrations/contracts"
+)
+
+// reportClock is a fake clock for a connect's grant report: each wait between the
+// report's tries is noted and moves the clock on, which the adapter and the Connect
+// read.
+type reportClock struct {
+	mu    sync.Mutex
+	t     time.Time
+	waits []time.Duration
+}
+
+func (c *reportClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *reportClock) sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.waits = append(c.waits, d)
+	c.t = c.t.Add(d)
+	return nil
+}
+
+func (c *reportClock) waited() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.waits)
+}
+
+// reportRig is a connect rig whose Connect and adapter read a [reportClock].
+func reportRig(t *testing.T) (*connectRig, *reportClock) {
+	t.Helper()
+	rig := newConnectRig(t)
+	clock := &reportClock{t: time.Now()}
+	rig.c.now, rig.adapter.now, rig.c.reportSleep, rig.client.Now = clock.now, clock.now, clock.sleep, clock.now
+	return rig, clock
+}
+
+// connectWith connects the installation 42 to testConnection through rig's Connect, with
+// a pass whose nonce is nonce.
+func connectWith(t *testing.T, rig *connectRig, nonce string) {
+	t.Helper()
+	pass := signPass(rig.signer, payload(testAdapterID, testConnection, nonce, time.Now().Add(10*time.Minute)))
+	rig.secrets = append(rig.secrets, pass)
+	b := rig.browser(t)
+	if r := rig.backTo(t, b.connect(pass, "42"), testConnection); r.Outcome != outcomeLinked {
+		t.Fatalf("the connect return %+v", r)
+	}
+}
+
+// TestAConnectReportsTheGrant pins that a connect's checked return reports the
+// installation's grant to Qory Apiary, POST /v1/grants, with the connection, the
+// installation's id as grant_ref and the pass's nonce, once, and that the grant Qory
+// Apiary takes is added to the store's copy, so the installation's deliveries are
+// handled once the linked connect return has expired too.
+func TestAConnectReportsTheGrant(t *testing.T) {
+	rig, clock := reportRig(t)
+	nonce := newNonce()
+	connectWith(t, rig, nonce)
+	eventually(t, "the grant kept", func() bool { c, _ := grantOf(rig.st, 42); return c == testConnection })
+	sent := rig.apiary.sent(routeGrants)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" || sent[0].body["pass_nonce"] != nonce || sent[0].body["version"] != 1.0 {
+		t.Fatalf("reported %d times: %v", len(sent), sent)
+	}
+	if w := clock.waited(); len(w) != 0 {
+		t.Errorf("waited %v", w)
+	}
+	clock.sleep(context.Background(), returnFor+time.Second)
+	if ok, err := granted(rig.st, 42, clock.now()); !ok || err != nil {
+		t.Errorf("granted %v %v", ok, err)
+	}
+	rig.noLeak(t)
+}
+
+// TestAGrantRefusedUntilTheReturnArrivesIsSentAgain pins that a report Qory Apiary
+// answers 409 pass_unknown, or 403 connection_unknown, is sent again after a wait that
+// doubles from 2 seconds, each try built anew, until Qory Apiary takes it.
+func TestAGrantRefusedUntilTheReturnArrivesIsSentAgain(t *testing.T) {
+	rig, clock := reportRig(t)
+	rig.apiary.refuse = func(route string, n int) (int, string) {
+		switch {
+		case route != routeGrants:
+			return 0, ""
+		case n == 1:
+			return http.StatusForbidden, `{"error":"connection_unknown"}`
+		case n <= 3:
+			return http.StatusConflict, `{"error":"pass_unknown"}`
+		}
+		return 0, ""
+	}
+	connectWith(t, rig, newNonce())
+	eventually(t, "the grant kept", func() bool { c, _ := grantOf(rig.st, 42); return c == testConnection })
+	sent := rig.apiary.sent(routeGrants)
+	if len(sent) != 4 || sent[0].signature == sent[1].signature {
+		t.Errorf("reported %d times", len(sent))
+	}
+	if w := clock.waited(); !slices.Equal(w, []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}) {
+		t.Errorf("waited %v", w)
+	}
+	if l, ok, _ := linkOf(rig.st, 42); !ok || l.Connection != testConnection {
+		t.Errorf("the link is %+v %v", l, ok)
+	}
+}
+
+// TestAGrantNeverTakenDropsTheLink pins that a report Qory Apiary refuses until the
+// linked connect return expires stops then, after waits that double to a minute and end
+// at the expiry, and drops the installation's link, with the line that says so; and
+// that a report refused for good stops at once and drops it too.
+func TestAGrantNeverTakenDropsTheLink(t *testing.T) {
+	rig, clock := reportRig(t)
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrants {
+			return http.StatusForbidden, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	connectWith(t, rig, newNonce())
+	const line = `"level":"WARN","msg":"reporting the installation's grant to Qory Apiary failed, so serve drops its link: connect it again","installation":42,"connection":"` + testConnection + `"`
+	eventually(t, "the line", func() bool { return strings.Contains(rig.log.String(), line) })
+	if _, ok, _ := linkOf(rig.st, 42); ok {
+		t.Error("the link is kept")
+	}
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute, time.Minute, 58 * time.Second}
+	if w := clock.waited(); !slices.Equal(w, want) {
+		t.Errorf("waited %v, want %v", w, want)
+	}
+	if c, _ := grantOf(rig.st, 42); c != "" {
+		t.Errorf("the grant %s is kept", c)
+	}
+
+	rig, clock = reportRig(t)
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrants {
+			return http.StatusBadRequest, `{"error":"invalid_request"}`
+		}
+		return 0, ""
+	}
+	connectWith(t, rig, newNonce())
+	eventually(t, "the line", func() bool { return strings.Contains(rig.log.String(), line) })
+	if _, ok, _ := linkOf(rig.st, 42); ok {
+		t.Error("the link is kept")
+	}
+	if n := len(rig.apiary.sent(routeGrants)); n != 1 || len(clock.waited()) != 0 {
+		t.Errorf("reported %d times, waited %v", n, clock.waited())
+	}
+}
+
+// TestTheGrantsCopyReplacesTheStores pins that a read of Qory Apiary's copy replaces the
+// store's: a grant the copy does not hold is dropped and one it holds is kept; that the
+// link of an installation the copy does not hold for the link's connection is dropped,
+// with its repositories' records and the line that says so, while one whose linked
+// connect return has not expired stays; and that a grant without a link here stays in
+// the copy alone.
+func TestTheGrantsCopyReplacesTheStores(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	const other = "ac_0000000000000002"
+	if err := grantedLink(w.st, 7, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	if err := grantedLink(w.st, 8, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	if err := grantedLink(w.st, 9, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimReach(w.st, widgetsRef, 8, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := putLink(w.st, 10, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(time.Minute).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.grant("7", testConnection)
+	w.apiary.grant("9", other)
+	w.apiary.grant("11", other)
+	if err := w.adapter.syncGrants(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[int64]string{7: testConnection, 8: "", 9: other, 10: "", 11: other} {
+		if c, err := grantOf(w.st, id); c != want || err != nil {
+			t.Errorf("the grant of %d is %q %v, want %q", id, c, err, want)
+		}
+	}
+	for id, want := range map[int64]bool{7: true, 8: false, 9: false, 10: true, 11: false} {
+		if _, ok, _ := linkOf(w.st, id); ok != want {
+			t.Errorf("the link of %d is there %v", id, ok)
+		}
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the dropped installation's repository is kept")
+	}
+	for _, id := range []string{"8", "9"} {
+		if !strings.Contains(w.log.String(), `"msg":"Qory Apiary's copy of the grants does not contain the installation for its connection, so serve drops its link","installation":`+id) {
+			t.Errorf("no line for %s: %s", id, w.log.String())
+		}
+	}
+	if ok, _ := granted(w.st, 10, time.Now()); !ok {
+		t.Error("the installation whose report may still be sent is not linked")
+	}
+	if ok, _ := granted(w.st, 10, time.Now().Add(2*time.Minute)); ok {
+		t.Error("the installation whose return expired is linked though the copy does not hold it")
+	}
+}
+
+// TestAnInstallationTheCopyDoesNotHoldIsNotHandled pins that a delivery of an
+// installation linked here, whose grant the copy does not hold, is done unhandled, and
+// that one whose grant the copy holds is handled.
+func TestAnInstallationTheCopyDoesNotHoldIsNotHandled(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if err := Link(w.st, 42, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimReach(w.st, widgetsRef, 42, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := linkCollection(w.st, widgetsRef); err != nil {
+		t.Fatal(err)
+	}
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	if n := len(w.apiary.sent(routeItems)); n != 0 || !strings.Contains(w.log.String(), `"msg":"the installation is not linked to Qory Apiary, so the delivery is not handled"`) {
+		t.Errorf("%d items sent; the log: %s", n, w.log.String())
+	}
+	if err := putGrant(w.st, 42, testConnection); err != nil {
+		t.Fatal(err)
+	}
+	w.deliver(t, "issues", guid2, issueEvent(42, "acme/widgets", "opened"))
+	if n := len(w.apiary.sent(routeItems)); n != 1 {
+		t.Errorf("%d items sent", n)
+	}
+}
+
+// TestAGrantEntryReadsTheCopyOncePerPage pins that the change feed's grant entries,
+// linked and unlinked, read Qory Apiary's copy once for each page that has them, and
+// that a grant entry that names no installation fails for good, logged and passed.
+func TestAGrantEntryReadsTheCopyOncePerPage(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if err := grantedLink(w.st, 42, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.changes = []contracts.Change{
+		{Kind: contracts.ChangeGrant, ConnectionID: testConnection, GrantRef: "42", Status: "linked"},
+		{Kind: contracts.ChangeGrant, ConnectionID: testConnection, GrantRef: "42", Status: "unlinked"},
+		{Kind: contracts.ChangeGrant, ConnectionID: testConnection, GrantRef: "acme", Status: "linked"},
+	}
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.apiary.sent("GET " + routeGrants)); n != 1 {
+		t.Errorf("the copy was read %d times", n)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link the copy does not hold is kept")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"a change of the feed failed, and is passed","kind":"grant","error":"the grant's entry has no installation's id as grant_ref, or no connection's id"`) {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestAWrongGrantsAnswerIsRefused pins the refusals of an answer to GET /v1/grants.
+func TestAWrongGrantsAnswerIsRefused(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"version":1,"revision":1,"grants":[]}`:          "",
+		`{"version":1,"revision":2,"grants":[]}`:          "the answer is not of the contract's revision 1",
+		`{"version":2,"revision":1,"grants":[]}`:          "the answer is not of version 1",
+		`{"version":1,"revision":1}`:                      "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[],"more":1}`: "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"acme"}]}`:                                                      "the answer has a grant whose grant_ref is not an installation's id",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_x","grant_ref":"7"}]}`:                                                                        "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"7"},{"connection_id":"ac_0000000000000002","grant_ref":"7"}]}`: "the answer has two grants for one installation",
+	} {
+		_, err := checkGrants([]byte(body))
+		if (want == "") != (err == nil) || err != nil && err.Error() != want {
+			t.Errorf("%s: err %v, want %q", body, err, want)
+		}
+	}
+}
+
+// TestTheFeedReadsTheCopyAtStart pins that the change feed's reader reads Qory Apiary's
+// copy of the grants once it has declared the adapter and before it reads the feed, and
+// that the copy it reads wins over the store's.
+func TestTheFeedReadsTheCopyAtStart(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if err := grantedLink(w.st, 42, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.hold = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { w.feed.run(ctx); close(done) }()
+	eventually(t, "the feed read", func() bool { return len(w.apiary.sent("GET "+routeChanges)) == 1 })
+	cancel()
+	<-done
+	w.apiary.mu.Lock()
+	var order []string
+	for _, r := range w.apiary.requests {
+		order = append(order, r.method+" "+strings.SplitN(r.target, "?", 2)[0])
+	}
+	w.apiary.mu.Unlock()
+	if !slices.Equal(order, []string{"POST " + routeAdapter, "GET " + routeGrants, "GET " + routeChanges}) {
+		t.Errorf("the requests %v", order)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link the copy does not hold is kept")
+	}
+}

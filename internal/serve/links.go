@@ -18,7 +18,10 @@ import (
 //
 //   - installations: an installation of the App that is linked to Qory Apiary, by its
 //     id, with the connection it is linked to and whether that connection is made, see
-//     [link]. Only a linked installation's deliveries are handled.
+//     [link]. Only the deliveries of a linked installation whose grant Qory Apiary's
+//     copy holds are handled, see [granted].
+//   - grants: Qory Apiary's copy of the adapter's grants, the connection of each by its
+//     grant_ref, an installation's id, see [nsGrants].
 //   - collections: a collection, a repository, that Qory Apiary linked to a workspace,
 //     by its ref, the repository's id, set from the change feed. Only a linked
 //     collection's items and comments are sent.

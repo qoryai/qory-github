@@ -120,9 +120,11 @@ type Connect struct {
 	Log *slog.Logger
 
 	// now is the clock; nil is time.Now. sleep waits d or until ctx is done between
-	// the tries of a connection's first listing; nil waits on a timer.
-	now   func() time.Time
-	sleep func(ctx context.Context, d time.Duration) error
+	// the tries of a connection's first listing, and reportSleep between those of a
+	// grant's report; nil waits on a timer.
+	now         func() time.Time
+	sleep       func(ctx context.Context, d time.Duration) error
+	reportSleep func(ctx context.Context, d time.Duration) error
 
 	once sync.Once
 	// route is the connect page's path as serve's listener receives it, [connectPath],
@@ -843,6 +845,7 @@ func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		c.failed(w, r, id, "making the connect return", err)
 		return
 	}
+	c.reportSoon(installation, s.Connection, s.Nonce, expires)
 	c.listSoon(installation, s.Connection, again)
 	c.end(w, id)
 	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again))...)

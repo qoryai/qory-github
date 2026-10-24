@@ -140,12 +140,14 @@ func TestAWrongSecretsAnswerIsRefused(t *testing.T) {
 			f.sealing = func(doc map[string]any, _ string) {
 				s := doc["sealed"].(map[string]any)
 				ct := []byte(s["ct"].(string))
-				ct[0] ^= 1
-				if ct[0] == '-' || ct[0] == '_' || (ct[0] >= '0' && ct[0] <= '9') || (ct[0] >= 'A' && ct[0] <= 'Z') || (ct[0] >= 'a' && ct[0] <= 'z') {
-					s["ct"] = string(ct)
+				// The first character changes to another of base64url's, and so do the
+				// six bits it encodes.
+				if ct[0] == 'A' {
+					ct[0] = 'B'
 				} else {
-					s["ct"] = "A" + s["ct"].(string)[1:]
+					ct[0] = 'A'
 				}
+				s["ct"] = string(ct)
 			}
 		}, "the answer is refused: its seal does not open with this adapter's access key"},
 		"with a member the contract does not define": {func(f *fakeApiary, _ *accesskey.Key) {

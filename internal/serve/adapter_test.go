@@ -110,7 +110,7 @@ func refsOf(names ...string) []string {
 // which send nothing.
 func TestAnIssueIsSentOnlyForALinkedInstallationAndCollection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	linkCollection(w.st, widgetsRef)
 	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
 	sent := w.apiary.sent(routeItems)
@@ -143,7 +143,7 @@ func TestAnIssueIsSentOnlyForALinkedInstallationAndCollection(t *testing.T) {
 // collection.
 func TestACommentIsSentForALinkedCollection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	linkCollection(w.st, refOf("acme/widgets"))
 	ev := issueEvent(42, "acme/widgets", "created")
 	ev["comment"] = map[string]any{"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
@@ -159,7 +159,7 @@ func TestACommentIsSentForALinkedCollection(t *testing.T) {
 // metadata and contents, and that each repository's installation is kept.
 func TestRepositoriesAddedListsTheCollections(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "added", "installation": map[string]any{"id": 42}, "repositories_added": []any{map[string]any{"id": gadgetsID, "full_name": "acme/gadgets"}}})
 	sent := w.apiary.sent(routeCollections)
 	if len(sent) != 1 {
@@ -197,7 +197,7 @@ func TestRepositoriesAddedListsTheCollections(t *testing.T) {
 // TestRepositoriesRemovedAreDisconnected delivers installation_repositories removed.
 func TestRepositoriesRemovedAreDisconnected(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/old"), 42)
 	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{map[string]any{"id": oldID, "full_name": "acme/old"}}})
 	sent := w.apiary.sent(routeDisconnect)
@@ -220,8 +220,8 @@ func TestRepositoriesRemovedAreDisconnected(t *testing.T) {
 // repository's record names as it is sent.
 func TestADisconnectNamesTheConnectionOfTheInstallationsLink(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	setReach(w.st, refOf("acme/old"), 42)
 	setReach(w.st, refOf("acme/gone"), 42)
 	w.apiary.refuse = func(route string, n int) (int, string) {
@@ -308,7 +308,7 @@ func (w *wired) disconnected(from int) []string {
 // disconnected.
 func TestASelectionSwitchedToAllRepositoriesIsListed(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.gh.installed("acme/widgets")
 	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "selected", []string{"acme/widgets"}, nil))
 	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets")) {
@@ -339,7 +339,7 @@ func TestASelectionSwitchedToAllRepositoriesIsListed(t *testing.T) {
 // installation is listed again with the selection alone.
 func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
 	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}, nil))
 	w.gh.installed("acme/gadgets")
@@ -366,7 +366,7 @@ func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
 // stay as they were, and the installation is listed again.
 func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	setReach(w.st, refOf("acme/gadgets"), 42)
 	setReach(w.st, refOf("octo-org/tools"), 43)
@@ -396,7 +396,7 @@ func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
 // token minted after it, and another installation's token is kept.
 func TestAChangeOfRepositoriesListsWithANewToken(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestAChangeOfRepositoriesListsWithANewToken(t *testing.T) {
 // and that each repository removed is disconnected once.
 func TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	guids := []string{guid1, guid2, guid3, "a4c5d6e7-1b2c-11ef-8f4b-0242ac120004", "b5d6e7f8-1c2d-11ef-8f4b-0242ac120005"}
 	for i, step := range []struct {
 		action, selection string
@@ -470,7 +470,7 @@ func TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas(t *testing.T) {
 // reads issues and the change writes them, on one repository.
 func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets"}, nil))
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
 	linkCollection(w.st, refOf("acme/widgets"))
@@ -614,8 +614,8 @@ func (a *Adapter) heldFor(installation int64) []string {
 // other's entries stay; the other's lock goes once it is given back.
 func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	for _, id := range []int64{42, 9} {
 		w.adapter.pacer(id)
 		w.adapter.mu.Lock()
@@ -662,7 +662,7 @@ func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 // of it.
 func TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.adapter.mu.Lock()
 	w.adapter.generation(&w.adapter.gens, 42)
 	w.adapter.generation(&w.adapter.firstGens, 42)
@@ -698,7 +698,7 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 	for _, after := range []string{"nothing", "a move", "a reader"} {
 		t.Run("token, then "+after, func(t *testing.T) {
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
-			Link(w.st, 42, testConnection, linkLive)
+			grantedLink(w.st, 42, testConnection, linkLive)
 			h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
 			w.adapter.GitHub.HTTP = &http.Client{Transport: h}
 			done := make(chan error, 1)
@@ -728,7 +728,7 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 		})
 		t.Run("first listing, then "+after, func(t *testing.T) {
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
-			Link(w.st, 42, testConnection, linkPending)
+			grantedLink(w.st, 42, testConnection, linkPending)
 			var derr error
 			var want []string
 			w.gh.envAfter = func(*fakeGitHub) {
@@ -766,7 +766,7 @@ func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
 // store keeps none of them, so the next delivery kept is the first.
 func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	body := `{"action":"opened","installation":{"id":42},"repository":{"full_name":"acme/widgets"}}`
 	var guids []string
 	for i := range 200 {
@@ -803,8 +803,8 @@ func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
 // another installation's stay.
 func TestAnInstallationSuspendedThenDeletedEndsItsConnection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 43, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, otherConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	setReach(w.st, refOf("acme/gadgets"), 42)
 	setReach(w.st, refOf("other/thing"), 43)
@@ -879,7 +879,7 @@ func TestADisconnectOfAConnectionIsSentAgainOn403(t *testing.T) {
 		"403 that lasts": {func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }, 5},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkPending)
+		grantedLink(w.st, 42, testConnection, linkPending)
 		setReach(w.st, refOf("acme/widgets"), 42)
 		// Each try is built anew, with a later time: the waits between them pass.
 		now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
@@ -952,8 +952,8 @@ func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
 	}}}
 	for _, code := range []string{codeConnectionEnded, codeConnectionSuspended} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
-		Link(w.st, 43, otherConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 43, otherConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		setReach(w.st, refOf("other/thing"), 43)
 		linkCollection(w.st, widgetsRef)
@@ -1002,8 +1002,8 @@ func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing
 				continue
 			}
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
-			Link(w.st, 42, testConnection, linkLive)
-			Link(w.st, 43, otherConnection, linkLive)
+			grantedLink(w.st, 42, testConnection, linkLive)
+			grantedLink(w.st, 43, otherConnection, linkLive)
 			setReach(w.st, refOf("acme/widgets"), 42)
 			setReach(w.st, refOf("other/thing"), 43)
 			linkCollection(w.st, refOf("acme/widgets"))
@@ -1042,7 +1042,7 @@ func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing
 	// A connection_ended about a connection the installation is no longer linked to
 	// drops nothing.
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	if dropped, err := dropConnection(w.st, otherConnection); dropped || err != nil {
 		t.Errorf("dropped %v, %v", dropped, err)
 	}
@@ -1056,7 +1056,7 @@ func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing
 // while its connect return lives, and a signed 204 makes it live.
 func TestAListingNamesTheConnectionAndMakesItsLinkLive(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.apiary.refuse = func(_ string, n int) (int, string) {
 		if n <= 1 {
 			return 403, `{"error":"connection_unknown"}`
@@ -1092,7 +1092,7 @@ func TestAListingNamesTheConnectionAndMakesItsLinkLive(t *testing.T) {
 // no handler takes is logged unhandled, before its installation is looked at.
 func TestDeliveriesOfAnInstallationNotLinkedAreNotKept(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	events := []struct {
 		event string
 		body  map[string]any
@@ -1136,7 +1136,7 @@ func TestDeliveriesOfAnInstallationNotLinkedAreNotKept(t *testing.T) {
 func TestAListingOf250CollectionsIsSentInThreeParts(t *testing.T) {
 	for _, refuse := range []bool{false, true} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		w.gh.repos = nil
 		for i := range 250 {
 			w.gh.repos = append(w.gh.repos, "acme/repo-"+strconv.Itoa(i))
@@ -1235,7 +1235,7 @@ func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
 		"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.",
 		"user": map[string]any{"login": strings.Repeat("m", 300), "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
 	}}
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
 	if err := w.feed.step(context.Background()); err != nil {
@@ -1351,7 +1351,7 @@ func TestAFeedEntryThatFailsForGoodIsPassed(t *testing.T) {
 // path is built from the ref's text.
 func TestAnEntryWhoseRefIsNotAnIDIsRefusedBeforeGitHub(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	items := []string{"widgets#7", "", "#7", widgetsRef + "#", "0" + widgetsRef + "#7", widgetsRef + "#07", "+" + widgetsRef + "#7", "-" + widgetsRef + "#7", widgetsRef + "#-7", "9223372036854775808#7", widgetsRef + "#9223372036854775808", widgetsRef, widgetsRef + "#7#8", "../" + widgetsRef + "#7", widgetsRef + "/../#7", "acme/widgets#7", "0#7", widgetsRef + "#0", " " + widgetsRef + "#7"}
 	collections := []string{"widgets", "", "0" + widgetsRef, "+" + widgetsRef, "-" + widgetsRef, "9223372036854775808", widgetsRef + "#7", "acme/widgets", "acme", "0", widgetsRef + " ", "../" + widgetsRef}
@@ -1395,7 +1395,7 @@ func TestAnEntryWhoseRefIsNotAnIDIsRefusedBeforeGitHub(t *testing.T) {
 // writes the issue is minted for the repository's id alone.
 func TestATakeInAndAnUndoReachGitHubByTheRepositoryID(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	w.apiary.add(
 		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: widgetsRef + "#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
@@ -1456,7 +1456,7 @@ func reachedGitHub(f *fakeGitHub) []string {
 // the repository's id; the listing is sent and complete, and the fill's start kept.
 func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	linkCollection(w.st, widgetsRef)
 	w.gh.issues = []map[string]any{ghIssue(1, 0)}
@@ -1494,7 +1494,7 @@ func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
 func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
 	for _, id := range []any{gadgetsRef, nil, "not found"} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		linkCollection(w.st, widgetsRef)
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
@@ -1530,7 +1530,7 @@ func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
 	const goneText = "the repository is deleted or out of the App's reach, or GitHub redirects a request by its id"
 	for _, status := range []int{404, 410, 500} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		linkCollection(w.st, widgetsRef)
 		w.gh.issues = []map[string]any{ghIssue(1, 0)}
@@ -1559,7 +1559,7 @@ func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
 // repository.
 func TestARepositoryRemovedIsFoundByItsID(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/old"), 42)
 	setReach(w.st, gadgetsRef, 42)
 	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{
@@ -2008,7 +2008,7 @@ func TestA409OnCommentsIsFinalForThatRequestOnly(t *testing.T) {
 // the collection stays linked, and the comments dropped are logged once.
 func TestAFillCarriesOnPastA409OnComments(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	linkCollection(w.st, widgetsRef)
 	for n := 1; n <= 150; n++ {
@@ -2296,7 +2296,7 @@ func TestA429IsWaitedOutAndBuiltAgain(t *testing.T) {
 // item for good, and checks the delivery is done after one request, logged.
 func TestAPermanentRefusalOfADeliveryIsNotTriedAgain(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	linkCollection(w.st, refOf("acme/widgets"))
 	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
 	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
@@ -2420,7 +2420,7 @@ func TestTheWireMatchesTheContractsSignedFixtures(t *testing.T) {
 func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	st := openStore(t, dir)
-	Link(st, 42, testConnection, linkLive)
+	grantedLink(st, 42, testConnection, linkLive)
 	at := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 	note := func(status int, code string, d time.Duration) bool {
 		t.Helper()
@@ -2449,7 +2449,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	// A 409 connection_suspended starts the day again too: Qory Apiary holds the
 	// connection.
 	st4 := openStore(t, filepath.Join(t.TempDir(), "state"))
-	Link(st4, 42, testConnection, linkLive)
+	grantedLink(st4, 42, testConnection, linkLive)
 	for i, a := range []struct {
 		status int
 		code   string
@@ -2463,7 +2463,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	// A 403 forbidden, or a 409 with another code, here collection_not_linked, neither
 	// counts nor starts the day again.
 	st5 := openStore(t, filepath.Join(t.TempDir(), "state"))
-	Link(st5, 42, testConnection, linkLive)
+	grantedLink(st5, 42, testConnection, linkLive)
 	for i, a := range []struct {
 		status int
 		code   string
@@ -2476,7 +2476,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	}
 	// Another code never counts.
 	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
-	Link(st2, 42, testConnection, linkLive)
+	grantedLink(st2, 42, testConnection, linkLive)
 	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
 		if end, err := noteAnswer(st2, testConnection, 403, "forbidden", at.Add(d)); end || err != nil {
 			t.Errorf("a 403 forbidden counts: %v, %v", end, err)
@@ -2487,7 +2487,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	}
 	// A pending connection is never ended.
 	st3 := openStore(t, filepath.Join(t.TempDir(), "state"))
-	Link(st3, 42, testConnection, linkPending)
+	grantedLink(st3, 42, testConnection, linkPending)
 	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
 		if end, err := noteAnswer(st3, testConnection, 403, codeConnectionUnknown, at.Add(d)); end || err != nil {
 			t.Errorf("a pending connection ends: %v, %v", end, err)
@@ -2506,7 +2506,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 // logs it.
 func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.st.Put(nsForbidden, testConnection, []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10)), 0)
 	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	if err := w.adapter.listRepositories(context.Background(), 42); !refusedAs(err, 403, codeConnectionUnknown) {
@@ -2530,7 +2530,7 @@ func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
 // 204 forgets it.
 func TestOnlyARequestThatNamesTheConnectionIsNoted(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	linkCollection(w.st, widgetsRef)
 	first := []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10))
@@ -2583,7 +2583,7 @@ func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 		"before the moment":        {403, `{"error":"connection_unknown"}`, false, time.Now().Add(returnFor).Unix(), linkPending},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: tc.ret})
+		grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: tc.ret})
 		if tc.status != 0 {
 			w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
 		}
@@ -2612,7 +2612,7 @@ func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
 // connection that replaced it.
 func TestAReplacedConnectionAnsweredSuspendedIsEnded(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	keepReplaced(w.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.apiary.refuse = func(route string, _ int) (int, string) {
 		if route == routeCollections {
@@ -2660,7 +2660,7 @@ func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
 				t.Fatal(err)
 			}
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
-			Link(w.st, 42, testConnection, linkLive)
+			grantedLink(w.st, 42, testConnection, linkLive)
 			w.apiary.refuse = func(string, int) (int, string) { return tc.status, string(b) }
 			if err := w.client.Items(context.Background(), widgetsItem()); !refusedAs(err, tc.status, tc.code) {
 				t.Errorf("err %v", err)
@@ -2674,7 +2674,7 @@ func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
 // answer, so no first 403 is kept.
 func TestAnUnsigned403KeepsNothing(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.apiary.signer = newKey(t)
 	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	if err := w.adapter.listRepositories(context.Background(), 42); err == nil {
@@ -2691,7 +2691,7 @@ func TestAnUnsigned403KeepsNothing(t *testing.T) {
 // connection.
 func TestTheRoundSettlesAReplacedConnection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
 	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	clock := &pullClock{t: time.Now()}
@@ -2717,7 +2717,7 @@ func TestTheRoundSettlesAReplacedConnection(t *testing.T) {
 // lock: the second round leaves it, and one listing is sent.
 func TestOneListingOfAReplacedConnectionAtATime(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
 	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	unlock, err := w.adapter.lockInstallation(context.Background(), 42)
@@ -2796,7 +2796,7 @@ func (a *Adapter) keepFirstNaming(key firstKey, names ...string) {
 // Nothing is listed.
 func TestARepositoryDeletedIsDisconnectedAndForgotten(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	setReach(w.st, gadgetsRef, 42)
 	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
@@ -2840,7 +2840,7 @@ func TestARepositoryDeletedIsDisconnectedAndForgotten(t *testing.T) {
 // for one serve never listed: neither is disconnected and the records stay.
 func TestARepositoryDeletedThatServeDidNotListForTheInstallationChangesNothing(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("octo-org/tools"), 43)
 	w.adapter.keepFirsts(firstKey{42, testConnection})
 	w.deliver(t, "repository", guid1, repositoryEvent(42, "octo-org/tools", "deleted"))
@@ -2881,7 +2881,7 @@ func TestARepositoryDeletedWhoseDisconnectFails(t *testing.T) {
 		{502, `{"error":"bad_gateway"}`, false},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
 		if tc.dropped {
@@ -2915,7 +2915,7 @@ func TestARepositoryDeletedWhoseDisconnectFails(t *testing.T) {
 // the installation. Nothing is disconnected.
 func TestARepositoryCreatedListsWithANewToken(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
@@ -2948,7 +2948,7 @@ func TestARepositoryCreatedListsWithANewToken(t *testing.T) {
 // the installation's, and nothing is disconnected.
 func TestARepositoryRenamedIsListedAgainAndNotDisconnected(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	w.gh.installed("acme/sprockets")
 	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/sprockets", "renamed"))
@@ -2975,7 +2975,7 @@ func TestARepositoryRenamedIsListedAgainAndNotDisconnected(t *testing.T) {
 // Apiary or changes a record.
 func TestRepositoryActionsThatChangeNothing(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	w.adapter.keepFirsts(firstKey{42, testConnection})
 	for i, action := range []string{"archived", "unarchived", "privatized", "publicized", "edited"} {
@@ -3004,7 +3004,7 @@ func TestRepositoryActionsThatChangeNothing(t *testing.T) {
 // which is kept and handled.
 func TestRepositoryDeliveriesOfAnInstallationNotLinked(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	for i, action := range []string{"deleted", "created", "renamed", "archived", "unarchived", "privatized", "publicized", "edited"} {
 		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
 		b, _ := json.Marshal(repositoryEvent(43, "acme/widgets", action))
@@ -3032,8 +3032,8 @@ func TestRepositoryDeliveriesOfAnInstallationNotLinked(t *testing.T) {
 // collection under the previous connection itself when the listing names the ref.
 func TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	setReach(w.st, widgetsRef, 9)
 	setReach(w.st, refOf("octo-org/tools"), 9)
 	w.adapter.keepFirsts(firstKey{42, testConnection}, firstKey{43, "ac_00000000000000aa"})
@@ -3084,7 +3084,7 @@ func TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection(t
 // so, disconnects nothing.
 func TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
 	w.adapter.keepFirsts(firstKey{42, testConnection})
@@ -3123,7 +3123,7 @@ func TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected(t *testin
 // name no repository's id: each fails for good, at once, and reaches nobody.
 func TestARepositoryEventWithoutARepositoryFailsForGood(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	for i, action := range []string{"deleted", "transferred"} {
 		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
 		w.deliver(t, "repository", g, map[string]any{"action": action, "installation": map[string]any{"id": 42}, "repository": map[string]any{"id": 0}})
@@ -3143,7 +3143,7 @@ func TestARepositoryEventWithoutARepositoryFailsForGood(t *testing.T) {
 // GitHub or Qory Apiary or changes a record.
 func TestARepositoryTransferredWithoutAnInstallationIDChangesNothing(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
 	linkCollection(w.st, widgetsRef)
@@ -3200,7 +3200,7 @@ var repositoryDrops = []struct {
 func TestARepositoryDroppedLeavesNoCollectionLink(t *testing.T) {
 	for _, tc := range repositoryDrops {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		setReach(w.st, gadgetsRef, 42)
 		linkCollection(w.st, widgetsRef)
@@ -3234,7 +3234,7 @@ func TestARepositoryDroppedLeavesNoCollectionLink(t *testing.T) {
 func TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked(t *testing.T) {
 	for _, tc := range repositoryDrops {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		w.gh.installed("acme/gadgets")
 		w.apiary.refuse = func(route string, _ int) (int, string) {
@@ -3264,7 +3264,7 @@ func TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked(t *testing.T) {
 // try of the first listing; no part after the rename names the old name.
 func TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	putLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.gh.installed("acme/widgets")
 	w.apiary.refuse = func(route string, n int) (int, string) {
 		if route == routeCollections && n == 1 {
@@ -3317,7 +3317,7 @@ const suspendedError = `GitHub answers that the installation is suspended, so no
 // for and nothing is written on GitHub.
 func TestAnEntryOfASuspendedInstallationIsPassedAtOnce(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installSuspended = true })
 	sixty := 60
@@ -3369,7 +3369,7 @@ func TestAnEntryOfASuspendedInstallationIsPassedAtOnce(t *testing.T) {
 // suspended by then, that try passes the entry for good.
 func TestAFillWhoseKeptTokenGitHubAnswers403MintsAgain(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	linkCollection(w.st, refOf("acme/widgets"))
 	w.adapter.mu.Lock()
@@ -3439,7 +3439,7 @@ func suspendedDisconnect(w *wired, ref string) {
 // the delivery fails for good with the refusal, not logged as a disconnect refused.
 func TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/old"), 42)
 	linkCollection(w.st, refOf("acme/old"))
 	keepPulled(w.st, refOf("acme/old"), pullMark{Since: time.Now()})
@@ -3472,7 +3472,7 @@ func TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords(t *testing.
 // fails for good with the refusal.
 func TestARemovedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	for _, ref := range refsOf("acme/old", "acme/gone") {
 		setReach(w.st, ref, 42)
 		linkCollection(w.st, ref)
@@ -3543,8 +3543,8 @@ func (w *wired) reachIs(t *testing.T, name string, installation, read int64) {
 // it is, acme/widgets in it, under 9's connection.
 func TestAStaleListingOfAnotherInstallationLeavesTheRepositorysInstallation(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
 	w.sendPart(t, 9, otherConnection, listingAt(0), "acme/widgets", "acme/gadgets")
 	w.reachIs(t, "acme/widgets", 42, listingAt(1).Unix())
@@ -3565,8 +3565,8 @@ func TestAStaleListingOfAnotherInstallationLeavesTheRepositorysInstallation(t *t
 // installation 9 that started later, at t2: the record becomes 9's, at t2.
 func TestAListingThatReadLaterTakesTheRepositoryFromAnotherInstallation(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
 	w.sendPart(t, 9, otherConnection, listingAt(2), "acme/widgets")
 	w.reachIs(t, "acme/widgets", 9, listingAt(2).Unix())
@@ -3577,8 +3577,8 @@ func TestAListingThatReadLaterTakesTheRepositoryFromAnotherInstallation(t *testi
 // first: the record becomes 9's, since a start no earlier than the record's takes it.
 func TestAListingThatStartedInTheSameSecondTakesTheRepository(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
 	w.sendPart(t, 9, otherConnection, listingAt(1), "acme/widgets")
 	w.reachIs(t, "acme/widgets", 9, listingAt(1).Unix())
@@ -3590,8 +3590,8 @@ func TestAListingThatStartedInTheSameSecondTakesTheRepository(t *testing.T) {
 // keeps t5, so 9's listing, older than that, leaves it 42's.
 func TestAnInstallationsStalePartDoesNotMoveItsReadBack(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	w.sendPart(t, 42, testConnection, listingAt(5), "acme/widgets")
 	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
 	w.reachIs(t, "acme/widgets", 42, listingAt(5).Unix())
@@ -3632,7 +3632,7 @@ func TestARecordWithoutAReadMomentIsTaken(t *testing.T) {
 // 42 forgets it.
 func TestADropKeepsARecordAnotherInstallationClaimed(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	if err := claimReach(w.st, widgetsRef, 42, listingAt(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -3659,7 +3659,7 @@ func TestADropKeepsARecordAnotherInstallationClaimed(t *testing.T) {
 // each disconnect.
 func (w *wired) holdListing(t *testing.T, guid, event string, body map[string]any) []string {
 	t.Helper()
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	w.gh.installed("acme/widgets", "acme/old")
 	var mu sync.Mutex
 	var order []string
@@ -3759,8 +3759,8 @@ func TestADeletedRepositoryWaitsForAListingInFlight(t *testing.T) {
 // names, and 43's stays.
 func TestATransferDropsTheFirstListingsKeptThatNameTheRepository(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	w.adapter.keepFirstNaming(firstKey{9, otherConnection}, "octo-org/widgets")
 	w.adapter.keepFirstNaming(firstKey{43, "ac_00000000000000aa"}, "acme/gadgets")
@@ -3804,8 +3804,8 @@ func (h holdListingRead) RoundTrip(r *http.Request) (*http.Response, error) {
 // reads GitHub again, and the record stays 42's, whose listing started later.
 func TestAFirstListingReadAcrossATransferIsNotKept(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	putLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedPutLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.gh.checked = map[int64]string{9: octoOrg.Login}
 	w.gh.installed("acme/widgets")
 	// 9's listing started before the transfer, and 42's, on the clock, after it.
@@ -3858,8 +3858,8 @@ func TestAFirstListingReadAcrossATransferIsNotKept(t *testing.T) {
 // guard compares, and the adapter's record is not moved back by it.
 func TestAPartReadBeforeATransferAndSentLateKeepsItsStartAndTheRecord(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	putLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedPutLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
 	w.gh.checked = map[int64]string{9: octoOrg.Login}
 	w.gh.installed("acme/widgets")
 	w.adapter.pacer(9).Now = func() time.Time { return listingAt(1) }
@@ -3906,8 +3906,8 @@ func TestAPartReadBeforeATransferAndSentLateKeepsItsStartAndTheRecord(t *testing
 // record stays 9's, the collection stays linked and its pulls stay, and it says false.
 func TestADropOfARepositoryAnotherInstallationClaimedChangesNothing(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 9, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
 	if err := claimReach(w.st, widgetsRef, 9, listingAt(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -3973,7 +3973,7 @@ func TestARepositoryOfAnInstallationWithNoLinkIsDroppedWithoutADisconnect(t *tes
 // 403 that lasts is still timed from it.
 func TestADisconnectsAnswerKeepsTheFirst403OfItsConnection(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	first := time.Now().Add(-time.Hour).Truncate(time.Second)
 	if end, err := noteAnswer(w.st, testConnection, http.StatusForbidden, codeConnectionUnknown, first); end || err != nil {
 		t.Fatalf("the first 403: %v %v", end, err)
@@ -4014,7 +4014,7 @@ func (w *wired) sentEnvironments() map[string]string {
 // acme/gadgets. A listing whose part Qory Apiary refuses keeps no new id.
 func TestAListingKeepsTheEnvironmentRefsQoryApiaryTook(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	keepEnvironment(w.st, gadgetsRef, envBefore)
 	w.gh.envs = map[int64]string{widgetsID: envBefore}
 	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
@@ -4060,7 +4060,7 @@ func TestAListingKeepsTheEnvironmentRefsQoryApiaryTook(t *testing.T) {
 func TestAListingThatCannotReadTheEnvironmentsLeavesTheCollectionsOut(t *testing.T) {
 	for _, fail := range []string{"node", "errors"} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		Link(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, widgetsRef, 42)
 		keepEnvironment(w.st, widgetsRef, envBefore)
 		w.gh.envFail = fail
@@ -4105,7 +4105,7 @@ func pushEvent(installation int64, repo, ref string, deleted bool) map[string]an
 func pushWired(t *testing.T) *wired {
 	t.Helper()
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, widgetsRef, 42)
 	setReach(w.st, gadgetsRef, 42)
 	linkCollection(w.st, widgetsRef)
@@ -4165,7 +4165,7 @@ func TestAPushThatLeavesTheEnvironmentListsNothing(t *testing.T) {
 func TestAPushElsewhereChangesNothing(t *testing.T) {
 	w := pushWired(t)
 	w.gh.envs = map[int64]string{widgetsID: envAfter, gadgetsID: envAfter}
-	Link(w.st, 43, otherConnection, linkLive)
+	grantedLink(w.st, 43, otherConnection, linkLive)
 	other := pushEvent(43, "acme/widgets", "refs/heads/main", false)
 	never := pushEvent(42, "acme/sprockets-two", "refs/heads/main", false)
 	linkCollection(w.st, refOf("acme/sprockets-two"))
@@ -4231,8 +4231,8 @@ func TestAPushWhoseEnvironmentCannotBeReadChangesNothing(t *testing.T) {
 // GitHub deletes the installation, which drops the rest, another installation's kept.
 func TestTheEnvironmentRefSentIsDroppedWithTheRepository(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	Link(w.st, 42, testConnection, linkLive)
-	Link(w.st, 43, otherConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, otherConnection, linkLive)
 	third := refOf("acme/third")
 	elsewhere := refOf("other/thing")
 	for ref, installation := range map[string]int64{widgetsRef: 42, gadgetsRef: 42, third: 42, elsewhere: 43} {

@@ -121,8 +121,8 @@ func (a *Adapter) delivered(event, action string, repository int64) {
 	}
 }
 
-// linked is h for the deliveries of a linked installation; another's is done and
-// logged. The installation event's deleted is [Adapter.deleted]'s, and the repository
+// linked is h for the deliveries of a linked installation that Qory Apiary's copy of the
+// grants holds, see [granted]; another's is done and logged. The installation event's deleted is [Adapter.deleted]'s, and the repository
 // event's transferred is [Adapter.transferred]'s, for any installation whose id is
 // above 0; one that names an id of 0 or below, or none, is done and logged as an
 // installation not linked, before any state changes or any request is sent.
@@ -134,7 +134,7 @@ func (a *Adapter) linked(h func(ctx context.Context, d Delivery) error) func(con
 		if d.Event == "repository" && d.Action == "transferred" && d.InstallationID > 0 {
 			return a.transferred(ctx, d)
 		}
-		ok, err := Linked(a.Store, d.InstallationID)
+		ok, err := granted(a.Store, d.InstallationID, a.clock())
 		if err != nil {
 			return err
 		}

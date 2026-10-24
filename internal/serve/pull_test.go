@@ -138,7 +138,7 @@ func pulling(t *testing.T) (*wired, *pullGitHub, *puller, *pullClock) {
 	w.adapter.GitHub = github.Client{API: f.srv.URL}
 	clock := &pullClock{t: pullStart}
 	w.adapter.now = clock.now
-	Link(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 42, testConnection, linkLive)
 	setReach(w.st, refOf("acme/widgets"), 42)
 	linkCollection(w.st, refOf("acme/widgets"))
 	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}
@@ -1678,7 +1678,7 @@ func TestASignDuringTheListingBeforeIts404StartsTheCountOver(t *testing.T) {
 // and drops the link.
 func TestAPendingLinkOfAnInstallationGitHubAnswers404ForIsEnded(t *testing.T) {
 	w, _, p, clock := pulling(t)
-	Link(w.st, 42, testConnection, linkPending)
+	grantedLink(w.st, 42, testConnection, linkPending)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
 	roundAt(p, clock, 0)
 	roundAt(p, clock, time.Hour)
@@ -2725,7 +2725,7 @@ func TestAnAbsenceUnderAnotherInstallationCountsAsNone(t *testing.T) {
 		t.Fatalf("under 42: %v", err)
 	}
 	setReach(w.st, ref, 9)
-	Link(w.st, 9, testConnection, linkLive)
+	grantedLink(w.st, 9, testConnection, linkLive)
 	if err := p.refused(context.Background(), ref, oldID, 9, none(), refused); !errors.Is(err, errAbsentOnce) {
 		t.Errorf("under 9: %v", err)
 	}
