@@ -169,7 +169,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, f.hookAnswer)
 			return
 		}
-		io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/github/webhook"}`)
+		io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/v1/events"}`)
 	default:
 		w.WriteHeader(404)
 	}

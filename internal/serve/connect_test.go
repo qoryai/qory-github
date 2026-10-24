@@ -606,16 +606,22 @@ func TestTheSessionsCookie(t *testing.T) {
 	if _, err := rig.st.Get(nsConnectSessions, sessionKey(ck.Value)); err != nil {
 		t.Errorf("the session: %v", err)
 	}
-	// Under a public URL with a path, the pages and the cookie are under it.
+	// Under a public URL with a path, which a proxy in front of serve strips, the pages
+	// are at /v1/connect as the listener receives it, and the cookie, the redirect and
+	// the sign-in's callback URL have the path.
 	c := rig.connect(rig.st)
 	defer c.stop()
 	c.PublicURL = "https://acme.example.com/github"
 	pb := &browser{t: t, h: c.Route(rig.mux)}
-	if rec := pb.get("/github/v1/connect?state=" + url.QueryEscape(rig.pass())); rec.Code != http.StatusSeeOther || pb.cookie == nil || pb.cookie.Path != "/github/v1/connect" {
-		t.Errorf("%d %+v", rec.Code, pb.cookie)
+	if rec := pb.get("/v1/connect?state=" + url.QueryEscape(rig.pass())); rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/github/v1/connect/continue" || pb.cookie == nil || pb.cookie.Path != "/github/v1/connect" {
+		t.Errorf("%d %v %+v", rec.Code, rec.Header(), pb.cookie)
 	}
-	if rec := pb.get("/v1/connect?state=" + url.QueryEscape(rig.pass())); rec.Code != http.StatusNotFound {
-		t.Errorf("the page outside the public URL's path answered %d", rec.Code)
+	rec = pb.get("/v1/connect/continue")
+	if loc, _ := url.Parse(rec.Header().Get("Location")); rec.Code != http.StatusSeeOther || loc.Query().Get("redirect_uri") != "https://acme.example.com/github/v1/connect/authorized" {
+		t.Errorf("the sign-in is asked for with %d %v", rec.Code, rec.Header())
+	}
+	if rec := pb.get("/github/v1/connect?state=" + url.QueryEscape(rig.pass())); rec.Code != http.StatusNotFound {
+		t.Errorf("the page with the public URL's path still in it answered %d", rec.Code)
 	}
 }
 

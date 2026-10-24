@@ -71,8 +71,9 @@ qory-github-server <command> -h prints a command's help.`
 var serveHelp = cli.Help{
 	Short: "Take the GitHub App's webhook deliveries",
 	Use:   "qory-github-server serve [--settings FILE]",
-	Long: `Take the GitHub App's webhook deliveries at POST /github/webhook, on plain HTTP: a
-proxy in front terminates TLS.
+	Long: `Take the GitHub App's webhook deliveries at POST /v1/events, on plain HTTP: a
+proxy in front terminates TLS, and strips public_url's path, if it has one, from each
+request.
 
 serve checks each delivery's signature with the App's webhook secret, keeps it in a
 store in the state directory and answers GitHub at once; it handles the delivery
@@ -80,9 +81,9 @@ after. For each installation linked to Qory Apiary it sends the repositories, is
 and comments to Qory Apiary, and it reads Qory Apiary's change feed and writes on GitHub
 what the feed says. It runs until it is stopped with SIGINT or SIGTERM.
 
-serve also answers the connect page under public_url, /v1/connect, where Qory Apiary
-sends a person who connects the App's installation. /health answers 200 from the
-first moment.
+serve also answers the connect page at /v1/connect, which a browser reaches at
+public_url followed by /v1/connect: Qory Apiary sends a person there who connects the
+App's installation. /health answers 200 from the first moment.
 
 The settings come from a file or from the environment, never both. With --settings,
 they are one JSON document in FILE: app_id, private_key_file, webhook_secret_file,

@@ -573,7 +573,7 @@ func fakeGitHub(t *testing.T) string {
 				io.WriteString(w, `{"message":"Server Error"}`)
 				return
 			}
-			io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/github/webhook"}`)
+			io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/v1/events"}`)
 			return
 		}
 		if r.Method != http.MethodPost || r.URL.Path != "/app-manifests/abc/conversions" {

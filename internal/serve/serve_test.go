@@ -517,7 +517,8 @@ func TestADeliveryWithoutItsHeadersOrJSONIsRefused(t *testing.T) {
 		{http.MethodGet, WebhookPath, http.StatusMethodNotAllowed},
 		{http.MethodPut, WebhookPath, http.StatusMethodNotAllowed},
 		{http.MethodPost, "/", http.StatusNotFound},
-		{http.MethodPost, "/github/webhook/x", http.StatusNotFound},
+		{http.MethodPost, "/v1/events/x", http.StatusNotFound},
+		{http.MethodPost, "/github/webhook", http.StatusNotFound},
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, strings.NewReader(body1)))

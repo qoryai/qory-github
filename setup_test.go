@@ -509,7 +509,7 @@ func TestServeManifestIsAsItWas(t *testing.T) {
 	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
 		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
 		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
-		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/github/webhook"},` +
+		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/v1/events"},` +
 		`"name":"qory-github-test","public":true,"redirect_url":"http://127.0.0.1:1/callback","request_oauth_on_install":false,` +
 		`"setup_on_update":true,"setup_url":"https://qory-github.example.com/base/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
 	if err != nil || string(b) != want {

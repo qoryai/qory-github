@@ -124,9 +124,13 @@ type Connect struct {
 	now   func() time.Time
 	sleep func(ctx context.Context, d time.Duration) error
 
-	once     sync.Once
-	base     string
-	refusals *throttle
+	once sync.Once
+	// route is the connect page's path as serve's listener receives it, [connectPath],
+	// and base the same path as a browser reaches it: public_url's path, then route. A
+	// proxy in front of serve strips public_url's path, so serve matches route and
+	// writes base into each cookie and redirect it sends.
+	route, base string
+	refusals    *throttle
 	// linking holds one token: the connect that holds it makes the checks of the
 	// installation's link and of the connection's, and the link, one step, so two
 	// connects at once link an installation to one connection, and a connection to one
@@ -340,6 +344,7 @@ func (c *Connect) init() {
 		if err == nil {
 			c.base = strings.TrimSuffix(u.Path, "/")
 		}
+		c.route = connectPath
 		c.base += connectPath
 		c.linking = make(chan struct{}, 1)
 		c.refilling = map[string]bool{}
@@ -405,15 +410,15 @@ func (c *Connect) Route(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var step func(http.ResponseWriter, *http.Request, url.Values)
 		switch r.URL.Path {
-		case c.base:
+		case c.route:
 			step = c.start
-		case c.base + "/continue":
+		case c.route + "/continue":
 			step = c.proceed
-		case c.base + "/refused":
+		case c.route + "/refused":
 			step = c.showPage
-		case c.base + "/authorized":
+		case c.route + "/authorized":
 			step = c.authorized
-		case c.base + "/return":
+		case c.route + "/return":
 			step = c.installed
 		default:
 			next.ServeHTTP(w, r)
@@ -1453,7 +1458,7 @@ func (c *Connect) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id 
 		c.end(w, id)
 	}
 	status := rf.status
-	if r.URL.Path == c.base && r.Method == http.MethodGet && rf.name != "" {
+	if r.URL.Path == c.route && r.Method == http.MethodGet && rf.name != "" {
 		// The request may carry a pass, so the page shows at an address without it.
 		status = http.StatusSeeOther
 		http.SetCookie(w, &http.Cookie{
@@ -1488,11 +1493,11 @@ func (c *Connect) failed(w http.ResponseWriter, r *http.Request, id, what string
 // step names the request's step for the log: connect, continue, authorized or return.
 func (c *Connect) step(r *http.Request) string {
 	switch r.URL.Path {
-	case c.base + "/return":
+	case c.route + "/return":
 		return "return"
-	case c.base + "/authorized":
+	case c.route + "/authorized":
 		return "authorized"
-	case c.base + "/continue":
+	case c.route + "/continue":
 		return "continue"
 	}
 	return "connect"

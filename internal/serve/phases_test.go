@@ -456,7 +456,7 @@ func TestAKeptAppWithAnInactiveWebhookDeclaresPulling(t *testing.T) {
 	if !strings.Contains(string(got), `"sends_changes":false`) || apiary.sent(routeAdapter)[0].body["setup_url"] != nil {
 		t.Errorf("declared %s", apiary.sent(routeAdapter)[0].raw)
 	}
-	want := `"msg":"the kept App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to https://qory-github.example.com/github/webhook and turn the webhook on at ` + s.APIURL + `/organizations/acme/settings/apps/qory-acme"`
+	want := `"msg":"the kept App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to https://qory-github.example.com/v1/events and turn the webhook on at ` + s.APIURL + `/organizations/acme/settings/apps/qory-acme"`
 	if !strings.Contains(log.String(), want) {
 		t.Errorf("the log: %s", log.String())
 	}
@@ -622,12 +622,47 @@ func TestAStartResolvesTheKeptAppsFiles(t *testing.T) {
 	}
 }
 
-// TestHealthIsAtTheRootOnAnyHost pins that /health is answered at the root path on
-// any host, whatever public_url's path, and the setup at public_url's path's /setup.
-func TestHealthIsAtTheRootOnAnyHost(t *testing.T) {
+// TestServeUnderAPublicURLWithAPathAnswersAtTheListenersRoot runs serve with a
+// public_url that has a path, behind a proxy that strips it: the webhook deliveries are
+// taken at /v1/events and the connect page answers at /v1/connect, as the listener
+// receives them, while the connect page's redirect and the connect_url serve declares
+// have the path. A request that still has the path is answered 404.
+func TestServeUnderAPublicURLWithAPathAnswersAtTheListenersRoot(t *testing.T) {
+	dir := t.TempDir()
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	s.PublicURL = "https://qory-github.example.com/adapters/github"
+	hs := &Handlers{}
+	hs.HandleFunc("issues", func(context.Context, Delivery) error { return nil })
+	addr, _, _ := runWith(t, s, Options{Handlers: hs, feedSleep: shortSleep})
+	delivery := http.Header{"X-Github-Event": {"issues"}, "X-Github-Delivery": {guid1}, "X-Hub-Signature-256": {sign(body1)}}
+	if resp, _ := fetch(t, nil, http.MethodPost, addr, "/adapters/github"+WebhookPath, strings.NewReader(body1), delivery); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("the delivery with the path answered %d", resp.StatusCode)
+	}
+	if resp, _ := fetch(t, nil, http.MethodPost, addr, "/v1/events", strings.NewReader(body1), delivery); resp.StatusCode != http.StatusAccepted {
+		t.Errorf("the delivery answered %d", resp.StatusCode)
+	}
+	if resp, _ := fetch(t, nil, http.MethodGet, addr, "/v1/connect?state=x", nil, nil); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/adapters/github/v1/connect/refused" {
+		t.Errorf("the connect page answered %d %v", resp.StatusCode, resp.Header)
+	}
+	if resp, _ := fetch(t, nil, http.MethodGet, addr, "/adapters/github/v1/connect?state=x", nil, nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("the connect page with the path answered %d", resp.StatusCode)
+	}
+	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
+	if b := apiary.sent(routeAdapter)[0].body; b["connect_url"] != "https://qory-github.example.com/adapters/github/v1/connect" {
+		t.Errorf("declared %v", b)
+	}
+}
+
+// TestHealthAndSetupAreAtTheListenersRoot pins that, with a public_url that has a path,
+// which a proxy in front of serve strips, /health is answered at the listener's root on
+// any host and the setup at /setup, and that the setup's cookie and redirect have the
+// path a browser sees. A request that still has the path is not answered as either.
+func TestHealthAndSetupAreAtTheListenersRoot(t *testing.T) {
 	setup := &appSetup{PublicURL: "https://qory-github.example.com/base", Store: openStore(t, filepath.Join(t.TempDir(), "state")), creds: &credentials{e: enrolment{pin: pinOf(newKey(t)), adapterID: testAdapterID}}}
 	p := &phase{health: healthNoApp, unavailable: unavailableNoApp, setup: setup}
-	for target, want := range map[string]int{"/health": 200, "http://other.example.com/health": 200, "/base/health": 503, "/setup": 503, "/base/setup?state=x": 303, "/base/setupx": 503} {
+	for target, want := range map[string]int{"/health": 200, "http://other.example.com/health": 200, "/base/health": 503, "/setup?state=x": 303, "/base/setup?state=x": 503, "/setupx": 503} {
 		w := httptest.NewRecorder()
 		p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 		if w.Code != want {
@@ -635,8 +670,8 @@ func TestHealthIsAtTheRootOnAnyHost(t *testing.T) {
 		}
 	}
 	w := httptest.NewRecorder()
-	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/base/setup?state=x", nil))
-	if ck := (&http.Response{Header: w.Header()}).Cookies(); len(ck) != 1 || ck[0].Path != "/base/setup" {
-		t.Errorf("the page cookie %v", ck)
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/setup?state=x", nil))
+	if ck := (&http.Response{Header: w.Header()}).Cookies(); len(ck) != 1 || ck[0].Path != "/base/setup" || w.Header().Get("Location") != "/base/setup/refused" {
+		t.Errorf("the page cookie %v, the redirect %q", ck, w.Header().Get("Location"))
 	}
 }

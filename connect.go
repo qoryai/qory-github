@@ -33,8 +33,8 @@ var ErrPublicURL = errors.New("is not an https URL of a host, an optional port a
 // 1 to 65535 or none, and a path or none, without a user, a query or a fragment, an
 // empty one among them, and without white space or a control character. It returns
 // the URL with its scheme and host in lower case and with no slash at its end, however
-// many it had, so a path joined to it, as /v1/connect, follows one slash alone. setup
-// and serve both check it so.
+// many it had, so a path joined to it, as /v1/connect, follows one slash alone. serve
+// checks it so.
 // The error, [ErrPublicURL], names the rule, never the URL.
 func CheckPublicURL(s string) (string, error) {
 	if strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }) || strings.ContainsAny(s, "#?") {

@@ -14,6 +14,11 @@ change what the program does, and notes it under Upgrading.
   `.github/workflows/prerelease.yml` publishes when a person runs that workflow. The
   program runs only where `QORY_FEATURES` names `factory`: without it, the program
   prints its usage line and knows no command.
+- `qory-github-server serve` takes the App's webhook deliveries at `/v1/events`, and
+  answers `/setup`, `/v1/connect` and `/health`, at the root of the address it listens
+  on. A proxy in front strips the path of `public_url`, such as `/adapters/github`.
+  Every address serve sends a browser or GitHub to starts with `public_url`, its path
+  included.
 - Where `QORY_FEATURES` names `factory`, `qory-github describe` prints the source
   role, `qory-github-server`, too.
 

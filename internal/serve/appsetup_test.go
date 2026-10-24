@@ -350,7 +350,7 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 		}
 		hook, _ := manifest["hook_attributes"].(map[string]any)
 		if manifest["name"] != "qory-"+login || manifest["redirect_url"] != "https://qory-github.example.com/setup/created" ||
-			hook["url"] != "https://qory-github.example.com/github/webhook" || hook["active"] != true || manifest["setup_url"] != "https://qory-github.example.com/v1/connect/return" {
+			hook["url"] != "https://qory-github.example.com/v1/events" || hook["active"] != true || manifest["setup_url"] != "https://qory-github.example.com/v1/connect/return" {
 			t.Errorf("the manifest is %v", manifest)
 		}
 		w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
@@ -444,6 +444,52 @@ func TestASetupWithoutAPublicAddressMakesTheWebhookInactive(t *testing.T) {
 	}
 	if a, err := loadApp(rig.dir); err != nil || a.webhookActive {
 		t.Errorf("the App kept: %+v %v", a, err)
+	}
+}
+
+// TestASetupUnderAPublicURLWithAPathSendsThePath runs the App setup with a public_url
+// that has a path, behind a proxy that strips it: serve answers /setup and the paths
+// under it as its listener receives them, and every address a browser or GitHub sees
+// has the path, the cookies, the redirects, the form's action, the manifest's redirect,
+// webhook, Setup URL and callback URL. An address that still has the path is not the
+// setup's.
+func TestASetupUnderAPublicURLWithAPathSendsThePath(t *testing.T) {
+	rig := newSetupRig(t, true)
+	rig.setup.PublicURL = "https://acme.example.com/adapters/github"
+	j := jar{}
+	w := rig.do(j, http.MethodGet, "/setup?state="+rig.pass(), nil)
+	ck := (&http.Response{Header: w.Header()}).Cookies()
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/adapters/github/setup/continue" || len(ck) != 1 || ck[0].Name != setupCookie || ck[0].Path != "/adapters/github/setup" {
+		t.Fatalf("the pass answered %d %v", w.Code, w.Header())
+	}
+	w = rig.do(j, http.MethodGet, "/setup/continue", nil)
+	if !strings.Contains(w.Body.String(), `action="/adapters/github/setup/continue"`) {
+		t.Errorf("the account form: %s", w.Body)
+	}
+	token := tokenField.FindStringSubmatch(w.Body.String())[1]
+	_, _, manifest := rig.account(j, token, "acme")
+	hook, _ := manifest["hook_attributes"].(map[string]any)
+	callbacks, _ := manifest["callback_urls"].([]any)
+	if manifest["redirect_url"] != "https://acme.example.com/adapters/github/setup/created" || hook["url"] != "https://acme.example.com/adapters/github/v1/events" ||
+		manifest["setup_url"] != "https://acme.example.com/adapters/github/v1/connect/return" ||
+		len(callbacks) != 1 || callbacks[0] != "https://acme.example.com/adapters/github/v1/connect/authorized" {
+		t.Errorf("the manifest is %v", manifest)
+	}
+	// A pass refused shows its page at an address with the path.
+	w = rig.do(jar{}, http.MethodGet, "/setup?state=x", nil)
+	ck = (&http.Response{Header: w.Header()}).Cookies()
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/adapters/github/setup/refused" || len(ck) != 1 || ck[0].Name != setupPageCookie || ck[0].Path != "/adapters/github/setup" {
+		t.Errorf("a refused pass answered %d %v", w.Code, w.Header())
+	}
+	for _, path := range []string{"/adapters/github/setup", "/adapters/github/setup/continue"} {
+		if rig.setup.owns(path) {
+			t.Errorf("%s is the setup's", path)
+		}
+	}
+	for _, path := range []string{"/setup", "/setup/continue", "/setup/created", "/setup/refused"} {
+		if !rig.setup.owns(path) {
+			t.Errorf("%s is not the setup's", path)
+		}
 	}
 }
 

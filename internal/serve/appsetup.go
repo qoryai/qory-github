@@ -94,9 +94,13 @@ type appSetup struct {
 	refusalEvery time.Duration
 	waits        func()
 
-	once     sync.Once
-	base     string
-	refusals *throttle
+	once sync.Once
+	// route is the App setup's path as serve's listener receives it, [setupPath], and
+	// base the same path as a browser reaches it: public_url's path, then route. A
+	// proxy in front of serve strips public_url's path, so serve matches route and
+	// writes base into each cookie, redirect and form it sends.
+	route, base string
+	refusals    *throttle
 	// lock holds one token: the step that holds it starts a session and moves the flow
 	// pointer, or keeps the App, one step, see [appSetup.take]. kept is whether an App
 	// is kept, or the settings give one, set only while the token is held.
@@ -185,6 +189,7 @@ func (a *appSetup) init() {
 		if err == nil {
 			a.base = strings.TrimSuffix(u.Path, "/")
 		}
+		a.route = setupPath
 		a.base += setupPath
 		a.lock = make(chan struct{}, 1)
 		// A count of refusals held back is said by the next refusal logged.
@@ -206,11 +211,11 @@ func (a *appSetup) log() *slog.Logger {
 	return a.Log
 }
 
-// owns is whether the path is one of the App setup's: its path under the public URL's,
-// or one under it.
+// owns is whether the path, as serve's listener receives it, is one of the App
+// setup's: [setupPath], or one under it.
 func (a *appSetup) owns(path string) bool {
 	a.init()
-	return path == a.base || strings.HasPrefix(path, a.base+"/")
+	return path == a.route || strings.HasPrefix(path, a.route+"/")
 }
 
 // ServeHTTP answers the App setup's paths. Every answer is never kept by a cache,
@@ -220,13 +225,13 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.init()
 	var step func(http.ResponseWriter, *http.Request, url.Values)
 	switch r.URL.Path {
-	case a.base:
+	case a.route:
 		step = a.start
-	case a.base + "/continue":
+	case a.route + "/continue":
 		step = a.proceed
-	case a.base + "/created":
+	case a.route + "/created":
 		step = a.created
-	case a.base + "/refused":
+	case a.route + "/refused":
 		step = a.showPage
 	default:
 		http.NotFound(w, r)
@@ -237,12 +242,12 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-	if r.URL.Path == a.base+"/continue" && r.Method == http.MethodPost {
+	if r.URL.Path == a.route+"/continue" && r.Method == http.MethodPost {
 		a.account(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
-		if r.URL.Path == a.base+"/continue" {
+		if r.URL.Path == a.route+"/continue" {
 			h.Set("Allow", "GET, POST")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -848,7 +853,7 @@ func (a *appSetup) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id
 		a.endSession(w, id)
 	}
 	status := rf.status
-	if r.URL.Path == a.base && r.Method == http.MethodGet && rf.name != "" {
+	if r.URL.Path == a.route && r.Method == http.MethodGet && rf.name != "" {
 		// The request may carry a pass, so the page shows at an address without it.
 		status = http.StatusSeeOther
 		http.SetCookie(w, &http.Cookie{
@@ -883,14 +888,14 @@ func (a *appSetup) failed(w http.ResponseWriter, r *http.Request, id, what strin
 // refused.
 func (a *appSetup) step(r *http.Request) string {
 	switch r.URL.Path {
-	case a.base + "/continue":
+	case a.route + "/continue":
 		if r.Method == http.MethodPost {
 			return "account"
 		}
 		return "continue"
-	case a.base + "/created":
+	case a.route + "/created":
 		return "created"
-	case a.base + "/refused":
+	case a.route + "/refused":
 		return "refused"
 	}
 	return "setup"
