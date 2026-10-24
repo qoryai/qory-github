@@ -21,9 +21,9 @@ change what the program does, and notes it under Upgrading.
   included.
 - Where `QORY_FEATURES` names `factory`, `qory-github describe` prints the source
   role, `qory-github-server`, too.
-- The setup page of `qory-github-server serve` asks who can install the GitHub App:
-  only the account it is for (private), selected first, or any GitHub account
-  (public). GitHub lets only the account that owns a private App install it.
+- The setup page of `qory-github-server serve` has a choice of who can install the
+  GitHub App: only the account it is for (private), selected first, or any GitHub
+  account (public). GitHub lets only the account that owns a private App install it.
 
 ### Changed
 
