@@ -7,6 +7,14 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-24
+
+### Added
+
+- The release has `description.json`, the description `qory-github describe` prints,
+  and `checksums.txt` lists its SHA-256, so Qory Apiary can add the integration from
+  the release. The program is unchanged.
+
 ## [0.2.0] - 2026-10-12
 
 ### Changed
@@ -205,6 +213,7 @@ change what the program does, and notes it under Upgrading.
   `go install github.com/qoryai/qory-github/cmd/qory-github@latest` installs it. The App
   `setup` creates links to this repository.
 
-[Unreleased]: https://github.com/qoryai/qory-github/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/qoryai/qory-github/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/qoryai/qory-github/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/qoryai/qory-github/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qoryai/qory-github/releases/tag/v0.1.0

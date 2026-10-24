@@ -10,6 +10,8 @@ jobs:
     if: ${{ github.server_url == 'https://github.com' }}
     permissions:
       contents: write
-    uses: qoryai/integrations/.github/workflows/release.yml@v0.3.0
+    # A main commit of integrations, for description.json, until its release; then the
+    # release tag.
+    uses: qoryai/integrations/.github/workflows/release.yml@5f92b11673052874cd1e2f9fbf246a230d50dd16
     with:
       program: qory-github
