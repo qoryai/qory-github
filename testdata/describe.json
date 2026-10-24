@@ -128,7 +128,8 @@
         "private-key",
         "webhook-secret",
         "client-secret"
-      ]
+      ],
+      "credential_scope": "resource"
     }
   },
   "egress_hosts": [

@@ -81,6 +81,10 @@ type SourceRole struct {
 	// Secrets are the names of the secrets qory-github-server stores in Qory Apiary:
 	// the App, its private key, its webhook secret and its client secret.
 	Secrets []string `json:"secrets,omitempty"`
+	// CredentialScope is how far one credential the adapter answers to Qory Apiary's
+	// run-credential call reaches: resource, the repositories the call lists and no
+	// other.
+	CredentialScope string `json:"credential_scope,omitempty"`
 }
 
 // Noun is the source's words for one thing, One, and for more than one, Other, which

@@ -173,6 +173,7 @@ var serveVariables = []string{
 	"QORY_GITHUB_LISTEN", "QORY_GITHUB_STATE_DIR", "QORY_GITHUB_API_URL", "QORY_GITHUB_APIARY_URL", "QORY_GITHUB_APIARY_PUBLIC_URL",
 	"QORY_GITHUB_PUBLIC_URL", "QORY_GITHUB_ACCESS_KEY_ID", "QORY_GITHUB_ACCESS_KEY_SECRET", "QORY_GITHUB_ACCESS_KEY_SECRET_FILE", "QORY_GITHUB_APIARY_PUBLIC_KEY",
 	"QORY_GITHUB_ADAPTER_ID", "QORY_GITHUB_ENROLMENT_CODE_FILE", "QORY_GITHUB_PUBLIC_ADDRESS", "QORY_GITHUB_UPLOAD_RETRY_SECONDS",
+	"QORY_GITHUB_CALL_URL",
 }
 
 // TestServeReadsTheEnvironmentWithoutSettings runs serve whole without --settings, the
@@ -280,6 +281,9 @@ func TestServeHelpSaysTheAppSetup(t *testing.T) {
 		"/health answers 200 from the first moment.",
 		"public_address, false when GitHub cannot reach public_url: the App setup creates has its webhook inactive, and serve learns of changes on GitHub by pulling. Left out, it is true.",
 		"QORY_GITHUB_PUBLIC_ADDRESS for public_address",
+		"Without call_url, serve takes no call.",
+		"public_url is the adapter's host name only, such as https://github.example.com, so GitHub sends the deliveries to https://github.example.com/v1/events.",
+		"Set call_url to the address Qory Apiary sends the calls to: public_url followed by /v1/calls/, such as https://github.example.com/v1/calls/.",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("the help lacks %q:\n%s", want, errs.String())

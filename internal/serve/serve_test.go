@@ -940,6 +940,10 @@ func writeFile(t *testing.T, path, content string, mode os.FileMode) {
 // pinJSON is a pin with one key that is no fixture's.
 const pinJSON = `[{"alg":"ed25519","public_key":"Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}]`
 
+// badPublicURL is the error of a public_url in a settings file that is not an https
+// origin: it starts with the fix.
+const badPublicURL = "Set public_url to the adapter's host name only, such as https://github.example.com: the settings are invalid: /public_url: is not an https URL of a host and an optional port, without a path, a user, a query or a fragment"
+
 func TestReadSettings(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "serve.json")
@@ -955,11 +959,11 @@ func TestReadSettings(t *testing.T) {
 		t.Fatalf("%+v %v", s, err)
 	}
 	base := map[string]any{"listen": ":8080", "state_dir": "/d",
-		"api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://qory-github.example.com/github",
+		"api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://github.example.com/",
 		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON),
 		"adapter_id": "na_0123456789abcdef"}
 	b, _ := json.Marshal(base)
-	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://qory-github.example.com/github" ||
+	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://github.example.com" ||
 		s.uploadFor() != 10*time.Minute {
 		t.Errorf("%+v %v", s, err)
 	}
@@ -973,10 +977,12 @@ func TestReadSettings(t *testing.T) {
 		"Qory Apiary on http":  {map[string]any{"apiary_url": "http://secret.example.com"}, "/apiary_url: is neither an https origin"},
 		"Qory Apiary's path":   {map[string]any{"apiary_url": "https://apiary.example.com/secret"}, "/apiary_url: is neither an https origin"},
 		"a user":               {map[string]any{"apiary_url": "https://secret@apiary.example.com"}, "/apiary_url: is neither an https origin"},
-		"a public http URL":    {map[string]any{"public_url": "http://secret.example.com"}, "/public_url: is not an https URL"},
-		"a public query":       {map[string]any{"public_url": "https://qory-github.example.com/?secret"}, "/public_url: is not an https URL"},
-		"a public fragment":    {map[string]any{"public_url": "https://qory-github.example.com/#secret"}, "/public_url: is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment"},
-		"a public bad port":    {map[string]any{"public_url": "https://qory-github.example.com:0"}, "/public_url: is not an https URL of a host, an optional port and an optional path"},
+		"a public http URL":    {map[string]any{"public_url": "http://secret.example.com"}, badPublicURL},
+		"a public path":        {map[string]any{"public_url": "https://github.example.com/adapters/github"}, badPublicURL},
+		"a public query":       {map[string]any{"public_url": "https://github.example.com/?secret"}, badPublicURL},
+		"a public fragment":    {map[string]any{"public_url": "https://github.example.com/#secret"}, badPublicURL},
+		"a public user":        {map[string]any{"public_url": "https://secret@github.example.com"}, badPublicURL},
+		"a public bad port":    {map[string]any{"public_url": "https://github.example.com:0"}, badPublicURL},
 		"a bad key id":         {map[string]any{"access_key_id": "ak_secret"}, "/access_key_id: is not ak_"},
 		"a pin of no list":     {map[string]any{"apiary_public_key": "secret value"}, `/apiary_public_key: is not a list of {"alg": "ed25519"`},
 		"a pin of a bad key":   {map[string]any{"apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": "c2VjcmV0"}}}, `/apiary_public_key: is not a list`},
@@ -1467,14 +1473,14 @@ func TestAStaleTickDoesNothing(t *testing.T) {
 	}
 }
 
-// TestServeTakesThePublicURLAsSetupDoes checks serve's public URL loses every slash at
-// its end, as setup's does, and is refused with setup's error, one that holds what looks
-// like a secret too.
-func TestServeTakesThePublicURLAsSetupDoes(t *testing.T) {
-	if got, err := checkPublicURL("https://qory-github.example.com/github//"); err != nil || got != "https://qory-github.example.com/github" {
+// TestServeTakesThePublicURLAsAnOrigin checks serve's public URL loses the slash at its
+// end, and is refused with [github.ErrPublicURL] when it has a path, a fragment, or what
+// looks like a secret.
+func TestServeTakesThePublicURLAsAnOrigin(t *testing.T) {
+	if got, err := checkPublicURL("https://github.example.com/"); err != nil || got != "https://github.example.com" {
 		t.Errorf("%q %v", got, err)
 	}
-	for _, in := range []string{"https://qory-github.example.com/#a", "https://qory-github.example.com/qak_a"} {
+	for _, in := range []string{"https://github.example.com/#a", "https://github.example.com/adapters/github", "https://github.example.com/qak_a", "https://qak_a.example.com"} {
 		if _, err := checkPublicURL(in); !errors.Is(err, github.ErrPublicURL) {
 			t.Errorf("%q: %v", in, err)
 		}

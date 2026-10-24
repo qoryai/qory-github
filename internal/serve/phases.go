@@ -5,9 +5,9 @@ import (
 	"sync/atomic"
 )
 
-// healthPath is where serve answers a load balancer's health check, as serve's
-// listener receives it, on any host: 200 from the moment serve listens, in each of its
-// phases, with a line that names the phase.
+// healthPath is where serve answers a load balancer's health check, on any host: 200
+// from the moment serve listens, in each of its phases, with a line that names the
+// phase.
 const healthPath = "/health"
 
 // The lines of serve's phases: /health's in each, and the line every other request is

@@ -320,3 +320,37 @@ func TestTheFeedReadsTheCopyAtStart(t *testing.T) {
 		t.Error("the link the copy does not hold is kept")
 	}
 }
+
+// TestACallServesOnlyAnInstallationTheCopyHolds pins the rule a call follows, the one
+// intake follows, see [granted]: an installation whose link's connect return has
+// expired and that Qory Apiary's copy of the grants does not hold is refused 409
+// grant_unknown, and nothing is minted for it; while its connect return has not
+// expired, or once the copy holds it, a run credential is minted.
+func TestACallServesOnlyAnInstallationTheCopyHolds(t *testing.T) {
+	rig := newCallsRig(t)
+	send := func() callAnswer {
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, callBody(runCredential("42", []string{widgetsRef}, "read", "work")))
+	}
+	if err := replaceGrants(rig.st, nil); err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, send(), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Fatalf("minted %q for an installation the copy does not hold", mints)
+	}
+	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkLive, Return: time.Now().Add(time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, send(), http.StatusOK, "run-credential-answer.schema.json", "")
+	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, send(), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
+	if err := putGrant(rig.st, 42, testConnection); err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, send(), http.StatusOK, "run-credential-answer.schema.json", "")
+	if mints := rig.gh.mintsSoFar(); len(mints) != 2 {
+		t.Errorf("minted %d credentials, want 2", len(mints))
+	}
+}

@@ -639,45 +639,37 @@ func TestReadingTheAppIsTriedAgainWhileHealthAnswers(t *testing.T) {
 	}
 }
 
-// TestServeUnderAPublicURLWithAPathAnswersAtTheListenersRoot runs serve with a
-// public_url that has a path, behind a proxy that strips it: the webhook deliveries are
-// taken at /v1/events and the connect page answers at /v1/connect, as the listener
-// receives them, while the connect page's redirect and the connect_url serve declares
-// have the path. A request that still has the path is answered 404.
-func TestServeUnderAPublicURLWithAPathAnswersAtTheListenersRoot(t *testing.T) {
+// TestServeAtAHostOnlyPublicURLDeclaresItsAddresses runs serve with public_url the
+// adapter's host name: the webhook deliveries are taken at /v1/events, the connect
+// page's redirect is /v1/connect/refused, and the connect_url serve declares is the
+// origin followed by /v1/connect.
+func TestServeAtAHostOnlyPublicURLDeclaresItsAddresses(t *testing.T) {
 	dir := t.TempDir()
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)
 	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
-	s.PublicURL = "https://qory-github.example.com/adapters/github"
+	s.PublicURL = "https://github.example.com"
 	hs := &Handlers{}
 	hs.HandleFunc("issues", func(context.Context, Delivery) error { return nil })
 	addr, _, _ := runWith(t, s, Options{Handlers: hs, feedSleep: shortSleep})
 	delivery := http.Header{"X-Github-Event": {"issues"}, "X-Github-Delivery": {guid1}, "X-Hub-Signature-256": {sign(body1)}}
-	if resp, _ := fetch(t, nil, http.MethodPost, addr, "/adapters/github"+WebhookPath, strings.NewReader(body1), delivery); resp.StatusCode != http.StatusNotFound {
-		t.Errorf("the delivery with the path answered %d", resp.StatusCode)
-	}
 	if resp, _ := fetch(t, nil, http.MethodPost, addr, "/v1/events", strings.NewReader(body1), delivery); resp.StatusCode != http.StatusAccepted {
 		t.Errorf("the delivery answered %d", resp.StatusCode)
 	}
-	if resp, _ := fetch(t, nil, http.MethodGet, addr, "/v1/connect?state=x", nil, nil); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/adapters/github/v1/connect/refused" {
+	if resp, _ := fetch(t, nil, http.MethodGet, addr, "/v1/connect?state=x", nil, nil); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/v1/connect/refused" {
 		t.Errorf("the connect page answered %d %v", resp.StatusCode, resp.Header)
 	}
-	if resp, _ := fetch(t, nil, http.MethodGet, addr, "/adapters/github/v1/connect?state=x", nil, nil); resp.StatusCode != http.StatusNotFound {
-		t.Errorf("the connect page with the path answered %d", resp.StatusCode)
-	}
 	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
-	if b := apiary.sent(routeAdapter)[0].body; b["connect_url"] != "https://qory-github.example.com/adapters/github/v1/connect" {
+	if b := apiary.sent(routeAdapter)[0].body; b["connect_url"] != "https://github.example.com/v1/connect" {
 		t.Errorf("declared %v", b)
 	}
 }
 
-// TestHealthAndSetupAreAtTheListenersRoot pins that, with a public_url that has a path,
-// which a proxy in front of serve strips, /health is answered at the listener's root on
-// any host and the setup at /setup, and that the setup's cookie and redirect have the
-// path a browser sees. A request that still has the path is not answered as either.
-func TestHealthAndSetupAreAtTheListenersRoot(t *testing.T) {
-	setup := &appSetup{PublicURL: "https://qory-github.example.com/base", Store: openStore(t, filepath.Join(t.TempDir(), "state")), creds: &credentials{e: enrolment{pin: pinOf(newKey(t)), adapterID: testAdapterID}}}
+// TestHealthAndSetupAreAtTheRoot pins that /health is answered at the root on any
+// host and the setup at /setup, and that the setup's cookie is for /setup and its
+// redirect is /setup/refused.
+func TestHealthAndSetupAreAtTheRoot(t *testing.T) {
+	setup := &appSetup{PublicURL: "https://github.example.com", Store: openStore(t, filepath.Join(t.TempDir(), "state")), creds: &credentials{e: enrolment{pin: pinOf(newKey(t)), adapterID: testAdapterID}}}
 	p := &phase{health: healthNoApp, unavailable: unavailableNoApp, setup: setup}
 	for target, want := range map[string]int{"/health": 200, "http://other.example.com/health": 200, "/base/health": 503, "/setup?state=x": 303, "/base/setup?state=x": 503, "/setupx": 503} {
 		w := httptest.NewRecorder()
@@ -688,7 +680,7 @@ func TestHealthAndSetupAreAtTheListenersRoot(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/setup?state=x", nil))
-	if ck := (&http.Response{Header: w.Header()}).Cookies(); len(ck) != 1 || ck[0].Path != "/base/setup" || w.Header().Get("Location") != "/base/setup/refused" {
+	if ck := (&http.Response{Header: w.Header()}).Cookies(); len(ck) != 1 || ck[0].Path != "/setup" || w.Header().Get("Location") != "/setup/refused" {
 		t.Errorf("the page cookie %v, the redirect %q", ck, w.Header().Get("Location"))
 	}
 }

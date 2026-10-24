@@ -126,13 +126,8 @@ type Connect struct {
 	sleep       func(ctx context.Context, d time.Duration) error
 	reportSleep func(ctx context.Context, d time.Duration) error
 
-	once sync.Once
-	// route is the connect page's path as serve's listener receives it, [connectPath],
-	// and base the same path as a browser reaches it: public_url's path, then route. A
-	// proxy in front of serve strips public_url's path, so serve matches route and
-	// writes base into each cookie and redirect it sends.
-	route, base string
-	refusals    *throttle
+	once     sync.Once
+	refusals *throttle
 	// linking holds one token: the connect that holds it makes the checks of the
 	// installation's link and of the connection's, and the link, one step, so two
 	// connects at once link an installation to one connection, and a connection to one
@@ -342,12 +337,6 @@ type session struct {
 
 func (c *Connect) init() {
 	c.once.Do(func() {
-		u, err := url.Parse(c.PublicURL)
-		if err == nil {
-			c.base = strings.TrimSuffix(u.Path, "/")
-		}
-		c.route = connectPath
-		c.base += connectPath
 		c.linking = make(chan struct{}, 1)
 		c.refilling = map[string]bool{}
 		c.refusals = &throttle{every: refusalEvery, now: c.now, flush: func(dropped int) {
@@ -398,7 +387,7 @@ func (c *Connect) stop() {
 	c.refusals.stop()
 }
 
-// Route is next with the connect page's five paths, under the public URL's path,
+// Route is next with the connect page's five paths, /v1/connect and the four under it,
 // answered by Connect: every other path goes to next, the receiver among them, whose
 // bounds stay as they are.
 //
@@ -412,15 +401,15 @@ func (c *Connect) Route(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var step func(http.ResponseWriter, *http.Request, url.Values)
 		switch r.URL.Path {
-		case c.route:
+		case connectPath:
 			step = c.start
-		case c.route + "/continue":
+		case connectPath + "/continue":
 			step = c.proceed
-		case c.route + "/refused":
+		case connectPath + "/refused":
 			step = c.showPage
-		case c.route + "/authorized":
+		case connectPath + "/authorized":
 			step = c.authorized
-		case c.route + "/return":
+		case connectPath + "/return":
 			step = c.installed
 		default:
 			next.ServeHTTP(w, r)
@@ -494,10 +483,10 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: connectCookie, Value: id, Path: c.base, MaxAge: int(sessionFor / time.Second), Expires: now.Add(sessionFor),
+		Name: connectCookie, Value: id, Path: connectPath, MaxAge: int(sessionFor / time.Second), Expires: now.Add(sessionFor),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 	})
-	redirect(w, c.base+"/continue")
+	redirect(w, connectPath+"/continue")
 }
 
 // proceed is GET /v1/connect/continue, where a pass accepted sends the browser, with no
@@ -536,7 +525,7 @@ func (c *Connect) showPage(w http.ResponseWriter, r *http.Request, _ url.Values)
 	if ck, err := r.Cookie(pageCookie); err == nil && pages[ck.Value] != nil {
 		rf = *pages[ck.Value]
 	}
-	http.SetCookie(w, &http.Cookie{Name: pageCookie, Value: "", Path: c.base, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: pageCookie, Value: "", Path: connectPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(rf.status)
 	io.WriteString(w, rf.page+"\n")
@@ -1416,7 +1405,7 @@ func (c *Connect) end(w http.ResponseWriter, id string) {
 			c.log().Error("dropping a connect session", slog.String("error", err.Error()))
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: connectCookie, Value: "", Path: c.base, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: connectCookie, Value: "", Path: connectPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 
 // takeLink takes the linking token, waiting for it while another connect holds it,
@@ -1461,13 +1450,13 @@ func (c *Connect) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id 
 		c.end(w, id)
 	}
 	status := rf.status
-	if r.URL.Path == c.route && r.Method == http.MethodGet && rf.name != "" {
+	if r.URL.Path == connectPath && r.Method == http.MethodGet && rf.name != "" {
 		// The request may carry a pass, so the page shows at an address without it.
 		status = http.StatusSeeOther
 		http.SetCookie(w, &http.Cookie{
-			Name: pageCookie, Value: rf.name, Path: c.base, MaxAge: int(pageFor / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+			Name: pageCookie, Value: rf.name, Path: connectPath, MaxAge: int(pageFor / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 		})
-		redirect(w, c.base+"/refused")
+		redirect(w, connectPath+"/refused")
 	} else {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(rf.status)
@@ -1496,11 +1485,11 @@ func (c *Connect) failed(w http.ResponseWriter, r *http.Request, id, what string
 // step names the request's step for the log: connect, continue, authorized or return.
 func (c *Connect) step(r *http.Request) string {
 	switch r.URL.Path {
-	case c.route + "/return":
+	case connectPath + "/return":
 		return "return"
-	case c.route + "/authorized":
+	case connectPath + "/authorized":
 		return "authorized"
-	case c.route + "/continue":
+	case connectPath + "/continue":
 		return "continue"
 	}
 	return "connect"

@@ -172,6 +172,10 @@ type Apiary struct {
 	// declares that the adapter does not send changes as they happen. It is set before
 	// a declaration is sent, never while one is.
 	PullsAlone bool
+	// CallURL is call_url, where Qory Apiary sends its calls, which [Apiary.Declare]
+	// declares when it is set and setupURL is empty: serve answers calls only while it
+	// serves with an App. It is set before a declaration is sent, never while one is.
+	CallURL string
 
 	once         sync.Once
 	unauthorized *throttle
@@ -301,7 +305,8 @@ func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.Connect
 // Declare sends POST /v1/adapter, which serve sends each time it starts, and again
 // once the App is set up: where a person connects GitHub, under publicURL; where an
 // instance admin sets the App up, setupURL, which is left out when it is empty, as it
-// is once an App is kept or the settings give one; how often serve pulls from GitHub,
+// is once an App is kept or the settings give one; where Qory Apiary calls serve,
+// [Apiary.CallURL], declared only with no setupURL; how often serve pulls from GitHub,
 // and whether it sends changes as they happen, which it does unless
 // [Apiary.PullsAlone]; and the integration's description. The description is
 // [github.Describe] with [Apiary.ProgramVersion], the source role among its roles: the
@@ -314,10 +319,15 @@ func (a *Apiary) Declare(ctx context.Context, publicURL, setupURL string) error 
 	if err != nil {
 		return Permanent(fmt.Errorf("%s: %w", what, err))
 	}
+	callURL := ""
+	if setupURL == "" {
+		callURL = a.CallURL
+	}
 	req := contracts.Adapter{
 		Version:     contracts.Version,
 		ConnectURL:  publicURL + connectPath,
 		SetupURL:    setupURL,
+		CallURL:     callURL,
 		Sync:        contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: !a.PullsAlone},
 		Description: description,
 	}

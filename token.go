@@ -14,9 +14,13 @@ import (
 
 // InstallationToken is a token GitHub minted for one installation of the App, and when
 // it expires. It is a secret: String, GoString, JSON and an error never say it.
+// Repositories are the repositories GitHub's answer to the mint lists, by id, each as
+// GitHub names it: the ones a token limited to repositories covers, and none for a token
+// that names no repository.
 type InstallationToken struct {
-	Token     string `json:"-"`
-	ExpiresAt time.Time
+	Token        string `json:"-"`
+	ExpiresAt    time.Time
+	Repositories map[int64]Repository `json:"-"`
 }
 
 // String says when the token expires, never the token, so a token printed by mistake
@@ -162,8 +166,9 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 		return InstallationToken{}, ErrSuspended
 	}
 	var got struct {
-		Token     string `json:"token"`
-		ExpiresAt string `json:"expires_at"`
+		Token        string   `json:"token"`
+		ExpiresAt    string   `json:"expires_at"`
+		Repositories []ghRepo `json:"repositories"`
 	}
 	body := map[string]any{"permissions": req.Permissions}
 	if len(req.Repositories) > 0 {
@@ -197,5 +202,14 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 	if err != nil {
 		return InstallationToken{}, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
 	}
-	return InstallationToken{Token: got.Token, ExpiresAt: expires.UTC()}, nil
+	t := InstallationToken{Token: got.Token, ExpiresAt: expires.UTC()}
+	for _, r := range got.Repositories {
+		if name, ok := nameOf(r); ok && r.ID > 0 {
+			if t.Repositories == nil {
+				t.Repositories = map[int64]Repository{}
+			}
+			t.Repositories[r.ID] = name
+		}
+	}
+	return t, nil
 }

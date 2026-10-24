@@ -77,7 +77,8 @@
       "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",
       "access": "These are the repositories GitHub lets this installation reach. To add or remove one, change the installation's repository access on GitHub.",
       "disconnect": "To uninstall GitHub, remove its installation on GitHub.",
-      "secrets": ["app", "private-key", "webhook-secret", "client-secret"]
+      "secrets": ["app", "private-key", "webhook-secret", "client-secret"],
+      "credential_scope": "resource"
     }
   },
   "egress_hosts": ["github.com", "api.github.com"]

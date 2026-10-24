@@ -14,11 +14,11 @@ change what the program does, and notes it under Upgrading.
   `.github/workflows/prerelease.yml` publishes when a person runs that workflow. The
   program runs only where `QORY_FEATURES` names `factory`: without it, the program
   prints its usage line and knows no command.
-- `qory-github-server serve` takes the App's webhook deliveries at `/v1/events`, and
-  answers `/setup`, `/v1/connect` and `/health`, at the root of the address it listens
-  on. A proxy in front strips the path of `public_url`, such as `/adapters/github`.
-  Every address serve sends a browser or GitHub to starts with `public_url`, its path
-  included.
+- `qory-github-server serve` answers at the root of the adapter's host name: set
+  `public_url` to that origin alone, such as `https://github.example.com`. GitHub sends
+  the App's webhook deliveries to `<public_url>/v1/events`, and serve answers `/setup`,
+  `/v1/connect` and `/health` at the same origin. A `public_url` with a path, a query, a
+  fragment or a user stops serve with an error.
 - Where `QORY_FEATURES` names `factory`, `qory-github describe` prints the source
   role, `qory-github-server`, too.
 - The setup page of `qory-github-server serve` has a choice of who can install the
@@ -42,6 +42,18 @@ change what the program does, and notes it under Upgrading.
   at each grant entry of the change feed. serve handles the deliveries of an
   installation while that copy holds its grant, or until the connect return of its
   link expires, and drops the link of an installation the copy does not hold.
+- With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
+  Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
+  to `public_url` followed by `/v1/calls/`, such as
+  `https://github.example.com/v1/calls/`. The calls are a credential for a run, the
+  repository that an address `https://github.com/<owner>/<name>` names, and a file of a
+  repository at a branch, a tag or a commit. serve checks each call's signature against
+  the Qory Apiary keys it pinned at enrolment, and signs each answer with its access
+  key. A run's credential covers only the repositories the call lists. For work, it
+  reads contents and pull requests with access `read`, and writes both with access
+  `write`. For a harness, it reads contents, and only on `github.com`.
+- The source role of the description has `credential_scope` `resource`: one credential
+  covers only the repositories a call lists.
 
 ### Changed
 

@@ -72,8 +72,9 @@ var serveHelp = cli.Help{
 	Short: "Take the GitHub App's webhook deliveries",
 	Use:   "qory-github-server serve [--settings FILE]",
 	Long: `Take the GitHub App's webhook deliveries at POST /v1/events, on plain HTTP: a
-proxy in front terminates TLS, and strips public_url's path, if it has one, from each
-request.
+proxy in front terminates TLS and passes each request on with its path unchanged.
+public_url is the adapter's host name only, such as https://github.example.com, so
+GitHub sends the deliveries to https://github.example.com/v1/events.
 
 serve checks each delivery's signature with the App's webhook secret, keeps it in a
 store in the state directory and answers GitHub at once; it handles the delivery
@@ -85,16 +86,24 @@ serve also answers the connect page at /v1/connect, which a browser reaches at
 public_url followed by /v1/connect: Qory Apiary sends a person there who connects the
 App's installation. /health answers 200 from the first moment.
 
+With call_url set, serve also takes Qory Apiary's calls at /v1/calls/: a credential
+for a run, the repository an address names, and a file at a version. serve checks
+each call's signature against the Qory Apiary keys it pinned at enrolment. Set
+call_url to the address Qory Apiary sends the calls to: public_url followed by
+/v1/calls/, such as https://github.example.com/v1/calls/. Without call_url, serve
+takes no call.
+
 The settings come from a file or from the environment, never both. With --settings,
 they are one JSON document in FILE: listen, state_dir, apiary_url, public_url,
 access_key_id, access_key_secret_file, apiary_public_key and adapter_id; api_url,
 which may be left out for GitHub's API; apiary_public_url, where a person's browser
 is sent back to Qory Apiary, https, which may be left out for apiary_url;
-enrolment_code_file, which may be left out; public_address, false when GitHub cannot
-reach public_url: the App setup creates has its webhook inactive, and serve learns
-of changes on GitHub by pulling. Left out, it is true. upload_retry_seconds is how
-long the App setup tries again to store the App in Qory Apiary, 60 to 86400; left
-out, it is 600. The access key's secret is in a file only its owner may read.
+enrolment_code_file and call_url, which may be left out; public_address, false when
+GitHub cannot reach public_url: the App setup creates has its webhook inactive, and
+serve learns of changes on GitHub by pulling. Left out, it is true.
+upload_retry_seconds is how long the App setup tries again to store the App in Qory
+Apiary, 60 to 86400; left out, it is 600. The access key's secret is in a file only
+its owner may read.
 
 No setting contains the GitHub App. Qory Apiary stores it: its id, slug, client id,
 private key, webhook secret and client secret. At each start serve reads the App

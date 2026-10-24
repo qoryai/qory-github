@@ -45,7 +45,7 @@ func envSettings(access *accesskey.Key) map[string]string {
 		"QORY_GITHUB_API_URL":              "http://127.0.0.1:9",
 		"QORY_GITHUB_APIARY_URL":           "http://127.0.0.1:4000/",
 		"QORY_GITHUB_APIARY_PUBLIC_URL":    "https://apiary.example.com/",
-		"QORY_GITHUB_PUBLIC_URL":           "https://qory-github.example.com/github",
+		"QORY_GITHUB_PUBLIC_URL":           "https://github.example.com/",
 		"QORY_GITHUB_ACCESS_KEY_ID":        "ak_0123456789abcdef",
 		"QORY_GITHUB_ACCESS_KEY_SECRET":    access.Secret() + "\n",
 		"QORY_GITHUB_APIARY_PUBLIC_KEY":    pinJSON,
@@ -81,7 +81,7 @@ func TestReadEnvironmentTakesEveryVariable(t *testing.T) {
 	env := envSettings(access)
 	s, err := ReadEnvironment(lookupIn(env))
 	want := Settings{Listen: ":8080", StateDir: "/var/lib/qory-github",
-		APIURL: "http://127.0.0.1:9", ApiaryURL: "http://127.0.0.1:4000", ApiaryPublicURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com/github",
+		APIURL: "http://127.0.0.1:9", ApiaryURL: "http://127.0.0.1:4000", ApiaryPublicURL: "https://apiary.example.com", PublicURL: "https://github.example.com",
 		AccessKeyID: "ak_0123456789abcdef", AccessKeySecret: SecretValue(access.Secret() + "\n"), ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}},
 		AdapterID: "na_0123456789abcdef", EnrolmentCodeFile: "/run/enrolment/code", UploadRetrySeconds: 900, env: true}
 	if err != nil || !reflect.DeepEqual(s, want) || s.uploadFor() != 15*time.Minute {
@@ -117,6 +117,7 @@ func TestReadEnvironmentRefusesAWrongVariable(t *testing.T) {
 	access := newKey(t)
 	env := envSettings(access)
 	const invalid = "the settings in the environment are invalid: "
+	const badPublicVariable = "Set QORY_GITHUB_PUBLIC_URL to the adapter's host name only, such as https://github.example.com: " + invalid + "QORY_GITHUB_PUBLIC_URL: is not an https URL of a host and an optional port, without a path, a user, a query or a fragment"
 	const qak = "holds what looks like an access key secret, qak_, which belongs only where serve keeps its access key: the access key secret setting, or the state directory"
 	for name, tc := range map[string]struct {
 		set   map[string]string
@@ -131,7 +132,8 @@ func TestReadEnvironmentRefusesAWrongVariable(t *testing.T) {
 		"Qory Apiary on http":     {set: map[string]string{"QORY_GITHUB_APIARY_URL": "http://secret.example.com"}, want: invalid + "QORY_GITHUB_APIARY_URL: is neither an https origin nor, for a test, http on a loopback host"},
 		"a public Qory Apiary":    {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_URL": "http://localhost:4000"}, want: invalid + "QORY_GITHUB_APIARY_PUBLIC_URL: is not an https origin, a scheme and a host with a port or none"},
 		"a public path":           {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_URL": "https://apiary.example.com/secret"}, want: invalid + "QORY_GITHUB_APIARY_PUBLIC_URL: is not an https origin"},
-		"a public http URL":       {set: map[string]string{"QORY_GITHUB_PUBLIC_URL": "http://secret.example.com"}, want: invalid + "QORY_GITHUB_PUBLIC_URL: is not an https URL"},
+		"a public http URL":       {set: map[string]string{"QORY_GITHUB_PUBLIC_URL": "http://secret.example.com"}, want: badPublicVariable},
+		"a public URL's path":     {set: map[string]string{"QORY_GITHUB_PUBLIC_URL": "https://github.example.com/secret"}, want: badPublicVariable},
 		"a bad key id":            {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_ID": "ak_secret"}, want: invalid + "QORY_GITHUB_ACCESS_KEY_ID: is not ak_"},
 		"a pin of no JSON":        {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_KEY": "secret value"}, want: invalid + `QORY_GITHUB_APIARY_PUBLIC_KEY: is not a list of {"alg": "ed25519"`},
 		"a node's id":             {set: map[string]string{"QORY_GITHUB_ADAPTER_ID": "nd_0123456789abcdef"}, want: invalid + "QORY_GITHUB_ADAPTER_ID: is not na_"},
@@ -525,20 +527,20 @@ func TestPublicAddressIsTrueOrFalse(t *testing.T) {
 // TestAPublicURLLongerThan2037CharactersIsRefused pins the bound on public_url, which
 // keeps connect_url and setup_url within the contract's 2048 characters.
 func TestAPublicURLLongerThan2037CharactersIsRefused(t *testing.T) {
-	prefix := "https://qory-github.example.com/"
+	const scheme, domain = "https://", ".example.com"
+	long := func(n int) string { return scheme + strings.Repeat("a", n-len(scheme)-len(domain)) + domain }
 	for n, ok := range map[int]bool{2037: true, 2038: false} {
-		u := prefix + strings.Repeat("a", n-len(prefix))
-		b, _ := json.Marshal(map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": u})
+		b, _ := json.Marshal(map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": long(n)})
 		s, err := parseSettings(b)
 		if ok && (err != nil || len(s.PublicURL+connectPath) != 2048) {
 			t.Errorf("%d: %v", n, err)
 		}
-		if !ok && (err == nil || err.Error() != "the settings are invalid: /public_url: is longer than 2037 characters") {
+		if !ok && (err == nil || err.Error() != "Set public_url to the adapter's host name only, such as https://github.example.com: the settings are invalid: /public_url: is longer than 2037 characters") {
 			t.Errorf("%d: err %v", n, err)
 		}
 	}
 	// A trailing slash is not counted: the URL is bounded as serve uses it.
-	b, _ := json.Marshal(map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": prefix + strings.Repeat("a", 2037-len(prefix)) + "/"})
+	b, _ := json.Marshal(map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": long(2037) + "/"})
 	if _, err := parseSettings(b); err != nil {
 		t.Errorf("a trailing slash: %v", err)
 	}
