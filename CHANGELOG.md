@@ -7,6 +7,24 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- `qory-github-server`, the program that connects a GitHub App to Qory Apiary, and its
+  container image, which the `Dockerfile` builds and
+  `.github/workflows/prerelease.yml` publishes when a person runs that workflow. The
+  program runs only where `QORY_FEATURES` names `factory`: without it, the program
+  prints its usage line and knows no command.
+- Where `QORY_FEATURES` names `factory`, `qory-github describe` prints the source
+  role, `qory-github-server`, too.
+
+### Changed
+
+- The description lists `egress_hosts`, the hosts a run of the integration reaches:
+  `github.com` and `api.github.com`, the hosts of the credential role. The policy that
+  `setup` prints allows the same two hosts, as before.
+- Building `qory-github` from source needs Go 1.27.3, up from 1.27.1: the integrations
+  and Forager modules it builds against require it.
+
 ## [0.2.1] - 2026-10-24
 
 ### Added

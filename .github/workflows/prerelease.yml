@@ -1,0 +1,127 @@
+name: Pre-release image
+
+# Run by hand only: from the Actions tab, once this file is on the default branch, or by
+# pushing a commit to the branch prerelease, which nothing else pushes to. Never on a push
+# to any other branch, a pull request or a schedule. Each run costs Actions minutes and
+# package storage.
+on:
+  push:
+    branches: [prerelease]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The branch, tag or commit to build. Empty: the branch the workflow is run on."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# Two runs for the same ref do not tag at once: a run waits while another for that ref
+# runs, and a newer run that starts waiting cancels the run already waiting, so at most
+# one waits. No running run is cancelled.
+concurrency:
+  group: prerelease-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+# Builds the server's image of a commit, the Dockerfile's server target, for linux/amd64
+# and linux/arm64 in one build: the Dockerfile's build stage runs on the runner's platform
+# and cross-compiles for each, so nothing runs under emulation. It publishes the image to
+# ghcr.io/qoryai/qory-github-server-prerelease alone, tagged only sha-<the commit's first
+# 7 characters>, and prints its digest in the run's summary. What runs a pre-release image
+# pulls it by that digest, as
+# ghcr.io/qoryai/qory-github-server-prerelease@sha256:<digest>; the tag is for people to
+# read.
+#
+# ghcr.io/qoryai/qory-github-server-prerelease stays private for good: it is never made
+# public. GHCR sets visibility per package, not per tag, so every image in it stays
+# private.
+#
+# No job deletes old images: old sha- tags are deleted by hand, in the package's settings
+# on GitHub.
+env:
+  IMAGE: ghcr.io/qoryai/qory-github-server-prerelease
+
+jobs:
+  image:
+    name: Build and publish the image
+    # Pre-release images are published from GitHub, as releases are.
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The commit the ref names, which the image is built from and named after.
+      - name: Name the commit
+        id: commit
+        env:
+          REF: ${{ inputs.ref || github.ref }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building $REF at $sha"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=ghcr.io/qoryai/ci-images:buildkit-buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+
+      # Both platforms in one image index, pushed by digest alone: no tag names the image
+      # until both are built. The program reports sha-<7> as its version. The labels give
+      # the image's revision, source and licenses, and no version, as no release names the
+      # image; the build uses the GitHub Actions cache in the scope server-image.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: server
+          platforms: linux/amd64,linux/arm64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=sha-${{ steps.commit.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha,scope=server-image
+          cache-to: type=gha,mode=max,scope=server-image
+
+      # sha-<7> names the image index pushed above, under the same digest; a tag that
+      # names another digest fails the run.
+      - name: Tag the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          SHORT: ${{ steps.commit.outputs.short }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${IMAGE}:sha-${SHORT}" "${IMAGE}@${DIGEST}"
+          docker buildx imagetools inspect "${IMAGE}:sha-${SHORT}" | tee inspect.txt
+          tagged="$(awk '/^Digest:/ { print $2; exit }' inspect.txt)"
+          [ "$tagged" = "$DIGEST" ] || {
+            echo "Delete or retag ${IMAGE}:sha-${SHORT}: it points to ${tagged:-no digest}, not to the pushed image ${DIGEST}" >&2; exit 1; }
+          {
+            echo "## Pre-release image"
+            echo
+            echo "Built from \`${SHA}\` for linux/amd64 and linux/arm64. Pull it by its digest:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Tagged \`${IMAGE}:sha-${SHORT}\`, for people to read."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Published ${IMAGE}:sha-${SHORT}, ${IMAGE}@${DIGEST}"

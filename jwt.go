@@ -11,12 +11,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/qoryai/qory-github/internal/ownerfile"
 )
 
 // ParseKey reads an App's private key from PEM: PKCS #1, the form GitHub hands out, or
@@ -40,9 +41,9 @@ func ParseKey(b []byte) (*rsa.PrivateKey, error) {
 	return rk, nil
 }
 
-// maxKeyFile is the most a key file may hold; one byte more is read to tell a larger
+// MaxKeyFile is the most a key file may hold; one byte more is read to tell a larger
 // file apart: an RSA key in PEM is a few kilobytes.
-const maxKeyFile = 64 << 10
+const MaxKeyFile = 64 << 10
 
 // ReadKeyFile reads an App's private key from a file that only its owner has any
 // permission on. It opens the file once, never through a symbolic link and without
@@ -51,33 +52,9 @@ const maxKeyFile = 64 << 10
 // the program runs as is refused before it is read, and one larger than a key is
 // refused having read at most one byte more than a key may hold.
 func ReadKeyFile(path string) (*rsa.PrivateKey, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if errors.Is(err, syscall.ELOOP) {
-		return nil, fmt.Errorf("the private key file %s is a symbolic link; use the path of the file itself", path)
-	}
+	b, err := ownerfile.ReadFile(path, MaxKeyFile, "the private key file", "a key")
 	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("the private key file %s is not a regular file", path)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("the private key file %s is %s: group or others have permissions on it; make it 0600", path, info.Mode().Perm())
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() {
-		return nil, fmt.Errorf("the private key file %s belongs to another user than the one qory-github runs as", path)
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxKeyFile+1))
-	if err != nil {
-		return nil, fmt.Errorf("the private key file: %w", err)
-	}
-	if len(b) > maxKeyFile {
-		return nil, fmt.Errorf("the private key file %s is larger than a key", path)
+		return nil, err
 	}
 	return ParseKey(b)
 }
@@ -109,12 +86,13 @@ func AppJWT(appID string, key *rsa.PrivateKey, now time.Time) (string, error) {
 	return signing + "." + enc.EncodeToString(sig), nil
 }
 
-// existsError is a key file that exists; it matches [fs.ErrExist].
-type existsError string
+// existsError is a file that exists, which what names, such as "the key file"; it
+// matches [fs.ErrExist].
+type existsError struct{ what, path string }
 
 // Error is the file that exists and what to do about it.
 func (e existsError) Error() string {
-	return "the key file " + string(e) + " exists; choose another or move it away"
+	return e.what + " " + e.path + " exists; choose another or move it away"
 }
 
 // Is matches [fs.ErrExist].
@@ -144,26 +122,32 @@ var createKeyFile = func(path string) (keyFile, error) {
 // file that could not be written whole, or whose sync failed, is removed; a file on a
 // filesystem that cannot sync one, see [syncUnsupported], is kept unsynced.
 func writeKeyFile(path string, pemBytes []byte) error {
+	return writeOwnerFile(path, "the key file", pemBytes)
+}
+
+// writeOwnerFile writes b to a new file at path as [writeKeyFile] writes a key, what
+// naming the file in an error, such as "the key file".
+func writeOwnerFile(path, what string, b []byte) error {
 	f, err := createKeyFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return existsError(path)
+			return existsError{what, path}
 		}
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
-	if _, err := f.Write(pemBytes); err != nil {
+	if _, err := f.Write(b); err != nil {
 		f.Close()
 		os.Remove(path)
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	if err := f.Sync(); err != nil && !syncUnsupported(err) {
 		f.Close()
 		os.Remove(path)
-		return fmt.Errorf("the key file could not be synced to disk: %w", err)
+		return fmt.Errorf("%s could not be synced to disk: %w", what, err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(path)
-		return fmt.Errorf("the key file: %w", err)
+		return fmt.Errorf("%s: %w", what, err)
 	}
 	// The directory's entry for the file is synced too where the system can sync a
 	// directory; where it cannot, the file itself is on disk all the same, so an error
