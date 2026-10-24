@@ -26,10 +26,11 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// callsPath is where serve's listener receives Qory Apiary's calls, by POST: Qory Apiary
-// sends each call to call_url followed by the call's path, such as run-credential, and
-// the proxy in front of serve sends it on to callsPath followed by the same path. The
-// call's signature covers the path alone, not the address.
+// callsPath is where serve receives Qory Apiary's calls, by POST: Qory Apiary sends
+// each call to call_url followed by the call's path, such as run-credential. The
+// instance admin sets call_url to public_url followed by callsPath, such as
+// https://github.example.com/v1/calls/, so each call reaches callsPath followed by the
+// call's path. The call's signature covers the path alone, not the address.
 const callsPath = "/v1/calls/"
 
 // callWindow is how far a call's time may be from serve's clock, either way: a call

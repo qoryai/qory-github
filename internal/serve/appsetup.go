@@ -100,13 +100,8 @@ type appSetup struct {
 	refusalEvery time.Duration
 	waits        func()
 
-	once sync.Once
-	// route is the App setup's path as serve's listener receives it, [setupPath], and
-	// base the same path as a browser reaches it: public_url's path, then route. A
-	// proxy in front of serve strips public_url's path, so serve matches route and
-	// writes base into each cookie, redirect and form it sends.
-	route, base string
-	refusals    *throttle
+	once     sync.Once
+	refusals *throttle
 	// lock holds one token: the step that holds it starts a session and moves the flow
 	// pointer, or keeps the App, one step, see [appSetup.take]. kept is whether an App
 	// is kept, or the settings give one, set only while the token is held.
@@ -197,12 +192,6 @@ const (
 
 func (a *appSetup) init() {
 	a.once.Do(func() {
-		u, err := url.Parse(a.PublicURL)
-		if err == nil {
-			a.base = strings.TrimSuffix(u.Path, "/")
-		}
-		a.route = setupPath
-		a.base += setupPath
 		a.lock = make(chan struct{}, 1)
 		// A count of refusals held back is said by the next refusal logged.
 		a.refusals = &throttle{every: cmp.Or(a.refusalEvery, refusalEvery), now: a.now}
@@ -223,11 +212,10 @@ func (a *appSetup) log() *slog.Logger {
 	return a.Log
 }
 
-// owns is whether the path, as serve's listener receives it, is one of the App
-// setup's: [setupPath], or one under it.
+// owns is whether the path is one of the App setup's: [setupPath], or one under it.
 func (a *appSetup) owns(path string) bool {
 	a.init()
-	return path == a.route || strings.HasPrefix(path, a.route+"/")
+	return path == setupPath || strings.HasPrefix(path, setupPath+"/")
 }
 
 // ServeHTTP answers the App setup's paths. Every answer is never kept by a cache,
@@ -237,13 +225,13 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.init()
 	var step func(http.ResponseWriter, *http.Request, url.Values)
 	switch r.URL.Path {
-	case a.route:
+	case setupPath:
 		step = a.start
-	case a.route + "/continue":
+	case setupPath + "/continue":
 		step = a.proceed
-	case a.route + "/created":
+	case setupPath + "/created":
 		step = a.created
-	case a.route + "/refused":
+	case setupPath + "/refused":
 		step = a.showPage
 	default:
 		http.NotFound(w, r)
@@ -254,12 +242,12 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-	if r.URL.Path == a.route+"/continue" && r.Method == http.MethodPost {
+	if r.URL.Path == setupPath+"/continue" && r.Method == http.MethodPost {
 		a.account(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
-		if r.URL.Path == a.route+"/continue" {
+		if r.URL.Path == setupPath+"/continue" {
 			h.Set("Allow", "GET, POST")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -331,11 +319,11 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name: setupCookie, Value: id, Path: a.base, MaxAge: int(sessionFor / time.Second), Expires: now.Add(sessionFor),
+		Name: setupCookie, Value: id, Path: setupPath, MaxAge: int(sessionFor / time.Second), Expires: now.Add(sessionFor),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 	})
 	a.log().LogAttrs(r.Context(), slog.LevelInfo, "setup started", slog.String("step", a.step(r)))
-	redirect(w, a.base+"/continue")
+	redirect(w, setupPath+"/continue")
 }
 
 // checkSetupPass checks a setup pass, in this order, and returns its payload and when
@@ -668,7 +656,7 @@ func (a *appSetup) showPage(w http.ResponseWriter, r *http.Request, _ url.Values
 	if ck, err := r.Cookie(setupPageCookie); err == nil && setupPages[ck.Value] != nil {
 		rf = *setupPages[ck.Value]
 	}
-	http.SetCookie(w, &http.Cookie{Name: setupPageCookie, Value: "", Path: a.base, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: setupPageCookie, Value: "", Path: setupPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 	plainPage(w, rf.status, rf.page)
 }
 
@@ -711,7 +699,7 @@ func (a *appSetup) accountPage(w http.ResponseWriter, token, line string, public
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	accountPageHTML.Execute(w, accountForm{
-		Heading: "Set up the GitHub App", Line: line, Action: a.base + "/continue",
+		Heading: "Set up the GitHub App", Line: line, Action: setupPath + "/continue",
 		Label:    "GitHub account for the App, an organisation or a user",
 		Question: "Who can install the App", Private: "Only this account (private)", Any: "Any GitHub account (public)",
 		Public: public, Token: token, Button: "Continue",
@@ -847,7 +835,7 @@ func (a *appSetup) endSession(w http.ResponseWriter, id string) {
 			a.log().Error("setup failed", slog.String("step", "end"), slog.String("what", "session"), slog.String("error", err.Error()))
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: setupCookie, Value: "", Path: a.base, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: setupCookie, Value: "", Path: setupPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 
 // take takes the lock's token, waiting for it until ctx is done, and says whether it
@@ -895,13 +883,13 @@ func (a *appSetup) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id
 		a.endSession(w, id)
 	}
 	status := rf.status
-	if r.URL.Path == a.route && r.Method == http.MethodGet && rf.name != "" {
+	if r.URL.Path == setupPath && r.Method == http.MethodGet && rf.name != "" {
 		// The request may carry a pass, so the page shows at an address without it.
 		status = http.StatusSeeOther
 		http.SetCookie(w, &http.Cookie{
-			Name: setupPageCookie, Value: rf.name, Path: a.base, MaxAge: int(pageFor / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+			Name: setupPageCookie, Value: rf.name, Path: setupPath, MaxAge: int(pageFor / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 		})
-		redirect(w, a.base+"/refused")
+		redirect(w, setupPath+"/refused")
 	} else {
 		plainPage(w, rf.status, rf.page)
 	}
@@ -930,14 +918,14 @@ func (a *appSetup) failed(w http.ResponseWriter, r *http.Request, id, what strin
 // refused.
 func (a *appSetup) step(r *http.Request) string {
 	switch r.URL.Path {
-	case a.route + "/continue":
+	case setupPath + "/continue":
 		if r.Method == http.MethodPost {
 			return "account"
 		}
 		return "continue"
-	case a.route + "/created":
+	case setupPath + "/created":
 		return "created"
-	case a.route + "/refused":
+	case setupPath + "/refused":
 		return "refused"
 	}
 	return "setup"

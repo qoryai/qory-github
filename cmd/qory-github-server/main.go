@@ -72,8 +72,9 @@ var serveHelp = cli.Help{
 	Short: "Take the GitHub App's webhook deliveries",
 	Use:   "qory-github-server serve [--settings FILE]",
 	Long: `Take the GitHub App's webhook deliveries at POST /v1/events, on plain HTTP: a
-proxy in front terminates TLS, and strips public_url's path, if it has one, from each
-request.
+proxy in front terminates TLS and passes each request on with its path unchanged.
+public_url is the adapter's host name only, such as https://github.example.com, so
+GitHub sends the deliveries to https://github.example.com/v1/events.
 
 serve checks each delivery's signature with the App's webhook secret, keeps it in a
 store in the state directory and answers GitHub at once; it handles the delivery
@@ -88,10 +89,9 @@ App's installation. /health answers 200 from the first moment.
 With call_url set, serve also takes Qory Apiary's calls at /v1/calls/: a credential
 for a run, the repository an address names, and a file at a version. serve checks
 each call's signature against the Qory Apiary keys it pinned at enrolment. Set
-call_url to the address Qory Apiary sends the calls to: https, with no query and no
-fragment, its path ending with /, such as
-https://qory.example.com/adapters/github/v1/calls/. The proxy in front sends each call
-on to /v1/calls/ at serve's root. Without call_url, serve takes no call.
+call_url to the address Qory Apiary sends the calls to: public_url followed by
+/v1/calls/, such as https://github.example.com/v1/calls/. Without call_url, serve
+takes no call.
 
 The settings come from a file or from the environment, never both. With --settings,
 they are one JSON document in FILE: app_id, private_key_file, webhook_secret_file,

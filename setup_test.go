@@ -505,19 +505,19 @@ func TestTheManifestIsAsItWas(t *testing.T) {
 // rest the same, when it is not.
 func TestServeManifestIsAsItWas(t *testing.T) {
 	m := Manifest("qory-github-test", "http://127.0.0.1:1/callback")
-	serveManifest(m, "https://qory-github.example.com/base", true)
+	serveManifest(m, "https://github.example.com", true)
 	b, err := json.Marshal(m)
-	want := `{"callback_urls":["https://qory-github.example.com/base/v1/connect/authorized"],` +
+	want := `{"callback_urls":["https://github.example.com/v1/connect/authorized"],` +
 		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
 		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
-		`"hook_attributes":{"active":true,"url":"https://qory-github.example.com/base/v1/events"},` +
+		`"hook_attributes":{"active":true,"url":"https://github.example.com/v1/events"},` +
 		`"name":"qory-github-test","public":true,"redirect_url":"http://127.0.0.1:1/callback","request_oauth_on_install":false,` +
-		`"setup_on_update":true,"setup_url":"https://qory-github.example.com/base/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
+		`"setup_on_update":true,"setup_url":"https://github.example.com/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
 	if err != nil || string(b) != want {
 		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
 	}
 	m = Manifest("qory-github-test", "http://127.0.0.1:1/callback")
-	serveManifest(m, "https://qory-github.example.com/base", false)
+	serveManifest(m, "https://github.example.com", false)
 	b, err = json.Marshal(m)
 	if want := strings.Replace(want, `"public":true`, `"public":false`, 1); err != nil || string(b) != want {
 		t.Errorf("the private manifest is\n%s\nwant\n%s", b, want)

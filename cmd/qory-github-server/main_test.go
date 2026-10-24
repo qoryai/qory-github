@@ -299,7 +299,8 @@ func TestServeHelpSaysTheAppSetup(t *testing.T) {
 		"public_address, false when GitHub cannot reach public_url: the App setup creates has its webhook inactive, and serve learns of changes on GitHub by pulling. Left out, it is true.",
 		"QORY_GITHUB_PUBLIC_ADDRESS for public_address",
 		"Without call_url, serve takes no call.",
-		"such as https://qory.example.com/adapters/github/v1/calls/. The proxy in front sends each call on to /v1/calls/ at serve's root.",
+		"public_url is the adapter's host name only, such as https://github.example.com, so GitHub sends the deliveries to https://github.example.com/v1/events.",
+		"Set call_url to the address Qory Apiary sends the calls to: public_url followed by /v1/calls/, such as https://github.example.com/v1/calls/.",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("the help lacks %q:\n%s", want, errs.String())

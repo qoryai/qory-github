@@ -658,7 +658,7 @@ func TestJSONRulesRefuseRepeatsAndFractions(t *testing.T) {
 // environment: an https URL with no query and no fragment whose path ends with /, and
 // the error for any other, which quotes nothing.
 func TestCallURLIsTheContractsCallURL(t *testing.T) {
-	const good = "https://qory.example.com/adapters/github/v1/calls/"
+	const good = "https://github.example.com/v1/calls/"
 	for _, u := range []string{good, "https://qory.example.com/", "https://qory.example.com:8443/calls/"} {
 		if err := checkCallURL(u); err != nil {
 			t.Errorf("%s: %v", u, err)
@@ -686,7 +686,7 @@ func TestCallURLIsTheContractsCallURL(t *testing.T) {
 // TestTheDeclarationHasCallURLOnlyWithoutSetupURL pins that Declare sends call_url when
 // it is set and the declaration has no setup_url, and leaves it out otherwise.
 func TestTheDeclarationHasCallURLOnlyWithoutSetupURL(t *testing.T) {
-	const call = "https://qory.example.com/adapters/github/v1/calls/"
+	const call = "https://github.example.com/v1/calls/"
 	for _, c := range []struct {
 		callURL, setupURL string
 		want              bool
@@ -713,7 +713,7 @@ func TestTheDeclarationHasCallURLOnlyWithoutSetupURL(t *testing.T) {
 // call_url, and its listener answers a call at /v1/calls/; without call_url, it declares
 // none, and the path is answered 404.
 func TestRunServesCallsOnlyWithCallURL(t *testing.T) {
-	const call = "https://qory.example.com/adapters/github/v1/calls/"
+	const call = "https://github.example.com/v1/calls/"
 	for _, callURL := range []string{call, ""} {
 		dir := t.TempDir()
 		access := newKey(t)

@@ -111,8 +111,7 @@ func Manifest(name, redirect string) map[string]any {
 }
 
 // WebhookPath is where serve receives the App's webhook deliveries: the App's webhook
-// URL is serve's public URL followed by this path, and serve's receiver listens on this
-// path, since a proxy in front of serve strips the public URL's path.
+// URL is serve's public URL, an origin, followed by this path.
 const WebhookPath = "/v1/events"
 
 // The bounds of a webhook secret serve's receiver takes, which serve's setup page keeps

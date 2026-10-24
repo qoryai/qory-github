@@ -27,14 +27,14 @@ const (
 )
 
 // ErrPublicURL is the refusal of a public URL [CheckPublicURL] does not take.
-var ErrPublicURL = errors.New("is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment")
+var ErrPublicURL = errors.New("is not an https URL of a host and an optional port, without a path, a user, a query or a fragment")
 
-// CheckPublicURL takes where serve is reached from outside: https, a host, a port from
-// 1 to 65535 or none, and a path or none, without a user, a query or a fragment, an
-// empty one among them, and without white space or a control character. It returns
-// the URL with its scheme and host in lower case and with no slash at its end, however
-// many it had, so a path joined to it, as /v1/connect, follows one slash alone. serve
-// checks it so.
+// CheckPublicURL takes where serve is reached from outside: an origin, https, a host
+// and a port from 1 to 65535 or none, with no path but / or none, without a user, a
+// query or a fragment, an empty one among them, and without white space or a control
+// character: the adapter is served at the root of its host name. It returns the
+// origin with its scheme and host in lower case and no slash at its end, so a path
+// joined to it, as /v1/connect, follows one slash alone. serve checks it so.
 // The error, [ErrPublicURL], names the rule, never the URL.
 func CheckPublicURL(s string) (string, error) {
 	if strings.ContainsFunc(s, func(r rune) bool { return r <= ' ' || r == 0x7f }) || strings.ContainsAny(s, "#?") {
@@ -51,7 +51,10 @@ func CheckPublicURL(s string) (string, error) {
 	} else if strings.HasSuffix(u.Host, ":") {
 		return "", ErrPublicURL
 	}
-	return strings.TrimRight("https://"+strings.ToLower(u.Host)+u.EscapedPath(), "/"), nil
+	if p := u.EscapedPath(); p != "" && p != "/" {
+		return "", ErrPublicURL
+	}
+	return "https://" + strings.ToLower(u.Host), nil
 }
 
 // ConnectManifest adds to the manifest m what Connect needs of the App, under serve's

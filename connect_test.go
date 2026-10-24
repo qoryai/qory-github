@@ -119,29 +119,33 @@ func TestTheUserListingsReadEveryPageOnce(t *testing.T) {
 	}
 }
 
-func TestThePublicURLIsAnHTTPSURLOfAHostAnOptionalPortAndAnOptionalPath(t *testing.T) {
+// TestThePublicURLIsAnHTTPSOrigin pins that a public URL is an https origin alone, a
+// host and an optional port with no path but / or none: a path, a query, a fragment or
+// a user is refused.
+func TestThePublicURLIsAnHTTPSOrigin(t *testing.T) {
 	for in, want := range map[string]string{
-		"https://qory-github.example.com":              "https://qory-github.example.com",
-		"https://qory-github.example.com/":             "https://qory-github.example.com",
-		"https://qory-github.example.com//":            "https://qory-github.example.com",
-		"https://qory-github.example.com/github///":    "https://qory-github.example.com/github",
-		"HTTPS://Qory-GitHub.Example.com:8443/GitHub/": "https://qory-github.example.com:8443/GitHub",
-		"https://qory-github.example.com/a%20b":        "https://qory-github.example.com/a%20b",
-		"https://[2001:db8::1]:443":                    "https://[2001:db8::1]:443",
+		"https://github.example.com":       "https://github.example.com",
+		"https://github.example.com/":      "https://github.example.com",
+		"HTTPS://GitHub.Example.com:8443/": "https://github.example.com:8443",
+		"https://[2001:db8::1]:443":        "https://[2001:db8::1]:443",
+		"https://github.example.com:443":   "https://github.example.com:443",
+		"https://GITHUB.example.com":       "https://github.example.com",
 	} {
 		if got, err := CheckPublicURL(in); err != nil || got != want {
 			t.Errorf("%q: %q %v, want %q", in, got, err, want)
 		}
 	}
 	for _, in := range []string{
-		"", "http://qory-github.example.com", "https://", "https:///github", "https://:443",
-		"https://qory-github.example.com#", "https://qory-github.example.com/#a", "https://qory-github.example.com?",
-		"https://qory-github.example.com/?a", "https://user@qory-github.example.com", "https:qory-github.example.com",
-		"https://qory-github.example.com:", "https://qory-github.example.com:0", "https://qory-github.example.com:65536",
-		"https://qory-github.example.com:01", "https://qory-github.example.com:x", "https://qory github.example.com",
-		"https://qory-github.example.com/a\nb", " https://qory-github.example.com",
+		"", "http://github.example.com", "https://", "https:///github", "https://:443",
+		"https://github.example.com//", "https://github.example.com/adapters/github", "https://github.example.com/github/",
+		"https://github.example.com/a%20b", "https://github.example.com/%2F",
+		"https://github.example.com#", "https://github.example.com/#a", "https://github.example.com?",
+		"https://github.example.com/?a", "https://user@github.example.com", "https://user:pass@github.example.com", "https:github.example.com",
+		"https://github.example.com:", "https://github.example.com:0", "https://github.example.com:65536",
+		"https://github.example.com:01", "https://github.example.com:x", "https://git hub.example.com",
+		"https://github.example.com/a\nb", " https://github.example.com",
 	} {
-		if got, err := CheckPublicURL(in); err == nil || err.Error() != "is not an https URL of a host, an optional port and an optional path, without a user, a query or a fragment" {
+		if got, err := CheckPublicURL(in); err == nil || err.Error() != "is not an https URL of a host and an optional port, without a path, a user, a query or a fragment" {
 			t.Errorf("%q: %q %v", in, got, err)
 		}
 	}

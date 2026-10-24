@@ -61,13 +61,13 @@ type Settings struct {
 	// the connect page sends the browser back to Qory Apiary there. It may be left
 	// out, empty, for ApiaryURL.
 	ApiaryPublicURL string
-	// PublicURL is where serve is reached from outside, https, 2037 characters at most:
-	// Qory Apiary sends a person to connect GitHub to its connect page under it, and an
-	// instance admin to set the App up to serve's App setup under it. The bound keeps
-	// both addresses, PublicURL with /v1/connect or /setup after it, within the
-	// contract's 2048 characters. A proxy in front of serve strips PublicURL's path, if
-	// it has one, from each request, so serve's listener receives /v1/connect, /setup,
-	// /v1/events and /health at its root.
+	// PublicURL is where serve is reached from outside: an https origin, the adapter's
+	// host name and a port or none, with no path, such as https://github.example.com,
+	// 2037 characters at most. Qory Apiary sends a person to connect GitHub to
+	// PublicURL/v1/connect, and an instance admin to set the App up to
+	// PublicURL/setup. The bound keeps both addresses within the contract's 2048
+	// characters. serve answers /v1/connect, /setup, /v1/events and /health at the
+	// root of its listener, so the proxy in front passes each path on unchanged.
 	PublicURL string
 	// AccessKeyID is the adapter's access key's id in Qory Apiary, ak_ and 16
 	// characters.
@@ -107,10 +107,9 @@ type Settings struct {
 	// learns of changes on GitHub by pulling, see [Settings.publicAddress].
 	PublicAddress *bool
 	// CallURL is where Qory Apiary sends its calls to serve, https, with no query and no
-	// fragment, its path ending with /, such as
-	// https://qory.example.com/adapters/github/v1/calls/. The proxy in front of serve
-	// sends each call to serve's listener at /v1/calls/ followed by the call's path. It
-	// may be left out: serve then declares no call_url, and answers no call.
+	// fragment, its path ending with /: PublicURL followed by /v1/calls/, such as
+	// https://github.example.com/v1/calls/. It may be left out: serve then declares no
+	// call_url, and answers no call.
 	CallURL string
 
 	// env is whether the settings come from the environment, so an error names a
@@ -596,6 +595,9 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 				err = checkCallURL(s.CallURL)
 			}
 		}
+		if err != nil && name == "public_url" {
+			return Settings{}, fmt.Errorf("Set %s %s: %s are invalid: %s: %w", src.name(name), publicURLFix, src.what(), src.pointer(name), err)
+		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("%s are invalid: %s: %w", src.what(), src.pointer(name), err)
 		}
@@ -692,11 +694,15 @@ func checkBrowserOrigin(s string) (string, error) {
 
 // maxPublicURL is the most characters public_url has, as [github.CheckPublicURL]
 // returns it: the contract's 2048 for a URL, less /v1/connect, the longest path serve
-// declares under it.
+// declares after it.
 const maxPublicURL = 2048 - len(connectPath)
 
+// publicURLFix is the fix every error about public_url starts with, after "Set " and
+// the setting's name.
+const publicURLFix = "to the adapter's host name only, such as https://github.example.com"
+
 // checkPublicURL takes where serve is reached from outside as [github.CheckPublicURL]
-// takes it, as setup does, and refuses one that holds what looks like a secret, and one
+// takes it, an origin, and refuses one that holds what looks like a secret, and one
 // longer than [maxPublicURL] characters as CheckPublicURL returns it.
 func checkPublicURL(s string) (string, error) {
 	if accesskey.ContainsSecret(s) {

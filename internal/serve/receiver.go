@@ -22,7 +22,7 @@ import (
 	"github.com/qoryai/qory-github/internal/store"
 )
 
-// WebhookPath is where serve's listener receives the App's webhook deliveries, by POST,
+// WebhookPath is where serve receives the App's webhook deliveries, by POST,
 // [github.WebhookPath]: GitHub sends them to serve's public URL followed by this path.
 const WebhookPath = github.WebhookPath
 
