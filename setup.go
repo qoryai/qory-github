@@ -115,9 +115,9 @@ func Manifest(name, redirect string) map[string]any {
 // path, since a proxy in front of serve strips the public URL's path.
 const WebhookPath = "/v1/events"
 
-// The bounds of a webhook secret serve's receiver takes, which setup keeps to:
-// MinWebhookSecret is the shortest secret, in bytes, and MaxWebhookSecretFile the most
-// its file may hold, the secret and a line break.
+// The bounds of a webhook secret serve's receiver takes, which serve's setup page keeps
+// to: MinWebhookSecret is the shortest secret, in bytes, and MaxWebhookSecretFile the
+// most its file may hold, the secret and a line break.
 const (
 	MinWebhookSecret     = 16
 	MaxWebhookSecretFile = 4 << 10
@@ -334,9 +334,10 @@ func (s Setup) Check() error {
 }
 
 // afterApprovalTimeout is how long each call setup makes once the person has approved
-// the App may take, the exchange of the code: 30 seconds, as long as the API client gives one request, so a slow answer fails
-// rather than leaving setup waiting, and an approval near the end of the wait still
-// leaves each call the whole of it. A test shortens it.
+// the App may take, the exchange of the code: 30 seconds, as long as the API client
+// gives one request, so a slow answer fails rather than leaving setup waiting, and an
+// approval near the end of the wait still leaves each call the whole of it. A test
+// shortens it.
 var afterApprovalTimeout = 30 * time.Second
 
 // randomHex is 16 random bytes from crypto/rand in hex, 32 digits, which no one guesses.
@@ -421,8 +422,9 @@ func (c Client) ConvertManifest(ctx context.Context, code string) (Conversion, e
 	return got, nil
 }
 
-// webhookSecretBytes is how many random bytes a webhook secret setup makes holds; it is
-// written as their hex, 64 digits, which serve's receiver takes as it is.
+// webhookSecretBytes is how many random bytes a webhook secret that serve's setup page
+// makes holds; it is written as their hex, 64 digits, which serve's receiver takes as it
+// is.
 const webhookSecretBytes = 32
 
 // NewWebhookSecret is a new webhook secret, [webhookSecretBytes] random bytes from
