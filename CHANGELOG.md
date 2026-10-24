@@ -24,6 +24,17 @@ change what the program does, and notes it under Upgrading.
 - The setup page of `qory-github-server serve` has a choice of who can install the
   GitHub App: only the account it is for (private), selected first, or any GitHub
   account (public). GitHub lets only the account that owns a private App install it.
+- `qory-github-server serve` stores the GitHub App that its setup creates in Qory
+  Apiary: the App's id, slug, client id, private key, webhook secret and client secret,
+  sealed to Qory Apiary's server key. At each start, serve reads the App back, sealed
+  to its access key, and keeps it in memory. serve writes none of it to disk, and no
+  setting contains it.
+- GitHub issues the App's private key once. When storing the App in Qory Apiary
+  fails, the setup tries again for `upload_retry_seconds`, 600 by default, and its page
+  reloads until the App is stored. When every try fails, the page shows which App to
+  delete on GitHub.
+- The description's source role lists the secrets `qory-github-server` stores in Qory
+  Apiary: `app`, `private-key`, `webhook-secret` and `client-secret`.
 
 ### Changed
 

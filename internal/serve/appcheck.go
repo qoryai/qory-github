@@ -4,22 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 
 	"github.com/qoryai/qory-github"
 )
 
 // checkApp asks GitHub which App a is, GET /app under a's token, once, as serve starts
-// with the App of the settings or the one kept in the state directory, before it
-// serves with it, see [Run]; the App the App setup keeps is GitHub's answer of seconds
-// before, and is not asked for. It returns the App serve serves with, or the error that
-// refuses the start.
+// with the App Qory Apiary delivered, before it serves with it, see [Run]; the App the
+// App setup creates is GitHub's answer of seconds before, and is not asked for. It
+// returns the App serve serves with, or the error that refuses the start.
 //
-// For the settings' App the slug is compared: GitHub's answer must name a slug, see
-// [github.CheckSlug], and the same one as app_slug. For the kept App the id is
-// compared: GitHub's answer must name a positive id, and the same one as app.json. A
-// new slug for the same id is kept in app.json in place of the old one, see
-// [keepSlug], a line says so, and serve serves with the App read back, its bot
+// GitHub's answer must name a positive id, and the same one as the App's. A new slug
+// for the same id is used in place of the old one, a line says so, and serve uploads
+// the App with the new slug to Qory Apiary, see [runner.keepSlug]; its bot is
 // <slug>[bot]. A 401 refuses, since GitHub does not take the App's token and asking
 // again does not change that. Any other answer, or no answer, is asked again after a
 // wait that doubles, as the change feed's reader waits, with a line at the first
@@ -34,7 +30,7 @@ func (r *runner) checkApp(ctx context.Context, a *app) (*app, error) {
 		got, err := gh.App(ctx, a.id, a.key)
 		switch {
 		case err == nil:
-			return r.compareApp(a, got)
+			return r.compareApp(ctx, a, got)
 		case github.Unauthorized(err):
 			return nil, fmt.Errorf("checking the App with GitHub: GitHub does not take the App's token, made from app_id and the App's private key: %w", err)
 		case ctx.Err() != nil:
@@ -56,42 +52,28 @@ func (r *runner) checkApp(ctx context.Context, a *app) (*app, error) {
 
 // compareApp compares a with got, GitHub's answer of which App a is, as [runner.checkApp]
 // says, and returns the App serve serves with.
-func (r *runner) compareApp(a *app, got github.AppIdentity) (*app, error) {
-	noSlug := fmt.Errorf("checking the App with GitHub: GitHub's answer names no slug for the App with app_id %s", a.id)
-	if !a.kept {
-		switch {
-		case github.CheckSlug(got.Slug) != nil:
-			return nil, noSlug
-		case got.Slug != a.slug:
-			return nil, fmt.Errorf("app_slug is %s, and GitHub answers that the App with app_id %s is %s; set app_slug to %s", a.slug, a.id, got.Slug, got.Slug)
-		}
-		return a, nil
-	}
+func (r *runner) compareApp(ctx context.Context, a *app, got github.AppIdentity) (*app, error) {
 	switch {
 	case got.ID <= 0:
 		return nil, fmt.Errorf("checking the App with GitHub: GitHub's answer names no id for the App with app_id %s", a.id)
 	case got.ID != a.numericID:
-		return nil, fmt.Errorf("the App file app.json names the App with app_id %d, and GitHub answers for another App", a.numericID)
+		return nil, fmt.Errorf("Qory Apiary stores the App with app_id %d, and GitHub answers for another App", a.numericID)
 	case got.Slug == a.slug:
 		return a, nil
 	case github.CheckSlug(got.Slug) != nil:
-		return nil, noSlug
+		return nil, fmt.Errorf("checking the App with GitHub: GitHub's answer names no slug for the App with app_id %s", a.id)
 	}
-	kept, err := keepSlug(r.s.StateDir, got.Slug)
-	if err != nil {
-		return nil, fmt.Errorf("keeping the App's new slug %s in the App file app.json: %w", got.Slug, err)
-	}
-	id := strconv.FormatInt(a.numericID, 10)
-	r.log.Info("GitHub names the App with app_id " + id + " " + got.Slug + " now, so serve keeps " + got.Slug + " in place of " + a.slug)
-	return kept, nil
+	r.log.Info("GitHub names the App with app_id " + a.id + " " + got.Slug + " now, so serve uses " + got.Slug + " in place of " + a.slug)
+	renamed := a.with(func(c *app) { c.slug = got.Slug })
+	r.keepSlug(ctx, renamed)
+	return renamed, nil
 }
 
-// keepSlug keeps slug in place of the slug of the App kept in the state directory dir,
-// app.json written again as [rewriteApp] writes it with that alone changed, and reads
-// the App back as a start reads it, see [loadApp].
-func keepSlug(dir, slug string) (*app, error) {
-	if err := rewriteApp(dir, func(k *keptApp) { k.AppSlug = slug }); err != nil {
-		return nil, err
+// keepSlug uploads the App a, with its new slug, to Qory Apiary, once, see
+// [Apiary.UploadSecrets]. When the upload fails, a line says so, and serve goes on with
+// the new slug: the next start finds the old one again and uploads again.
+func (r *runner) keepSlug(ctx context.Context, a *app) {
+	if err := r.upload(ctx, a); err != nil {
+		r.log.Warn("storing the App's new slug in Qory Apiary failed; serve stores it again at its next start", slog.String("slug", a.slug), slog.String("error", err.Error()))
 	}
-	return loadApp(dir)
 }

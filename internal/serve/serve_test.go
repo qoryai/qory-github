@@ -943,23 +943,24 @@ const pinJSON = `[{"alg":"ed25519","public_key":"Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2
 func TestReadSettings(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "serve.json")
-	writeFile(t, file, `{"app_id":123456,"private_key_file":"/k.pem","webhook_secret_file":"/s","listen":"127.0.0.1:8080","state_dir":"/var/lib/qory-github",
-		"app_slug":"qory-acme","apiary_url":"https://apiary.example.com/","public_url":"https://qory-github.example.com/","access_key_id":"ak_0123456789abcdef",
-		"access_key_secret_file":"/a","apiary_public_key":`+pinJSON+`,"adapter_id":"na_0123456789abcdef","client_id":"Iv1.abc","client_secret_file":"/c"}`, 0o644)
+	writeFile(t, file, `{"listen":"127.0.0.1:8080","state_dir":"/var/lib/qory-github",
+		"apiary_url":"https://apiary.example.com/","public_url":"https://qory-github.example.com/","access_key_id":"ak_0123456789abcdef",
+		"access_key_secret_file":"/a","apiary_public_key":`+pinJSON+`,"adapter_id":"na_0123456789abcdef","upload_retry_seconds":900}`, 0o644)
 	s, err := ReadSettings(file)
-	want := Settings{AppID: "123456", PrivateKeyFile: "/k.pem", WebhookSecretFile: "/s", Listen: "127.0.0.1:8080", StateDir: "/var/lib/qory-github",
-		AppSlug: "qory-acme", APIURL: "https://api.github.com", ApiaryURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com",
+	want := Settings{Listen: "127.0.0.1:8080", StateDir: "/var/lib/qory-github",
+		APIURL: "https://api.github.com", ApiaryURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com",
 		AccessKeyID: "ak_0123456789abcdef", AccessKeySecretFile: "/a", ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}},
-		AdapterID: "na_0123456789abcdef", ClientID: "Iv1.abc", ClientSecretFile: "/c"}
-	if err != nil || !reflect.DeepEqual(s, want) {
+		AdapterID: "na_0123456789abcdef", UploadRetrySeconds: 900}
+	if err != nil || !reflect.DeepEqual(s, want) || s.uploadFor() != 15*time.Minute {
 		t.Fatalf("%+v %v", s, err)
 	}
-	base := map[string]any{"app_id": "Iv1.abc", "private_key_file": "/k.pem", "webhook_secret_file": "/s", "listen": ":8080", "state_dir": "/d",
-		"app_slug": "qory-acme", "api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://qory-github.example.com/github",
+	base := map[string]any{"listen": ":8080", "state_dir": "/d",
+		"api_url": "http://127.0.0.1:9", "apiary_url": "http://localhost:8443", "public_url": "https://qory-github.example.com/github",
 		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON),
-		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.abc", "client_secret_file": "/c"}
+		"adapter_id": "na_0123456789abcdef"}
 	b, _ := json.Marshal(base)
-	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://qory-github.example.com/github" {
+	if s, err := parseSettings(b); err != nil || s.APIURL != "http://127.0.0.1:9" || s.ApiaryURL != "http://localhost:8443" || s.PublicURL != "https://qory-github.example.com/github" ||
+		s.uploadFor() != 10*time.Minute {
 		t.Errorf("%+v %v", s, err)
 	}
 	for name, tc := range map[string]struct {
@@ -967,7 +968,7 @@ func TestReadSettings(t *testing.T) {
 		want   string
 	}{
 		"an unknown field":     {map[string]any{"github_url": "https://api.github.com"}, `unknown fields "github_url"`},
-		"a bad slug":           {map[string]any{"app_slug": "secret value"}, "/app_slug: is not an App's slug"},
+		"an App setting":       {map[string]any{"app_id": 123456, "private_key_file": "/k.pem", "client_secret_file": "/c"}, `unknown fields "app_id", "client_secret_file", "private_key_file"`},
 		"another API":          {map[string]any{"api_url": "https://secret.example.com"}, "/api_url: the API is neither"},
 		"Qory Apiary on http":  {map[string]any{"apiary_url": "http://secret.example.com"}, "/apiary_url: is neither an https origin"},
 		"Qory Apiary's path":   {map[string]any{"apiary_url": "https://apiary.example.com/secret"}, "/apiary_url: is neither an https origin"},
@@ -984,19 +985,19 @@ func TestReadSettings(t *testing.T) {
 		"a secret as the path": {map[string]any{"access_key_secret_file": "qak_secret value"}, "the settings contain what looks like an access key secret"},
 		"a secret as a name":   {map[string]any{"qak_secret value": "/a"}, "the settings contain what looks like an access key secret"},
 		"a run key":            {map[string]any{"state_dir": "QRK_secret value"}, "the settings contain what looks like a run key, qrk_, which belongs nowhere in them"},
-		"a PEM as the path":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY-----\nsecret value\n-----END RSA PRIVATE KEY-----"}, "/private_key_file: holds a control character, so it is not a file's path"},
-		"a PEM on one line":    {map[string]any{"private_key_file": "-----BEGIN RSA PRIVATE KEY----- secret value"}, "/private_key_file: holds a PEM block, which belongs in the file it names"},
-		"a control character":  {map[string]any{"webhook_secret_file": "/s\tsecret value"}, "/webhook_secret_file: holds a control character"},
+		"a PEM as the path":    {map[string]any{"access_key_secret_file": "-----BEGIN RSA PRIVATE KEY-----\nsecret value\n-----END RSA PRIVATE KEY-----"}, "/access_key_secret_file: holds a control character, so it is not a file's path"},
+		"a PEM on one line":    {map[string]any{"access_key_secret_file": "-----BEGIN RSA PRIVATE KEY----- secret value"}, "/access_key_secret_file: holds a PEM block, which belongs in the file it names"},
+		"a control character":  {map[string]any{"enrolment_code_file": "/s\tsecret value"}, "/enrolment_code_file: holds a control character"},
 		"an odd unknown name":  {map[string]any{"a\nb": 1}, `unknown fields "a\nb"`},
 		"a null field":         {map[string]any{"state_dir": nil}, "/state_dir: is not a string that is not empty"},
-		"an empty path":        {map[string]any{"private_key_file": ""}, "/private_key_file: is not a string"},
-		"a bad App id":         {map[string]any{"app_id": "secret value"}, "/app_id: is not an App's id"},
-		"a negative App id":    {map[string]any{"app_id": -1}, "/app_id: is neither"},
+		"an empty path":        {map[string]any{"access_key_secret_file": ""}, "/access_key_secret_file: is not a string"},
+		"a short retry":        {map[string]any{"upload_retry_seconds": 59}, "/upload_retry_seconds: is not an integer from 60 to 86400"},
+		"a long retry":         {map[string]any{"upload_retry_seconds": 86401}, "/upload_retry_seconds: is not an integer from 60 to 86400"},
+		"a retry of no number": {map[string]any{"upload_retry_seconds": "600"}, "/upload_retry_seconds: is not an integer from 60 to 86400"},
+		"a retry in parts":     {map[string]any{"upload_retry_seconds": 600.5}, "/upload_retry_seconds: is not an integer from 60 to 86400"},
 		"no port":              {map[string]any{"listen": "127.0.0.1"}, "/listen: is not an address and a port"},
 		"a port too large":     {map[string]any{"listen": ":65536"}, "/listen: has a port"},
 		"a node's id":          {map[string]any{"adapter_id": "nd_0123456789abcdef"}, "/adapter_id: is not na_"},
-		"a bad client id":      {map[string]any{"client_id": "secret value"}, "/client_id: is not an App's client id"},
-		"a client secret path": {map[string]any{"client_secret_file": "-----BEGIN secret value"}, "/client_secret_file: holds a PEM block"},
 	} {
 		doc := map[string]any{}
 		for k, v := range base {
@@ -1033,7 +1034,7 @@ func TestReadSettings(t *testing.T) {
 		"":                  "are empty",
 		"[]":                "not one JSON object",
 		"null":              "not one JSON object",
-		`{"app_id":` + "x}": "breaks at byte",
+		`{"listen":` + "x}": "breaks at byte",
 		"{} {}":             "something other than white space",
 	} {
 		if _, err := parseSettings([]byte(doc)); err == nil || !strings.Contains(err.Error(), want) {
@@ -1047,20 +1048,11 @@ func TestReadSettings(t *testing.T) {
 // and the cause, never the path.
 func TestAFileASettingNamesIsNeverQuoted(t *testing.T) {
 	const pasted = "a-pasted-one-line-secret-0123456789"
-	for _, setting := range []string{"private_key_file", "webhook_secret_file", "access_key_secret_file", "client_secret_file"} {
+	for _, setting := range []string{"access_key_secret_file"} {
 		dir := t.TempDir()
 		s := settingsFiles(t, dir, newKey(t), "https://apiary.example.com", pinOf(newKey(t)))
 		s.StateDir = filepath.Join(dir, "state")
-		switch setting {
-		case "private_key_file":
-			s.PrivateKeyFile = pasted
-		case "webhook_secret_file":
-			s.WebhookSecretFile = pasted
-		case "access_key_secret_file":
-			s.AccessKeySecretFile = pasted
-		case "client_secret_file":
-			s.ClientSecretFile = pasted
-		}
+		s.AccessKeySecretFile = pasted
 		err := Run(context.Background(), s, Options{ProgramVersion: testVersion})
 		if err == nil || err.Error() != "the file "+setting+" names: no such file or directory" {
 			t.Errorf("%s: err %v", setting, err)
@@ -1068,49 +1060,6 @@ func TestAFileASettingNamesIsNeverQuoted(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), pasted) {
 			t.Errorf("%s: the error quotes the path: %v", setting, err)
 		}
-	}
-}
-
-func TestAWebhookSecretFileOthersMayReadIsRefused(t *testing.T) {
-	dir := t.TempDir()
-	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o610, 0o620, 0o601} {
-		open := filepath.Join(dir, "open")
-		os.Remove(open)
-		writeFile(t, open, secret, mode)
-		_, err := ReadWebhookSecret(open)
-		if err == nil || !strings.HasPrefix(err.Error(), "the file webhook_secret_file names is ") || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0600") || strings.Contains(err.Error(), dir) {
-			t.Errorf("%s: err %v", mode, err)
-		}
-		if err != nil && strings.Contains(err.Error(), secret) {
-			t.Errorf("the error says the secret: %v", err)
-		}
-	}
-	own := filepath.Join(dir, "own")
-	writeFile(t, own, secret+"\n", 0o600)
-	if b, err := ReadWebhookSecret(own); err != nil || string(b) != secret {
-		t.Errorf("%q %v", b, err)
-	}
-	for _, short := range []string{"\n", "fifteen-bytes!!\n", "fifteen-bytes!!\r\n"} {
-		file := filepath.Join(dir, "short")
-		writeFile(t, file, short, 0o600)
-		if _, err := ReadWebhookSecret(file); err == nil || !strings.Contains(err.Error(), "shorter than 16 bytes") || strings.Contains(err.Error(), "fifteen") {
-			t.Errorf("%q: err %v", short, err)
-		}
-	}
-	sixteen := filepath.Join(dir, "sixteen")
-	writeFile(t, sixteen, "sixteen-bytes!!!", 0o600)
-	if _, err := ReadWebhookSecret(sixteen); err != nil {
-		t.Errorf("sixteen bytes: %v", err)
-	}
-	large := filepath.Join(dir, "large")
-	writeFile(t, large, strings.Repeat("a", maxSecretFile+1), 0o600)
-	if _, err := ReadWebhookSecret(large); err == nil || !strings.Contains(err.Error(), "larger than a webhook secret") {
-		t.Errorf("err %v", err)
-	}
-	link := filepath.Join(dir, "link")
-	os.Symlink(own, link)
-	if _, err := ReadWebhookSecret(link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-		t.Errorf("err %v", err)
 	}
 }
 
@@ -1322,7 +1271,7 @@ func TestRunRefusesOptionsWithoutAProgramVersion(t *testing.T) {
 
 func TestRunRefusesALooseSecretBeforeItListens(t *testing.T) {
 	access := newKey(t)
-	for _, loose := range []string{"secret", "access-key", "client-secret"} {
+	for _, loose := range []string{"access-key"} {
 		dir := t.TempDir()
 		s := settingsFiles(t, dir, access, "https://apiary.example.com", pinOf(newKey(t)))
 		os.Chmod(filepath.Join(dir, loose), 0o644)

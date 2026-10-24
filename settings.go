@@ -78,6 +78,9 @@ type SourceRole struct {
 	Connect        string     `json:"connect"`
 	Access         string     `json:"access"`
 	Disconnect     string     `json:"disconnect"`
+	// Secrets are the names of the secrets qory-github-server stores in Qory Apiary:
+	// the App, its private key, its webhook secret and its client secret.
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Noun is the source's words for one thing, One, and for more than one, Other, which

@@ -8,10 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"io"
 	"io/fs"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,7 +97,7 @@ func TestServeIsPresentWithFactory(t *testing.T) {
 		var out, errs bytes.Buffer
 		if code := run(context.Background(), []string{"serve", "-h"}, &out, &errs); code != 2 || !strings.Contains(errs.String(), "\nusage:\n  qory-github-server serve [--settings FILE]\n") || strings.Contains(errs.String(), "More:") ||
 			!strings.Contains(errs.String(), "\nexamples:\n  qory-github-server serve --settings /etc/qory-github/serve.json   # the settings in a file\n  qory-github-server serve                                          # the settings in QORY_GITHUB_ variables\n") ||
-			!strings.Contains(errs.String(), "\n  QORY_GITHUB_PRIVATE_KEY or QORY_GITHUB_PRIVATE_KEY_FILE\n  QORY_GITHUB_WEBHOOK_SECRET or QORY_GITHUB_WEBHOOK_SECRET_FILE\n  QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE\n  QORY_GITHUB_CLIENT_SECRET or QORY_GITHUB_CLIENT_SECRET_FILE\nAn empty variable counts as one not set.\n") {
+			!strings.Contains(errs.String(), "\n  QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE\nAn empty variable counts as one not set.\n") {
 			t.Errorf("QORY_FEATURES=%q: serve -h exits %d:\n%s", features, code, errs.String())
 		}
 		errs.Reset()
@@ -124,46 +121,28 @@ func TestServeRefusesSettingsItDoesNotKnow(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "serve.json")
 	writeFile(t, file, []byte(`{"app_id":1,"private_key_file":"/k","webhook_secret_file":"/s","listen":":0","state_dir":"/d","github_url":"https://api.github.com"}`))
 	var out, errs bytes.Buffer
-	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "github_url"`) || out.Len() != 0 {
+	if code := run(context.Background(), []string{"serve", "--settings", file}, &out, &errs); code != 1 || !strings.Contains(errs.String(), `unknown fields "app_id", "github_url", "private_key_file", "webhook_secret_file"`) || out.Len() != 0 {
 		t.Errorf("exit %d: %q", code, errs.String())
 	}
 }
 
-// gitHubAPI is GitHub's API as serve's check of the App at start reaches it: GET /app
-// answers the App with app_id 1, qory-acme; every other request is answered 404.
-func gitHubAPI(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/app" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"id":1,"slug":"qory-acme"}`)
-	}))
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
+// readingFails is the line serve logs while it cannot reach Qory Apiary to read the App.
+const readingFails = `"msg":"reading the GitHub App from Qory Apiary failed, and is tried again"`
 
 // TestServeStopsOnItsContext runs serve whole, and stops it as a signal does.
 func TestServeStopsOnItsContext(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	dir := t.TempDir()
-	key, _ := keyFile(t)
-	secret := filepath.Join(dir, "secret")
-	writeFile(t, secret, []byte("s3cr3t-0123456789abcdef\n"))
 	access, _ := accesskey.Generate()
 	server, _ := accesskey.Generate()
 	accessFile := filepath.Join(dir, "access-key")
 	writeFile(t, accessFile, []byte(access.Secret()+"\n"))
-	clientFile := filepath.Join(dir, "client-secret")
-	writeFile(t, clientFile, []byte("c1ient-s3cr3t\n"))
-	// Qory Apiary is a loopback port nothing listens on: serve serves all the same,
-	// and declares the adapter again after a wait.
-	settings, _ := json.Marshal(map[string]any{"app_id": 1, "private_key_file": key, "webhook_secret_file": secret, "listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state"),
-		"app_slug": "qory-acme", "api_url": gitHubAPI(t), "apiary_url": "http://127.0.0.1:1", "public_url": "https://qory-github.example.com", "access_key_id": "ak_0123456789abcdef",
+	// Qory Apiary is a loopback port nothing listens on: serve listens all the same,
+	// and reads the App again after a wait.
+	settings, _ := json.Marshal(map[string]any{"listen": "127.0.0.1:0", "state_dir": filepath.Join(dir, "state"),
+		"apiary_url": "http://127.0.0.1:1", "public_url": "https://qory-github.example.com", "access_key_id": "ak_0123456789abcdef",
 		"access_key_secret_file": accessFile, "apiary_public_key": []any{map[string]any{"alg": "ed25519", "public_key": server.PublicKey().String()}},
-		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.acme", "client_secret_file": clientFile})
+		"adapter_id": "na_0123456789abcdef", "upload_retry_seconds": 120})
 	file := filepath.Join(dir, "serve.json")
 	writeFile(t, file, settings)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -172,16 +151,16 @@ func TestServeStopsOnItsContext(t *testing.T) {
 	done := make(chan int, 1)
 	go func() { done <- run(ctx, []string{"serve", "--settings", file}, &out, errs) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(errs.String(), `"msg":"serving"`) {
+	for !strings.Contains(errs.String(), readingFails) {
 		if time.Now().After(deadline) {
-			t.Fatalf("serve does not serve: %s", errs.String())
+			t.Fatalf("serve does not read the App: %s", errs.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
 	select {
 	case code := <-done:
-		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), "s3cr3t") || strings.Contains(errs.String(), access.Secret()) || strings.Contains(errs.String(), "c1ient") {
+		if code != 0 || out.Len() != 0 || strings.Contains(errs.String(), access.Secret()) || !strings.Contains(errs.String(), `"msg":"stopped"`) {
 			t.Errorf("exit %d, stdout %q, stderr %s", code, out.String(), errs.String())
 		}
 	case <-time.After(10 * time.Second):
@@ -191,15 +170,15 @@ func TestServeStopsOnItsContext(t *testing.T) {
 
 // serveVariables are the environment variables serve reads its settings from.
 var serveVariables = []string{
-	"QORY_GITHUB_APP_ID", "QORY_GITHUB_PRIVATE_KEY", "QORY_GITHUB_PRIVATE_KEY_FILE", "QORY_GITHUB_WEBHOOK_SECRET", "QORY_GITHUB_WEBHOOK_SECRET_FILE",
-	"QORY_GITHUB_LISTEN", "QORY_GITHUB_STATE_DIR", "QORY_GITHUB_APP_SLUG", "QORY_GITHUB_API_URL", "QORY_GITHUB_APIARY_URL", "QORY_GITHUB_APIARY_PUBLIC_URL",
+	"QORY_GITHUB_LISTEN", "QORY_GITHUB_STATE_DIR", "QORY_GITHUB_API_URL", "QORY_GITHUB_APIARY_URL", "QORY_GITHUB_APIARY_PUBLIC_URL",
 	"QORY_GITHUB_PUBLIC_URL", "QORY_GITHUB_ACCESS_KEY_ID", "QORY_GITHUB_ACCESS_KEY_SECRET", "QORY_GITHUB_ACCESS_KEY_SECRET_FILE", "QORY_GITHUB_APIARY_PUBLIC_KEY",
-	"QORY_GITHUB_ADAPTER_ID", "QORY_GITHUB_CLIENT_ID", "QORY_GITHUB_CLIENT_SECRET", "QORY_GITHUB_CLIENT_SECRET_FILE", "QORY_GITHUB_ENROLMENT_CODE_FILE", "QORY_GITHUB_PUBLIC_ADDRESS",
+	"QORY_GITHUB_ADAPTER_ID", "QORY_GITHUB_ENROLMENT_CODE_FILE", "QORY_GITHUB_PUBLIC_ADDRESS", "QORY_GITHUB_UPLOAD_RETRY_SECONDS",
 }
 
-// TestServeReadsTheEnvironmentWithoutSettings runs serve whole without --settings,
-// every secret a value in the environment, and stops it as a signal does; with
-// --settings, the environment is not read.
+// TestServeReadsTheEnvironmentWithoutSettings runs serve whole without --settings, the
+// access key's secret a value in the environment, and stops it as a signal does; with
+// --settings, the environment is not read. The variables of the App that settings
+// gave before are not read.
 func TestServeReadsTheEnvironmentWithoutSettings(t *testing.T) {
 	dir := t.TempDir()
 	_, key := keyFile(t)
@@ -210,7 +189,7 @@ func TestServeReadsTheEnvironmentWithoutSettings(t *testing.T) {
 		"QORY_GITHUB_APP_ID": "1", "QORY_GITHUB_APP_SLUG": "qory-acme", "QORY_GITHUB_CLIENT_ID": "Iv1.acme",
 		"QORY_GITHUB_PRIVATE_KEY": string(key), "QORY_GITHUB_WEBHOOK_SECRET": "s3cr3t-0123456789abcdef", "QORY_GITHUB_CLIENT_SECRET": "c1ient-s3cr3t",
 		"QORY_GITHUB_LISTEN": "127.0.0.1:0", "QORY_GITHUB_STATE_DIR": filepath.Join(dir, "state"),
-		"QORY_GITHUB_APIARY_URL": "http://127.0.0.1:1", "QORY_GITHUB_PUBLIC_URL": "https://qory-github.example.com", "QORY_GITHUB_API_URL": gitHubAPI(t),
+		"QORY_GITHUB_APIARY_URL": "http://127.0.0.1:1", "QORY_GITHUB_PUBLIC_URL": "https://qory-github.example.com", "QORY_GITHUB_UPLOAD_RETRY_SECONDS": "120",
 		"QORY_GITHUB_ACCESS_KEY_ID": "ak_0123456789abcdef", "QORY_GITHUB_ACCESS_KEY_SECRET": access.Secret(),
 		"QORY_GITHUB_APIARY_PUBLIC_KEY": string(pin), "QORY_GITHUB_ADAPTER_ID": "na_0123456789abcdef",
 	}
@@ -220,9 +199,9 @@ func TestServeReadsTheEnvironmentWithoutSettings(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runServe(ctx, nil, errs, lookup) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(errs.String(), `"msg":"serving"`) {
+	for !strings.Contains(errs.String(), readingFails) {
 		if time.Now().After(deadline) {
-			t.Fatalf("serve does not serve: %s", errs.String())
+			t.Fatalf("serve does not read the App: %s", errs.String())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -293,7 +272,11 @@ func TestServeHelpSaysTheAppSetup(t *testing.T) {
 	run(context.Background(), []string{"serve", "-h"}, &out, &errs)
 	help := strings.Join(strings.Fields(errs.String()), " ")
 	for _, want := range []string{
-		"client_secret_file, the App, may be left out together. serve then uses the App it keeps in the state directory or, until one is kept, serves GitHub's App setup at public_url's /setup, which an instance admin opens with Set up in Qory Apiary.",
+		"No setting contains the GitHub App. Qory Apiary stores it: its id, slug, client id, private key, webhook secret and client secret.",
+		"At each start serve reads the App from Qory Apiary, sealed to its access key, and keeps it in memory; serve writes none of it to disk.",
+		"Until Qory Apiary stores an App, serve serves GitHub's App setup at public_url's /setup, which an instance admin opens with Set up in Qory Apiary.",
+		"GitHub issues the App's private key once: when storing the App in Qory Apiary fails, the setup tries again for upload_retry_seconds, and then shows which App to delete on GitHub.",
+		"upload_retry_seconds is how long the App setup tries again to store the App in Qory Apiary, 60 to 86400; left out, it is 600.",
 		"/health answers 200 from the first moment.",
 		"public_address, false when GitHub cannot reach public_url: the App setup creates has its webhook inactive, and serve learns of changes on GitHub by pulling. Left out, it is true.",
 		"QORY_GITHUB_PUBLIC_ADDRESS for public_address",

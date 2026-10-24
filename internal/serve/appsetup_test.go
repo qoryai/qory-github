@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -210,7 +212,10 @@ func (j jar) header() string {
 }
 
 // setupRig is an App setup on a store in a temporary directory, with the fake GitHub,
-// Qory Apiary's server key, which signs the setup passes, and its log.
+// Qory Apiary's server key, which signs the setup passes, and its log. Its uploads of
+// the App to Qory Apiary are recorded in stored, each failing with fail's error for
+// the try n, numbered from 1, when fail is set; its waits between tries are recorded
+// in waits, and last no time.
 type setupRig struct {
 	t      *testing.T
 	gh     *setupGitHub
@@ -219,6 +224,14 @@ type setupRig struct {
 	log    *syncBuffer
 	dir    string
 	kept   chan *app
+
+	mu     sync.Mutex
+	tries  int
+	stored []*app
+	fail   func(n int) error
+	waits  []time.Duration
+	// released, when set, is received from before each wait ends.
+	released chan struct{}
 }
 
 func newSetupRig(t *testing.T, active bool) *setupRig {
@@ -231,11 +244,59 @@ func newSetupRig(t *testing.T, active bool) *setupRig {
 	rig := &setupRig{t: t, gh: gh, server: server, log: log, dir: filepath.Join(dir, "state"), kept: make(chan *app, 2)}
 	rig.setup = &appSetup{
 		Store: st, GitHub: github.Client{API: gh.srv.URL}, PublicURL: "https://qory-github.example.com", ApiaryPublicURL: "https://apiary.example.com",
-		StateDir: rig.dir, Active: active, Log: slog.New(slog.NewJSONHandler(log, nil)),
+		Active: active, Log: slog.New(slog.NewJSONHandler(log, nil)), Upload: rig.upload, UploadFor: time.Minute,
 		creds: &credentials{e: enrolment{pin: pinOf(server), adapterID: testAdapterID}},
-		setUp: func(a *app) { rig.kept <- a }, refusalEvery: time.Nanosecond,
+		setUp: func(a *app) { rig.kept <- a }, refusalEvery: time.Nanosecond, wait: rig.wait,
 	}
+	// The tries of an upload end when the test does, as they end when serve stops.
+	ctx, cancel := context.WithCancel(context.Background())
+	rig.setup.ctx = ctx
+	t.Cleanup(func() {
+		cancel()
+		rig.setup.stop()
+	})
 	return rig
+}
+
+// upload is the rig's upload of the App a to Qory Apiary.
+func (rig *setupRig) upload(_ context.Context, a *app) error {
+	rig.mu.Lock()
+	defer rig.mu.Unlock()
+	rig.tries++
+	if rig.fail != nil {
+		if err := rig.fail(rig.tries); err != nil {
+			return err
+		}
+	}
+	rig.stored = append(rig.stored, a)
+	return nil
+}
+
+// wait is the rig's wait between tries: it records d, and ends at once, after a receive
+// from released when that is set, or when ctx is done.
+func (rig *setupRig) wait(ctx context.Context, d time.Duration) error {
+	rig.mu.Lock()
+	rig.waits = append(rig.waits, d)
+	released := rig.released
+	rig.mu.Unlock()
+	if released != nil {
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return ctx.Err()
+}
+
+// storedApp is the last App the rig stored in Qory Apiary, or nil.
+func (rig *setupRig) storedApp() *app {
+	rig.mu.Lock()
+	defer rig.mu.Unlock()
+	if len(rig.stored) == 0 {
+		return nil
+	}
+	return rig.stored[len(rig.stored)-1]
 }
 
 // pass is a valid setup pass, new each call, that expires in ten minutes.
@@ -319,10 +380,10 @@ func stateOf(t *testing.T, action string) string {
 
 // TestTheSetupFlowKeepsTheAppGitHubCreated runs the App setup whole for an
 // organisation's public App, and for a user's private App, against the fake GitHub:
-// every page, its headers and
-// its sentences, the manifest it posts and where, the App kept as GitHub's answer
-// says it, the cookie at each step, and the lines it logs, none of which, nor any
-// answer, holds the pass, the code, a cookie or a secret.
+// every page, its headers and its sentences, the manifest it posts and where, the App
+// stored in Qory Apiary as GitHub's answer says it, the cookie at each step, and the
+// lines it logs, none of which, nor any answer, contains the pass, the code, a cookie
+// or a secret. Nothing but the store is written to the state directory.
 func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 	for _, tc := range []struct {
 		handle, org, install, owner, ownerKind, end string
@@ -401,18 +462,13 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 		if c := rig.gh.converted(); len(c) != 1 || c[0] != setupCode {
 			t.Errorf("the conversions: %v", c)
 		}
-		loaded, err := loadApp(rig.dir)
-		if err != nil || loaded.numericID != setupAppID || loaded.slug != setupSlug || loaded.owner != tc.owner || loaded.ownerKind != tc.ownerKind ||
-			string(loaded.webhookSecret) != string(kept.webhookSecret) || !loaded.confirmed || !loaded.webhookActive {
-			t.Errorf("the App kept is %+v, %v", loaded, err)
+		stored := rig.storedApp()
+		if stored == nil || stored != kept || stored.numericID != setupAppID || stored.slug != setupSlug || stored.owner != tc.owner || stored.ownerKind != tc.ownerKind ||
+			string(stored.pem) != strings.TrimSpace(appKeyPEM()) || !stored.confirmed || !stored.webhookActive || rig.tries != 1 {
+			t.Errorf("the App stored is %+v after %d tries", stored, rig.tries)
 		}
-		for _, name := range []string{appFile, appKeyFile, appWebhookFile, appClientFile} {
-			if info, err := os.Lstat(filepath.Join(rig.dir, name)); err != nil || info.Mode().Perm() != 0o600 {
-				t.Errorf("%s: %v %v", name, info, err)
-			}
-		}
-		if _, err := os.Lstat(filepath.Join(rig.dir, appTemp)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("%s is left: %v", appTemp, err)
+		if entries, _ := os.ReadDir(rig.dir); len(entries) != 1 || entries[0].Name() != store.FileName {
+			t.Errorf("the state directory contains %v", entries)
 		}
 		logged := rig.log.String()
 		for _, want := range []string{`"msg":"setup started"`, `"msg":"GitHub created the App","app_id":777001,"slug":"qory-acme","html_url":"https://github.com/apps/qory-acme"`, `"msg":"the GitHub App is set up","app_id":777001,"slug":"qory-acme","webhook_active":true`} {
@@ -465,8 +521,8 @@ func TestASetupWithoutAPublicAddressMakesTheWebhookInactive(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "<p>GitHub sends this App no webhooks: changes on GitHub arrive with each pull.</p>") {
 		t.Errorf("the end page: %s", w.Body)
 	}
-	if a, err := loadApp(rig.dir); err != nil || a.webhookActive {
-		t.Errorf("the App kept: %+v %v", a, err)
+	if a := rig.storedApp(); a == nil || a.webhookActive {
+		t.Errorf("the App stored: %+v", a)
 	}
 }
 
@@ -929,28 +985,8 @@ func TestAPassWhileAnAppIsKeptIsRefused(t *testing.T) {
 	}
 }
 
-// TestAKeptAppFoundAtTheRedirectIsNotReplaced pins that GitHub's redirect is refused
-// with the page that says the App is set up, its code not exchanged, when app.json is
-// in the state directory though no App was marked kept.
-func TestAKeptAppFoundAtTheRedirectIsNotReplaced(t *testing.T) {
-	rig := newSetupRig(t, true)
-	j, token := rig.begin(rig.pass())
-	_, action, _ := rig.account(j, token, "acme")
-	if err := keepApp(rig.dir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
-	w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-	if w.Code != http.StatusConflict || w.Body.String() != "This adapter's GitHub App is set up already.\n" {
-		t.Errorf("the redirect answered %d %q", w.Code, w.Body)
-	}
-	if c := rig.gh.converted(); len(c) != 0 {
-		t.Errorf("the code was exchanged: %v", c)
-	}
-}
-
-// TestAnAppThatCannotBeKeptSaysToDeleteIt pins the pages of a setup whose App GitHub
-// created, or may have, and serve did not keep: the exchange failing, and the commit
-// failing at its rename, which leaves no file behind.
+// TestAnAppThatCannotBeKeptSaysToDeleteIt pins the page of a setup whose code's
+// exchange failed, so GitHub may have created an App: it links to the account's Apps.
 func TestAnAppThatCannotBeKeptSaysToDeleteIt(t *testing.T) {
 	rig := newSetupRig(t, true)
 	rig.gh.convStatus = http.StatusInternalServerError
@@ -960,26 +996,7 @@ func TestAnAppThatCannotBeKeptSaysToDeleteIt(t *testing.T) {
 	if w.Code != http.StatusBadGateway || w.Body.String() != "GitHub may have created an App; delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps, then press Set up in Qory Apiary again.\n" || j[setupCookie] != "" {
 		t.Errorf("a failed exchange answered %d %q", w.Code, w.Body)
 	}
-	rig.gh.convStatus = 0
-	rename = func(string, string) error { return errors.New("no rename") }
-	t.Cleanup(func() { rename = os.Rename })
-	j, token = rig.begin(rig.pass())
-	_, action, _ = rig.account(j, token, "acme")
-	w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-	if w.Code != http.StatusInternalServerError || w.Body.String() != "GitHub created the App qory-acme, and this server could not keep it. Delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps/qory-acme, then press Set up in Qory Apiary again.\n" {
-		t.Errorf("a failed commit answered %d %q", w.Code, w.Body)
-	}
-	if entries, _ := os.ReadDir(rig.dir); len(entries) != 1 || entries[0].Name() != store.FileName {
-		names := []string{}
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Errorf("the state directory holds %v", names)
-	}
-	if len(rig.kept) != 0 || rig.setup.kept.Load() {
-		t.Error("an App not kept was handed on")
-	}
-	if !strings.Contains(rig.log.String(), `"msg":"setup failed","step":"created","what":"keep"`) || !strings.Contains(rig.log.String(), `"what":"conversion"`) {
+	if !strings.Contains(rig.log.String(), `"what":"conversion"`) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
 	noSetupLeak(t, rig.log.String())
@@ -990,8 +1007,8 @@ func TestAnAppThatCannotBeKeptSaysToDeleteIt(t *testing.T) {
 // or webhook secret serve cannot keep, and what looks like an access key secret or a
 // run key in the key or a secret. Each ends the flow with the page that says to delete
 // the App, at its settings page, or at the account's Apps when the slug is not one
-// serve takes, keeps no file, and logs an error that names no file of the state
-// directory and no secret: the private key's says the key is not one, and every other
+// serve takes, stores nothing in Qory Apiary, and logs an error that names no file
+// of the state directory and no secret: the private key's says the key is not one, and every other
 // names GitHub's answer. An owner's login that is not one, or one longer than 39
 // characters, makes the page name the session's account; one of 39 characters is the
 // account the page names.
@@ -1045,7 +1062,7 @@ func TestGitHubsAnswerIsCheckedBeforeTheAppIsKept(t *testing.T) {
 		if tc.owner != "" {
 			owner = tc.owner
 		}
-		page, status := "GitHub created the App qory-acme, and this server could not keep it. Delete it at "+rig.gh.srv.URL+"/organizations/"+owner+"/settings/apps/qory-acme, then press Set up in Qory Apiary again.\n", http.StatusInternalServerError
+		page, status := "GitHub created the App qory-acme, and this server could not use it. Delete it at "+rig.gh.srv.URL+"/organizations/"+owner+"/settings/apps/qory-acme, then press Set up in Qory Apiary again.\n", http.StatusInternalServerError
 		if tc.noSlug {
 			page, status = "GitHub may have created an App; delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps, then press Set up in Qory Apiary again.\n", http.StatusBadGateway
 		}
@@ -1062,20 +1079,20 @@ func TestGitHubsAnswerIsCheckedBeforeTheAppIsKept(t *testing.T) {
 		if entries, _ := os.ReadDir(rig.dir); len(entries) != 1 {
 			t.Errorf("%s: the state directory holds %v", name, entries)
 		}
-		if len(rig.kept) != 0 || rig.setup.kept.Load() {
+		if len(rig.kept) != 0 || rig.setup.kept.Load() || rig.storedApp() != nil {
 			t.Errorf("%s: an App not kept was handed on", name)
 		}
 		noSetupLeak(t, rig.log.String(), accessKey, "QRK_secret", "qrk_-a-pasted")
 	}
 }
 
-// TestTheLargestPrivateKeyLoadAppReadsIsKept pins keep's bound on the private key in
-// GitHub's answer: one whose file, with the line break keepApp writes at its end, is
-// [github.MaxKeyFile] bytes is kept and read back, also with a line break at its end in
-// the answer, which is not part of it, and one a byte larger is refused, keeping no
-// file and logging no secret.
-func TestTheLargestPrivateKeyLoadAppReadsIsKept(t *testing.T) {
-	largest := appKeyPEM() + strings.Repeat("a", github.MaxKeyFile-1-len(appKeyPEM()))
+// TestTheLargestPrivateKeyQoryApiaryStoresIsKept pins keep's bound on the private key
+// in GitHub's answer: one of [contracts.SecretValueMaxBytes] bytes, the most Qory
+// Apiary stores in a secret, is stored and read back, also with a line break at its
+// end in the answer, which is not part of it, and one a byte larger is refused,
+// storing nothing and logging no secret.
+func TestTheLargestPrivateKeyQoryApiaryStoresIsKept(t *testing.T) {
+	largest := strings.TrimSpace(appKeyPEM()) + "\n" + strings.Repeat("a", contracts.SecretValueMaxBytes-1-len(strings.TrimSpace(appKeyPEM())))
 	for name, tc := range map[string]struct {
 		pem  string
 		kept bool
@@ -1089,12 +1106,16 @@ func TestTheLargestPrivateKeyLoadAppReadsIsKept(t *testing.T) {
 		j, token := rig.begin(rig.pass())
 		_, action, _ := rig.account(j, token, "acme")
 		w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-		_, err := loadApp(rig.dir)
-		if tc.kept && (w.Code != http.StatusOK || err != nil) {
-			t.Errorf("%s: answered %d %q, and the App read back: %v", name, w.Code, w.Body, err)
+		stored := rig.storedApp()
+		if tc.kept {
+			if w.Code != http.StatusOK || stored == nil || len(stored.pem) != contracts.SecretValueMaxBytes {
+				t.Errorf("%s: answered %d %q", name, w.Code, w.Body)
+			} else if _, err := appOf(must(stored.plaintext())); err != nil {
+				t.Errorf("%s: the App stored is not read back: %v", name, err)
+			}
 		}
 		if !tc.kept {
-			if w.Code != http.StatusInternalServerError || !strings.Contains(rig.log.String(), `"what":"keep","error":"GitHub's answer holds a private key larger than setup can keep"`) {
+			if w.Code != http.StatusInternalServerError || stored != nil || !strings.Contains(rig.log.String(), `"what":"keep","error":"GitHub's answer contains a private key larger than setup can store in Qory Apiary"`) {
 				t.Errorf("%s: answered %d %q, the log %s", name, w.Code, w.Body, rig.log.String())
 			}
 			if entries, _ := os.ReadDir(rig.dir); len(entries) != 1 {
@@ -1106,7 +1127,7 @@ func TestTheLargestPrivateKeyLoadAppReadsIsKept(t *testing.T) {
 }
 
 // TestAnUnconfirmedWebhookSecretKeepsTheApp pins that an App whose webhook secret
-// GitHub does not confirm is kept all the same, marked so, with the line that says
+// GitHub does not confirm is stored all the same, marked so, with the line that says
 // serve sets it again at its next start.
 func TestAnUnconfirmedWebhookSecretKeepsTheApp(t *testing.T) {
 	rig := newSetupRig(t, true)
@@ -1116,9 +1137,9 @@ func TestAnUnconfirmedWebhookSecretKeepsTheApp(t *testing.T) {
 	if w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil); w.Code != http.StatusOK {
 		t.Fatalf("answered %d %s", w.Code, w.Body)
 	}
-	a, err := loadApp(rig.dir)
-	if err != nil || a.confirmed {
-		t.Errorf("the App kept: %+v %v", a, err)
+	a := rig.storedApp()
+	if a == nil || a.confirmed {
+		t.Fatalf("the App stored: %+v", a)
 	}
 	if !strings.Contains(rig.log.String(), `"msg":"GitHub did not confirm the App's webhook secret; serve sets it again at its next start"`) {
 		t.Errorf("the log: %s", rig.log.String())
@@ -1131,8 +1152,8 @@ func TestAnUnconfirmedWebhookSecretKeepsTheApp(t *testing.T) {
 	j, token = rig.begin(rig.pass())
 	_, action, _ = rig.account(j, token, "acme")
 	rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-	if a, err := loadApp(rig.dir); err != nil || string(a.webhookSecret) != setupHookSecret || !a.confirmed || len(rig.gh.patched()) != 0 {
-		t.Errorf("the App kept: %+v %v", a, err)
+	if a := rig.storedApp(); a == nil || string(a.webhookSecret) != setupHookSecret || !a.confirmed || len(rig.gh.patched()) != 0 {
+		t.Errorf("the App stored: %+v", a)
 	}
 }
 
@@ -1148,5 +1169,149 @@ func TestASessionThatEndedFindsNone(t *testing.T) {
 	}
 	if w := rig.do(jar{}, http.MethodGet, "/setup/other", nil); w.Code != http.StatusNotFound {
 		t.Errorf("an unknown path answered %d", w.Code)
+	}
+}
+
+// must is v; it panics when err is set.
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
+
+// createdAfterFailedUpload runs a setup whose first upload fails, and returns the
+// browser and the answer to GitHub's redirect.
+func (rig *setupRig) createdAfterFailedUpload() (jar, *httptest.ResponseRecorder) {
+	rig.t.Helper()
+	j, token := rig.begin(rig.pass())
+	_, action, _ := rig.account(j, token, "acme")
+	return j, rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(rig.t, action), nil)
+}
+
+// errUpload is an upload's failure, as Qory Apiary's 503 makes one.
+var errUpload = errors.New("storing the GitHub App in Qory Apiary: Qory Apiary answered 503")
+
+// TestAFailedUploadIsTriedAgainUntilItSucceeds pins that a first upload that fails
+// sends the browser to the status page, which says the setup tries again and reloads
+// itself, that every setup pass is refused meanwhile, and that the App is set up once
+// an upload succeeds: the status page then says so and ends the session. The waits
+// double from 2 seconds to 30, and no line or page contains a secret.
+func TestAFailedUploadIsTriedAgainUntilItSucceeds(t *testing.T) {
+	rig := newSetupRig(t, true)
+	now := time.Now().UTC().Truncate(time.Minute)
+	rig.setup.now = func() time.Time { return now }
+	rig.released = make(chan struct{})
+	rig.fail = func(n int) error {
+		if n <= 6 {
+			return errUpload
+		}
+		return nil
+	}
+	j, w := rig.createdAfterFailedUpload()
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/setup/status" || j[setupCookie] == "" {
+		t.Fatalf("the redirect answered %d %v %s", w.Code, w.Header(), w.Body)
+	}
+	w = rig.do(j, http.MethodGet, "/setup/status", nil)
+	body := w.Body.String()
+	if w.Code != http.StatusAccepted || !strings.Contains(body, `<meta http-equiv="refresh" content="10">`) ||
+		!strings.Contains(body, "<p>GitHub created the App qory-acme. Storing it in Qory Apiary failed, and this server tries again until "+uploadTime(now.Add(time.Minute))+".</p>") ||
+		!strings.Contains(body, "<p>Keep this page open: it reloads every 10 seconds and shows the result.</p>") {
+		t.Errorf("the status page answered %d %s", w.Code, body)
+	}
+	// Another setup is refused while the tries go on.
+	w = rig.do(jar{}, http.MethodGet, "/setup?state="+rig.pass(), nil)
+	j2 := jar{}
+	j2.take(w.Header())
+	if w = rig.do(j2, http.MethodGet, "/setup/refused", nil); w.Code != http.StatusConflict ||
+		w.Body.String() != "Wait until the earlier setup ends, then press Set up in Qory Apiary again if this adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.\n" {
+		t.Errorf("a pass while the setup tries again answered %d %q", w.Code, w.Body)
+	}
+	for range 6 {
+		rig.released <- struct{}{}
+	}
+	select {
+	case a := <-rig.kept:
+		if a.numericID != setupAppID || rig.storedApp() != a {
+			t.Errorf("handed on %+v", a)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the App is not set up")
+	}
+	w = rig.do(j, http.MethodGet, "/setup/status", nil)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>The GitHub App qory-acme is set up. Only acme can install it, with Install in Qory Apiary.</p>") || j[setupCookie] != "" {
+		t.Errorf("the status page answered %d %s", w.Code, w.Body)
+	}
+	rig.mu.Lock()
+	waits := slices.Clone(rig.waits)
+	rig.mu.Unlock()
+	if want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}; !slices.Equal(waits, want) {
+		t.Errorf("waited %v, want %v", waits, want)
+	}
+	logged := rig.log.String()
+	for _, want := range []string{
+		`"level":"WARN","msg":"storing the GitHub App in Qory Apiary failed; the setup tries again","app_id":777001,"slug":"qory-acme","until":"` + contracts.FormatTime(now.Add(time.Minute)) + `","error":"storing the GitHub App in Qory Apiary: Qory Apiary answered 503"`,
+		`"level":"WARN","msg":"storing the GitHub App in Qory Apiary failed again; the setup tries again","app_id":777001`,
+		`"msg":"the GitHub App is set up","app_id":777001`,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the log lacks %s: %s", want, logged)
+		}
+	}
+	noSetupLeak(t, logged)
+}
+
+// TestAnUploadThatFailsForGoodSaysWhichAppToDelete pins that when every try fails
+// until upload_retry_seconds have passed, the App's secrets are dropped, the line says
+// which App to delete on GitHub, the status page says so with the App's settings page
+// and ends the session, and a new setup may start.
+func TestAnUploadThatFailsForGoodSaysWhichAppToDelete(t *testing.T) {
+	rig := newSetupRig(t, true)
+	now := time.Now().UTC().Truncate(time.Minute)
+	rig.setup.now = func() time.Time { return now }
+	// The tries end at a deadline of the real clock, upload_retry_seconds after the
+	// first failure: a short one ends them here.
+	rig.setup.UploadFor = 50 * time.Millisecond
+	rig.fail = func(int) error { return errUpload }
+	rig.setup.wait = func(ctx context.Context, _ time.Duration) error { return wait(ctx, 5*time.Millisecond) }
+	j, w := rig.createdAfterFailedUpload()
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/setup/status" {
+		t.Fatalf("the redirect answered %d %v", w.Code, w.Header())
+	}
+	const line = `"level":"ERROR","msg":"storing the GitHub App in Qory Apiary failed for good: delete the App on GitHub, then press Set up in Qory Apiary again","app_id":777001,"slug":"qory-acme","settings_url":"`
+	eventually(t, "the tries end", func() bool { return strings.Contains(rig.log.String(), line) })
+	if !strings.Contains(rig.log.String(), line+rig.gh.srv.URL+`/organizations/acme/settings/apps/qory-acme"`) {
+		t.Errorf("the log: %s", rig.log.String())
+	}
+	w = rig.do(j, http.MethodGet, "/setup/status", nil)
+	if w.Code != http.StatusBadGateway || j[setupCookie] != "" ||
+		w.Body.String() != "Delete the GitHub App qory-acme at "+rig.gh.srv.URL+"/organizations/acme/settings/apps/qory-acme, then press Set up in Qory Apiary again. This server could not store the App in Qory Apiary by "+uploadTime(now)+".\n" {
+		t.Errorf("the status page answered %d %q", w.Code, w.Body)
+	}
+	rig.setup.mu.Lock()
+	p := rig.setup.pending
+	rig.setup.mu.Unlock()
+	if p == nil || p.app.key != nil || p.app.pem != nil || p.app.webhookSecret != nil || p.app.clientSecret != nil || len(rig.kept) != 0 || rig.setup.kept.Load() {
+		t.Errorf("the App's secrets stay in memory, or the App is set up: %+v", p)
+	}
+	// A new setup may start.
+	if j, _ := rig.begin(rig.pass()); j[setupCookie] == "" {
+		t.Error("no new setup starts")
+	}
+	noSetupLeak(t, rig.log.String())
+}
+
+// TestTheStatusPageNeedsTheSessionThatSetTheAppUp pins that the status page, without
+// the session whose upload is tried again, is refused as a step without a session.
+func TestTheStatusPageNeedsTheSessionThatSetTheAppUp(t *testing.T) {
+	rig := newSetupRig(t, true)
+	rig.released = make(chan struct{})
+	rig.fail = func(int) error { return errUpload }
+	rig.createdAfterFailedUpload()
+	for _, j := range []jar{{}, {setupCookie: randomID()}} {
+		w := rig.do(j, http.MethodGet, "/setup/status", nil)
+		if w.Code != http.StatusBadRequest || w.Body.String() != "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.\n" {
+			t.Errorf("%v: answered %d %q", j, w.Code, w.Body)
+		}
 	}
 }

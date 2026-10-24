@@ -3,6 +3,7 @@ package serve
 import (
 	"bytes"
 	"cmp"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -112,6 +113,20 @@ type fakeApiary struct {
 	// answers each with a 201.
 	enrolReply func(n int) enrolAnswer
 
+	// secrets are the secrets the fake stores for the adapter, [testApp] from the start,
+	// which GET
+	// /v1/adapter/secrets answers sealed to the access key that signed the request, and
+	// each accepted upload replaces; uploads are the plaintexts of the uploads it
+	// opened. sealing, when set, changes the answer's document before it is signed, as
+	// a forged or a wrong answer would be: it is given the document and the access key
+	// id the request was signed with.
+	secrets []contracts.SecretEntry
+	uploads []contracts.AdapterSecretsPlaintext
+	sealing func(doc map[string]any, keyID string)
+	// node is the adapter id of the last enrolment, which a seal of secrets binds to,
+	// testAdapterID before any.
+	node string
+
 	mu       sync.Mutex
 	requests []apiaryRequest
 	changes  []contracts.Change
@@ -173,6 +188,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 		routeDisconnect:  "sources-disconnect.schema.json",
 
 		routeConnectionsDisconnect: "connections-disconnect.schema.json",
+		routeSecrets:               "adapter-secrets.schema.json",
 	} {
 		s, err := contracts.Compile(name)
 		if err != nil {
@@ -253,7 +269,15 @@ func newFakeApiary(t *testing.T, adapter *accesskey.Key) *fakeApiary {
 	f := &fakeApiary{t: t, adapter: adapter.PublicKey(), server: newKey(t)}
 	f.srv = httptest.NewServer(f)
 	t.Cleanup(f.srv.Close)
+	f.storeTestApp()
 	return f
+}
+
+// noApp makes the fake store no secret, as before the App setup.
+func (f *fakeApiary) noApp() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets = nil
 }
 
 func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -339,9 +363,18 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	refuse, refuseGet := f.refuse, f.refuseGet
 	f.mu.Unlock()
+	refused := false
 	if refuse != nil && r.Method == http.MethodPost {
 		if s, b := refuse(r.URL.Path, n); s != 0 {
-			status, body = s, b
+			status, body, refused = s, b, true
+		}
+	}
+	switch {
+	case r.URL.Path == routeSecrets && r.Method == http.MethodGet:
+		body = f.sealedSecrets(signer, req.AccessKeyID)
+	case r.URL.Path == routeSecrets && !refused:
+		if !f.openUpload(b, req.AccessKeyID) {
+			status, body = http.StatusBadRequest, `{"error":"invalid_request"}`
 		}
 	}
 	if refuseGet != nil && r.Method == http.MethodGet {
@@ -415,6 +448,9 @@ func (f *fakeApiary) enrol(w http.ResponseWriter, r *http.Request) {
 		f.adapter = pub
 		f.mu.Unlock()
 		kind, node := cmp.Or(a.kind, "adapter"), cmp.Or(a.node, testAdapterID)
+		f.mu.Lock()
+		f.node = node
+		f.mu.Unlock()
 		doc = map[string]any{"version": 1, "access_key_id": id, "node_id": node, "node_kind": kind, "stored_secrets": false, "apiary_public_key": listed}
 	}
 	body, _ := json.Marshal(doc)
@@ -454,6 +490,141 @@ func (f *fakeApiary) page(after string) string {
 	}
 	b, _ := json.Marshal(map[string]any{"version": contracts.Version, "revision": revision, "cursor": "c_" + strconv.Itoa(len(f.changes)), "changes": entries})
 	return string(b)
+}
+
+// storeApp makes the fake store the App a for the adapter, as an upload of the App
+// setup would.
+func (f *fakeApiary) storeApp(a *app) {
+	f.t.Helper()
+	p, err := a.plaintext()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets = p.Secrets
+}
+
+// storeTestApp makes the fake store [testApp].
+func (f *fakeApiary) storeTestApp() { f.storeApp(testApp()) }
+
+// stored are the secrets the fake stores, by name.
+func (f *fakeApiary) stored() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]string{}
+	for _, e := range f.secrets {
+		out[e.Name] = e.Value
+	}
+	return out
+}
+
+// uploaded are the plaintexts of the uploads the fake opened.
+func (f *fakeApiary) uploaded() []contracts.AdapterSecretsPlaintext {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.uploads)
+}
+
+// sealedSecrets is the body of the answer to GET /v1/adapter/secrets: the secrets the
+// fake stores, sealed to the access key pub that signed the request, whose id is keyID,
+// for the adapter of the last enrolment, as adapter-secrets-answer.schema.json says, changed by
+// sealing when it is set.
+func (f *fakeApiary) sealedSecrets(pub accesskey.PublicKey, keyID string) string {
+	f.mu.Lock()
+	secrets := f.secrets
+	if secrets == nil {
+		secrets = []contracts.SecretEntry{}
+	}
+	pt, err := json.Marshal(contracts.AdapterSecretsPlaintext{Version: contracts.Version, Secrets: secrets})
+	sealing, node := f.sealing, cmp.Or(f.node, testAdapterID)
+	f.mu.Unlock()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	enc, ct := sealTo(f.t, pub, pt, contracts.SecretsInfo(keyID), contracts.SecretsAAD(node, keyID))
+	doc := map[string]any{"version": contracts.Version, "revision": contracts.Revision, "sealed": map[string]any{
+		"suite": contracts.SealSuite, "access_key_id": keyID, "enc": enc, "ct": ct,
+	}}
+	if sealing != nil {
+		sealing(doc, keyID)
+	}
+	b, _ := json.Marshal(doc)
+	return string(b)
+}
+
+// sealTo seals pt to the Ed25519 public key pub's X25519 form with info and aad, and
+// returns enc and the ciphertext in base64url, as the contract writes them.
+func sealTo(t *testing.T, pub accesskey.PublicKey, pt, info, aad []byte) (string, string) {
+	t.Helper()
+	u, err := pub.X25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kem, kdf, aead := sealSuite()
+	pk, err := kem.NewPublicKey(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, sender, err := hpke.NewSender(pk, kdf, aead, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, err := sender.Seal(aad, pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(enc), base64.RawURLEncoding.EncodeToString(ct)
+}
+
+// openUpload opens the upload b, signed with the access key keyID, with the server
+// key, as Qory Apiary does: info from sealed.server_key, aad from the adapter of the
+// last enrolment and keyID. An upload sealed to another key than the server's, or one that does not open
+// or holds no plaintext the contract takes, is refused; an accepted one replaces the
+// secrets the fake stores.
+func (f *fakeApiary) openUpload(b []byte, keyID string) bool {
+	var doc contracts.AdapterSecrets
+	if err := json.Unmarshal(b, &doc); err != nil || doc.Sealed.ServerKey != f.server.PublicKey().String() {
+		return false
+	}
+	f.mu.Lock()
+	node := cmp.Or(f.node, testAdapterID)
+	f.mu.Unlock()
+	pt, err := openSealedWith(f.server, doc.Sealed.Enc, doc.Sealed.CT, contracts.SecretsUploadInfo(doc.Sealed.ServerKey), contracts.SecretsAAD(node, keyID))
+	if err != nil {
+		return false
+	}
+	var p contracts.AdapterSecretsPlaintext
+	if err := json.Unmarshal(pt, &p); err != nil || p.Version != contracts.Version || p.Check() != nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.secrets = p.Secrets
+	f.uploads = append(f.uploads, p)
+	return true
+}
+
+// openSealedWith opens enc and ct, in base64url, with key's X25519 form, info and aad.
+func openSealedWith(key *accesskey.Key, enc, ct string, info, aad []byte) ([]byte, error) {
+	e, err := base64.RawURLEncoding.DecodeString(enc)
+	if err != nil {
+		return nil, err
+	}
+	c, err := base64.RawURLEncoding.DecodeString(ct)
+	if err != nil {
+		return nil, err
+	}
+	kem, kdf, aead := sealSuite()
+	priv, err := kem.NewPrivateKey(key.X25519PrivateKey())
+	if err != nil {
+		return nil, err
+	}
+	r, err := hpke.NewRecipient(e, priv, kdf, aead, info)
+	if err != nil {
+		return nil, err
+	}
+	return r.Open(aad, c)
 }
 
 // count is how many requests the fake received.
@@ -1061,23 +1232,44 @@ func (f *fakeGitHub) postedComments() []string {
 	return append([]string(nil), f.posted...)
 }
 
-// settingsFiles writes the App's key, the webhook secret and the access key's secret
-// in dir, and returns settings that name them, Qory Apiary at apiaryURL, under the pin.
+// settingsFiles writes the access key's secret in dir, and returns settings that name
+// it, Qory Apiary at apiaryURL, under the pin. The App is in no setting: a test that
+// runs serve with one has the fake Qory Apiary store it, see [fakeApiary.storeTestApp].
 func settingsFiles(t *testing.T, dir string, access *accesskey.Key, apiaryURL string, pin accesskey.Pin) Settings {
 	t.Helper()
-	keyFile := filepath.Join(dir, "app.pem")
-	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(appKey())})), 0o600)
-	secretFile := filepath.Join(dir, "secret")
-	writeFile(t, secretFile, secret, 0o600)
 	accessFile := filepath.Join(dir, "access-key")
 	writeFile(t, accessFile, access.Secret()+"\n", 0o600)
-	clientFile := filepath.Join(dir, "client-secret")
-	writeFile(t, clientFile, clientSecret+"\n", 0o600)
 	return Settings{
-		AppID: "1", PrivateKeyFile: keyFile, WebhookSecretFile: secretFile, Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state"),
-		AppSlug: testSlug, APIURL: appAPI(t), ApiaryURL: apiaryURL, PublicURL: "https://qory-github.example.com",
+		Listen: "127.0.0.1:0", StateDir: filepath.Join(dir, "state"),
+		APIURL: appAPI(t), ApiaryURL: apiaryURL, PublicURL: "https://qory-github.example.com",
 		AccessKeyID: testKeyID, AccessKeySecretFile: accessFile, ApiaryPublicKey: pin,
-		AdapterID: testAdapterID, ClientID: testClientID, ClientSecretFile: clientFile,
+		AdapterID: testAdapterID,
+	}
+}
+
+// testPEM is the App's key, appKey, in PEM.
+func testPEM() []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(appKey())})
+}
+
+// testApp is the App most tests run serve with, as Qory Apiary delivers it: app_id 1,
+// testSlug, the client testClientID, the key appKey, the webhook secret secret and the
+// client secret clientSecret, its webhook active and its secret confirmed.
+func testApp() *app {
+	return &app{
+		id: "1", numericID: 1, slug: testSlug, clientID: testClientID, pem: testPEM(), key: appKey(),
+		webhookSecret: []byte(secret), clientSecret: []byte(clientSecret), webhookActive: true,
+		owner: "acme", ownerKind: github.AccountOrganization, confirmed: true,
+	}
+}
+
+// setupApp is the App the fake GitHub's conversion answers, setupAppID, as Qory Apiary
+// stores it after the App setup.
+func setupApp() *app {
+	return &app{
+		id: strconv.Itoa(setupAppID), numericID: setupAppID, slug: setupSlug, clientID: setupClientID, pem: []byte(strings.TrimSpace(appKeyPEM())), key: appKey(),
+		webhookSecret: []byte(setupHookSecret), clientSecret: []byte(setupClientSecret), webhookActive: true,
+		owner: "acme", ownerKind: github.AccountOrganization, confirmed: true,
 	}
 }
 
@@ -1114,9 +1306,9 @@ func appAPI(t *testing.T) string {
 	return api.URL
 }
 
-// answerApp answers GET /app as GitHub answers it for the App's token in r: the
-// settings' test App, app_id 1, is testSlug, and the kept test App, app_id setupAppID,
-// is setupSlug; any other token is answered 401.
+// answerApp answers GET /app as GitHub answers it for the App's token in r: the test
+// App, app_id 1, is testSlug, and the setup's App, app_id setupAppID, is setupSlug; any
+// other token is answered 401.
 func answerApp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch tokenApp(r.Header.Get("Authorization")) {

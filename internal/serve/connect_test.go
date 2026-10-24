@@ -1179,25 +1179,6 @@ func TestTheConnectPagesBounds(t *testing.T) {
 	}
 }
 
-func TestTheClientSecretFileIsReadAsASecret(t *testing.T) {
-	dir := t.TempDir()
-	file := dir + "/client-secret"
-	writeFile(t, file, clientSecret+"\r\n", 0o600)
-	if b, err := ReadClientSecret(file); err != nil || string(b) != clientSecret {
-		t.Errorf("%q %v", b, err)
-	}
-	for _, content := range []string{"", "\n", "two words\n"} {
-		writeFile(t, file, content, 0o600)
-		if _, err := ReadClientSecret(file); err == nil || strings.Contains(err.Error(), file) {
-			t.Errorf("%q: %v", content, err)
-		}
-	}
-	writeFile(t, file, clientSecret, 0o644)
-	if _, err := ReadClientSecret(file); err == nil || strings.Contains(err.Error(), file) || strings.Contains(err.Error(), clientSecret) {
-		t.Errorf("a file others read: %v", err)
-	}
-}
-
 func TestTheAppsConnectPathsAreServes(t *testing.T) {
 	if github.ConnectReturnPath != connectPath+"/return" || github.ConnectAuthorizedPath != connectPath+"/authorized" {
 		t.Errorf("setup's paths %s and %s are not serve's", github.ConnectReturnPath, github.ConnectAuthorizedPath)

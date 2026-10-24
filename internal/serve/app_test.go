@@ -1,278 +1,289 @@
 package serve
 
 import (
-	"errors"
-	"log/slog"
-	"os"
-	"path/filepath"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
 )
 
-// testKeptApp is what appFile says of the App the tests keep.
-func testKeptApp() keptApp {
-	return keptApp{AppID: setupAppID, AppSlug: setupSlug, ClientID: setupClientID, Owner: "acme", OwnerKind: github.AccountOrganization, WebhookActive: true, WebhookSecretConfirmed: true}
-}
-
-// keepTestApp keeps the test App in a new state directory, and returns it.
-func keepTestApp(t *testing.T, k keptApp) string {
+// testApiary is a client of Qory Apiary, an [Apiary], of the access key access, enrolled as testKeyID in
+// testAdapterID, that reaches the fake f.
+func testApiary(t *testing.T, f *fakeApiary, access *accesskey.Key) *Apiary {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "state")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
+	return &Apiary{
+		URL: f.srv.URL, KeyID: testKeyID, Key: access, Pin: pinOf(f.server), AdapterID: testAdapterID,
+		InstanceID: mustInstance(t), Sleep: shortSleep,
 	}
-	if err := keepApp(dir, k, []byte(strings.TrimSpace(appKeyPEM())), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
-	return dir
 }
 
-// TestAKeptAppIsReadBackWhole keeps an App and reads it back as a start does: every
-// file 0600, app.json last, and each value as it was kept.
-func TestAKeptAppIsReadBackWhole(t *testing.T) {
-	dir := keepTestApp(t, testKeptApp())
-	a, err := loadApp(dir)
+// TestTheAppIsSealedAndOpenedWhole uploads the App, which the fake opens with the
+// server key, and reads it back sealed to the access key: every value comes back as it
+// went, and no request or answer contains a value in the clear.
+func TestTheAppIsSealedAndOpenedWhole(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	api := testApiary(t, f, access)
+	a := setupApp()
+	p, err := a.plaintext()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.id != "777001" || a.numericID != setupAppID || a.slug != setupSlug || a.clientID != setupClientID || !a.key.Equal(appKey()) || string(a.webhookSecret) != setupHookSecret ||
-		string(a.clientSecret) != setupClientSecret || !a.webhookActive || !a.confirmed || !a.kept || a.owner != "acme" || a.ownerKind != github.AccountOrganization {
-		t.Errorf("read back %+v", a)
-	}
-	for _, name := range []string{appFile, appKeyFile, appWebhookFile, appClientFile} {
-		info, err := os.Lstat(filepath.Join(dir, name))
-		if err != nil || info.Mode().Perm() != 0o600 {
-			t.Errorf("%s: %v %v", name, info, err)
-		}
-	}
-	b, _ := os.ReadFile(filepath.Join(dir, appFile))
-	if strings.Contains(string(b), setupHookSecret) || strings.Contains(string(b), setupClientSecret) || strings.Contains(string(b), "PRIVATE") {
-		t.Errorf("app.json holds a secret: %s", b)
-	}
-	if got := a.settingsURL("https://github.com"); got != "https://github.com/organizations/acme/settings/apps/qory-acme" {
-		t.Errorf("the settings page is %s", got)
-	}
-	// A rewrite of app.json that did not finish leaves app.json.tmp beside it, which a
-	// start removes.
-	writeFile(t, filepath.Join(dir, appTemp), "{", 0o600)
-	if _, err := loadApp(dir); err != nil {
+	if err := api.UploadSecrets(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(dir, appTemp)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s is left: %v", appTemp, err)
-	}
-	// The confirmation of the webhook secret writes app.json again, that alone changed.
-	k := testKeptApp()
-	k.WebhookSecretConfirmed = false
-	dir = keepTestApp(t, k)
-	if a, _ := loadApp(dir); a.confirmed {
-		t.Fatal("confirmed before the confirmation")
-	}
-	if err := confirmWebhookSecret(dir); err != nil {
+	got, err := api.Secrets(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if a, err := loadApp(dir); err != nil || !a.confirmed || string(a.webhookSecret) != setupHookSecret {
-		t.Errorf("after the confirmation %+v %v", a, err)
-	}
-}
-
-// TestAKeptAppThatDoesNotHoldWhatItNamesIsRefused pins the start's refusals of a kept
-// App: a secret's file missing or changed, and an app.json not as serve writes it.
-func TestAKeptAppThatDoesNotHoldWhatItNamesIsRefused(t *testing.T) {
-	for _, name := range []string{appKeyFile, appWebhookFile, appClientFile} {
-		dir := keepTestApp(t, testKeptApp())
-		os.Remove(filepath.Join(dir, name))
-		want := "the App file app.json names " + name + " in the state directory, which is missing or does not hold what app.json names"
-		if _, err := loadApp(dir); err == nil || err.Error() != want {
-			t.Errorf("%s missing: %v", name, err)
-		}
-		writeFile(t, filepath.Join(dir, name), "something else\n", 0o600)
-		if _, err := loadApp(dir); err == nil || err.Error() != want {
-			t.Errorf("%s changed: %v", name, err)
-		}
-	}
-	dir := keepTestApp(t, testKeptApp())
-	b, _ := os.ReadFile(filepath.Join(dir, appFile))
-	for _, bad := range []string{
-		"", "{}", "[]", strings.Replace(string(b), `"app_id": 777001`, `"app_id": 0`, 1),
-		strings.Replace(string(b), `"owner_kind": "Organization"`, `"owner_kind": "Bot"`, 1),
-		strings.Replace(string(b), `"webhook_active": true,`, ``, 1),
-		strings.Replace(string(b), `{`, `{"extra": 1,`, 1),
-		string(b) + "{}",
-	} {
-		os.Remove(filepath.Join(dir, appFile))
-		writeFile(t, filepath.Join(dir, appFile), bad, 0o600)
-		if _, err := loadApp(dir); err == nil || err.Error() != "the App file app.json does not hold app_id, app_slug, client_id, owner, owner_kind, webhook_active, webhook_secret_confirmed, private_key_sha256, webhook_secret_sha256, client_secret_sha256 as serve writes them" {
-			t.Errorf("%q: %v", bad, err)
-		}
-	}
-	// A kept secret that holds what looks like an access key secret or a run key is
-	// refused, the file named.
-	access := newKey(t)
-	for name, tc := range map[string]struct{ hook, client, want string }{
-		appWebhookFile: {access.Secret(), setupClientSecret, "the file " + appWebhookFile + " in the state directory holds what looks like an access key secret, qak_, which belongs only where serve keeps its access key: the access key secret setting, or the state directory"},
-		appClientFile:  {setupHookSecret, "qrk_-a-pasted-run-key", "the file " + appClientFile + " in the state directory holds what looks like a run key, qrk_, which belongs nowhere in serve's state directory"},
-	} {
-		d := filepath.Join(t.TempDir(), "state")
-		os.Mkdir(d, 0o700)
-		if err := keepApp(d, testKeptApp(), []byte(appKeyPEM()), []byte(tc.hook), []byte(tc.client)); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := loadApp(d); err == nil || err.Error() != tc.want {
-			t.Errorf("%s: %v", name, err)
-		}
-	}
-	os.Chmod(filepath.Join(dir, appFile), 0o644)
-	if _, err := loadApp(dir); err == nil || !strings.Contains(err.Error(), "group or others") {
-		t.Errorf("an app.json others may read: %v", err)
-	}
-}
-
-// TestASetupThatDidNotFinishIsCleanedUp pins how a start resolves what a crash in a
-// setup's commit left: app.json.tmp half written, or whole beside some of the
-// secrets' files, are removed, with the line that says to delete the App on GitHub,
-// naming it when app.json.tmp says it; an empty state directory gives no line.
-func TestASetupThatDidNotFinishIsCleanedUp(t *testing.T) {
-	whole := keepTestApp(t, testKeptApp())
-	tmp, _ := os.ReadFile(filepath.Join(whole, appFile))
-	for name, tc := range map[string]struct {
-		files map[string]string
-		named bool
-	}{
-		"nothing":                         {nil, false},
-		"app.json.tmp half written":       {map[string]string{appTemp: string(tmp[:20])}, false},
-		"app.json.tmp whole, no secret":   {map[string]string{appTemp: string(tmp)}, true},
-		"app.json.tmp and the key":        {map[string]string{appTemp: string(tmp), appKeyFile: appKeyPEM()}, true},
-		"app.json.tmp and every secret":   {map[string]string{appTemp: string(tmp), appKeyFile: appKeyPEM(), appWebhookFile: "x\n", appClientFile: "y\n"}, true},
-		"a secret's file alone, half one": {map[string]string{appKeyFile: "-----BEGIN"}, false},
-	} {
-		dir := t.TempDir()
-		for f, content := range tc.files {
-			writeFile(t, filepath.Join(dir, f), content, 0o600)
-		}
-		log := &syncBuffer{}
-		if err := dropUnfinished(dir, "https://github.com", slog.New(slog.NewJSONHandler(log, nil))); err != nil {
-			t.Fatal(err)
-		}
-		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-			t.Errorf("%s: left %v", name, entries)
-		}
-		const line = `"msg":"a setup that did not finish left files in the state directory, which are removed: delete the App it created on GitHub"`
-		switch {
-		case tc.files == nil && log.String() != "":
-			t.Errorf("%s: logged %s", name, log.String())
-		case tc.files != nil && !strings.Contains(log.String(), line):
-			t.Errorf("%s: the log %s", name, log.String())
-		case tc.named != strings.Contains(log.String(), `"app_id":777001,"slug":"qory-acme","settings_url":"https://github.com/organizations/acme/settings/apps/qory-acme"`):
-			t.Errorf("%s: names the App %v: %s", name, tc.named, log.String())
-		}
-		noSetupLeak(t, log.String())
-	}
-}
-
-// TestAFailedCommitKeepsNoApp pins that a commit that fails at its rename, the step
-// that keeps the App, or because app.json is there already, leaves no file of it.
-func TestAFailedCommitKeepsNoApp(t *testing.T) {
-	dir := t.TempDir()
-	rename = func(string, string) error { return errors.New("no rename") }
-	err := keepApp(dir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret))
-	rename = os.Rename
-	if err == nil {
-		t.Fatal("kept")
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Errorf("left %v", entries)
-	}
-	dir = keepTestApp(t, testKeptApp())
-	before, _ := os.ReadFile(filepath.Join(dir, appFile))
-	k := testKeptApp()
-	k.AppSlug = "qory-other"
-	if err := keepApp(dir, k, []byte(appKeyPEM()), []byte("another webhook secret"), []byte("another client secret")); err == nil {
-		t.Fatal("kept over app.json")
-	}
-	if after, _ := os.ReadFile(filepath.Join(dir, appFile)); string(after) != string(before) {
-		t.Errorf("app.json changed: %s", after)
-	}
-	// The kept App's secrets' files are as they were: a start reads it whole.
-	if a, err := loadApp(dir); err != nil || a.slug != setupSlug || string(a.webhookSecret) != setupHookSecret || string(a.clientSecret) != setupClientSecret {
-		t.Errorf("the kept App after a refused commit: %+v %v", a, err)
-	}
-}
-
-// TestTheRenameKeepsTheAppAndComesLast pins keepApp's order: app.json.tmp, then the
-// three secrets' files, then the rename onto app.json, the step that keeps the App;
-// a write that fails after app.json.tmp leaves no file, so the next start waits for a
-// setup.
-func TestTheRenameKeepsTheAppAndComesLast(t *testing.T) {
-	var steps []string
-	writeKept = func(path string, b []byte, what string) error {
-		steps = append(steps, "write "+filepath.Base(path))
-		return writeNew(path, b, what)
-	}
-	rename = func(from, to string) error {
-		steps = append(steps, "rename "+filepath.Base(from)+" "+filepath.Base(to))
-		return os.Rename(from, to)
-	}
-	t.Cleanup(func() { writeKept, rename = writeNew, os.Rename })
-	dir := t.TempDir()
-	if err := keepApp(dir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
+	back, err := appOf(got)
+	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"write " + appTemp, "write " + appKeyFile, "write " + appWebhookFile, "write " + appClientFile, "rename " + appTemp + " " + appFile}
-	if strings.Join(steps, "; ") != strings.Join(want, "; ") {
-		t.Errorf("the steps %v", steps)
+	if back.id != "777001" || back.numericID != setupAppID || back.slug != setupSlug || back.clientID != setupClientID || !back.key.Equal(appKey()) ||
+		string(back.pem) != string(a.pem) || string(back.webhookSecret) != setupHookSecret || string(back.clientSecret) != setupClientSecret ||
+		!back.webhookActive || !back.confirmed || back.owner != "acme" || back.ownerKind != github.AccountOrganization {
+		t.Errorf("read back %+v", back)
 	}
-	for _, failing := range []string{appKeyFile, appWebhookFile, appClientFile} {
-		writeKept = func(path string, b []byte, what string) error {
-			if filepath.Base(path) == failing {
-				return errors.New("no write")
+	for _, r := range f.sent(routeSecrets) {
+		for _, bad := range []string{setupHookSecret, setupClientSecret, "PRIVATE KEY", setupClientID} {
+			if strings.Contains(string(r.raw), bad) {
+				t.Errorf("the upload contains a value in the clear")
 			}
-			return writeNew(path, b, what)
 		}
-		dir := t.TempDir()
-		if err := keepApp(dir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err == nil {
-			t.Fatalf("%s: kept", failing)
-		}
-		if hasApp(dir) {
-			t.Errorf("%s: app.json is left", failing)
-		}
-		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-			t.Errorf("%s: left %v", failing, entries)
+	}
+	if b := f.sealedSecrets(access.PublicKey(), testKeyID); strings.Contains(b, setupHookSecret) || strings.Contains(b, "PRIVATE KEY") {
+		t.Error("the answer contains a value in the clear")
+	}
+}
+
+// TestAnAppPrintsNoSecret pins that the App prints as its id and slug with every verb,
+// as a value and as a pointer.
+func TestAnAppPrintsNoSecret(t *testing.T) {
+	a := setupApp()
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%d"} {
+		for _, v := range []any{a, *a} {
+			got := fmt.Sprintf(verb, v)
+			if got != "the App with app_id 777001, qory-acme" {
+				t.Errorf("%s prints %q", verb, got)
+			}
 		}
 	}
 }
 
-// TestAnAppKeptAtTheRenameIsLeftAsItIs pins that keepApp, finding app.json there at
-// the rename, refuses, removes app.json.tmp, and leaves app.json and the secrets'
-// files as they are.
-func TestAnAppKeptAtTheRenameIsLeftAsItIs(t *testing.T) {
-	dir := t.TempDir()
-	const kept = "the kept App's app.json"
-	writeKept = func(path string, b []byte, what string) error {
-		if err := writeNew(path, b, what); err != nil {
-			return err
+// TestNoSecretsAreNoApp pins that the answer before the App setup, no secret, is no
+// App and no error.
+func TestNoSecretsAreNoApp(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	f.noApp()
+	got, err := testApiary(t, f, access).Secrets(context.Background())
+	if err != nil || len(got.Secrets) != 0 {
+		t.Fatalf("%d secrets, %v", len(got.Secrets), err)
+	}
+	if a, err := appOf(got); a != nil || err != nil {
+		t.Errorf("%+v %v", a, err)
+	}
+}
+
+// TestAWrongSecretsAnswerIsRefused pins the refusals of an answer to GET
+// /v1/adapter/secrets: one not signed under the pin, one sealed to another access key,
+// one sealed for another adapter or bound to another key id, one of another revision or
+// suite, and one whose ciphertext was changed. No error contains a value.
+func TestAWrongSecretsAnswerIsRefused(t *testing.T) {
+	other := newKey(t)
+	for name, tc := range map[string]struct {
+		change func(f *fakeApiary, access *accesskey.Key)
+		want   string
+	}{
+		"signed under another key": {func(f *fakeApiary, _ *accesskey.Key) { f.signer = newKey(t) }, "is not signed under a key of apiary_public_key, so it is not used"},
+		"sealed to another access key": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, other.PublicKey(), []byte(`{"version":1,"secrets":[]}`), contracts.SecretsInfo(keyID), contracts.SecretsAAD(testAdapterID, keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}, "the answer is refused: its seal does not open with this adapter's access key"},
+		"sealed for another adapter": {func(f *fakeApiary, access *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, access.PublicKey(), []byte(`{"version":1,"secrets":[]}`), contracts.SecretsInfo(keyID), contracts.SecretsAAD("na_fedcba9876543210", keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}, "the answer is refused: its seal does not open with this adapter's access key"},
+		"sealed with another key id's info": {func(f *fakeApiary, access *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, access.PublicKey(), []byte(`{"version":1,"secrets":[]}`), contracts.SecretsInfo("ak_fedcba9876543210"), contracts.SecretsAAD(testAdapterID, keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}, "the answer is refused: its seal does not open with this adapter's access key"},
+		"naming another access key": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) {
+				doc["sealed"].(map[string]any)["access_key_id"] = "ak_fedcba9876543210"
+			}
+		}, "the answer is sealed to another access key than " + testKeyID + ", which signed the request"},
+		"of another revision": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) { doc["revision"] = contracts.Revision + 1 }
+		}, "the answer is not of the contract's revision 1"},
+		"of another suite": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) {
+				doc["sealed"].(map[string]any)["suite"] = "x25519-sha256-chacha20poly1305"
+			}
+		}, "the answer is not sealed with the suite " + contracts.SealSuite},
+		"with a changed ciphertext": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) {
+				s := doc["sealed"].(map[string]any)
+				ct := []byte(s["ct"].(string))
+				ct[0] ^= 1
+				if ct[0] == '-' || ct[0] == '_' || (ct[0] >= '0' && ct[0] <= '9') || (ct[0] >= 'A' && ct[0] <= 'Z') || (ct[0] >= 'a' && ct[0] <= 'z') {
+					s["ct"] = string(ct)
+				} else {
+					s["ct"] = "A" + s["ct"].(string)[1:]
+				}
+			}
+		}, "the answer is refused: its seal does not open with this adapter's access key"},
+		"with a member the contract does not define": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) { doc["expires_at"] = "2026-10-25T00:00:00Z" }
+		}, "the answer is not the secrets' document"},
+	} {
+		access := newKey(t)
+		f := newFakeApiary(t, access)
+		f.storeApp(setupApp())
+		tc.change(f, access)
+		_, err := testApiary(t, f, access).Secrets(context.Background())
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err %v", name, err)
+			continue
 		}
-		if filepath.Base(path) == appClientFile {
-			// Another commit keeps an App meanwhile.
-			writeFile(t, filepath.Join(dir, appFile), kept, 0o600)
-		}
-		return nil
-	}
-	t.Cleanup(func() { writeKept = writeNew })
-	if err := keepApp(dir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); !errors.Is(err, os.ErrExist) {
-		t.Fatalf("kept over app.json: %v", err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(dir, appFile)); string(b) != kept {
-		t.Errorf("app.json is %q", b)
-	}
-	for _, name := range []string{appKeyFile, appWebhookFile, appClientFile} {
-		if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
-			t.Errorf("%s: %v", name, err)
+		for _, bad := range []string{setupHookSecret, setupClientSecret, "PRIVATE KEY"} {
+			if strings.Contains(err.Error(), bad) {
+				t.Errorf("%s: the error contains a value", name)
+			}
 		}
 	}
-	if _, err := os.Lstat(filepath.Join(dir, appTemp)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s is left: %v", appTemp, err)
+}
+
+// TestAnAnswerBoundToAnotherRequestIsRefused pins that an answer signed for a request
+// of a minute before, as one replayed is, is refused: its signature binds it to that
+// request's signature, which covers that request's timestamp.
+func TestAnAnswerBoundToAnotherRequestIsRefused(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	f.storeApp(setupApp())
+	api := testApiary(t, f, access)
+	if _, err := api.Secrets(context.Background()); err != nil {
+		t.Fatal(err)
 	}
+	first := f.sent("GET " + routeSecrets)[0]
+	body := f.sealedSecrets(access.PublicKey(), testKeyID)
+	old := f.server.SignAnswer(accesskey.Answer{Status: http.StatusOK, RequestSignature: first.signature, Body: []byte(body)})
+	api.HTTP = &http.Client{Transport: replayed{signature: old, body: body}}
+	api.Now = func() time.Time { return time.Now().Add(time.Minute) }
+	if _, err := api.Secrets(context.Background()); err == nil || !strings.Contains(err.Error(), "is not signed under a key of apiary_public_key, so it is not used") {
+		t.Errorf("err %v", err)
+	}
+}
+
+// TestAppOfRefusesWhatServeDoesNotUpload pins the refusals of secrets that are not the
+// App as serve uploads it, each with the secret's name and no value.
+func TestAppOfRefusesWhatServeDoesNotUpload(t *testing.T) {
+	base := func() map[string]string {
+		p, _ := setupApp().plaintext()
+		m := map[string]string{}
+		for _, e := range p.Secrets {
+			m[e.Name] = e.Value
+		}
+		return m
+	}
+	entry := func(change func(map[string]any)) string {
+		var m map[string]any
+		json.Unmarshal([]byte(base()[secretApp]), &m)
+		change(m)
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
+	for name, tc := range map[string]struct {
+		change func(map[string]string)
+		want   string
+	}{
+		"another secret":           {func(m map[string]string) { m["token"] = "x" }, "Qory Apiary stores the secret token, which serve does not upload"},
+		"no private key":           {func(m map[string]string) { delete(m, secretPrivateKey) }, "Qory Apiary stores no secret private-key for the GitHub App"},
+		"no client secret":         {func(m map[string]string) { delete(m, secretClientSecret) }, "Qory Apiary stores no secret client-secret for the GitHub App"},
+		"an app without its slug":  {func(m map[string]string) { m[secretApp] = entry(func(e map[string]any) { delete(e, "app_slug") }) }, errAppEntry.Error()},
+		"an app with another kind": {func(m map[string]string) { m[secretApp] = entry(func(e map[string]any) { e["owner_kind"] = "Bot" }) }, errAppEntry.Error()},
+		"an app with more":         {func(m map[string]string) { m[secretApp] = entry(func(e map[string]any) { e["pem"] = "x" }) }, errAppEntry.Error()},
+		"a key that is no key":     {func(m map[string]string) { m[secretPrivateKey] = "not a key" }, "the secret private-key in Qory Apiary: "},
+		"a short webhook secret":   {func(m map[string]string) { m[secretWebhookSecret] = "short" }, "the secret webhook-secret in Qory Apiary is shorter than"},
+		"a webhook secret with a space": {func(m map[string]string) { m[secretWebhookSecret] = setupHookSecret + " x" },
+			"the secret webhook-secret in Qory Apiary is shorter than"},
+		"a client secret with a line break": {func(m map[string]string) { m[secretClientSecret] = setupClientSecret + "\n" },
+			"the secret client-secret in Qory Apiary is larger than"},
+		"a run key in the webhook secret": {func(m map[string]string) { m[secretWebhookSecret] = "qrk_" + strings.Repeat("a", 43) },
+			"the secret webhook-secret in Qory Apiary contains what looks like a run key"},
+	} {
+		m := base()
+		tc.change(m)
+		p := contracts.AdapterSecretsPlaintext{Version: contracts.Version}
+		for k, v := range m {
+			p.Secrets = append(p.Secrets, contracts.SecretEntry{Name: k, Value: v})
+		}
+		a, err := appOf(p)
+		if a != nil || err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v %v", name, a, err)
+			continue
+		}
+		for _, bad := range []string{setupHookSecret, setupClientSecret, "PRIVATE KEY", "qrk_aaaa"} {
+			if strings.Contains(err.Error(), bad) {
+				t.Errorf("%s: the error contains a value", name)
+			}
+		}
+	}
+}
+
+// TestAnUploadTriesThePinsNextKey pins that an upload Qory Apiary refuses with 400,
+// as it refuses one sealed to a key it does not hold, is sealed again to the pin's next
+// key, and that a pin of one key Qory Apiary does not hold makes one try, which fails.
+func TestAnUploadTriesThePinsNextKey(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	api := testApiary(t, f, access)
+	api.Pin = append(pinOf(newKey(t)), pinOf(f.server)...)
+	p, _ := setupApp().plaintext()
+	if err := api.UploadSecrets(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.sent(routeSecrets)); n != 2 || len(f.uploaded()) != 1 {
+		t.Errorf("%d uploads, %d opened", n, len(f.uploaded()))
+	}
+	api.Pin = pinOf(newKey(t))
+	if err := api.UploadSecrets(context.Background(), p); err == nil || len(f.sent(routeSecrets)) != 3 || len(f.uploaded()) != 1 {
+		t.Errorf("err %v after %d uploads", err, len(f.sent(routeSecrets)))
+	}
+}
+
+// replayed answers every request 200 with body under signature, as an answer replayed
+// from an earlier request is.
+type replayed struct{ signature, body string }
+
+func (r replayed) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK, Header: http.Header{accesskey.HeaderSignature: {r.signature}, "Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(r.body)), ContentLength: int64(len(r.body)), Request: req,
+	}, nil
+}
+
+// mustInstance is a new instance id.
+func mustInstance(t *testing.T) string {
+	t.Helper()
+	id, err := accesskey.NewInstanceID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

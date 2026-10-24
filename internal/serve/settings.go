@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -25,30 +26,16 @@ import (
 // Settings are what serve runs with, from one of two sources and never both: one JSON
 // document in a file, --settings FILE, which [ReadSettings] reads, or environment
 // variables, which [ReadEnvironment] reads. They are not part of the integration's
-// description, which describes credential's settings alone. A secret is never in the
-// file: each is in a file it names, which only its owner may read. The environment
-// gives each secret as its value or as such a file.
+// description, which describes credential's settings alone. The access key's secret
+// is never in the file: it is in a file the settings name, which only its owner may
+// read. The environment gives it as its value or as such a file. The GitHub App is in
+// no setting: Qory Apiary stores it, see [Run].
 type Settings struct {
-	// AppID is the App's numeric id or its client id.
-	AppID string
-	// PrivateKeyFile is a file that contains the App's private key, read as
-	// [github.ReadKeyFile] reads one, with errors that name the setting and never the
-	// path. PrivateKey is the key itself, which the environment gives in place of the
-	// file; one of the two is set when the App is given.
-	PrivateKeyFile string
-	PrivateKey     SecretValue
-	// WebhookSecretFile is a file that contains the App's webhook secret, read with
-	// [ReadWebhookSecret], and WebhookSecret the secret itself, which the environment
-	// gives in place of the file.
-	WebhookSecretFile string
-	WebhookSecret     SecretValue
 	// Listen is the address and port serve listens on for GitHub's webhook deliveries,
 	// plain HTTP: the instance admin's proxy terminates TLS.
 	Listen string
 	// StateDir is the directory the store is in, see [store.Open].
 	StateDir string
-	// AppSlug is the App's slug: its bot, slug[bot], writes the work item comment.
-	AppSlug string
 	// APIURL is GitHub's API, which [github.CheckAPIURL] takes; the field may be left
 	// out for [github.APIURL].
 	APIURL string
@@ -83,13 +70,6 @@ type Settings struct {
 	// AdapterID is the id Qory Apiary enrolled the access key in, na_ and 16
 	// characters, which access-key enrol prints: a connect pass must name it.
 	AdapterID string
-	// ClientID is the App's client id, and ClientSecretFile a file that contains its
-	// client secret, read with [ReadClientSecret]: Connect signs a person in with GitHub
-	// with them. ClientSecret is the client secret itself, which the environment gives in
-	// place of the file.
-	ClientID         string
-	ClientSecretFile string
-	ClientSecret     SecretValue
 	// EnrolmentCodeFile is a file that holds an adapter's enrolment code on one line,
 	// as Qory Apiary writes it for an adapter installed with it, checked as the other
 	// paths are. It may be left out. When the settings give no enrolment and the state
@@ -104,6 +84,10 @@ type Settings struct {
 	// false makes that App's webhook inactive, and serve declares to Qory Apiary that it
 	// learns of changes on GitHub by pulling, see [Settings.publicAddress].
 	PublicAddress *bool
+	// UploadRetrySeconds is upload_retry_seconds: how long the App setup tries again to
+	// store the App in Qory Apiary when its first upload fails, 60 to 86400 seconds;
+	// 0, left out, is [defaultUploadRetry]. See [appSetup.retry].
+	UploadRetrySeconds int
 
 	// env is whether the settings come from the environment, so an error names a
 	// setting by its variable.
@@ -140,16 +124,25 @@ func (v SecretValue) LogValue() slog.Value { return slog.StringValue(v.String())
 
 // fields are the settings' fields, in the order an error lists the missing ones. A
 // field that is added later is added here and in [settingsOf]'s switch.
-var fields = []string{"app_id", "private_key_file", "webhook_secret_file", "listen", "state_dir", "app_slug", "api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "client_id", "client_secret_file", "enrolment_code_file", "public_address"}
+var fields = []string{"listen", "state_dir", "api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "enrolment_code_file", "public_address", "upload_retry_seconds"}
 
 // required are the fields the settings always give. api_url may be left out for
 // GitHub's API, apiary_public_url for apiary_url, enrolment_code_file, which has no
-// default, and public_address for true; the others are in a group, see [groups].
+// default, public_address for true, and upload_retry_seconds for
+// [defaultUploadRetry]; the others are in a group, see [groups].
 var required = []string{"listen", "state_dir", "apiary_url", "public_url"}
 
-// secretFields are the fields that name a file that holds a secret, which the
+// secretFields are the fields that name a file that contains a secret, which the
 // environment may give as the secret's value in place of the file, see [valueName].
-var secretFields = []string{"private_key_file", "webhook_secret_file", "access_key_secret_file", "client_secret_file"}
+var secretFields = []string{"access_key_secret_file"}
+
+// The bounds of upload_retry_seconds, and the value serve takes when it is left out:
+// ten minutes.
+const (
+	defaultUploadRetry = 600
+	minUploadRetry     = 60
+	maxUploadRetry     = 86400
+)
 
 // group is fields the settings give all of or none of: name names the group in an
 // error, and members are its fields.
@@ -158,13 +151,10 @@ type group struct {
 	members []string
 }
 
-// groups are the settings' groups: the App, and the adapter's enrolment in Qory
-// Apiary. Settings that give part of a group are refused when they are read. Settings
-// that give no App are taken: serve then uses the App it keeps in the state directory,
-// or serves the App setup until one is kept, see [Run]. Run refuses settings that give
-// no enrolment when serve has no way to one, see [Settings.checkEnrolmentSource].
+// groups are the settings' groups: the adapter's enrolment in Qory Apiary. Settings
+// that give part of a group are refused when they are read. Run refuses settings that
+// give no enrolment when serve has no way to one, see [Settings.checkEnrolmentSource].
 var groups = []group{
-	{"App", []string{"app_id", "app_slug", "client_id", "private_key_file", "webhook_secret_file", "client_secret_file"}},
 	{"enrolment in Qory Apiary", []string{"access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id"}},
 }
 
@@ -178,7 +168,7 @@ func envName(field string) string { return envPrefix + strings.ToUpper(field) }
 
 // valueName is the environment variable that gives the secret of a field in
 // [secretFields] as its value: the field's variable without _FILE, such as
-// QORY_GITHUB_PRIVATE_KEY for private_key_file.
+// QORY_GITHUB_ACCESS_KEY_SECRET for access_key_secret_file.
 func valueName(field string) string { return strings.TrimSuffix(envName(field), "_FILE") }
 
 // source is where settings come from, which their errors name: the file --settings
@@ -202,8 +192,8 @@ func (src source) name(field string) string {
 }
 
 // listed is a field as a list of missing fields names it: [source.name], and for a
-// secret in the environment both its variables, QORY_GITHUB_PRIVATE_KEY or
-// QORY_GITHUB_PRIVATE_KEY_FILE say.
+// secret in the environment both its variables, QORY_GITHUB_ACCESS_KEY_SECRET or
+// QORY_GITHUB_ACCESS_KEY_SECRET_FILE say.
 func (src source) listed(field string) string {
 	if src.env && slices.Contains(secretFields, field) {
 		return valueName(field) + " or " + envName(field)
@@ -261,18 +251,6 @@ func halfGiven(given func(field string) bool) []string {
 // the secret's value in its place.
 func (s Settings) given(field string) bool {
 	switch field {
-	case "app_id":
-		return s.AppID != ""
-	case "app_slug":
-		return s.AppSlug != ""
-	case "client_id":
-		return s.ClientID != ""
-	case "private_key_file":
-		return s.PrivateKeyFile != "" || len(s.PrivateKey) > 0
-	case "webhook_secret_file":
-		return s.WebhookSecretFile != "" || len(s.WebhookSecret) > 0
-	case "client_secret_file":
-		return s.ClientSecretFile != "" || len(s.ClientSecret) > 0
 	case "access_key_id":
 		return s.AccessKeyID != ""
 	case "access_key_secret_file":
@@ -285,21 +263,15 @@ func (s Settings) given(field string) bool {
 	return false
 }
 
-// GivesApp is whether the settings give the App: app_id, app_slug, client_id, and the
-// private key, the webhook secret and the client secret, each as a file or a value.
-func (s Settings) GivesApp() bool { return len(missingIn(groups[0], s.given)) == 0 }
-
 // GivesEnrolment is whether the settings give the adapter's enrolment in Qory Apiary:
 // access_key_id, the access key's secret, as a file or a value, apiary_public_key and
 // adapter_id.
-func (s Settings) GivesEnrolment() bool { return len(missingIn(groups[1], s.given)) == 0 }
+func (s Settings) GivesEnrolment() bool { return len(missingIn(groups[0], s.given)) == 0 }
 
 // check refuses settings that give part of a group, naming the members they lack, as
-// they are refused when they are read. Settings that give no App are taken here: serve
-// then uses the App it keeps in the state directory, or serves the App setup until one
-// is kept. Settings that give no enrolment are taken here too: serve then uses the one
-// kept in the state directory, or enrols with the code in the file
-// enrolment_code_file names, see [Settings.checkEnrolmentSource].
+// they are refused when they are read. Settings that give no enrolment are taken here:
+// serve then uses the one kept in the state directory, or enrols with the code in the
+// file enrolment_code_file names, see [Settings.checkEnrolmentSource].
 func (s Settings) check() error {
 	if half := halfGiven(s.given); len(half) > 0 {
 		return source{s.env}.missing(half)
@@ -310,11 +282,20 @@ func (s Settings) check() error {
 // publicAddress is public_address: true when the settings leave it out.
 func (s Settings) publicAddress() bool { return s.PublicAddress == nil || *s.PublicAddress }
 
+// uploadFor is upload_retry_seconds as a duration: [defaultUploadRetry] seconds when the
+// settings leave it out.
+func (s Settings) uploadFor() time.Duration {
+	if s.UploadRetrySeconds == 0 {
+		return defaultUploadRetry * time.Second
+	}
+	return time.Duration(s.UploadRetrySeconds) * time.Second
+}
+
 // maxSettingsFile is the most a settings file may hold, far more than its fields need.
 const maxSettingsFile = 1 << 20
 
-// appIDShape is an App's id as credential's settings take it: its numeric id or its
-// client id.
+// appIDShape is an App's client id, as Qory Apiary stores it in the secret app: 1 to
+// 64 letters, digits or dots.
 var appIDShape = regexp.MustCompile(`^[A-Za-z0-9.]{1,64}$`)
 
 // adapterIDShape is the id of an adapter Qory Apiary enrolled, the contract's pattern
@@ -324,10 +305,10 @@ var adapterIDShape = regexp.MustCompile(`^na_[0-9a-hjkmnp-tv-z]{16}$`)
 // ReadSettings reads the settings file at path, one JSON object with nothing after it
 // but white space. listen, state_dir, apiary_url and public_url are required. api_url
 // may be left out for GitHub's API, apiary_public_url for apiary_url,
-// enrolment_code_file, and public_address, a JSON boolean, for true. The App's fields,
-// app_id, app_slug, client_id, private_key_file, webhook_secret_file and
-// client_secret_file, are given all or none, and so are the enrolment's,
-// access_key_id, access_key_secret_file, apiary_public_key and adapter_id. Run refuses
+// enrolment_code_file, public_address, a JSON boolean, for true, and
+// upload_retry_seconds, a JSON integer, for [defaultUploadRetry]. The enrolment's
+// fields, access_key_id, access_key_secret_file, apiary_public_key and adapter_id, are
+// given all or none. Run refuses
 // settings that give no enrolment when the state directory holds none and
 // enrolment_code_file is not set. A field it does not know is refused. An error says
 // where the settings are wrong and what is wrong there, never a value: a field's name
@@ -355,17 +336,16 @@ func ReadSettings(path string) (Settings, error) {
 // lookup, as [os.LookupEnv] looks one up: a field's variable is QORY_GITHUB_ and its
 // name in upper case, such as QORY_GITHUB_LISTEN, and an empty variable counts as one
 // not set. Each value is the field's string; QORY_GITHUB_APIARY_PUBLIC_KEY is the
-// pin's JSON, and QORY_GITHUB_PUBLIC_ADDRESS is true or false. A secret is given as its value, QORY_GITHUB_PRIVATE_KEY,
-// QORY_GITHUB_WEBHOOK_SECRET, QORY_GITHUB_ACCESS_KEY_SECRET or
-// QORY_GITHUB_CLIENT_SECRET, or as the file the same variable with _FILE names, and
-// both set is refused. Every field is checked as [ReadSettings] checks it, with errors
-// that name the variable and never a value. Before anything else, every variable it
-// reads is scanned for what looks like a secret, qak_ or qrk_ in any case, and one
-// that holds it is refused with an error that names the variable and quotes nothing:
-// each field's variable, a _FILE variable among them, and QORY_GITHUB_PRIVATE_KEY,
-// QORY_GITHUB_WEBHOOK_SECRET and QORY_GITHUB_CLIENT_SECRET. Only
-// QORY_GITHUB_ACCESS_KEY_SECRET is not scanned: it holds the access key's secret,
-// qak_, and is read as [ReadAccessKeySecret] reads its file.
+// pin's JSON, QORY_GITHUB_PUBLIC_ADDRESS is true or false, and
+// QORY_GITHUB_UPLOAD_RETRY_SECONDS is an integer. The access key's secret is given as
+// its value, QORY_GITHUB_ACCESS_KEY_SECRET, or as the file
+// QORY_GITHUB_ACCESS_KEY_SECRET_FILE names, and both set is refused. Every field is
+// checked as [ReadSettings] checks it, with errors that name the variable and never a
+// value. Before anything else, every field's variable it reads, a _FILE variable among
+// them, is scanned for what looks like a secret, qak_ or qrk_ in any case, and one
+// that contains it is refused with an error that names the variable and quotes
+// nothing. Only QORY_GITHUB_ACCESS_KEY_SECRET is not scanned: it contains the access
+// key's secret, qak_, and is read as [ReadAccessKeySecret] reads its file.
 func ReadEnvironment(lookup func(string) (string, bool)) (Settings, error) {
 	src := source{env: true}
 	get := func(name string) string { v, _ := lookup(name); return v }
@@ -394,7 +374,7 @@ func ReadEnvironment(lookup func(string) (string, bool)) (Settings, error) {
 		if !utf8.ValidString(v) {
 			return Settings{}, fmt.Errorf("%s are invalid: %s: is not UTF-8 text", src.what(), name)
 		}
-		if field == "apiary_public_key" || field == "public_address" {
+		if field == "apiary_public_key" || field == "public_address" || field == "upload_retry_seconds" {
 			doc[field] = json.RawMessage(v)
 			continue
 		}
@@ -524,22 +504,12 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 		}
 		var err error
 		switch name {
-		case "app_id":
-			s.AppID, err = appID(raw)
-		case "private_key_file":
-			s.PrivateKeyFile, err = filePath(raw)
-		case "webhook_secret_file":
-			s.WebhookSecretFile, err = filePath(raw)
 		case "listen":
 			if s.Listen, err = text(raw); err == nil {
 				err = checkListen(s.Listen)
 			}
 		case "state_dir":
 			s.StateDir, err = text(raw)
-		case "app_slug":
-			if s.AppSlug, err = text(raw); err == nil {
-				err = github.CheckSlug(s.AppSlug)
-			}
 		case "api_url":
 			if s.APIURL, err = text(raw); err == nil {
 				err = github.CheckAPIURL(s.APIURL)
@@ -568,12 +538,6 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 			if s.AdapterID, err = text(raw); err == nil && !adapterIDShape.MatchString(s.AdapterID) {
 				err = errors.New("is not na_ and 16 lower-case Crockford base32 characters")
 			}
-		case "client_id":
-			if s.ClientID, err = text(raw); err == nil && !appIDShape.MatchString(s.ClientID) {
-				err = errors.New("is not an App's client id, 1 to 64 letters, digits or dots")
-			}
-		case "client_secret_file":
-			s.ClientSecretFile, err = filePath(raw)
 		case "enrolment_code_file":
 			s.EnrolmentCodeFile, err = filePath(raw)
 		case "public_address":
@@ -582,15 +546,14 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 				err = errors.New("is neither true nor false")
 			}
 			s.PublicAddress = &b
+		case "upload_retry_seconds":
+			s.UploadRetrySeconds, err = uploadRetry(raw)
 		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("%s are invalid: %s: %w", src.what(), src.pointer(name), err)
 		}
 	}
-	s.PrivateKey = values["private_key_file"]
-	s.WebhookSecret = values["webhook_secret_file"]
 	s.AccessKeySecret = values["access_key_secret_file"]
-	s.ClientSecret = values["client_secret_file"]
 	return s, nil
 }
 
@@ -621,21 +584,14 @@ func filePath(raw json.RawMessage) (string, error) {
 	return s, nil
 }
 
-// appID is the App's id: a positive integer, or a string of 1 to 64 letters, digits or
-// dots, its numeric id or its client id, as credential's settings take it.
-func appID(raw json.RawMessage) (string, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		if !appIDShape.MatchString(s) {
-			return "", errors.New("is not an App's id, 1 to 64 letters, digits or dots")
-		}
-		return s, nil
-	}
+// uploadRetry is upload_retry_seconds: an integer from [minUploadRetry] to
+// [maxUploadRetry].
+func uploadRetry(raw json.RawMessage) (int, error) {
 	r, ok := new(big.Rat).SetString(string(raw))
-	if !ok || !r.IsInt() || !r.Num().IsInt64() || r.Num().Sign() <= 0 {
-		return "", errors.New("is neither a positive 64-bit integer nor an App's client id")
+	if !ok || !r.IsInt() || !r.Num().IsInt64() || r.Num().Int64() < minUploadRetry || r.Num().Int64() > maxUploadRetry {
+		return 0, fmt.Errorf("is not an integer from %d to %d", minUploadRetry, maxUploadRetry)
 	}
-	return strconv.FormatInt(r.Num().Int64(), 10), nil
+	return int(r.Num().Int64()), nil
 }
 
 // checkOrigin takes Qory Apiary's origin, a scheme and a host with a port or none:

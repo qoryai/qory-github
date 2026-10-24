@@ -455,8 +455,9 @@ func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
 
 // TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
 // names factory, names the source role, qory-github-server, with every member the
-// integration contract requires, item_noun, issue and issues, and collection_noun,
-// repository and repositories, and that the contract's schema, as conformance compiles
+// integration contract requires, item_noun, issue and issues, collection_noun,
+// repository and repositories, and secrets, the four the adapter stores in Qory
+// Apiary, and that the contract's schema, as conformance compiles
 // it, checks that role: the description without any one member the contract requires,
 // or with a member the schema refuses, does not conform.
 func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
@@ -483,8 +484,11 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+2 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+2, source)
+	if len(source) != len(members)+3 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+3, source)
+	}
+	if got := fmt.Sprint(source["secrets"]); got != "[app private-key webhook-secret client-secret]" {
+		t.Errorf("the source role's secrets are %s, want app, private-key, webhook-secret and client-secret", got)
 	}
 	if noun, _ := source["item_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "issue" || noun["other"] != "issues" {
 		t.Errorf("the source role's item_noun is %v, want issue and issues", source["item_noun"])
@@ -538,6 +542,9 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 		"a collection noun with an unknown member": func(s map[string]any) {
 			s["collection_noun"].(map[string]any)["few"] = "repos"
 		},
+		"a secret name in capitals": func(s map[string]any) { s["secrets"] = []any{"App"} },
+		"a secret named twice":      func(s map[string]any) { s["secrets"] = []any{"app", "app"} },
+		"no secret in the list":     func(s map[string]any) { s["secrets"] = []any{} },
 	}
 	for _, m := range members {
 		refused["no "+m] = func(s map[string]any) { delete(s, m) }

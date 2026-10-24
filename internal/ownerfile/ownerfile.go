@@ -87,7 +87,7 @@ func ReadFile(path string, max int, what, holds string) ([]byte, error) {
 }
 
 // ReadNamed reads the file at path as [ReadFile] does, for a file a setting names, such
-// as "the file webhook_secret_file names": an error names the file by what alone and
+// as "the file access_key_secret_file names": an error names the file by what alone and
 // never says the path, so a secret pasted in place of the path is never quoted.
 func ReadNamed(path string, max int, what, holds string) ([]byte, error) {
 	return readFile(path, max, what, holds, false)

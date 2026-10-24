@@ -22,10 +22,10 @@
 # Give the server its settings in a mounted serve.json with --settings, or, with no
 # --settings, in QORY_GITHUB_* environment variables: each is a serve.json setting's
 # name in upper case, such as QORY_GITHUB_PUBLIC_URL for public_url. With --settings,
-# serve reads no QORY_GITHUB_* variable. Give each secret as a value or as a file, never
-# both: QORY_GITHUB_PRIVATE_KEY, QORY_GITHUB_WEBHOOK_SECRET, QORY_GITHUB_CLIENT_SECRET
-# and QORY_GITHUB_ACCESS_KEY_SECRET, or the same name with _FILE for a file that
-# contains it.
+# serve reads no QORY_GITHUB_* variable. Give the access key's secret as a value or as
+# a file, never both: QORY_GITHUB_ACCESS_KEY_SECRET, or QORY_GITHUB_ACCESS_KEY_SECRET_FILE
+# for a file that contains it. No setting contains the GitHub App: serve stores it in Qory
+# Apiary, and keeps it in memory alone.
 #
 # For the server from a file, and the server from the environment:
 #
@@ -41,15 +41,14 @@
 # docker run. With --settings, the server uses listen and state_dir from serve.json.
 #
 # The image contains no secret, and no setting except the server's listen and state_dir
-# in its environment. When the settings point to secret files, in serve.json or in the
-# *_FILE variables, mount them: private_key_file, webhook_secret_file,
-# access_key_secret_file and client_secret_file. serve refuses each one that does not
+# in its environment. When the settings point to a secret file, in serve.json or in
+# QORY_GITHUB_ACCESS_KEY_SECRET_FILE, mount it. serve refuses a file that does not
 # belong to the user it runs as, or that grants group or others any permission. The
 # program runs as distroless's nonroot user, uid 65532 and gid 65532, so on the host:
 #
-#   chown 65532:65532 FILE && chmod 0600 FILE   # for each secret file
+#   chown 65532:65532 FILE && chmod 0600 FILE
 #
-# or run the container with --user set to the uid and gid that own the files. The state
+# or run the container with --user set to the uid and gid that own the file. The state
 # directory must then belong to that uid too: the image's /var/lib/qory-github is
 # 65532's, and serve refuses a state directory that belongs to another user, so mount
 # there, or at the settings' state_dir, a directory that uid owns, 0700. A volume

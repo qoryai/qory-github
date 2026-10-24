@@ -86,21 +86,24 @@ public_url followed by /v1/connect: Qory Apiary sends a person there who connect
 App's installation. /health answers 200 from the first moment.
 
 The settings come from a file or from the environment, never both. With --settings,
-they are one JSON document in FILE: app_id, private_key_file, webhook_secret_file,
-listen, state_dir, app_slug, apiary_url, public_url, access_key_id,
-access_key_secret_file, apiary_public_key, adapter_id, client_id and
-client_secret_file; api_url, which may be left out for GitHub's API;
-apiary_public_url, where a person's browser is sent back to Qory Apiary, https, which
-may be left out for apiary_url; enrolment_code_file, which may be left out; and
-public_address, false when GitHub cannot reach public_url: the App setup creates has
-its webhook inactive, and serve learns of changes on GitHub by pulling. Left out, it
-is true. The private key, the webhook secret, the access key's secret and the App's
-client secret are each in a file only its owner may read.
+they are one JSON document in FILE: listen, state_dir, apiary_url, public_url,
+access_key_id, access_key_secret_file, apiary_public_key and adapter_id; api_url,
+which may be left out for GitHub's API; apiary_public_url, where a person's browser
+is sent back to Qory Apiary, https, which may be left out for apiary_url;
+enrolment_code_file, which may be left out; public_address, false when GitHub cannot
+reach public_url: the App setup creates has its webhook inactive, and serve learns
+of changes on GitHub by pulling. Left out, it is true. upload_retry_seconds is how
+long the App setup tries again to store the App in Qory Apiary, 60 to 86400; left
+out, it is 600. The access key's secret is in a file only its owner may read.
 
-app_id, app_slug, client_id, private_key_file, webhook_secret_file and
-client_secret_file, the App, may be left out together. serve then uses the App it
-keeps in the state directory or, until one is kept, serves GitHub's App setup at
-public_url's /setup, which an instance admin opens with Set up in Qory Apiary.
+No setting contains the GitHub App. Qory Apiary stores it: its id, slug, client id,
+private key, webhook secret and client secret. At each start serve reads the App
+from Qory Apiary, sealed to its access key, and keeps it in memory; serve writes
+none of it to disk. Until Qory Apiary stores an App, serve serves GitHub's App setup
+at public_url's /setup, which an instance admin opens with Set up in Qory Apiary.
+GitHub issues the App's private key once: when storing the App in Qory Apiary
+fails, the setup tries again for upload_retry_seconds, and then shows which App to
+delete on GitHub.
 
 access_key_id, access_key_secret_file, apiary_public_key and adapter_id, the
 enrolment in Qory Apiary, may be left out together. serve then uses the enrolment it
@@ -121,12 +124,9 @@ enrolment in the settings, serve never reads the file.
 Without --settings, they are environment variables, each a setting's name in upper
 case after QORY_GITHUB_: QORY_GITHUB_LISTEN for listen, QORY_GITHUB_APIARY_PUBLIC_KEY
 for apiary_public_key, which holds its JSON, QORY_GITHUB_PUBLIC_ADDRESS for
-public_address, and so on. A secret is given as its value or as a file that a
-variable ending in _FILE names, never both:
-  QORY_GITHUB_PRIVATE_KEY or QORY_GITHUB_PRIVATE_KEY_FILE
-  QORY_GITHUB_WEBHOOK_SECRET or QORY_GITHUB_WEBHOOK_SECRET_FILE
+public_address, and so on. The access key's secret is given as its value or as a
+file that a variable ending in _FILE names, never both:
   QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE
-  QORY_GITHUB_CLIENT_SECRET or QORY_GITHUB_CLIENT_SECRET_FILE
 An empty variable counts as one not set.`,
 	Example: `  qory-github-server serve --settings /etc/qory-github/serve.json   # the settings in a file
   qory-github-server serve                                          # the settings in QORY_GITHUB_ variables`,

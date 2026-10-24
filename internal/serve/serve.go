@@ -26,6 +26,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -68,9 +69,8 @@ type Options struct {
 	// Log takes serve's lines; nil logs nothing.
 	Log *slog.Logger
 	// Listening, when set, is called with the address serve listens on, once it serves
-	// there: at a first start that enrols, before it is enrolled; otherwise, at a start
-	// with an App, before serve asks GitHub which App it is, and at a start with no App,
-	// once the no-App phase is in place, see [Run].
+	// there: at a first start that enrols, before it is enrolled; otherwise, before
+	// serve reads the App from Qory Apiary, see [Run].
 	Listening func(net.Addr)
 
 	// idleTimeout, maxConns and refusalEvery replace [idleTimeout], [maxConns] and
@@ -91,6 +91,9 @@ type Options struct {
 	// orders them.
 	declarerWaits func(done <-chan struct{})
 	feedStarts    func()
+	// uploadWait replaces the waits between the App setup's uploads of the App, see
+	// [appSetup.retry].
+	uploadWait func(context.Context, time.Duration) error
 }
 
 // endedIn is what serve does when Qory Apiary answers that a connection ended: it drops
@@ -126,13 +129,12 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 }
 
 // Run serves until ctx is done. It refuses options without a program version before it
-// reads anything, and then settings that give part of the App or of the enrolment in
-// Qory Apiary, see [Settings.check], and settings that give no enrolment when the
-// state directory holds none and enrolment_code_file is not set. When the settings
-// give the App, it reads the App's private key, the webhook secret and the App's
-// client secret, and, when they give the enrolment, the access key's secret, each from
-// its value or its file, so a wrong secret or file stops it at once. Then it opens the
-// store and listens; /health answers 200 from then on.
+// reads anything, and then settings that give part of the enrolment in Qory Apiary,
+// see [Settings.check], and settings that give no enrolment when the state directory
+// holds none and enrolment_code_file is not set. When the settings give the enrolment,
+// it reads the access key's secret from its value or its file, so a wrong secret or
+// file stops it at once. Then it opens the store and listens; /health answers 200 from
+// then on.
 //
 // serve goes through these phases, forward only, on the one listener. A start goes
 // through the App check or the no-App phase, never both.
@@ -141,47 +143,46 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 //     none: at the first start it enrols with the code in the file
 //     enrolment_code_file names, see [enroller.run]. Every request but /health is
 //     answered 503 until it is enrolled.
-//   - App check, when the settings give an App or the state directory keeps one: serve
-//     asks GitHub which App it is, see [runner.checkApp]. Every request but /health is
-//     answered 503 until serve serves with the App or stops.
-//   - No App, when the settings give no App and the state directory keeps none: it
-//     declares the adapter with setup_url, <public_url>/setup, where an instance admin
-//     sets the App up, see [appSetup], and answers 503 to every other request, the
-//     webhook's and the connect page's among them. The change feed is not read and
-//     nothing is pulled, since nothing can be linked without an App. Once the setup
-//     keeps an App, serve goes on to serve without a restart, and declares the adapter
-//     again at once, without setup_url, after the declaration with it has ended.
+//   - Reading the App: serve reads the App's values from Qory Apiary, sealed to its
+//     access key, see [runner.loadApp], and keeps them in memory alone. Every request
+//     but /health is answered 503 until Qory Apiary answers.
+//   - App check, when Qory Apiary delivers an App: serve asks GitHub which App it is,
+//     see [runner.checkApp]. Every request but /health is answered 503 until serve
+//     serves with the App or stops.
+//   - No App, when Qory Apiary stores no App: it declares the adapter with setup_url,
+//     <public_url>/setup, where an instance admin sets the App up, see [appSetup],
+//     and answers 503 to every other request, the webhook's and the connect page's
+//     among them. The change feed is not read and nothing is pulled, since nothing can
+//     be linked without an App. Once the setup has stored an App in Qory Apiary, serve
+//     goes on to serve without a restart, and declares the adapter again at once,
+//     without setup_url, after the declaration with it has ended.
 //   - Serving: the webhook receiver and, beside it, the connect page, see [Connect].
 //     It reads Qory Apiary's change feed, after it declares the adapter, without
 //     setup_url, until it stops, and pulls from GitHub what the webhooks missed, see
 //     [puller]. The App setup refuses every setup pass.
 //
-// The App is the settings' when they give one, in place of one kept in the state
-// directory; else the one kept there, see [loadApp], whose files a crash cannot leave
-// half written, see [keepApp]. Before serve serves with either, it asks GitHub once
-// which App it is, see [runner.checkApp], and refuses to start when GitHub does not
-// take the App's token; for the App of the settings, when GitHub's answer names no
-// slug, or answers for the same app_id with a slug other than app_slug; and for the
-// kept App, when GitHub's answer names no id, answers for another App than the id
-// app.json names, or names a new slug that is no slug. A new slug of the kept App is
-// kept in app.json in place of the old one, and the App read back as a start reads it;
-// a start whose new slug cannot be kept, or whose App cannot be read back, is refused
-// too. A kept App whose webhook secret GitHub did not confirm has it set again at each
-// start. With public_address false, serve declares that it
-// learns of changes on GitHub by pulling, and so it does for a kept App whose webhook
-// was created inactive.
+// serve writes none of the App's values to disk: the state directory holds the access
+// key, the enrolment and the store alone. Before serve serves with the App Qory Apiary
+// delivered, it asks GitHub once which App it is, see [runner.checkApp], and refuses
+// to start when GitHub does not take the App's token, or when GitHub's answer names no
+// id, answers for another App, or names a new slug that is no slug. A new slug is used
+// in place of the old one and stored in Qory Apiary. An App whose webhook secret GitHub
+// did not confirm has it set again at each start. With public_address false, serve
+// declares that it learns of changes on GitHub by pulling, and so it does for an App
+// whose webhook was created inactive.
 //
 // With the enrolment kept in the state directory and enrolment_code_file set, it looks
 // at the code file again at start and after each 401 Qory Apiary answers, beside
 // serving, and replaces the key once a new one is enrolled, see [reenroller]; a 401
 // itself changes no state, and with the enrolment in the settings it never looks at the
 // code file. After each new enrolment, the adapter is declared again under the new
-// key, with setup_url while no App is kept; one that makes the adapter another adapter
-// in Qory Apiary drops what the store held for the old one first, see [ownState], or,
-// should serve stop before, at the next start. When ctx is done it stops taking
-// requests, waits for the requests under way and the handlers that run, each within a
-// bound, stops the fills a re-connect started, the declaration, the feed's reader, the
-// pull and the reenroller, and closes the store.
+// key, with setup_url while no App is in use; one that makes the adapter another
+// adapter in Qory Apiary drops what the store held for the old one first, see
+// [ownState], or, should serve stop before, at the next start, and stores the App in
+// use, if any, in the new adapter. When ctx is done it stops taking requests, waits
+// for the requests under way and the handlers that run, each within a bound, stops the
+// fills a re-connect started, the App setup's uploads, the declaration, the feed's
+// reader, the pull and the reenroller, and closes the store.
 func Run(ctx context.Context, s Settings, opts Options) error {
 	if opts.ProgramVersion == "" {
 		return errors.New("no program version, which the description serve declares carries")
@@ -196,13 +197,6 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	if err := s.checkEnrolmentSource(); err != nil {
 		return err
 	}
-	var given *app
-	if s.GivesApp() {
-		var err error
-		if given, err = s.app(); err != nil {
-			return err
-		}
-	}
 	var accessKey *accesskey.Key
 	if s.GivesEnrolment() {
 		var err error
@@ -210,20 +204,13 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 			return err
 		}
 	}
-	if given != nil {
-		clientSecret, err := s.secretOf("client_secret_file").clientSecret()
-		if err != nil {
-			return err
-		}
-		given.clientSecret = clientSecret
-	}
 	st, err := store.Open(s.StateDir, store.Options{})
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	// The store is open, so no other serve runs on the state directory, which is
-	// checked: the enrolment and the App are kept there when the settings give none.
+	// checked: the enrolment is kept there when the settings give none.
 	if _, err := st.Sweep(); err != nil {
 		return err
 	}
@@ -237,25 +224,11 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	log.Info("listening", slog.String("address", ln.Addr().String()))
 	r := &runner{
-		s: s, opts: opts, log: log, st: st, instance: instance, given: given,
+		s: s, opts: opts, log: log, st: st, instance: instance,
 		creds:  &credentials{e: enrolment{keyID: s.AccessKeyID, key: accessKey, pin: s.ApiaryPublicKey, adapterID: s.AdapterID}},
 		router: &router{}, setUp: make(chan *app, 1),
 	}
 	return r.run(ctx, ln)
-}
-
-// app is the App the settings give, its private key and its webhook secret read; its
-// client secret is read after the access key's secret, see [Run].
-func (s Settings) app() (*app, error) {
-	key, err := s.secretOf("private_key_file").key()
-	if err != nil {
-		return nil, err
-	}
-	secret, err := s.secretOf("webhook_secret_file").webhookSecret()
-	if err != nil {
-		return nil, err
-	}
-	return &app{id: s.AppID, slug: s.AppSlug, clientID: s.ClientID, key: key, webhookSecret: secret, webhookActive: true}, nil
 }
 
 // runner is one [Run] of serve, once it listens: what each phase starts and what the
@@ -268,7 +241,6 @@ type runner struct {
 	log      *slog.Logger
 	st       *store.Store
 	instance string
-	given    *app
 	creds    *credentials
 	router   *router
 	srv      *http.Server
@@ -278,13 +250,17 @@ type runner struct {
 	apiary   *Apiary
 	setup    *appSetup
 	re       *reenroller
-	// setUp takes the App the App setup keeps, which Run's goroutine then serves.
+	// setUp takes the App the App setup stored in Qory Apiary, which Run's goroutine
+	// then serves.
 	setUp chan *app
+	// inUse is the App serve serves with, nil before; mu guards it once serving starts.
+	inUse *app
 
-	// mu guards start and stop: start starts what declares the adapter in the phase in
-	// place, the declaration with setup_url or the change feed's reader and the pull,
-	// and returns what stops it, stop, which waits for it. A phase's change and a new
-	// enrolment both stop it and start it again.
+	// mu guards start, stop and inUse: start starts what declares the adapter in the
+	// phase in place, the declaration with setup_url or the change feed's reader and the
+	// pull, and returns what stops it, stop, which waits for it; both are nil until
+	// serve has read the App. A phase's change and a new enrolment both stop it and
+	// start it again.
 	mu    sync.Mutex
 	start func() func()
 	stop  func()
@@ -294,7 +270,7 @@ type runner struct {
 	rc      *Receiver
 	connect *Connect
 	adapter *Adapter
-	// confirmCancel and confirmed are the setting again of a kept App's webhook
+	// confirmCancel and confirmed are the setting again of the App's webhook
 	// secret, see [runner.confirm], which the stop cancels and waits for.
 	confirmCancel context.CancelFunc
 	confirmed     chan struct{}
@@ -394,56 +370,30 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 		PullsAlone:   !s.publicAddress(),
 		creds:        r.creds, refused: refused,
 	}
-	web := github.Client{API: s.APIURL}.Web()
-	a, err := r.appOf(web)
-	if err == nil && a != nil {
-		// The App the settings give or the state directory keeps is checked with
-		// GitHub before anything serves with it; a stop meanwhile stops serve.
-		r.router.set(&phase{health: healthAppCheck, unavailable: unavailableAppCheck})
-		r.serve()
-		a, err = r.checkApp(ctx, a)
-		if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
-			end()
-			log.Info("stopped")
-			return nil
-		}
-	}
-	if err != nil {
-		end()
-		return err
-	}
-	if !s.publicAddress() {
-		log.Info("public_address is false: GitHub sends no webhooks, and serve learns of changes on GitHub by pulling")
-	}
-	r.setup = &appSetup{
-		Store: st, GitHub: github.Client{API: s.APIURL}, PublicURL: s.PublicURL, ApiaryPublicURL: cmp.Or(s.ApiaryPublicURL, s.ApiaryURL),
-		StateDir: s.StateDir, Active: s.publicAddress(), Log: log, creds: r.creds, refusalEvery: r.opts.refusalEvery,
-		setUp: func(kept *app) { r.setUp <- kept },
-	}
-	if a == nil {
-		r.router.set(&phase{health: healthNoApp, unavailable: unavailableNoApp, setup: r.setup})
-		r.start = r.declareForSetup
-		log.Info("waiting for the GitHub App's setup: an instance admin presses Set up on the adapter's page in Qory Apiary")
-	} else {
-		r.setup.markKept()
-		r.serveApp(a, true)
-	}
-	r.stop = r.start()
-	r.serve()
 	if r.re != nil {
 		// A new enrolment stops what declares the adapter, drops what the store holds
 		// for the old record when the enrolment is in another one, puts the enrolment
 		// in use, whether the drop failed or not, and starts it again, so the adapter
 		// is declared again under the new key, and a new record's feed is read from its
-		// start. Only the reenroller calls it, one look at a time, and it is stopped
-		// before what declares the adapter is at the stop.
+		// start. In another record, the App in use is stored there too, see
+		// [runner.storeInNewRecord]. Only the reenroller calls it, one look at a time,
+		// and it is stopped before what declares the adapter is at the stop. Before
+		// serve has read the App, nothing declares the adapter yet.
 		r.re.inUse = func(got enrolment) error {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			r.stop()
+			old := r.creds.get()
+			if r.stop != nil {
+				r.stop()
+			}
 			err := ownState(st, got.adapterID, log)
 			r.creds.set(got)
-			r.stop = r.start()
+			if got.adapterID != old.adapterID {
+				r.storeInNewRecord()
+			}
+			if r.start != nil {
+				r.stop = r.start()
+			}
 			return err
 		}
 	}
@@ -456,6 +406,51 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 			r.re.run(reCtx)
 		}
 	}()
+	// stopped stops the reenroller, then what is started before the serving loop, when
+	// Run returns before it.
+	stopped := func() {
+		stopRe()
+		<-reenrolled
+		end()
+	}
+	r.router.set(&phase{health: healthLoading, unavailable: unavailableLoading})
+	r.serve()
+	a, err := r.loadApp(ctx)
+	if err == nil && a != nil {
+		// The App Qory Apiary delivered is checked with GitHub before anything serves
+		// with it; a stop meanwhile stops serve.
+		r.router.set(&phase{health: healthAppCheck, unavailable: unavailableAppCheck})
+		a, err = r.checkApp(ctx, a)
+	}
+	if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+		stopped()
+		log.Info("stopped")
+		return nil
+	}
+	if err != nil {
+		stopped()
+		return err
+	}
+	if !s.publicAddress() {
+		log.Info("public_address is false: GitHub sends no webhooks, and serve learns of changes on GitHub by pulling")
+	}
+	r.setup = &appSetup{
+		Store: st, GitHub: github.Client{API: s.APIURL}, PublicURL: s.PublicURL, ApiaryPublicURL: cmp.Or(s.ApiaryPublicURL, s.ApiaryURL),
+		Active: s.publicAddress(), Log: log, creds: r.creds, refusalEvery: r.opts.refusalEvery,
+		Upload: r.upload, UploadFor: s.uploadFor(), ctx: ctx, wait: r.opts.uploadWait,
+		setUp: func(kept *app) { r.setUp <- kept },
+	}
+	r.mu.Lock()
+	if a == nil {
+		r.router.set(&phase{health: healthNoApp, unavailable: unavailableNoApp, setup: r.setup})
+		r.start = r.declareForSetup
+		log.Info("waiting for the GitHub App's setup: an instance admin presses Set up on the adapter's page in Qory Apiary")
+	} else {
+		r.setup.markKept()
+		r.serveApp(a, true)
+	}
+	r.stop = r.start()
+	r.mu.Unlock()
 	sweep := time.NewTicker(sweepEvery)
 	defer sweep.Stop()
 	var serveErr error
@@ -482,6 +477,7 @@ loop:
 		}
 	}
 	r.shutdownServer()
+	r.setup.stop()
 	if r.worker != nil {
 		r.worker.Stop(handlerGrace)
 		r.connect.stop()
@@ -520,22 +516,65 @@ func (r *runner) shutdownServer() {
 	}
 }
 
-// appOf is the App serve runs with: the settings', in place of one kept in the state
-// directory, which a line then says is not used; else the one kept there; else none,
-// once what a setup that did not finish left there is removed, see [dropUnfinished].
-// web is GitHub's website, which the line of such a setup links to the App's page on.
-func (r *runner) appOf(web string) (*app, error) {
-	dir := r.s.StateDir
-	if r.given != nil {
-		if hasApp(dir) {
-			r.log.Info("the settings give the App, so the App kept in the state directory is not used")
+// loadApp reads the App from Qory Apiary, see [Apiary.Secrets], and returns it, or nil
+// when Qory Apiary stores none, see [appOf]. A read that fails, Qory Apiary out of
+// reach, a 401, or an answer refused, is tried again after a wait that doubles, as
+// the change feed's reader waits, with a line at the first failure and then once each
+// [feedMaxBackoff] at most. Secrets that are not an App serve uploads refuse the
+// start. When ctx is done it returns ctx's error.
+func (r *runner) loadApp(ctx context.Context) (*app, error) {
+	waits := &feed{sleep: r.opts.feedSleep}
+	failed := &throttle{every: feedMaxBackoff}
+	backoff := feedFirstBackoff
+	for {
+		p, err := r.apiary.Secrets(ctx)
+		if err == nil {
+			a, err := appOf(p)
+			if err != nil {
+				return nil, fmt.Errorf("reading the GitHub App from Qory Apiary: %w", err)
+			}
+			return a, nil
 		}
-		return r.given, nil
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if ok, dropped := failed.allow(); ok {
+			attrs := []slog.Attr{slog.String("error", err.Error())}
+			if dropped > 0 {
+				attrs = append(attrs, slog.Int("failed_dropped", dropped))
+			}
+			r.log.LogAttrs(ctx, slog.LevelWarn, "reading the GitHub App from Qory Apiary failed, and is tried again", attrs...)
+		}
+		if waits.wait(ctx, backoff) != nil {
+			return nil, ctx.Err()
+		}
+		backoff = min(2*backoff, feedMaxBackoff)
 	}
-	if hasApp(dir) {
-		return loadApp(dir)
+}
+
+// upload stores the App a in Qory Apiary, see [Apiary.UploadSecrets].
+func (r *runner) upload(ctx context.Context, a *app) error {
+	p, err := a.plaintext()
+	if err != nil {
+		return err
 	}
-	return nil, dropUnfinished(dir, web, r.log)
+	return r.apiary.UploadSecrets(ctx, p)
+}
+
+// storeInNewRecord stores the App in use, if any, in the adapter record of the
+// enrolment in use, after a new enrolment made the adapter another record in Qory
+// Apiary, which stores no App. When the upload fails, a line says so: the next start
+// of serve finds no App, and serves the App setup. r.mu is held.
+func (r *runner) storeInNewRecord() {
+	a := r.inUse
+	if a == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, connectBound)
+	defer cancel()
+	if err := r.upload(ctx, a); err != nil {
+		r.log.Error("storing the GitHub App in the new adapter in Qory Apiary failed; at its next start serve finds no App there", slog.String("slug", a.slug), slog.String("error", err.Error()))
+	}
 }
 
 // declareForSetup starts declaring the adapter with setup_url, until Qory Apiary
@@ -581,16 +620,17 @@ func (r *runner) declareForSetup() func() {
 // connect page and the handlers' worker, puts the serving phase in place, and makes
 // start the change feed's reader and the pull, which declare the adapter without
 // setup_url first. serve declares that it sends changes as they happen only with
-// public_address true and a's webhook active; a kept App whose webhook was created
-// inactive is said so. atStart is whether a is the App serve started with: then a kept
-// App whose webhook secret GitHub did not confirm has it set again, see
-// [runner.confirm]. What declares the adapter in the phase before is stopped already.
+// public_address true and a's webhook active; an App whose webhook was created
+// inactive is said so. atStart is whether a is the App serve started with: then an App
+// whose webhook secret GitHub did not confirm has it set again, see [runner.confirm].
+// What declares the adapter in the phase before is stopped already. r.mu is held.
 func (r *runner) serveApp(a *app, atStart bool) {
 	s, log, st := r.s, r.log, r.st
+	r.inUse = a
 	web := github.Client{API: s.APIURL}.Web()
 	r.apiary.PullsAlone = !s.publicAddress() || !a.webhookActive
 	if s.publicAddress() && !a.webhookActive {
-		log.Warn("the kept App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to " + s.PublicURL + WebhookPath + " and turn the webhook on at " + a.settingsURL(web))
+		log.Warn("the App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to " + s.PublicURL + WebhookPath + " and turn the webhook on at " + a.settingsURL(web))
 	}
 	adapter := &Adapter{Store: st, GitHub: github.Client{API: s.APIURL}, AppID: a.id, Key: a.key, Slug: a.slug, Sink: r.apiary, Log: log}
 	r.apiary.Ended = adapter.forgetEnded(r.apiary.Ended)
@@ -637,15 +677,15 @@ func (r *runner) serveApp(a *app, atStart bool) {
 			<-pulled
 		}
 	}
-	if atStart && a.kept && !a.confirmed {
+	if atStart && !a.confirmed {
 		r.confirm(a)
 	}
 }
 
-// confirm sets the kept App a's webhook secret on its webhook again, beside serving,
-// since GitHub did not confirm it when the App was set up, and records it once GitHub
-// does, see [confirmWebhookSecret]; when GitHub does not, a line says so, and the next
-// start sets it again.
+// confirm sets the App a's webhook secret on its webhook again, beside serving, since
+// GitHub did not confirm it when the App was set up, and stores in Qory Apiary that
+// GitHub confirmed it once GitHub does, see [Apiary.UploadSecrets]; when GitHub does
+// not, or the upload fails, a line says so, and the next start sets it again.
 func (r *runner) confirm(a *app) {
 	ctx, cancel := context.WithTimeout(context.Background(), connectBound)
 	r.confirmCancel, r.confirmed = cancel, make(chan struct{})
@@ -656,8 +696,8 @@ func (r *runner) confirm(a *app) {
 			r.log.Warn("GitHub did not confirm the App's webhook secret; serve sets it again at its next start", slog.Int64("app_id", a.numericID), slog.String("error", err.Error()))
 			return
 		}
-		if err := confirmWebhookSecret(r.s.StateDir); err != nil {
-			r.log.Error("setup failed", slog.String("step", "start"), slog.String("what", "confirmation"), slog.String("error", err.Error()))
+		if err := r.upload(ctx, a.with(func(c *app) { c.confirmed = true })); err != nil {
+			r.log.Warn("storing in Qory Apiary that GitHub confirmed the App's webhook secret failed; serve sets it again at its next start", slog.Int64("app_id", a.numericID), slog.String("error", err.Error()))
 		}
 	}()
 }

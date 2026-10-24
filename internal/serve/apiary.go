@@ -117,9 +117,11 @@ var refusalShape = regexp.MustCompile(`^[a-z_]{1,64}$`)
 type Apiary struct {
 	// URL is Qory Apiary's origin, without a trailing slash.
 	URL string
-	// KeyID and Key are the adapter's access key: its id and its secret.
-	KeyID string
-	Key   *accesskey.Key
+	// KeyID and Key are the adapter's access key: its id and its secret. AdapterID is
+	// the id Qory Apiary enrolled the key in, which a seal of secrets binds to.
+	KeyID     string
+	Key       *accesskey.Key
+	AdapterID string
 	// Pin are Qory Apiary's public keys. Every answer is signed under them but a 401,
 	// which is always unsigned, and a 413, 415 or 400 bad_request, which may be
 	// unsigned. No unsigned answer is acted on but a 401, which is [Held]: any other
@@ -398,6 +400,12 @@ func (a *Apiary) post(ctx context.Context, what, route, collection, connection s
 // connection, when it is not "", and whose 409 connection_ended speaks of the connection
 // of, when it is not "".
 func (a *Apiary) postAs(ctx context.Context, what, route, connection, of string, body func(time string) any) error {
+	return a.postWith(ctx, nil, what, route, connection, of, body)
+}
+
+// postWith is [Apiary.postAs] signed with the enrolment e for every try, when e is set,
+// or else with the enrolment in use as each try is sent.
+func (a *Apiary) postWith(ctx context.Context, e *enrolment, what, route, connection, of string, body func(time string) any) error {
 	for try := 1; ; try++ {
 		b, err := json.Marshal(body(contracts.FormatTime(a.now())))
 		if err != nil {
@@ -406,7 +414,11 @@ func (a *Apiary) postAs(ctx context.Context, what, route, connection, of string,
 		if len(b) > contracts.MaxRequest {
 			return Permanent(fmt.Errorf("%s: the request is larger than %d bytes, which Qory Apiary refuses", what, contracts.MaxRequest))
 		}
-		ans, err := a.send(ctx, what, http.MethodPost, route, b, maxPostAnswer, postTimeout)
+		in := a.current()
+		if e != nil {
+			in = *e
+		}
+		ans, err := a.sendWith(ctx, in, what, http.MethodPost, route, b, maxPostAnswer, postTimeout)
 		if err == nil {
 			err = a.judge(what, ans, connection, of)
 		}
@@ -435,6 +447,12 @@ type answer struct {
 // signed. An error is no answer; it begins with what and never says a header, the
 // body or a secret. Qory Apiary out of reach, or its answer unread, is an [Outage].
 func (a *Apiary) send(ctx context.Context, what, method, target string, body []byte, max int64, timeout time.Duration) (*answer, error) {
+	return a.sendWith(ctx, a.current(), what, method, target, body, max, timeout)
+}
+
+// sendWith is [Apiary.send] signed with the enrolment e, its answer checked under e's
+// pin.
+func (a *Apiary) sendWith(ctx context.Context, e enrolment, what, method, target string, body []byte, max int64, timeout time.Duration) (*answer, error) {
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
@@ -443,11 +461,7 @@ func (a *Apiary) send(ctx context.Context, what, method, target string, body []b
 	if err != nil {
 		return nil, fmt.Errorf("%s: the request could not be made", what)
 	}
-	keyID, key, pin := a.KeyID, a.Key, a.Pin
-	if a.creds != nil {
-		e := a.creds.get()
-		keyID, key, pin = e.keyID, e.key, e.pin
-	}
+	keyID, key, pin := e.keyID, e.key, e.pin
 	signed := accesskey.Request{AccessKeyID: keyID, InstanceID: a.InstanceID, Method: method, Target: req.URL.RequestURI()}
 	if method == http.MethodPost {
 		signed.Body = body

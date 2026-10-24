@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -14,11 +15,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github/internal/store"
 )
 
 // noRedirect is a client that follows no redirect, so a test reads each answer.
@@ -77,7 +82,7 @@ func pastAppCheck(t *testing.T, addr string) {
 		}
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if string(b) != healthAppCheck+"\n" {
+		if string(b) != healthAppCheck+"\n" && string(b) != healthLoading+"\n" {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -130,12 +135,6 @@ func runListening(t *testing.T, s Settings, opts Options) (string, *syncBuffer, 
 	return "", nil, nil
 }
 
-// noApp is s without the App.
-func noApp(s Settings) Settings {
-	s.AppID, s.AppSlug, s.ClientID, s.PrivateKeyFile, s.WebhookSecretFile, s.ClientSecretFile = "", "", "", "", "", ""
-	return s
-}
-
 // checkPhase checks /health's answer and the 503 of every other request but the
 // setup's, which sends no referrer.
 func checkPhase(t *testing.T, addr, health, unavailable string) {
@@ -181,20 +180,23 @@ func TestRunListensWhileItEnrols(t *testing.T) {
 	})
 }
 
-// TestRunWithoutAnAppServesTheSetup runs serve whose settings give no App and whose
-// state directory keeps none, with public_address true and false: it declares
-// setup_url, answers 503 but for /health and the setup, reads no feed; an instance
-// admin sets the App up through it, against the fake GitHub; then, without a
-// restart, it serves: the webhook takes a delivery signed with the kept secret, the
+// TestRunWithoutAnAppServesTheSetup runs serve for which Qory Apiary stores no App,
+// with public_address true and false: it declares setup_url, answers 503 but for
+// /health and the setup, reads no feed; an instance admin sets the App up through it,
+// against the fake GitHub, which stores the App in Qory Apiary; then, without a
+// restart, it serves: the webhook takes a delivery signed with the stored secret, the
 // connect page answers, the setup refuses a pass, and it declares again without
-// setup_url, after the declaration with it. A restart serves at once with the kept App.
+// setup_url, after the declaration with it. A restart serves at once with the App it
+// reads from Qory Apiary alone. The state directory contains the access key,
+// enrolment.json and the store alone, and no file contains a value of the App.
 func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 	for _, public := range []bool{true, false} {
 		dir := t.TempDir()
 		access := newKey(t)
 		apiary := newFakeApiary(t, access)
+		apiary.noApp()
 		gh := newSetupGitHub(t)
-		s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
+		s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 		s.APIURL = gh.srv.URL
 		s.PublicAddress = &public
 		handled := make(chan string, 1)
@@ -238,7 +240,7 @@ func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 		apiary.mu.Lock()
 		without := -1
 		for i, rq := range apiary.requests {
-			if rq.method == http.MethodGet && without < 0 {
+			if rq.method == http.MethodGet && strings.HasPrefix(rq.target, routeChanges) && without < 0 {
 				t.Errorf("public %v: the feed was read before the declaration without setup_url", public)
 			}
 			if rq.target != routeAdapter {
@@ -259,9 +261,9 @@ func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 			}
 		}
 		apiary.mu.Unlock()
-		kept, err := loadApp(s.StateDir)
-		if err != nil {
-			t.Fatal(err)
+		kept := storedApp(t, apiary)
+		if kept.numericID != setupAppID || len(kept.webhookSecret) != 64 || string(kept.clientSecret) != setupClientSecret || len(apiary.uploaded()) != 1 {
+			t.Errorf("public %v: Qory Apiary stores %v after %d uploads", public, kept, len(apiary.uploaded()))
 		}
 		mac := hmac.New(sha256.New, kept.webhookSecret)
 		mac.Write([]byte(body1))
@@ -295,8 +297,10 @@ func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 			t.Errorf("public %v: the App was checked %d times after the setup", public, n)
 		}
 
-		// A restart serves with the kept App at once, once it is checked with GitHub, and
-		// declares without setup_url.
+		onlyAllowedFiles(t, s.StateDir)
+
+		// A restart serves with the App it reads from Qory Apiary at once, once it is
+		// checked with GitHub, and declares without setup_url.
 		n := len(apiary.sent(routeAdapter))
 		addr, log, _ = runWith(t, s, opts)
 		checkPhase(t, addr, "serving", "")
@@ -307,8 +311,45 @@ func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 		if strings.Contains(log.String(), waiting) {
 			t.Errorf("public %v: the restart waits for a setup: %s", public, log.String())
 		}
-		if n := gh.checks(); n != 1 {
-			t.Errorf("public %v: the restart checked the App %d times", public, n)
+		if n := gh.checks(); n != 1 || len(apiary.uploaded()) != 1 {
+			t.Errorf("public %v: the restart checked the App %d times, and uploaded %d times in all", public, n, len(apiary.uploaded()))
+		}
+		onlyAllowedFiles(t, s.StateDir)
+	}
+}
+
+// storedApp is the App the fake Qory Apiary stores.
+func storedApp(t *testing.T, f *fakeApiary) *app {
+	t.Helper()
+	f.mu.Lock()
+	p := contracts.AdapterSecretsPlaintext{Version: contracts.Version, Secrets: slices.Clone(f.secrets)}
+	f.mu.Unlock()
+	a, err := appOf(p)
+	if err != nil || a == nil {
+		t.Fatalf("Qory Apiary stores no App: %v", err)
+	}
+	return a
+}
+
+// onlyAllowedFiles checks that the state directory dir contains the access key,
+// enrolment.json, the store and nothing else, and that no file in it contains a value
+// of the App.
+func onlyAllowedFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := []string{accessKeyFile, enrolmentFile, store.FileName}
+	for _, e := range entries {
+		if !slices.Contains(allowed, e.Name()) {
+			t.Errorf("the state directory contains %s", e.Name())
+		}
+		b, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		for _, bad := range []string{setupHookSecret, setupClientSecret, secret, clientSecret, "PRIVATE KEY"} {
+			if bytes.Contains(b, []byte(bad)) {
+				t.Errorf("%s contains a value of the App", e.Name())
+			}
 		}
 	}
 }
@@ -382,8 +423,9 @@ func TestTheDeclarationWithSetupURLIsAnsweredFirst(t *testing.T) {
 		answer()
 		return 0, ""
 	}
+	apiary.noApp()
 	gh := newSetupGitHub(t)
-	s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 	s.APIURL = gh.srv.URL
 	opts := Options{feedSleep: shortSleep}
 	opts.declarerWaits = func(done <-chan struct{}) {
@@ -436,48 +478,38 @@ func TestTheDeclarationWithSetupURLIsAnsweredFirst(t *testing.T) {
 	}
 }
 
-// TestAKeptAppWithAnInactiveWebhookDeclaresPulling pins that a kept App whose webhook
-// was created inactive makes serve declare that it does not send changes, with the
-// line that says how to change that, though public_address is true.
-func TestAKeptAppWithAnInactiveWebhookDeclaresPulling(t *testing.T) {
+// TestAnAppWithAnInactiveWebhookDeclaresPulling pins that an App whose webhook was
+// created inactive makes serve declare that it does not send changes, with the line
+// that says how to change that, though public_address is true.
+func TestAnAppWithAnInactiveWebhookDeclaresPulling(t *testing.T) {
 	dir := t.TempDir()
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)
-	s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
-	k := testKeptApp()
-	k.WebhookActive = false
-	os.Mkdir(s.StateDir, 0o700)
-	if err := keepApp(s.StateDir, k, []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	apiary.storeApp(setupApp().with(func(a *app) { a.webhookActive = false }))
 	_, log, _ := runWith(t, s, Options{feedSleep: shortSleep})
 	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
 	got, _ := json.Marshal(apiary.sent(routeAdapter)[0].body["sync"])
 	if !strings.Contains(string(got), `"sends_changes":false`) || apiary.sent(routeAdapter)[0].body["setup_url"] != nil {
 		t.Errorf("declared %s", apiary.sent(routeAdapter)[0].raw)
 	}
-	want := `"msg":"the kept App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to https://qory-github.example.com/v1/events and turn the webhook on at ` + s.APIURL + `/organizations/acme/settings/apps/qory-acme"`
+	want := `"msg":"the App's webhook was created inactive, so serve declares that it learns of changes by pulling; to change that, set the App's webhook URL to https://qory-github.example.com/v1/events and turn the webhook on at ` + s.APIURL + `/organizations/acme/settings/apps/qory-acme"`
 	if !strings.Contains(log.String(), want) {
 		t.Errorf("the log: %s", log.String())
 	}
 }
 
-// TestAnInactiveKeptAppWithoutAPublicAddressSaysPullingOnce pins that a kept App whose
-// webhook was created inactive, with public_address false, makes serve declare that
-// it pulls with the line public_address false gives, and not the line that says how to
-// turn the webhook on, which GitHub could not reach.
-func TestAnInactiveKeptAppWithoutAPublicAddressSaysPullingOnce(t *testing.T) {
+// TestAnInactiveAppWithoutAPublicAddressSaysPullingOnce pins that an App whose webhook
+// was created inactive, with public_address false, makes serve declare that it pulls
+// with the line public_address false gives, and not the line that says how to turn the
+// webhook on, which GitHub could not reach.
+func TestAnInactiveAppWithoutAPublicAddressSaysPullingOnce(t *testing.T) {
 	dir := t.TempDir()
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)
-	s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 	s.PublicAddress = new(bool)
-	k := testKeptApp()
-	k.WebhookActive = false
-	os.Mkdir(s.StateDir, 0o700)
-	if err := keepApp(s.StateDir, k, []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
+	apiary.storeApp(setupApp().with(func(a *app) { a.webhookActive = false }))
 	_, log, _ := runWith(t, s, Options{feedSleep: shortSleep})
 	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
 	got, _ := json.Marshal(apiary.sent(routeAdapter)[0].body["sync"])
@@ -490,9 +522,10 @@ func TestAnInactiveKeptAppWithoutAPublicAddressSaysPullingOnce(t *testing.T) {
 	}
 }
 
-// TestAnUnconfirmedWebhookSecretIsSetAgainAtStart pins that a kept App whose webhook
-// secret GitHub did not confirm has it set again at the start, which, once GitHub
-// confirms it, app.json records; when GitHub does not, a line says so.
+// TestAnUnconfirmedWebhookSecretIsSetAgainAtStart pins that an App whose webhook secret
+// GitHub did not confirm has it set again at the start, which, once GitHub confirms it,
+// an upload to Qory Apiary records; when GitHub does not, a line says so, and nothing
+// is uploaded.
 func TestAnUnconfirmedWebhookSecretIsSetAgainAtStart(t *testing.T) {
 	for _, confirms := range []bool{true, false} {
 		dir := t.TempDir()
@@ -502,14 +535,9 @@ func TestAnUnconfirmedWebhookSecretIsSetAgainAtStart(t *testing.T) {
 		if !confirms {
 			gh.hookStatus = http.StatusBadGateway
 		}
-		s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
+		s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 		s.APIURL = gh.srv.URL
-		k := testKeptApp()
-		k.WebhookSecretConfirmed = false
-		os.Mkdir(s.StateDir, 0o700)
-		if err := keepApp(s.StateDir, k, []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-			t.Fatal(err)
-		}
+		apiary.storeApp(setupApp().with(func(a *app) { a.confirmed = false }))
 		_, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
 		eventually(t, "set again", func() bool { return len(gh.patched()) > 0 })
 		if p := gh.patched(); p[0] != setupHookSecret {
@@ -517,56 +545,21 @@ func TestAnUnconfirmedWebhookSecretIsSetAgainAtStart(t *testing.T) {
 		}
 		const line = `"msg":"GitHub did not confirm the App's webhook secret; serve sets it again at its next start"`
 		if confirms {
-			// app.json is read alone, as loadApp would remove a rewrite under way.
-			eventually(t, "recorded", func() bool {
-				b, _ := os.ReadFile(filepath.Join(s.StateDir, appFile))
-				k, err := parseKeptApp(b)
-				return err == nil && k.WebhookSecretConfirmed
-			})
+			eventually(t, "recorded", func() bool { return len(apiary.uploaded()) == 1 })
 		} else {
 			eventually(t, "said", func() bool { return strings.Contains(log.String(), line) })
 		}
 		stop()
-		if a, err := loadApp(s.StateDir); err != nil || a.confirmed != confirms {
-			t.Errorf("confirms %v: %+v %v", confirms, a, err)
+		if a := storedApp(t, apiary); a.confirmed != confirms || string(a.webhookSecret) != setupHookSecret || len(apiary.uploaded()) != map[bool]int{true: 1, false: 0}[confirms] {
+			t.Errorf("confirms %v: %+v after %d uploads", confirms, a, len(apiary.uploaded()))
 		}
 		noSetupLeak(t, log.String())
 	}
 }
 
-// TestTheSettingsAppWinsOverTheKeptOne pins that the settings' App is used when the
-// state directory keeps one too, with the line that says so, and that no setup_url is
-// declared.
-func TestTheSettingsAppWinsOverTheKeptOne(t *testing.T) {
-	dir := t.TempDir()
-	access := newKey(t)
-	apiary := newFakeApiary(t, access)
-	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
-	os.Mkdir(s.StateDir, 0o700)
-	if err := keepApp(s.StateDir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
-	handled := make(chan string, 1)
-	hs := &Handlers{}
-	hs.HandleFunc("issues", func(_ context.Context, d Delivery) error { handled <- d.GUID; return nil })
-	addr, log, _ := runWith(t, s, Options{Handlers: hs, feedSleep: shortSleep})
-	if !strings.Contains(log.String(), `"msg":"the settings give the App, so the App kept in the state directory is not used"`) {
-		t.Errorf("the log: %s", log.String())
-	}
-	// The settings' webhook secret signs what is taken.
-	resp, _ := fetch(t, nil, http.MethodPost, addr, WebhookPath, strings.NewReader(body1), http.Header{"X-Github-Event": {"issues"}, "X-Github-Delivery": {guid1}, "X-Hub-Signature-256": {sign(body1)}})
-	if resp.StatusCode != http.StatusAccepted {
-		t.Errorf("the delivery answered %d", resp.StatusCode)
-	}
-	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
-	if b := apiary.sent(routeAdapter)[0].body; b["setup_url"] != nil {
-		t.Errorf("declared %v", b)
-	}
-}
-
 // TestPublicAddressFalseDeclaresPullingWithAnyApp pins that public_address false
 // makes serve declare that it does not send changes with an App whose webhook is
-// active, as the settings' App is, with the line that says so, and that it is true
+// active, as the test App's is, with the line that says so, and that it is true
 // when public_address is left out.
 func TestPublicAddressFalseDeclaresPullingWithAnyApp(t *testing.T) {
 	for _, public := range []*bool{nil, new(bool)} {
@@ -589,36 +582,60 @@ func TestPublicAddressFalseDeclaresPullingWithAnyApp(t *testing.T) {
 	}
 }
 
-// TestAStartResolvesTheKeptAppsFiles pins the start with what a setup left in the
-// state directory: files of one that did not finish are removed, with the line, and
-// serve waits for a setup; a kept App whose file is missing stops it before it serves.
-func TestAStartResolvesTheKeptAppsFiles(t *testing.T) {
+// TestSecretsServeCannotUseRefuseTheStart pins that secrets in Qory Apiary that are not
+// the App as serve uploads it stop serve before it serves, with the error that names
+// the secret and no value.
+func TestSecretsServeCannotUseRefuseTheStart(t *testing.T) {
 	dir := t.TempDir()
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)
-	s := noApp(settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server)))
-	os.Mkdir(s.StateDir, 0o700)
-	writeFile(t, filepath.Join(s.StateDir, appTemp), "{", 0o600)
-	writeFile(t, filepath.Join(s.StateDir, appKeyFile), appKeyPEM(), 0o600)
-	addr, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
-	checkPhase(t, addr, "waiting for the GitHub App's setup", "")
-	if !strings.Contains(log.String(), `"msg":"a setup that did not finish left files in the state directory, which are removed: delete the App it created on GitHub"`) {
-		t.Errorf("the log: %s", log.String())
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	apiary.mu.Lock()
+	apiary.secrets = slices.DeleteFunc(slices.Clone(apiary.secrets), func(e contracts.SecretEntry) bool { return e.Name == secretClientSecret })
+	apiary.mu.Unlock()
+	var log syncBuffer
+	err := Run(context.Background(), s, Options{ProgramVersion: testVersion, Log: slog.New(slog.NewJSONHandler(&log, nil))})
+	if err == nil || err.Error() != "reading the GitHub App from Qory Apiary: Qory Apiary stores no secret client-secret for the GitHub App" || strings.Contains(log.String(), lineServing) {
+		t.Errorf("err %v; the log: %s", err, log.String())
 	}
-	stop()
-	for _, name := range []string{appTemp, appKeyFile} {
-		if _, err := os.Lstat(filepath.Join(s.StateDir, name)); !os.IsNotExist(err) {
-			t.Errorf("%s is left: %v", name, err)
+	if strings.Contains(log.String(), secret) || strings.Contains(log.String(), "PRIVATE KEY") {
+		t.Error("the log contains a value of the App")
+	}
+}
+
+// TestReadingTheAppIsTriedAgainWhileHealthAnswers pins that serve listens while it
+// cannot read the App from Qory Apiary: /health answers 200 with the reading's line,
+// every other request 503, the failures of a minute have one line, and serve serves
+// once Qory Apiary answers.
+func TestReadingTheAppIsTriedAgainWhileHealthAnswers(t *testing.T) {
+	dir := t.TempDir()
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	var mu sync.Mutex
+	failing := true
+	apiary.refuseGet = func(int) (int, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failing {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
 		}
+		return 0, ""
 	}
-	if err := keepApp(s.StateDir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-		t.Fatal(err)
-	}
-	os.Remove(filepath.Join(s.StateDir, appClientFile))
-	listened := false
-	err := Run(context.Background(), s, Options{ProgramVersion: testVersion, Listening: func(net.Addr) { listened = true }})
-	if err == nil || err.Error() != "the App file app.json names app-client-secret in the state directory, which is missing or does not hold what app.json names" || listened {
-		t.Errorf("err %v, listened %v", err, listened)
+	addr, log, _ := runListening(t, s, Options{feedSleep: func(ctx context.Context, _ time.Duration) error { return wait(ctx, 20*time.Millisecond) }})
+	const line = `"level":"WARN","msg":"reading the GitHub App from Qory Apiary failed, and is tried again"`
+	eventually(t, "the failure's line", func() bool { return strings.Contains(log.String(), line) })
+	checkPhase(t, addr, healthLoading, unavailableLoading)
+	eventually(t, "tried again", func() bool { return len(apiary.sent("GET "+routeSecrets)) > 2 })
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	eventually(t, "serving", func() bool {
+		resp, body := fetch(t, nil, http.MethodGet, addr, "/health", nil, nil)
+		return resp.StatusCode == http.StatusOK && body == "serving\n"
+	})
+	if strings.Count(log.String(), line) != 1 {
+		t.Errorf("the log: %s", log.String())
 	}
 }
 

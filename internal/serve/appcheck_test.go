@@ -1,16 +1,12 @@
 package serve
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -83,23 +79,20 @@ func (g *appGitHub) checks() int {
 	return g.asked
 }
 
-// checkSettings are settings for a start with the settings' App, or with the App kept
-// in the state directory, k, when kept is set, whose GitHub is gh.
-func checkSettings(t *testing.T, gh *appGitHub, kept *keptApp) Settings {
+// checkSettings are settings for a start whose GitHub is gh, with the App a stored in
+// the fake Qory Apiary, which it returns, or [testApp] when a is nil.
+func checkSettings(t *testing.T, gh *appGitHub, a *app) (Settings, *fakeApiary) {
 	t.Helper()
 	dir := t.TempDir()
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)
 	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
 	s.APIURL = gh.srv.URL
-	if kept != nil {
-		s = noApp(s)
-		os.Mkdir(s.StateDir, 0o700)
-		if err := keepApp(s.StateDir, *kept, []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-			t.Fatal(err)
-		}
+	if a == nil {
+		a = testApp()
 	}
-	return s
+	apiary.storeApp(a)
+	return s, apiary
 }
 
 // refusedStart runs serve with s until it returns, which it must before the serving
@@ -129,78 +122,53 @@ const (
 	lineServing = `"msg":"serving"`
 )
 
-// TestTheSettingsAppWithItsSlugServes pins that the settings' App whose slug GitHub
-// answers serves, after one check and no line of it.
-func TestTheSettingsAppWithItsSlugServes(t *testing.T) {
+// TestTheAppWithItsSlugServes pins that the App Qory Apiary delivers, whose id and
+// slug GitHub answers, serves after one check, with no line of it and no upload.
+func TestTheAppWithItsSlugServes(t *testing.T) {
 	gh := newAppGitHub(t)
-	s := checkSettings(t, gh, nil)
+	s, apiary := checkSettings(t, gh, nil)
 	_, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
 	stop()
-	if n := gh.checks(); n != 1 || !strings.Contains(log.String(), lineServing) || strings.Contains(log.String(), "checking the App") {
-		t.Errorf("checked %d times; the log: %s", n, log.String())
+	if n := gh.checks(); n != 1 || !strings.Contains(log.String(), lineServing) || strings.Contains(log.String(), "checking the App") || len(apiary.sent(routeSecrets)) != 0 {
+		t.Errorf("checked %d times, %d uploads; the log: %s", n, len(apiary.sent(routeSecrets)), log.String())
 	}
 }
 
-// TestTheSettingsAppIsRefusedForAnotherSlug pins that a settings' App whose slug GitHub
-// answers is another refuses the start with the slug to set, and serves nothing.
-func TestTheSettingsAppIsRefusedForAnotherSlug(t *testing.T) {
-	gh := newAppGitHub(t, appAnswer{200, `{"id":1,"slug":"qory-renamed"}`})
-	log, err := refusedStart(t, checkSettings(t, gh, nil))
-	const want = "app_slug is qory-test, and GitHub answers that the App with app_id 1 is qory-renamed; set app_slug to qory-renamed"
-	if err == nil || err.Error() != want || strings.Contains(log, lineServing) {
-		t.Errorf("err %v; the log: %s", err, log)
-	}
-}
-
-// TestAnAnswerWithNoSlugIsRefused pins that an answer that names no slug, or what is
-// not one, refuses the start for the settings' App, and for the kept App when its id
-// is the same, with the line that says so and no echo of the answer.
+// TestAnAnswerWithNoSlugIsRefused pins that an answer for the App's id that names no
+// slug, or what is not one, refuses the start, with no echo of the answer.
 func TestAnAnswerWithNoSlugIsRefused(t *testing.T) {
-	for _, body := range []string{`{"id":1}`, `{"id":1,"slug":null}`, `{"id":1,"slug":7}`, `{"id":1,"slug":""}`, `{"id":1,"slug":"no slug at all"}`, `{"id":1,"slug":"-qory"}`, `not JSON`, `[]`} {
+	for _, body := range []string{`{"id":1}`, `{"id":1,"slug":null}`, `{"id":1,"slug":7}`, `{"id":1,"slug":""}`, `{"id":1,"slug":"no slug at all"}`, `{"id":1,"slug":"-qory"}`} {
 		gh := newAppGitHub(t, appAnswer{200, body})
-		_, err := refusedStart(t, checkSettings(t, gh, nil))
-		const want = "checking the App with GitHub: GitHub's answer names no slug for the App with app_id 1"
-		if err == nil || err.Error() != want {
-			t.Errorf("%s: err %v", body, err)
-		}
-	}
-	for _, body := range []string{`{"id":777001}`, `{"id":777001,"slug":"no slug"}`} {
-		k := testKeptApp()
-		gh := newAppGitHub(t, appAnswer{200, body})
-		s := checkSettings(t, gh, &k)
-		before, _ := os.ReadFile(filepath.Join(s.StateDir, appFile))
+		s, apiary := checkSettings(t, gh, nil)
 		_, err := refusedStart(t, s)
-		const want = "checking the App with GitHub: GitHub's answer names no slug for the App with app_id 777001"
-		if err == nil || err.Error() != want {
+		const want = "checking the App with GitHub: GitHub's answer names no slug for the App with app_id 1"
+		if err == nil || err.Error() != want || len(apiary.sent(routeSecrets)) != 0 {
 			t.Errorf("%s: err %v", body, err)
-		}
-		if after, _ := os.ReadFile(filepath.Join(s.StateDir, appFile)); !bytes.Equal(before, after) {
-			t.Errorf("%s: app.json changed: %s", body, after)
 		}
 	}
 }
 
-// TestTheKeptAppIsRefusedForAnotherID pins that a kept App whose id GitHub answers is
-// another refuses the start, whatever the slug.
-func TestTheKeptAppIsRefusedForAnotherID(t *testing.T) {
+// TestTheAppIsRefusedForAnotherID pins that an App whose id GitHub answers is another
+// refuses the start, whatever the slug.
+func TestTheAppIsRefusedForAnotherID(t *testing.T) {
 	for _, body := range []string{`{"id":5,"slug":"qory-acme"}`, `{"id":5,"slug":"qory-other"}`, `{"id":5}`} {
-		k := testKeptApp()
 		gh := newAppGitHub(t, appAnswer{200, body})
-		log, err := refusedStart(t, checkSettings(t, gh, &k))
-		const want = "the App file app.json names the App with app_id 777001, and GitHub answers for another App"
+		s, _ := checkSettings(t, gh, setupApp())
+		log, err := refusedStart(t, s)
+		const want = "Qory Apiary stores the App with app_id 777001, and GitHub answers for another App"
 		if err == nil || err.Error() != want || strings.Contains(log, lineServing) {
 			t.Errorf("%s: err %v; the log: %s", body, err, log)
 		}
 	}
 }
 
-// TestAnAnswerWithNoIDIsRefusedForTheKeptApp pins that an answer that names no id, or
-// one that is not a positive integer, refuses the start for the kept App.
-func TestAnAnswerWithNoIDIsRefusedForTheKeptApp(t *testing.T) {
-	for _, body := range []string{`{"slug":"qory-acme"}`, `{"id":null,"slug":"qory-acme"}`, `{"id":"777001","slug":"qory-acme"}`, `{"id":0,"slug":"qory-acme"}`, `{"id":-777001,"slug":"qory-acme"}`, `{"id":777001.5,"slug":"qory-acme"}`, `{"id":7.77001e5,"slug":"qory-acme"}`, `not JSON`} {
-		k := testKeptApp()
+// TestAnAnswerWithNoIDIsRefused pins that an answer that names no id, or one that is
+// not a positive integer, refuses the start.
+func TestAnAnswerWithNoIDIsRefused(t *testing.T) {
+	for _, body := range []string{`{"slug":"qory-acme"}`, `{"id":null,"slug":"qory-acme"}`, `{"id":"777001","slug":"qory-acme"}`, `{"id":0,"slug":"qory-acme"}`, `{"id":-777001,"slug":"qory-acme"}`, `{"id":777001.5,"slug":"qory-acme"}`, `{"id":7.77001e5,"slug":"qory-acme"}`, `not JSON`, `[]`} {
 		gh := newAppGitHub(t, appAnswer{200, body})
-		_, err := refusedStart(t, checkSettings(t, gh, &k))
+		s, _ := checkSettings(t, gh, setupApp())
+		_, err := refusedStart(t, s)
 		const want = "checking the App with GitHub: GitHub's answer names no id for the App with app_id 777001"
 		if err == nil || err.Error() != want {
 			t.Errorf("%s: err %v", body, err)
@@ -208,120 +176,62 @@ func TestAnAnswerWithNoIDIsRefusedForTheKeptApp(t *testing.T) {
 	}
 }
 
-// TestTheKeptAppKeepsItsNewSlug pins that a kept App whose id GitHub answers with a new
-// slug has app.json written again with that alone changed, read back as a start reads
-// it, the line that says so once, and serve serving with the new slug: the App's page
-// the line of an inactive webhook links to is the new slug's.
-func TestTheKeptAppKeepsItsNewSlug(t *testing.T) {
-	k := testKeptApp()
-	k.WebhookActive = false
+// TestTheAppKeepsItsNewSlug pins that an App whose id GitHub answers with a new slug
+// is uploaded to Qory Apiary with that alone changed, the line that says so once, and
+// serve serves with the new slug: the App's page the line of an inactive webhook links
+// to is the new slug's.
+func TestTheAppKeepsItsNewSlug(t *testing.T) {
+	a := setupApp()
+	a.webhookActive = false
 	gh := newAppGitHub(t, appAnswer{200, `{"id":777001,"slug":"qory-acme-2"}`})
-	s := checkSettings(t, gh, &k)
-	before, _ := os.ReadFile(filepath.Join(s.StateDir, appFile))
+	s, apiary := checkSettings(t, gh, a)
 	_, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
 	stop()
-	const line = `"level":"INFO","msg":"GitHub names the App with app_id 777001 qory-acme-2 now, so serve keeps qory-acme-2 in place of qory-acme"`
+	const line = `"level":"INFO","msg":"GitHub names the App with app_id 777001 qory-acme-2 now, so serve uses qory-acme-2 in place of qory-acme"`
 	if strings.Count(log.String(), line) != 1 || !strings.Contains(log.String(), "/organizations/acme/settings/apps/qory-acme-2\"") || !strings.Contains(log.String(), lineServing) {
 		t.Errorf("the log: %s", log.String())
 	}
-	a, err := loadApp(s.StateDir)
-	if err != nil || a.slug != "qory-acme-2" || a.numericID != setupAppID {
-		t.Fatalf("read back %+v %v", a, err)
+	ups := apiary.uploaded()
+	if len(ups) != 1 {
+		t.Fatalf("%d uploads", len(ups))
 	}
-	after, _ := os.ReadFile(filepath.Join(s.StateDir, appFile))
-	if want := strings.Replace(string(before), `"app_slug": "qory-acme"`, `"app_slug": "qory-acme-2"`, 1); string(after) != want {
-		t.Errorf("app.json\n%s\nwant\n%s", after, want)
-	}
-	if info, err := os.Lstat(filepath.Join(s.StateDir, appFile)); err != nil || info.Mode().Perm() != 0o600 {
-		t.Errorf("app.json: %v %v", info, err)
-	}
-	if _, err := os.Lstat(filepath.Join(s.StateDir, appTemp)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s is left: %v", appTemp, err)
+	got, err := appOf(ups[0])
+	want := a.with(func(c *app) { c.slug = "qory-acme-2" })
+	if err != nil || got.slug != want.slug || got.numericID != want.numericID || got.webhookActive || string(got.pem) != string(want.pem) ||
+		string(got.webhookSecret) != setupHookSecret || string(got.clientSecret) != setupClientSecret || got.clientID != setupClientID {
+		t.Errorf("uploaded %+v %v", got, err)
 	}
 }
 
-// TestTheKeptAppWithItsSlugIsNotWritten pins that a kept App whose id and slug GitHub
-// answers serves with app.json as it was and no line of the check.
-func TestTheKeptAppWithItsSlugIsNotWritten(t *testing.T) {
-	k := testKeptApp()
-	gh := newAppGitHub(t)
-	s := checkSettings(t, gh, &k)
-	path := filepath.Join(s.StateDir, appFile)
-	old := time.Now().Add(-time.Hour).Truncate(time.Second)
-	os.Chtimes(path, old, old)
-	before, _ := os.ReadFile(path)
+// TestANewSlugThatCannotBeStoredServes pins that serve serves with the new slug when
+// Qory Apiary refuses its upload, with a line that says the next start stores it.
+func TestANewSlugThatCannotBeStoredServes(t *testing.T) {
+	gh := newAppGitHub(t, appAnswer{200, `{"id":777001,"slug":"qory-acme-2"}`})
+	s, apiary := checkSettings(t, gh, setupApp())
+	apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeSecrets {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
 	_, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
 	stop()
-	after, _ := os.ReadFile(path)
-	info, _ := os.Lstat(path)
-	if !bytes.Equal(before, after) || !info.ModTime().Equal(old) || gh.checks() != 1 {
-		t.Errorf("app.json changed: %s, at %v; checked %d times", after, info.ModTime(), gh.checks())
-	}
-	if strings.Contains(log.String(), "checking the App") || strings.Contains(log.String(), "now, so serve keeps") || !strings.Contains(log.String(), lineServing) {
+	const line = `"msg":"storing the App's new slug in Qory Apiary failed; serve stores it again at its next start","slug":"qory-acme-2"`
+	if !strings.Contains(log.String(), line) || !strings.Contains(log.String(), lineServing) || apiary.stored()[secretApp] == "" ||
+		strings.Contains(apiary.stored()[secretApp], "qory-acme-2") {
 		t.Errorf("the log: %s", log.String())
 	}
 }
 
-// TestANewSlugThatCannotBeKeptRefuses pins that a new slug app.json cannot be written
-// with refuses the start with the write's error, app.json as it was.
-func TestANewSlugThatCannotBeKeptRefuses(t *testing.T) {
-	k := testKeptApp()
-	gh := newAppGitHub(t, appAnswer{200, `{"id":777001,"slug":"qory-acme-2"}`})
-	s := checkSettings(t, gh, &k)
-	before, _ := os.ReadFile(filepath.Join(s.StateDir, appFile))
-	rename = func(string, string) error { return errors.New("no rename") }
-	t.Cleanup(func() { rename = os.Rename })
-	log, err := refusedStart(t, s)
-	const want = "keeping the App's new slug qory-acme-2 in the App file app.json: no rename"
-	if err == nil || err.Error() != want || strings.Contains(log, "now, so serve keeps") {
-		t.Errorf("err %v; the log: %s", err, log)
-	}
-	if after, _ := os.ReadFile(filepath.Join(s.StateDir, appFile)); !bytes.Equal(before, after) {
-		t.Errorf("app.json changed: %s", after)
-	}
-	if _, err := os.Lstat(filepath.Join(s.StateDir, appTemp)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s is left: %v", appTemp, err)
-	}
-}
-
-// TestANewSlugWhoseAppCannotBeReadBackRefuses pins that a new slug app.json is written
-// with, whose App the read back that follows refuses, as when the webhook secret's file
-// no longer holds what app.json names, refuses the start with the read back's error,
-// with no line that the slug is kept, and serve does not serve.
-func TestANewSlugWhoseAppCannotBeReadBackRefuses(t *testing.T) {
-	k := testKeptApp()
-	gh := newAppGitHub(t, appAnswer{200, `{"id":777001,"slug":"qory-acme-2"}`})
-	s := checkSettings(t, gh, &k)
-	gh.onAsk = func() {
-		if err := os.WriteFile(filepath.Join(s.StateDir, appWebhookFile), []byte("another-webhook-secret-of-the-same-length-x\n"), 0o600); err != nil {
-			t.Error(err)
-		}
-	}
-	log, err := refusedStart(t, s)
-	const want = "keeping the App's new slug qory-acme-2 in the App file app.json: the App file app.json names " + appWebhookFile + " in the state directory, which is missing or does not hold what app.json names"
-	if err == nil || err.Error() != want || strings.Contains(log, "now, so serve keeps") || strings.Contains(log, lineServing) {
-		t.Errorf("err %v; the log: %s", err, log)
-	}
-	if after, _ := os.ReadFile(filepath.Join(s.StateDir, appFile)); !strings.Contains(string(after), `"app_slug": "qory-acme-2"`) {
-		t.Errorf("app.json is not written again: %s", after)
-	}
-}
-
-// TestA401RefusesTheStart pins that GitHub's 401 to the App's token refuses the start,
-// for the settings' App and for the kept one, at once.
+// TestA401RefusesTheStart pins that GitHub's 401 to the App's token refuses the start
+// at once.
 func TestA401RefusesTheStart(t *testing.T) {
 	const want = "checking the App with GitHub: GitHub does not take the App's token, made from app_id and the App's private key: reading the App: GitHub answered 401: Bad credentials"
-	for _, kept := range []bool{false, true} {
-		gh := newAppGitHub(t, appAnswer{401, `{"message":"Bad credentials"}`})
-		var k *keptApp
-		if kept {
-			ka := testKeptApp()
-			k = &ka
-		}
-		log, err := refusedStart(t, checkSettings(t, gh, k))
-		if err == nil || err.Error() != want || gh.checks() != 1 || strings.Contains(log, lineRetried) {
-			t.Errorf("kept %v: err %v, checked %d times; the log: %s", kept, err, gh.checks(), log)
-		}
+	gh := newAppGitHub(t, appAnswer{401, `{"message":"Bad credentials"}`})
+	s, _ := checkSettings(t, gh, nil)
+	log, err := refusedStart(t, s)
+	if err == nil || err.Error() != want || gh.checks() != 1 || strings.Contains(log, lineRetried) {
+		t.Errorf("err %v, checked %d times; the log: %s", err, gh.checks(), log)
 	}
 }
 
@@ -331,7 +241,7 @@ func TestA401RefusesTheStart(t *testing.T) {
 // once GitHub answers.
 func TestAFailedCheckIsTriedAgainWhileHealthAnswers(t *testing.T) {
 	gh := newAppGitHub(t, appAnswer{503, `{"message":"Service Unavailable"}`})
-	s := checkSettings(t, gh, nil)
+	s, _ := checkSettings(t, gh, nil)
 	release := make(chan struct{})
 	var once sync.Once
 	sleep := func(ctx context.Context, d time.Duration) error {
@@ -367,45 +277,36 @@ func TestAFailedCheckIsTriedAgainWhileHealthAnswers(t *testing.T) {
 }
 
 // TestAnEnrolledStartAnswersWhileGitHubDoesNotAnswerTheCheck pins that a start with
-// the enrolment kept in the state directory or given by the settings, and the App kept
-// there or given by the settings, listens while GitHub has not answered GET /app:
-// /health answers 200 with the App check's line, and every other request 503 with the
-// App check's 503 line.
+// the enrolment kept in the state directory or given by the settings listens while
+// GitHub has not answered GET /app: /health answers 200 with the App check's line, and
+// every other request 503 with the App check's 503 line.
 func TestAnEnrolledStartAnswersWhileGitHubDoesNotAnswerTheCheck(t *testing.T) {
 	for _, keptEnrolment := range []bool{false, true} {
-		for _, keptApp := range []bool{false, true} {
-			gh := newAppGitHub(t)
-			// GitHub's answer to GET /app is held until the test ends; this cleanup runs
-			// after serve's stop and before GitHub's server closes.
-			block := make(chan struct{})
-			gh.onAsk = func() { <-block }
-			t.Cleanup(func() { close(block) })
-			var s Settings
-			if keptEnrolment {
-				e := newEnrolEnv(t)
-				e.writeCode(enrolCode(codeCore, e.apiary.server) + "\n")
-				if _, err := e.enrol(); err != nil {
-					t.Fatal(err)
-				}
-				s = e.settings
-				s.APIURL = gh.srv.URL
-			} else {
-				s = checkSettings(t, gh, nil)
+		gh := newAppGitHub(t)
+		// GitHub's answer to GET /app is held until the test ends; this cleanup runs
+		// after serve's stop and before GitHub's server closes.
+		block := make(chan struct{})
+		gh.onAsk = func() { <-block }
+		t.Cleanup(func() { close(block) })
+		var s Settings
+		if keptEnrolment {
+			e := newEnrolEnv(t)
+			e.writeCode(enrolCode(codeCore, e.apiary.server) + "\n")
+			if _, err := e.enrol(); err != nil {
+				t.Fatal(err)
 			}
-			if keptApp {
-				s = noApp(s)
-				os.Mkdir(s.StateDir, 0o700)
-				if err := keepApp(s.StateDir, testKeptApp(), []byte(appKeyPEM()), []byte(setupHookSecret), []byte(setupClientSecret)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			addr, log, _ := runListening(t, s, Options{feedSleep: shortSleep})
-			eventually(t, "the check asked", func() bool { return gh.checks() == 1 })
-			checkPhase(t, addr, "waiting for GitHub to answer the App check",
-				"This adapter is starting. It is waiting for GitHub to answer a check of its GitHub App. Try again in a few minutes. If this message stays, the adapter's log shows GitHub's error.")
-			if strings.Contains(log.String(), lineServing) {
-				t.Errorf("enrolment kept %v, App kept %v: the log: %s", keptEnrolment, keptApp, log.String())
-			}
+			e.apiary.storeTestApp()
+			s = e.settings
+			s.APIURL = gh.srv.URL
+		} else {
+			s, _ = checkSettings(t, gh, nil)
+		}
+		addr, log, _ := runListening(t, s, Options{feedSleep: shortSleep})
+		eventually(t, "the check asked", func() bool { return gh.checks() == 1 })
+		checkPhase(t, addr, "waiting for GitHub to answer the App check",
+			"This adapter is starting. It is waiting for GitHub to answer a check of its GitHub App. Try again in a few minutes. If this message stays, the adapter's log shows GitHub's error.")
+		if strings.Contains(log.String(), lineServing) {
+			t.Errorf("enrolment kept %v: the log: %s", keptEnrolment, log.String())
 		}
 	}
 }
@@ -419,8 +320,7 @@ func TestEachOtherAnswerIsTriedAgain(t *testing.T) {
 		appAnswer{301, `{}`}, appAnswer{403, `{"message":"rate limited"}`}, appAnswer{404, `{"message":"Not Found"}`},
 		appAnswer{429, `{}`}, appAnswer{502, `{}`}, appAnswer{-1, ""},
 	)
-	k := testKeptApp()
-	s := checkSettings(t, gh, &k)
+	s, _ := checkSettings(t, gh, setupApp())
 	// The waits are recorded in order: the check's come before the change feed
 	// reader's, which starts once serve serves.
 	var mu sync.Mutex
@@ -449,7 +349,7 @@ func TestEachOtherAnswerIsTriedAgain(t *testing.T) {
 // GitHub again, with no error.
 func TestAStopWhileTheCheckWaitsStops(t *testing.T) {
 	gh := newAppGitHub(t, appAnswer{503, `{}`}, appAnswer{503, `{}`}, appAnswer{503, `{}`})
-	s := checkSettings(t, gh, nil)
+	s, _ := checkSettings(t, gh, nil)
 	var log syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan struct{})

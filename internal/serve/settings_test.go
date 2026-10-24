@@ -31,32 +31,27 @@ func lookupIn(env map[string]string) func(string) (string, bool) {
 	}
 }
 
-// appKeyPEM is the App's private key in PEM, as the environment gives it.
+// appKeyPEM is the App's private key in PEM, as GitHub's conversion answers it.
 func appKeyPEM() string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(appKey())}))
 }
 
-// envSettings is an environment that gives every setting, the private key and the
-// access key's secret as values, the webhook secret and the client secret as files.
+// envSettings is an environment that gives every setting, the access key's secret as
+// its value.
 func envSettings(access *accesskey.Key) map[string]string {
 	return map[string]string{
-		"QORY_GITHUB_APP_ID":              "123456",
-		"QORY_GITHUB_PRIVATE_KEY":         appKeyPEM(),
-		"QORY_GITHUB_WEBHOOK_SECRET_FILE": "/s",
-		"QORY_GITHUB_LISTEN":              ":8080",
-		"QORY_GITHUB_STATE_DIR":           "/var/lib/qory-github",
-		"QORY_GITHUB_APP_SLUG":            "qory-acme",
-		"QORY_GITHUB_API_URL":             "http://127.0.0.1:9",
-		"QORY_GITHUB_APIARY_URL":          "http://127.0.0.1:4000/",
-		"QORY_GITHUB_APIARY_PUBLIC_URL":   "https://apiary.example.com/",
-		"QORY_GITHUB_PUBLIC_URL":          "https://qory-github.example.com/github",
-		"QORY_GITHUB_ACCESS_KEY_ID":       "ak_0123456789abcdef",
-		"QORY_GITHUB_ACCESS_KEY_SECRET":   access.Secret() + "\n",
-		"QORY_GITHUB_APIARY_PUBLIC_KEY":   pinJSON,
-		"QORY_GITHUB_ADAPTER_ID":          "na_0123456789abcdef",
-		"QORY_GITHUB_CLIENT_ID":           "Iv1.abc",
-		"QORY_GITHUB_CLIENT_SECRET_FILE":  "/c",
-		"QORY_GITHUB_ENROLMENT_CODE_FILE": "/run/enrolment/code",
+		"QORY_GITHUB_LISTEN":               ":8080",
+		"QORY_GITHUB_STATE_DIR":            "/var/lib/qory-github",
+		"QORY_GITHUB_API_URL":              "http://127.0.0.1:9",
+		"QORY_GITHUB_APIARY_URL":           "http://127.0.0.1:4000/",
+		"QORY_GITHUB_APIARY_PUBLIC_URL":    "https://apiary.example.com/",
+		"QORY_GITHUB_PUBLIC_URL":           "https://qory-github.example.com/github",
+		"QORY_GITHUB_ACCESS_KEY_ID":        "ak_0123456789abcdef",
+		"QORY_GITHUB_ACCESS_KEY_SECRET":    access.Secret() + "\n",
+		"QORY_GITHUB_APIARY_PUBLIC_KEY":    pinJSON,
+		"QORY_GITHUB_ADAPTER_ID":           "na_0123456789abcdef",
+		"QORY_GITHUB_ENROLMENT_CODE_FILE":  "/run/enrolment/code",
+		"QORY_GITHUB_UPLOAD_RETRY_SECONDS": "900",
 	}
 }
 
@@ -77,39 +72,41 @@ func changed(env map[string]string, set map[string]string, unset ...string) map[
 }
 
 // TestReadEnvironmentTakesEveryVariable pins that each setting is read from its
-// variable, QORY_GITHUB_ and its name in upper case, the pin as its JSON, and a secret
-// as its value or as the file its _FILE variable names, checked as the file's settings
-// are.
+// variable, QORY_GITHUB_ and its name in upper case, the pin as its JSON, and the
+// access key's secret as its value or as the file its _FILE variable names, checked as
+// the file's settings are. The variables of the App that settings gave before are not
+// read.
 func TestReadEnvironmentTakesEveryVariable(t *testing.T) {
 	access := newKey(t)
 	env := envSettings(access)
 	s, err := ReadEnvironment(lookupIn(env))
-	want := Settings{AppID: "123456", PrivateKey: SecretValue(env["QORY_GITHUB_PRIVATE_KEY"]), WebhookSecretFile: "/s", Listen: ":8080", StateDir: "/var/lib/qory-github",
-		AppSlug: "qory-acme", APIURL: "http://127.0.0.1:9", ApiaryURL: "http://127.0.0.1:4000", ApiaryPublicURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com/github",
+	want := Settings{Listen: ":8080", StateDir: "/var/lib/qory-github",
+		APIURL: "http://127.0.0.1:9", ApiaryURL: "http://127.0.0.1:4000", ApiaryPublicURL: "https://apiary.example.com", PublicURL: "https://qory-github.example.com/github",
 		AccessKeyID: "ak_0123456789abcdef", AccessKeySecret: SecretValue(access.Secret() + "\n"), ApiaryPublicKey: accesskey.Pin{{Alg: "ed25519", PublicKey: "Pjsm5s3nnSkGz0Vag3fbXsTMycY1__2Z0w5jggPsA70"}},
-		AdapterID: "na_0123456789abcdef", ClientID: "Iv1.abc", ClientSecretFile: "/c", EnrolmentCodeFile: "/run/enrolment/code", env: true}
-	if err != nil || !reflect.DeepEqual(s, want) {
+		AdapterID: "na_0123456789abcdef", EnrolmentCodeFile: "/run/enrolment/code", UploadRetrySeconds: 900, env: true}
+	if err != nil || !reflect.DeepEqual(s, want) || s.uploadFor() != 15*time.Minute {
 		t.Fatalf("%+v %v", s, err)
 	}
-	if !s.GivesApp() || !s.GivesEnrolment() {
-		t.Errorf("the groups: App %v, enrolment %v", s.GivesApp(), s.GivesEnrolment())
+	if !s.GivesEnrolment() {
+		t.Error("the enrolment is not given")
 	}
-	// The other way round: the private key and the access key's secret as files, the
-	// webhook secret and the client secret as values. An empty variable counts as one
-	// not set: api_url is GitHub's, apiary_public_url and enrolment_code_file are left
-	// out, and an empty value beside its file is no second value.
+	// The variables of the App are not read.
+	withApp := changed(env, map[string]string{
+		"QORY_GITHUB_APP_ID": "123456", "QORY_GITHUB_APP_SLUG": "qory-acme", "QORY_GITHUB_CLIENT_ID": "Iv1.abc",
+		"QORY_GITHUB_PRIVATE_KEY": appKeyPEM(), "QORY_GITHUB_WEBHOOK_SECRET_FILE": "/s", "QORY_GITHUB_CLIENT_SECRET": clientSecret,
+	})
+	if s, err := ReadEnvironment(lookupIn(withApp)); err != nil || !reflect.DeepEqual(s, want) {
+		t.Errorf("with the App's variables: %+v %v", s, err)
+	}
+	// The other way round: the access key's secret as a file. An empty variable counts
+	// as one not set: api_url is GitHub's, upload_retry_seconds is 600, and
+	// apiary_public_url and enrolment_code_file are left out.
 	other := changed(env, map[string]string{
-		"QORY_GITHUB_PRIVATE_KEY_FILE": "/k.pem", "QORY_GITHUB_PRIVATE_KEY": "", "QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "/a",
-		"QORY_GITHUB_WEBHOOK_SECRET": secret, "QORY_GITHUB_CLIENT_SECRET": clientSecret, "QORY_GITHUB_API_URL": "", "QORY_GITHUB_ENROLMENT_CODE_FILE": "",
-	}, "QORY_GITHUB_ACCESS_KEY_SECRET", "QORY_GITHUB_WEBHOOK_SECRET_FILE", "QORY_GITHUB_CLIENT_SECRET_FILE", "QORY_GITHUB_APIARY_PUBLIC_URL")
+		"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "/a", "QORY_GITHUB_API_URL": "", "QORY_GITHUB_ENROLMENT_CODE_FILE": "", "QORY_GITHUB_UPLOAD_RETRY_SECONDS": "",
+	}, "QORY_GITHUB_ACCESS_KEY_SECRET", "QORY_GITHUB_APIARY_PUBLIC_URL")
 	s, err = ReadEnvironment(lookupIn(other))
-	if err != nil || s.PrivateKeyFile != "/k.pem" || s.PrivateKey != nil || s.AccessKeySecretFile != "/a" || s.AccessKeySecret != nil ||
-		string(s.WebhookSecret) != secret || s.WebhookSecretFile != "" || string(s.ClientSecret) != clientSecret || s.ClientSecretFile != "" ||
-		s.APIURL != github.APIURL || s.ApiaryPublicURL != "" || s.EnrolmentCodeFile != "" {
-		t.Errorf("%+v %v", s, err)
-	}
-	// An App's numeric id is a string in the environment, as its client id is.
-	if s, err := ReadEnvironment(lookupIn(changed(env, map[string]string{"QORY_GITHUB_APP_ID": "Iv1.abc"}))); err != nil || s.AppID != "Iv1.abc" {
+	if err != nil || s.AccessKeySecretFile != "/a" || s.AccessKeySecret != nil || s.APIURL != github.APIURL || s.ApiaryPublicURL != "" || s.EnrolmentCodeFile != "" ||
+		s.UploadRetrySeconds != 0 || s.uploadFor() != 10*time.Minute {
 		t.Errorf("%+v %v", s, err)
 	}
 }
@@ -126,9 +123,10 @@ func TestReadEnvironmentRefusesAWrongVariable(t *testing.T) {
 		unset []string
 		want  string
 	}{
-		"a bad App id":            {set: map[string]string{"QORY_GITHUB_APP_ID": "secret value"}, want: invalid + "QORY_GITHUB_APP_ID: is not an App's id, 1 to 64 letters, digits or dots"},
 		"no port":                 {set: map[string]string{"QORY_GITHUB_LISTEN": "127.0.0.1"}, want: invalid + "QORY_GITHUB_LISTEN: is not an address and a port, host:port"},
-		"a bad slug":              {set: map[string]string{"QORY_GITHUB_APP_SLUG": "secret value"}, want: invalid + "QORY_GITHUB_APP_SLUG: is not an App's slug"},
+		"a short retry":           {set: map[string]string{"QORY_GITHUB_UPLOAD_RETRY_SECONDS": "59"}, want: invalid + "QORY_GITHUB_UPLOAD_RETRY_SECONDS: is not an integer from 60 to 86400"},
+		"a retry of no number":    {set: map[string]string{"QORY_GITHUB_UPLOAD_RETRY_SECONDS": "ten minutes"}, want: invalid + "QORY_GITHUB_UPLOAD_RETRY_SECONDS: is not an integer from 60 to 86400"},
+		"a retry in quotes":       {set: map[string]string{"QORY_GITHUB_UPLOAD_RETRY_SECONDS": `"600"`}, want: invalid + "QORY_GITHUB_UPLOAD_RETRY_SECONDS: is not an integer from 60 to 86400"},
 		"another API":             {set: map[string]string{"QORY_GITHUB_API_URL": "https://secret.example.com"}, want: invalid + "QORY_GITHUB_API_URL: the API is neither"},
 		"Qory Apiary on http":     {set: map[string]string{"QORY_GITHUB_APIARY_URL": "http://secret.example.com"}, want: invalid + "QORY_GITHUB_APIARY_URL: is neither an https origin nor, for a test, http on a loopback host"},
 		"a public Qory Apiary":    {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_URL": "http://localhost:4000"}, want: invalid + "QORY_GITHUB_APIARY_PUBLIC_URL: is not an https origin, a scheme and a host with a port or none"},
@@ -137,25 +135,20 @@ func TestReadEnvironmentRefusesAWrongVariable(t *testing.T) {
 		"a bad key id":            {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_ID": "ak_secret"}, want: invalid + "QORY_GITHUB_ACCESS_KEY_ID: is not ak_"},
 		"a pin of no JSON":        {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_KEY": "secret value"}, want: invalid + `QORY_GITHUB_APIARY_PUBLIC_KEY: is not a list of {"alg": "ed25519"`},
 		"a node's id":             {set: map[string]string{"QORY_GITHUB_ADAPTER_ID": "nd_0123456789abcdef"}, want: invalid + "QORY_GITHUB_ADAPTER_ID: is not na_"},
-		"a bad client id":         {set: map[string]string{"QORY_GITHUB_CLIENT_ID": "secret value"}, want: invalid + "QORY_GITHUB_CLIENT_ID: is not an App's client id"},
-		"a control character":     {set: map[string]string{"QORY_GITHUB_WEBHOOK_SECRET_FILE": "/s\tsecret value"}, want: invalid + "QORY_GITHUB_WEBHOOK_SECRET_FILE: holds a control character, so it is not a file's path"},
-		"a PEM as a path":         {set: map[string]string{"QORY_GITHUB_CLIENT_SECRET_FILE": "-----BEGIN secret value"}, want: invalid + "QORY_GITHUB_CLIENT_SECRET_FILE: holds a PEM block, which belongs in the file it names"},
+		"a control character":     {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "/s\tsecret value"}, unset: []string{"QORY_GITHUB_ACCESS_KEY_SECRET"}, want: invalid + "QORY_GITHUB_ACCESS_KEY_SECRET_FILE: holds a control character, so it is not a file's path"},
+		"a PEM as a path":         {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "-----BEGIN secret value"}, unset: []string{"QORY_GITHUB_ACCESS_KEY_SECRET"}, want: invalid + "QORY_GITHUB_ACCESS_KEY_SECRET_FILE: holds a PEM block, which belongs in the file it names"},
 		"a code file's line":      {set: map[string]string{"QORY_GITHUB_ENROLMENT_CODE_FILE": "/e\nsecret value"}, want: invalid + "QORY_GITHUB_ENROLMENT_CODE_FILE: holds a control character"},
 		"no UTF-8":                {set: map[string]string{"QORY_GITHUB_STATE_DIR": "/d\xffsecret value"}, want: invalid + "QORY_GITHUB_STATE_DIR: is not UTF-8 text"},
-		"a key as both":           {set: map[string]string{"QORY_GITHUB_PRIVATE_KEY_FILE": "/k.pem"}, want: invalid + "both QORY_GITHUB_PRIVATE_KEY and QORY_GITHUB_PRIVATE_KEY_FILE are set; set one of them"},
-		"a webhook secret twice":  {set: map[string]string{"QORY_GITHUB_WEBHOOK_SECRET": "secret value 0123456789"}, want: invalid + "both QORY_GITHUB_WEBHOOK_SECRET and QORY_GITHUB_WEBHOOK_SECRET_FILE are set; set one of them"},
-		"an access secret twice":  {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "/a"}, want: invalid + "both QORY_GITHUB_ACCESS_KEY_SECRET and QORY_GITHUB_ACCESS_KEY_SECRET_FILE are set"},
-		"a client secret twice":   {set: map[string]string{"QORY_GITHUB_CLIENT_SECRET": "secret-value"}, want: invalid + "both QORY_GITHUB_CLIENT_SECRET and QORY_GITHUB_CLIENT_SECRET_FILE are set"},
+		"an access secret twice":  {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "/a"}, want: invalid + "both QORY_GITHUB_ACCESS_KEY_SECRET and QORY_GITHUB_ACCESS_KEY_SECRET_FILE are set; set one of them"},
 		"a missing variable":      {set: map[string]string{"QORY_GITHUB_STATE_DIR": ""}, unset: []string{"QORY_GITHUB_LISTEN"}, want: invalid + "missing variables QORY_GITHUB_LISTEN, QORY_GITHUB_STATE_DIR"},
 		"no public URL":           {unset: []string{"QORY_GITHUB_PUBLIC_URL", "QORY_GITHUB_APIARY_URL"}, want: invalid + "missing variables QORY_GITHUB_APIARY_URL, QORY_GITHUB_PUBLIC_URL"},
-		"half the App":            {unset: []string{"QORY_GITHUB_APP_SLUG", "QORY_GITHUB_PRIVATE_KEY"}, want: invalid + "missing variables QORY_GITHUB_PRIVATE_KEY or QORY_GITHUB_PRIVATE_KEY_FILE, QORY_GITHUB_APP_SLUG"},
 		"half the enrolment":      {unset: []string{"QORY_GITHUB_ACCESS_KEY_SECRET", "QORY_GITHUB_ADAPTER_ID"}, want: invalid + "missing variables QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE, QORY_GITHUB_ADAPTER_ID"},
 		"a secret in a setting":   {set: map[string]string{"QORY_GITHUB_STATE_DIR": "qak_secret value"}, want: "the environment variable QORY_GITHUB_STATE_DIR " + qak},
 		"a secret as its file":    {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "QAK_secret value"}, unset: []string{"QORY_GITHUB_ACCESS_KEY_SECRET"}, want: "the environment variable QORY_GITHUB_ACCESS_KEY_SECRET_FILE " + qak},
 		"a secret in a URL":       {set: map[string]string{"QORY_GITHUB_PUBLIC_URL": "https://qory-github.example.com/qak_secret value"}, want: "the environment variable QORY_GITHUB_PUBLIC_URL " + qak},
 		"an escaped secret":       {set: map[string]string{"QORY_GITHUB_APIARY_PUBLIC_KEY": `["qak_secret value"]`}, want: "the environment variable QORY_GITHUB_APIARY_PUBLIC_KEY " + qak},
 		"a run key":               {set: map[string]string{"QORY_GITHUB_LISTEN": "QRK_secret value"}, want: "the environment variable QORY_GITHUB_LISTEN holds what looks like a run key, qrk_, which belongs nowhere in serve's settings"},
-		"a secret before a twice": {set: map[string]string{"QORY_GITHUB_PRIVATE_KEY_FILE": "qak_secret value"}, want: "the environment variable QORY_GITHUB_PRIVATE_KEY_FILE " + qak},
+		"a secret before a twice": {set: map[string]string{"QORY_GITHUB_ACCESS_KEY_SECRET_FILE": "qak_secret value"}, want: "the environment variable QORY_GITHUB_ACCESS_KEY_SECRET_FILE " + qak},
 	} {
 		_, err := ReadEnvironment(lookupIn(changed(env, tc.set, tc.unset...)))
 		if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
@@ -169,9 +162,8 @@ func TestReadEnvironmentRefusesAWrongVariable(t *testing.T) {
 
 // TestOnlyTheAccessKeySecretMayHoldQak pins that the access key's secret, qak_ and 43
 // characters, is taken in QORY_GITHUB_ACCESS_KEY_SECRET and its file, while every other
-// variable is scanned for one, the private key's, the webhook secret's and the client
-// secret's values among them, and so are those three secrets' files, in either source:
-// each is refused with an error that names the variable or the file and quotes nothing.
+// variable is scanned for one: each is refused with an error that names the variable
+// and quotes nothing.
 func TestOnlyTheAccessKeySecretMayHoldQak(t *testing.T) {
 	access := newKey(t)
 	env := envSettings(access)
@@ -183,7 +175,7 @@ func TestOnlyTheAccessKeySecretMayHoldQak(t *testing.T) {
 	}
 	const inEnv = " holds what looks like an access key secret, qak_, which belongs only where serve keeps its access key: the access key secret setting, or the state directory"
 	const runKey = " holds what looks like a run key, qrk_, which belongs nowhere in serve's settings"
-	for _, name := range []string{"QORY_GITHUB_APP_SLUG", "QORY_GITHUB_ADAPTER_ID", "QORY_GITHUB_API_URL", "QORY_GITHUB_APIARY_PUBLIC_URL", "QORY_GITHUB_ENROLMENT_CODE_FILE", "QORY_GITHUB_CLIENT_SECRET_FILE", "QORY_GITHUB_PRIVATE_KEY", "QORY_GITHUB_WEBHOOK_SECRET", "QORY_GITHUB_CLIENT_SECRET"} {
+	for _, name := range []string{"QORY_GITHUB_ADAPTER_ID", "QORY_GITHUB_API_URL", "QORY_GITHUB_APIARY_PUBLIC_URL", "QORY_GITHUB_ENROLMENT_CODE_FILE", "QORY_GITHUB_PUBLIC_URL"} {
 		for value, want := range map[string]string{
 			access.Secret():                       "the environment variable " + name + inEnv,
 			"a-webhook-secret-" + access.Secret(): "the environment variable " + name + inEnv,
@@ -195,44 +187,7 @@ func TestOnlyTheAccessKeySecretMayHoldQak(t *testing.T) {
 			}
 		}
 	}
-	// Settings made otherwise are checked as each secret is read, the value or the
-	// file, in either source, by the check the bytes of each source go through.
 	dir := t.TempDir()
-	read := func(c secretSource, field string) error {
-		var err error
-		switch field {
-		case "private_key_file":
-			_, err = c.key()
-		case "webhook_secret_file":
-			_, err = c.webhookSecret()
-		case "client_secret_file":
-			_, err = c.clientSecret()
-		}
-		return err
-	}
-	for _, field := range []string{"private_key_file", "webhook_secret_file", "client_secret_file"} {
-		file := filepath.Join(dir, field)
-		writeFile(t, file, "a-pasted-"+access.Secret()+"\n", 0o600)
-		for _, tc := range []struct {
-			s    Settings
-			want string
-		}{
-			{Settings{PrivateKeyFile: file, WebhookSecretFile: file, ClientSecretFile: file}, "the file " + field + " names holds what looks like an access key secret, qak_, which belongs only where serve keeps its access key: the access key secret setting, or the state directory"},
-			{Settings{env: true, PrivateKeyFile: file, WebhookSecretFile: file, ClientSecretFile: file}, "the file " + envName(field) + " names" + inEnv},
-			{Settings{env: true, PrivateKey: SecretValue(access.Secret()), WebhookSecret: SecretValue(access.Secret()), ClientSecret: SecretValue(access.Secret())}, valueName(field) + inEnv},
-		} {
-			if err := read(tc.s.secretOf(field), field); err == nil || err.Error() != tc.want || strings.Contains(err.Error(), access.Secret()) || strings.Contains(err.Error(), dir) {
-				t.Errorf("%s: err %v, want %q", field, err, tc.want)
-			}
-		}
-		writeFile(t, file, "qrk_-a-pasted-run-key\n", 0o600)
-		if err := read(fileSecret(field, file), field); err == nil || err.Error() != "the file "+field+" names"+runKey {
-			t.Errorf("%s: a run key: %v", field, err)
-		}
-	}
-	if _, err := ReadWebhookSecret(filepath.Join(dir, "webhook_secret_file")); err == nil || !strings.Contains(err.Error(), "run key") {
-		t.Errorf("ReadWebhookSecret: %v", err)
-	}
 	// The access key's secret file is the one place a qak_ belongs.
 	keyFile := filepath.Join(dir, "access-key")
 	writeFile(t, keyFile, access.Secret()+"\n", 0o600)
@@ -248,33 +203,27 @@ func TestOnlyTheAccessKeySecretMayHoldQak(t *testing.T) {
 // text, or logged with slog's JSON and text handlers, show [secret] and no secret.
 func TestASecretValueIsNeverPrinted(t *testing.T) {
 	access := newKey(t)
-	env := changed(envSettings(access), map[string]string{"QORY_GITHUB_WEBHOOK_SECRET": secret, "QORY_GITHUB_CLIENT_SECRET": clientSecret}, "QORY_GITHUB_WEBHOOK_SECRET_FILE", "QORY_GITHUB_CLIENT_SECRET_FILE")
-	s, err := ReadEnvironment(lookupIn(env))
+	s, err := ReadEnvironment(lookupIn(envSettings(access)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	verbs := []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "% x", "%#x", "%d", "%o", "%O", "%b", "%c", "%U", "%e", "%f", "%g", "%t", "%10s", "%-12v", "%08d"}
 	for _, verb := range verbs {
-		for _, v := range []SecretValue{s.WebhookSecret, s.ClientSecret, s.AccessKeySecret, s.PrivateKey} {
-			if got := fmt.Sprintf(verb, v); got != "[secret]" {
-				t.Errorf("%s prints a secret value as %q", verb, got)
-			}
+		if got := fmt.Sprintf(verb, s.AccessKeySecret); got != "[secret]" {
+			t.Errorf("%s prints a secret value as %q", verb, got)
 		}
 		if got := fmt.Sprintf(verb, SecretValue(nil)); got != "" {
 			t.Errorf("%s prints an empty value as %q", verb, got)
 		}
 	}
-	if got := fmt.Sprint(s.WebhookSecret) + fmt.Sprintln(s.WebhookSecret) + s.WebhookSecret.String() + s.WebhookSecret.GoString(); got != "[secret][secret]\n[secret][secret]" {
+	if got := fmt.Sprint(s.AccessKeySecret) + fmt.Sprintln(s.AccessKeySecret) + s.AccessKeySecret.String() + s.AccessKeySecret.GoString(); got != "[secret][secret]\n[secret][secret]" {
 		t.Errorf("a secret value prints as %q", got)
 	}
 	// The forms a secret's bytes print in without [SecretValue.Format], which settings
 	// printed whole must hold none of.
-	var forbidden []string
-	for _, value := range []string{secret, clientSecret, string(s.AccessKeySecret), string(s.PrivateKey)} {
-		b := []byte(value)
-		forbidden = append(forbidden, value, fmt.Sprint(b), fmt.Sprintf("%#v", b), fmt.Sprintf("%o", b), fmt.Sprintf("%b", b), fmt.Sprintf("%c", b),
-			fmt.Sprintf("%x", b), fmt.Sprintf("%X", b), fmt.Sprintf("% x", b), fmt.Sprintf("%q", b), base64.StdEncoding.EncodeToString(b))
-	}
+	b := []byte(s.AccessKeySecret)
+	forbidden := []string{string(b), fmt.Sprint(b), fmt.Sprintf("%#v", b), fmt.Sprintf("%o", b), fmt.Sprintf("%b", b), fmt.Sprintf("%c", b),
+		fmt.Sprintf("%x", b), fmt.Sprintf("%X", b), fmt.Sprintf("% x", b), fmt.Sprintf("%q", b), base64.StdEncoding.EncodeToString(b)}
 	var out strings.Builder
 	for _, verb := range append(verbs, "%T") {
 		fmt.Fprintf(&out, verb+" ", s)
@@ -282,126 +231,65 @@ func TestASecretValueIsNeverPrinted(t *testing.T) {
 	}
 	fmt.Fprint(&out, s, &s)
 	fmt.Fprintln(&out, s, &s)
-	fmt.Fprint(&out, s.ClientSecret.String(), s.AccessKeySecret.GoString())
+	fmt.Fprint(&out, s.AccessKeySecret.String(), s.AccessKeySecret.GoString())
 	settingsJSON, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	valueJSON, _ := json.Marshal(s.WebhookSecret)
-	text, _ := s.ClientSecret.MarshalText()
+	valueJSON, _ := json.Marshal(s.AccessKeySecret)
+	text, _ := s.AccessKeySecret.MarshalText()
 	out.Write(settingsJSON)
 	out.Write(valueJSON)
 	out.Write(text)
 	for _, h := range []slog.Handler{slog.NewJSONHandler(&out, nil), slog.NewTextHandler(&out, nil)} {
-		slog.New(h).Info("settings", slog.Any("settings", s), slog.Any("secret", s.WebhookSecret), "client", s.ClientSecret, "key", s.PrivateKey)
+		slog.New(h).Info("settings", slog.Any("settings", s), slog.Any("secret", s.AccessKeySecret), "key", s.AccessKeySecret)
 	}
-	for _, value := range append(forbidden, access.Secret(), "PRIVATE KEY") {
+	for _, value := range append(forbidden, access.Secret()) {
 		if strings.Contains(out.String(), value) {
 			t.Errorf("the settings show %q: %s", value, out.String())
 		}
 	}
-	if string(valueJSON) != `"[secret]"` || string(text) != "[secret]" || !strings.Contains(string(settingsJSON), `"WebhookSecret":"[secret]"`) ||
+	if string(valueJSON) != `"[secret]"` || string(text) != "[secret]" || !strings.Contains(string(settingsJSON), `"AccessKeySecret":"[secret]"`) ||
 		!strings.Contains(out.String(), `"secret":"[secret]"`) || !strings.Contains(out.String(), "secret=[secret]") {
 		t.Errorf("%s", out.String())
 	}
 	empty, _ := json.Marshal(SecretValue(nil))
 	emptyText, _ := SecretValue(nil).MarshalText()
-	if SecretValue(nil).String() != "" || string(empty) != `""` || len(emptyText) != 0 || SecretValue(nil).LogValue().String() != "" || s.WebhookSecret.LogValue().String() != "[secret]" {
+	if SecretValue(nil).String() != "" || string(empty) != `""` || len(emptyText) != 0 || SecretValue(nil).LogValue().String() != "" || s.AccessKeySecret.LogValue().String() != "[secret]" {
 		t.Errorf("an empty value: %s %q", empty, emptyText)
 	}
 }
 
-// TestASecretValueIsCheckedAsItsFileIs pins that a secret the environment gives as its
-// value is checked as its file is, with errors that name the variable, and that a
-// file a _FILE variable names is read with errors that name that variable.
+// TestASecretValueIsCheckedAsItsFileIs pins that the access key's secret the
+// environment gives as its value is checked as its file is, with errors that name the
+// variable, and that a file its _FILE variable names is read with errors that name
+// that variable.
 func TestASecretValueIsCheckedAsItsFileIs(t *testing.T) {
-	env := Settings{env: true}
-	value := func(field, v string) secretSource {
-		s := env
-		switch field {
-		case "private_key_file":
-			s.PrivateKey = SecretValue(v)
-		case "webhook_secret_file":
-			s.WebhookSecret = SecretValue(v)
-		case "access_key_secret_file":
-			s.AccessKeySecret = SecretValue(v)
-		case "client_secret_file":
-			s.ClientSecret = SecretValue(v)
-		}
-		return s.secretOf(field)
-	}
-	if b, err := value("webhook_secret_file", secret+"\r\n").webhookSecret(); err != nil || string(b) != secret {
-		t.Errorf("%q %v", b, err)
-	}
-	for _, short := range []string{"\n", "fifteen-bytes!!\n", "fifteen-bytes!!"} {
-		if _, err := value("webhook_secret_file", short).webhookSecret(); err == nil || err.Error() != "the webhook secret in QORY_GITHUB_WEBHOOK_SECRET is shorter than 16 bytes; set a longer random secret on the App and in QORY_GITHUB_WEBHOOK_SECRET" {
-			t.Errorf("%q: err %v", short, err)
-		}
-	}
-	if _, err := value("webhook_secret_file", strings.Repeat("a", maxSecretFile+1)).webhookSecret(); err == nil || err.Error() != "QORY_GITHUB_WEBHOOK_SECRET is larger than a webhook secret" {
-		t.Errorf("a large secret: %v", err)
-	}
-	if b, err := value("client_secret_file", clientSecret+"\n").clientSecret(); err != nil || string(b) != clientSecret {
-		t.Errorf("%q %v", b, err)
-	}
-	if _, err := value("client_secret_file", "two words").clientSecret(); err == nil || err.Error() != "QORY_GITHUB_CLIENT_SECRET holds no client secret, or one with white space or a control character in it" {
-		t.Errorf("err %v", err)
+	value := func(v string) secretSource {
+		return Settings{env: true, AccessKeySecret: SecretValue(v)}.secretOf("access_key_secret_file")
 	}
 	access := newKey(t)
-	if k, err := value("access_key_secret_file", access.Secret()+"\n").accessKey(); err != nil || k.PublicKey().String() != access.PublicKey().String() {
+	if k, err := value(access.Secret() + "\n").accessKey(); err != nil || k.PublicKey().String() != access.PublicKey().String() {
 		t.Errorf("%v %v", k, err)
 	}
-	if _, err := value("access_key_secret_file", "not-a-secret-value").accessKey(); err == nil || err.Error() != "QORY_GITHUB_ACCESS_KEY_SECRET: an access key secret starts with qak_" {
+	if _, err := value("not-a-secret-value").accessKey(); err == nil || err.Error() != "QORY_GITHUB_ACCESS_KEY_SECRET: an access key secret starts with qak_" {
 		t.Errorf("err %v", err)
 	}
-	if _, err := value("access_key_secret_file", "qak_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA").accessKey(); err == nil || err.Error() != "QORY_GITHUB_ACCESS_KEY_SECRET holds a published fixture key, whose secret anyone can read" {
+	if _, err := value("qak_AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA").accessKey(); err == nil || err.Error() != "QORY_GITHUB_ACCESS_KEY_SECRET holds a published fixture key, whose secret anyone can read" {
 		t.Errorf("a fixture key: %v", err)
 	}
-	if k, err := value("private_key_file", appKeyPEM()).key(); err != nil || !k.Equal(appKey()) {
-		t.Errorf("the key: %v", err)
-	}
-	if _, err := value("private_key_file", "secret value").key(); err == nil || err.Error() != "the private key is not PEM" {
-		t.Errorf("err %v", err)
-	}
-	if _, err := value("private_key_file", strings.Repeat("a", github.MaxKeyFile+1)).key(); err == nil || err.Error() != "QORY_GITHUB_PRIVATE_KEY is larger than a key" {
-		t.Errorf("a large key: %v", err)
-	}
-	// A file a _FILE variable names is read with its checks, and an error names the
+	// A file the _FILE variable names is read with its checks, and an error names the
 	// variable, never the path.
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "none")
-	for field, want := range map[string]string{
-		"private_key_file":       "the file QORY_GITHUB_PRIVATE_KEY_FILE names: no such file or directory",
-		"webhook_secret_file":    "the file QORY_GITHUB_WEBHOOK_SECRET_FILE names: no such file or directory",
-		"access_key_secret_file": "the file QORY_GITHUB_ACCESS_KEY_SECRET_FILE names: no such file or directory",
-		"client_secret_file":     "the file QORY_GITHUB_CLIENT_SECRET_FILE names: no such file or directory",
-	} {
-		s := Settings{env: true, PrivateKeyFile: missing, WebhookSecretFile: missing, AccessKeySecretFile: missing, ClientSecretFile: missing}
-		c := s.secretOf(field)
-		var err error
-		switch field {
-		case "private_key_file":
-			_, err = c.key()
-		case "webhook_secret_file":
-			_, err = c.webhookSecret()
-		case "access_key_secret_file":
-			_, err = c.accessKey()
-		case "client_secret_file":
-			_, err = c.clientSecret()
-		}
-		if err == nil || err.Error() != want {
-			t.Errorf("%s: err %v, want %q", field, err, want)
-		}
+	if _, err := (Settings{env: true, AccessKeySecretFile: missing}).secretOf("access_key_secret_file").accessKey(); err == nil ||
+		err.Error() != "the file QORY_GITHUB_ACCESS_KEY_SECRET_FILE names: no such file or directory" {
+		t.Errorf("err %v", err)
 	}
 	loose := filepath.Join(dir, "loose")
-	writeFile(t, loose, secret, 0o644)
-	if _, err := (Settings{env: true, WebhookSecretFile: loose}).secretOf("webhook_secret_file").webhookSecret(); err == nil || !strings.HasPrefix(err.Error(), "the file QORY_GITHUB_WEBHOOK_SECRET_FILE names is -rw-r--r--: group or others have permissions on it") {
+	writeFile(t, loose, access.Secret(), 0o644)
+	if _, err := (Settings{env: true, AccessKeySecretFile: loose}).secretOf("access_key_secret_file").accessKey(); err == nil || !strings.HasPrefix(err.Error(), "the file QORY_GITHUB_ACCESS_KEY_SECRET_FILE names is -rw-r--r--: group or others have permissions on it") {
 		t.Errorf("a loose file: %v", err)
-	}
-	small := filepath.Join(dir, "small")
-	writeFile(t, small, "fifteen-bytes!!\n", 0o600)
-	if _, err := (Settings{env: true, WebhookSecretFile: small}).secretOf("webhook_secret_file").webhookSecret(); err == nil || err.Error() != "the webhook secret in the file QORY_GITHUB_WEBHOOK_SECRET_FILE names is shorter than 16 bytes; set a longer random secret on the App and in the file" {
-		t.Errorf("a short file: %v", err)
 	}
 }
 
@@ -409,10 +297,10 @@ func TestASecretValueIsCheckedAsItsFileIs(t *testing.T) {
 // enrolment_code_file in the settings file, and that a group left out whole is read
 // while part of one is refused, naming the fields it lacks.
 func TestTheFileTakesTheNewFieldsAndAGroupLeftOut(t *testing.T) {
-	base := map[string]any{"app_id": "Iv1.abc", "private_key_file": "/k.pem", "webhook_secret_file": "/s", "listen": ":8080", "state_dir": "/d",
-		"app_slug": "qory-acme", "apiary_url": "http://localhost:8443", "apiary_public_url": "https://Apiary.example.com:8443/", "public_url": "https://qory-github.example.com",
+	base := map[string]any{"listen": ":8080", "state_dir": "/d",
+		"apiary_url": "http://localhost:8443", "apiary_public_url": "https://Apiary.example.com:8443/", "public_url": "https://qory-github.example.com",
 		"access_key_id": "ak_0123456789abcdef", "access_key_secret_file": "/a", "apiary_public_key": json.RawMessage(pinJSON),
-		"adapter_id": "na_0123456789abcdef", "client_id": "Iv1.abc", "client_secret_file": "/c", "enrolment_code_file": "/run/enrolment/code"}
+		"adapter_id": "na_0123456789abcdef", "enrolment_code_file": "/run/enrolment/code"}
 	read := func(change map[string]any, drop ...string) (Settings, error) {
 		doc := map[string]any{}
 		for k, v := range base {
@@ -427,7 +315,7 @@ func TestTheFileTakesTheNewFieldsAndAGroupLeftOut(t *testing.T) {
 		b, _ := json.Marshal(doc)
 		return parseSettings(b)
 	}
-	if s, err := read(nil); err != nil || s.ApiaryPublicURL != "https://Apiary.example.com:8443" || s.EnrolmentCodeFile != "/run/enrolment/code" || s.env || !s.GivesApp() || !s.GivesEnrolment() {
+	if s, err := read(nil); err != nil || s.ApiaryPublicURL != "https://Apiary.example.com:8443" || s.EnrolmentCodeFile != "/run/enrolment/code" || s.env || !s.GivesEnrolment() {
 		t.Errorf("%+v %v", s, err)
 	}
 	for value, want := range map[string]string{
@@ -459,44 +347,39 @@ func TestTheFileTakesTheNewFieldsAndAGroupLeftOut(t *testing.T) {
 	if s, err := read(nil, "apiary_public_url", "enrolment_code_file"); err != nil || s.ApiaryPublicURL != "" || s.EnrolmentCodeFile != "" {
 		t.Errorf("%+v %v", s, err)
 	}
-	app := []string{"app_id", "app_slug", "client_id", "private_key_file", "webhook_secret_file", "client_secret_file"}
 	enrolment := []string{"access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id"}
-	if s, err := read(nil, app...); err != nil || s.GivesApp() || !s.GivesEnrolment() {
-		t.Errorf("no App: %+v %v", s, err)
-	}
-	if s, err := read(nil, enrolment...); err != nil || !s.GivesApp() || s.GivesEnrolment() {
+	if s, err := read(nil, enrolment...); err != nil || s.GivesEnrolment() {
 		t.Errorf("no enrolment: %+v %v", s, err)
 	}
-	if _, err := read(nil, "client_secret_file", "apiary_public_key", "state_dir"); err == nil || err.Error() != "the settings are invalid: missing fields state_dir, apiary_public_key, client_secret_file" {
+	if _, err := read(nil, "apiary_public_key", "state_dir"); err == nil || err.Error() != "the settings are invalid: missing fields state_dir, apiary_public_key" {
 		t.Errorf("err %v", err)
 	}
 }
 
 // TestRunRefusesSettingsWithoutAGroup pins that Run refuses settings that give no
 // enrolment when the state directory holds none and no code file is set, or part of
-// the App or of the enrolment, naming what they lack in the source's words, before it
-// reads a secret or makes the state directory. Settings that give no App are taken,
-// see [TestRunWithoutAnAppServesTheSetup].
+// the enrolment, naming what they lack in the source's words, before it reads a secret
+// or makes the state directory.
 func TestRunRefusesSettingsWithoutAGroup(t *testing.T) {
 	dir := t.TempDir()
 	full := settingsFiles(t, dir, newKey(t), "https://apiary.example.com", pinOf(newKey(t)))
 	noEnrolment := full
 	noEnrolment.AccessKeyID, noEnrolment.AccessKeySecretFile, noEnrolment.ApiaryPublicKey, noEnrolment.AdapterID = "", "", nil, ""
 	half := full
-	half.AppSlug, half.AdapterID = "", ""
+	half.AdapterID = ""
 	envNoEnrolment := noEnrolment
 	envNoEnrolment.env, envNoEnrolment.AccessKeySecret = true, SecretValue("x")
 	envHalf := half
-	envHalf.env, envHalf.PrivateKeyFile = true, ""
+	envHalf.env = true
 	for name, tc := range map[string]struct {
 		s    Settings
 		want string
 	}{
 		"no enrolment":                 {noEnrolment, "the settings give no enrolment in Qory Apiary, the state directory holds none, and enrolment_code_file is not set: give access_key_id, access_key_secret_file, apiary_public_key, adapter_id, or set enrolment_code_file for serve to enrol at its first start"},
-		"half of each":                 {half, "the settings are invalid: missing fields app_slug, adapter_id"},
+		"half the enrolment":           {half, "the settings are invalid: missing fields adapter_id"},
 		"half the enrolment, env":      {envNoEnrolment, "the settings in the environment are invalid: missing variables QORY_GITHUB_ACCESS_KEY_ID, QORY_GITHUB_APIARY_PUBLIC_KEY, QORY_GITHUB_ADAPTER_ID"},
-		"half of each, environment":    {envHalf, "the settings in the environment are invalid: missing variables QORY_GITHUB_PRIVATE_KEY or QORY_GITHUB_PRIVATE_KEY_FILE, QORY_GITHUB_APP_SLUG, QORY_GITHUB_ADAPTER_ID"},
-		"no enrolment, in environment": {Settings{env: true, AppID: "1", AppSlug: testSlug, ClientID: testClientID, PrivateKey: SecretValue("k"), WebhookSecret: SecretValue("w"), ClientSecret: SecretValue("c"), StateDir: full.StateDir}, "the settings in the environment give no enrolment in Qory Apiary, the state directory holds none, and QORY_GITHUB_ENROLMENT_CODE_FILE is not set: give QORY_GITHUB_ACCESS_KEY_ID, QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE, QORY_GITHUB_APIARY_PUBLIC_KEY, QORY_GITHUB_ADAPTER_ID, or set QORY_GITHUB_ENROLMENT_CODE_FILE for serve to enrol at its first start"},
+		"half, in the environment":     {envHalf, "the settings in the environment are invalid: missing variables QORY_GITHUB_ADAPTER_ID"},
+		"no enrolment, in environment": {Settings{env: true, StateDir: full.StateDir}, "the settings in the environment give no enrolment in Qory Apiary, the state directory holds none, and QORY_GITHUB_ENROLMENT_CODE_FILE is not set: give QORY_GITHUB_ACCESS_KEY_ID, QORY_GITHUB_ACCESS_KEY_SECRET or QORY_GITHUB_ACCESS_KEY_SECRET_FILE, QORY_GITHUB_APIARY_PUBLIC_KEY, QORY_GITHUB_ADAPTER_ID, or set QORY_GITHUB_ENROLMENT_CODE_FILE for serve to enrol at its first start"},
 	} {
 		listened := false
 		err := Run(context.Background(), tc.s, Options{ProgramVersion: testVersion, Listening: func(net.Addr) { listened = true }})
@@ -510,18 +393,17 @@ func TestRunRefusesSettingsWithoutAGroup(t *testing.T) {
 }
 
 // TestRunTakesSecretsAsValuesAndSendsTheBrowserToTheApiaryPublicURL runs serve with
-// settings from the environment, every secret a value, Qory Apiary's origin on
-// loopback and its public origin apart: a delivery signed with the webhook secret
-// value is taken, and a connect return sends the browser to apiary_public_url, not to
-// apiary_url; with apiary_public_url left out, it goes to apiary_url.
+// settings from the environment, the access key's secret a value, Qory Apiary's origin
+// on loopback and its public origin apart: a delivery signed with the webhook secret
+// of the App Qory Apiary stores is taken, and a connect return sends the browser to
+// apiary_public_url, not to apiary_url; with apiary_public_url left out, it goes to
+// apiary_url.
 func TestRunTakesSecretsAsValuesAndSendsTheBrowserToTheApiaryPublicURL(t *testing.T) {
 	for _, public := range []string{"https://apiary.example.com", ""} {
 		dir := t.TempDir()
 		access := newKey(t)
 		apiary := newFakeApiary(t, access)
 		env := map[string]string{
-			"QORY_GITHUB_APP_ID": "1", "QORY_GITHUB_APP_SLUG": testSlug, "QORY_GITHUB_CLIENT_ID": testClientID,
-			"QORY_GITHUB_PRIVATE_KEY": appKeyPEM(), "QORY_GITHUB_WEBHOOK_SECRET": secret + "\n", "QORY_GITHUB_CLIENT_SECRET": clientSecret,
 			"QORY_GITHUB_LISTEN": "127.0.0.1:0", "QORY_GITHUB_STATE_DIR": filepath.Join(dir, "state"),
 			"QORY_GITHUB_APIARY_URL": apiary.srv.URL, "QORY_GITHUB_APIARY_PUBLIC_URL": public, "QORY_GITHUB_PUBLIC_URL": "https://qory-github.example.com",
 			"QORY_GITHUB_ACCESS_KEY_ID": testKeyID, "QORY_GITHUB_ACCESS_KEY_SECRET": access.Secret(), "QORY_GITHUB_ADAPTER_ID": testAdapterID,
@@ -600,8 +482,7 @@ func TestRunTakesSecretsAsValuesAndSendsTheBrowserToTheApiaryPublicURL(t *testin
 
 // TestPublicAddressIsTrueOrFalse pins public_address: a JSON boolean in the file, true
 // or false in the environment, left out for true, anything else refused with an error
-// that names the field or its variable and quotes nothing; and that the settings may
-// give no App.
+// that names the field or its variable and quotes nothing.
 func TestPublicAddressIsTrueOrFalse(t *testing.T) {
 	base := map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": "https://qory-github.example.com"}
 	read := func(v any) (Settings, error) {
@@ -613,7 +494,7 @@ func TestPublicAddressIsTrueOrFalse(t *testing.T) {
 		return parseSettings(b)
 	}
 	for _, v := range []bool{true, false} {
-		if s, err := read(v); err != nil || s.PublicAddress == nil || *s.PublicAddress != v || s.publicAddress() != v || s.GivesApp() {
+		if s, err := read(v); err != nil || s.PublicAddress == nil || *s.PublicAddress != v || s.publicAddress() != v {
 			t.Errorf("%v: %+v %v", v, s, err)
 		}
 	}

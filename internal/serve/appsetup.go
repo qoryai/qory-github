@@ -26,8 +26,8 @@ import (
 )
 
 // appSetup is serve's App setup: how an instance admin creates the GitHub App serve
-// runs with, when the settings give none and the state directory keeps none. serve
-// declares setup_url, <public_url>/setup, to Qory Apiary while no App is kept; an
+// runs with, when Qory Apiary stores none. serve declares setup_url,
+// <public_url>/setup, to Qory Apiary while no App is set up; an
 // instance admin presses Set up on the adapter's page there, and Qory Apiary sends
 // the browser to setup_url with a setup pass it signed. Then:
 //
@@ -56,12 +56,19 @@ import (
 //     the script does not run.
 //  4. GET /setup/created?code=...&state=..., GitHub's redirect once the admin pressed
 //     Create on GitHub, needs the session's cookie and state, and that the session is
-//     still the flow pointer's. Under the lock, it checks again that no App is kept and
-//     that the session is still the flow's, then exchanges the code for the App with
-//     GitHub, [github.Client.ConvertManifest]: the App is GitHub's answer, never what
-//     the browser sends but the code. It sets a webhook secret on the App when GitHub
-//     made none, keeps the App in the state directory, see [keepApp], and marks it
-//     kept, still under the lock, so of two flows one alone is set up.
+//     still the flow pointer's. Under the lock, it checks again that no App is set up
+//     or being stored, and that the session is still the flow's, then exchanges the
+//     code for the App with GitHub, [github.Client.ConvertManifest]: the App is
+//     GitHub's answer, never what the browser sends but the code. It sets a webhook
+//     secret on the App when GitHub made none, and stores the App in Qory Apiary, see
+//     [runner.upload], still under the lock, so of two flows one alone is set up. The
+//     App is kept in memory alone: nothing of it is written to disk.
+//  5. GitHub issues the App's private key once, at the exchange. When the upload
+//     fails, the setup keeps the App in memory and tries again for upload_retry_seconds,
+//     see [appSetup.retry], and the browser is sent to GET /setup/status, which shows
+//     that it tries again and reloads itself until the upload ends: with the page that
+//     says the App is set up, or, once every try failed, the page that says to delete
+//     the App on GitHub. While the setup tries again, every setup pass is refused.
 //
 // The session's cookie, __Secure-qory_github_setup, is for <public_url>/setup alone,
 // HttpOnly, Secure and SameSite=Lax, for 900 seconds at most; it holds a random id, and
@@ -70,8 +77,8 @@ import (
 // did not set is never logged, kept or sent on. Every redirect's target is built from
 // the settings and the session, and a page says nothing the request carries.
 //
-// Once an App is kept, or when the settings give one, every setup pass is refused with
-// a page that says the App is set up already.
+// Once an App is set up, every setup pass is refused with a page that says the App is
+// set up already.
 type appSetup struct {
 	// Store keeps the nonces, the sessions and the flow pointer.
 	Store *store.Store
@@ -82,8 +89,10 @@ type appSetup struct {
 	// page that ends a setup links back to.
 	PublicURL       string
 	ApiaryPublicURL string
-	// StateDir is the state directory, where the App is kept.
-	StateDir string
+	// Upload stores an App in Qory Apiary, see [runner.upload], and UploadFor is how
+	// long the setup tries again when an upload fails, upload_retry_seconds.
+	Upload    func(context.Context, *app) error
+	UploadFor time.Duration
 	// Active is public_address: whether the App's webhook is created active.
 	Active bool
 	// Log takes the setup's lines, and its refusals, once a second at most.
@@ -91,8 +100,13 @@ type appSetup struct {
 	// creds are the pin and the adapter's id a setup pass is checked under, read once
 	// for each pass, so a re-enrolment applies at once.
 	creds *credentials
-	// setUp is called once, with the App kept, under the lock, when a setup keeps one.
+	// setUp is called once, with the App stored, under the lock, when a setup stores
+	// one in Qory Apiary.
 	setUp func(*app)
+	// ctx is Run's, done when serve stops, which ends the tries of an upload; wait, when
+	// set, replaces the waits between them.
+	ctx  context.Context
+	wait func(context.Context, time.Duration) error
 
 	// now is the clock; nil is time.Now. refusalEvery replaces [refusalEvery] in a
 	// test, and waits, when set, is called as a step starts to wait for the lock.
@@ -108,11 +122,48 @@ type appSetup struct {
 	route, base string
 	refusals    *throttle
 	// lock holds one token: the step that holds it starts a session and moves the flow
-	// pointer, or keeps the App, one step, see [appSetup.take]. kept is whether an App
-	// is kept, or the settings give one, set only while the token is held.
+	// pointer, or stores the App, one step, see [appSetup.take]. kept is whether an App
+	// is set up, set only while the token is held.
 	lock chan struct{}
 	kept atomic.Bool
+	// mu guards pending, the App whose upload is tried again, or was, nil when none is;
+	// tries counts the goroutines of [appSetup.retry], which the stop waits for.
+	mu      sync.Mutex
+	pending *pendingUpload
+	tries   sync.WaitGroup
 }
+
+// pendingUpload is an App GitHub created whose first upload to Qory Apiary failed: the
+// App, whether it is public, until when the setup tries again, the store's key of the
+// session that set it up, and how its tries ended.
+type pendingUpload struct {
+	app     *app
+	public  bool
+	until   time.Time
+	session string
+	state   uploadState
+}
+
+// uploadState is where the tries of a [pendingUpload] are: under way, stored, or
+// failed, every try failed or serve stopped first.
+type uploadState int
+
+const (
+	uploadTrying uploadState = iota
+	uploadStored
+	uploadFailed
+)
+
+// The bounds of an upload of the App: the first, made while GitHub's redirect waits,
+// is answered within firstUploadBound; then the tries again wait from
+// uploadFirstWait, doubling, to uploadMaxWait between them; the status page reloads
+// itself every statusEvery seconds while they go on.
+const (
+	firstUploadBound = 15 * time.Second
+	uploadFirstWait  = 2 * time.Second
+	uploadMaxWait    = 30 * time.Second
+	statusEvery      = 10
+)
 
 // setupPath is the App setup's path under the public URL, which serve declares as
 // setup_url.
@@ -154,6 +205,9 @@ type setupSession struct {
 	Kind    string `json:"kind,omitempty"`
 	Public  bool   `json:"public,omitempty"`
 	State   string `json:"state,omitempty"`
+	// Uploading is whether the setup tries again to store the session's App in Qory
+	// Apiary, see [appSetup.retry].
+	Uploading bool `json:"uploading,omitempty"`
 }
 
 // The App setup's pages, each with its status, the one sentence the browser shows,
@@ -174,25 +228,32 @@ var (
 	setupRefuseForm      = refusal{status: http.StatusBadRequest, page: setupRefuseNoSession.page, why: "form"}
 	setupRefuseState     = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "state", endSession: true}
 	setupRefuseSetUp     = refusal{status: http.StatusConflict, page: "This adapter's GitHub App is set up already.", why: "set_up", name: "set-up", endSession: true}
+	setupRefusePending   = refusal{status: http.StatusConflict, page: "Wait until the earlier setup ends, then press Set up in Qory Apiary again if this adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.", why: "pending", name: "pending"}
 )
 
 // setupPages are the pages [setupPageCookie] names, by name.
 var setupPages = map[string]*refusal{
 	"invalid": &setupRefusePass, "adapter": &setupRefuseAdapter, "expired": &setupRefuseExpired,
-	"used": &setupRefuseUsed, "failed": &setupRefuseFailed, "set-up": &setupRefuseSetUp,
+	"used": &setupRefuseUsed, "failed": &setupRefuseFailed, "set-up": &setupRefuseSetUp, "pending": &setupRefusePending,
 }
 
-// The pages that end a setup with an App on GitHub that serve does not keep: a newer
+// The pages that end a setup with an App on GitHub that serve does not use: a newer
 // setup replaced the session's, which links to the account's Apps on GitHub; the App
-// GitHub created could not be kept, which links to its settings page; or the code's
+// GitHub created could not be used, which links to its settings page; or the code's
 // exchange failed, and GitHub may have created an App, which links to the account's
-// Apps.
+// Apps. pageNotStored ends a setup whose every upload of the App failed, see
+// [appSetup.status].
 const (
 	pageReplaced     = "A newer setup replaced this one. If you created an App on GitHub for it, delete it at "
 	pageNotKeptStart = "GitHub created the App "
-	pageNotKeptMid   = ", and this server could not keep it. Delete it at "
+	pageNotKeptMid   = ", and this server could not use it. Delete it at "
 	pageNotKeptEnd   = ", then press Set up in Qory Apiary again."
 	pageMayHave      = "GitHub may have created an App; delete it at "
+	// pageNotStored is followed by the App's slug, pageNotStoredAt, its settings page,
+	// pageNotStoredEnd, and when the tries ended.
+	pageNotStored    = "Delete the GitHub App "
+	pageNotStoredAt  = " at "
+	pageNotStoredEnd = ", then press Set up in Qory Apiary again. This server could not store the App in Qory Apiary by "
 )
 
 func (a *appSetup) init() {
@@ -245,6 +306,8 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		step = a.created
 	case a.route + "/refused":
 		step = a.showPage
+	case a.route + "/status":
+		step = a.status
 	default:
 		http.NotFound(w, r)
 		return
@@ -284,6 +347,10 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		a.refuse(w, r, setupRefuseSetUp, "")
 		return
 	}
+	if a.trying() {
+		a.refuse(w, r, setupRefusePending, "")
+		return
+	}
 	pass, ok := one(q, "state")
 	if !ok {
 		a.refuse(w, r, setupRefusePass, "")
@@ -318,6 +385,14 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 		a.refuse(w, r, setupRefuseSetUp, "")
 		return
 	}
+	if a.trying() {
+		a.refuse(w, r, setupRefusePending, "")
+		return
+	}
+	a.mu.Lock()
+	// The tries of an earlier setup have ended, and its status page ends with them.
+	a.pending = nil
+	a.mu.Unlock()
 	id := randomID()
 	s := setupSession{Expires: now.Add(sessionFor).UnixNano(), Nonce: p.Nonce, Pass: expires.Unix(), Token: randomID()}
 	if err := a.save(id, s); err != nil {
@@ -407,6 +482,10 @@ func (a *appSetup) flowSession(w http.ResponseWriter, r *http.Request) (string, 
 		a.refuse(w, r, setupRefuseSetUp, id)
 		return "", setupSession{}, false
 	}
+	if a.trying() {
+		a.refuse(w, r, setupRefusePending, "")
+		return "", setupSession{}, false
+	}
 	return id, s, true
 }
 
@@ -476,8 +555,10 @@ func readForm(w http.ResponseWriter, r *http.Request) (url.Values, error) {
 // created is GitHub's redirect once the App is created, GET
 // /setup/created?code=...&state=..., which needs the session, its state, and that the
 // session is the flow pointer's. Under the lock, it checks that again and that no App
-// is kept, then exchanges the code for the App, which GitHub's answer alone says, and
-// keeps it, see [keepApp].
+// is set up or being stored, then exchanges the code for the App, which GitHub's
+// answer alone says, checks it, see [appSetup.keep], and stores it in Qory Apiary.
+// When that first upload fails, it tries again, see [appSetup.retry], and sends the
+// browser to the status page.
 func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values) {
 	id, s, ok := a.flowSession(w, r)
 	if !ok {
@@ -507,8 +588,12 @@ func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values)
 		a.replaced(w, r, id, s)
 		return
 	}
-	if a.kept.Load() || hasApp(a.StateDir) {
+	if a.kept.Load() {
 		a.refuse(w, r, setupRefuseSetUp, id)
+		return
+	}
+	if a.trying() {
+		a.refuse(w, r, setupRefusePending, "")
 		return
 	}
 	conv, err := a.GitHub.ConvertManifest(ctx, code)
@@ -522,30 +607,193 @@ func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values)
 		a.notKept(w, r, id, s, &conv, "keep", err)
 		return
 	}
-	a.kept.Store(true)
-	a.endSession(w, id)
-	a.log().LogAttrs(r.Context(), slog.LevelInfo, "the GitHub App is set up", slog.Int64("app_id", kept.numericID), slog.String("slug", kept.slug), slog.Bool("webhook_active", kept.webhookActive))
-	if a.setUp != nil {
-		a.setUp(kept)
+	first, cancelFirst := context.WithTimeout(ctx, firstUploadBound)
+	err = a.Upload(first, kept)
+	cancelFirst()
+	if err == nil {
+		a.stored(r.Context(), kept)
+		a.endSession(w, id)
+		a.donePage(w, kept, s.Public)
+		return
 	}
-	a.donePage(w, kept, s.Public)
+	now := a.clock()
+	until := now.Add(a.UploadFor)
+	a.log().LogAttrs(r.Context(), slog.LevelWarn, "storing the GitHub App in Qory Apiary failed; the setup tries again", slog.Int64("app_id", kept.numericID),
+		slog.String("slug", kept.slug), slog.String("until", contracts.FormatTime(until)), slog.String("error", err.Error()))
+	// The session lasts while the setup tries again, and for sessionFor after, so the
+	// status page shows how the tries ended.
+	s.Uploading = true
+	s.Expires = until.Add(sessionFor).UnixNano()
+	if err := a.save(id, s); err != nil {
+		a.log().Error("setup failed", slog.String("step", a.step(r)), slog.String("what", "session"), slog.String("error", err.Error()))
+	}
+	p := &pendingUpload{app: kept, public: s.Public, until: until, session: sessionKey(id)}
+	a.mu.Lock()
+	a.pending = p
+	a.mu.Unlock()
+	a.tries.Add(1)
+	go a.retry(p)
+	lasts := time.Unix(0, s.Expires).Sub(now)
+	http.SetCookie(w, &http.Cookie{
+		Name: setupCookie, Value: id, Path: a.base, MaxAge: int(lasts / time.Second), Expires: now.Add(lasts),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+	})
+	redirect(w, a.base+"/status")
 }
 
-// keep checks the App conv, as GitHub answered the code's exchange, and keeps it in
-// the state directory, see [keepApp]: its private key must be an RSA key, as
-// qory-github setup takes one, and no larger than serve reads back from the state
-// directory, the line break keepApp writes at its end counted; its slug, client id and
-// client secret must be ones serve takes and reads back from the state directory; a
-// webhook secret in the answer must be one serve's receiver takes; and neither its key
-// nor a secret may hold what looks like an access key secret or a run key. An error
-// never holds a secret. When GitHub made the App no webhook secret,
-// keep makes one and sets it on the App's webhook; when GitHub does not confirm it,
-// the App is kept all the same, its webhook secret not confirmed, which serve sets
-// again at its next start, see [Run]. The account that owns the App is GitHub's
-// answer's, or the session's when the answer names none serve takes, see [ownerOf].
+// stored marks the App k set up, logs it, and hands it to serve, see [appSetup.setUp].
+// The lock is held.
+func (a *appSetup) stored(ctx context.Context, k *app) {
+	a.kept.Store(true)
+	a.log().LogAttrs(ctx, slog.LevelInfo, "the GitHub App is set up", slog.Int64("app_id", k.numericID), slog.String("slug", k.slug), slog.Bool("webhook_active", k.webhookActive))
+	if a.setUp != nil {
+		a.setUp(k)
+	}
+}
+
+// trying is whether the setup tries again to store an App in Qory Apiary.
+func (a *appSetup) trying() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.pending != nil && a.pending.state == uploadTrying
+}
+
+// retry tries again to store the App of p in Qory Apiary, after a wait that doubles
+// from [uploadFirstWait] to [uploadMaxWait], until p's until or until serve stops. Once
+// an upload succeeds, it marks the App set up under the lock, see [appSetup.stored].
+// When none does, the App's secrets are dropped from memory, a line names the App to
+// delete on GitHub, and a new setup may start.
+func (a *appSetup) retry(p *pendingUpload) {
+	defer a.tries.Done()
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithDeadline(parent, p.until)
+	defer cancel()
+	wait := uploadFirstWait
+	for {
+		if a.pause(ctx, wait) != nil {
+			break
+		}
+		err := a.Upload(ctx, p.app)
+		if err == nil {
+			a.lock <- struct{}{}
+			a.mu.Lock()
+			p.state = uploadStored
+			a.mu.Unlock()
+			a.stored(context.Background(), p.app)
+			<-a.lock
+			return
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		a.log().Warn("storing the GitHub App in Qory Apiary failed again; the setup tries again", slog.Int64("app_id", p.app.numericID), slog.String("error", err.Error()))
+		wait = min(2*wait, uploadMaxWait)
+	}
+	a.mu.Lock()
+	p.state = uploadFailed
+	settings := p.app.settingsURL(a.GitHub.Web())
+	gone := &app{id: p.app.id, numericID: p.app.numericID, slug: p.app.slug, owner: p.app.owner, ownerKind: p.app.ownerKind}
+	// GitHub's answer is dropped: no secret of the App stays in memory.
+	p.app = gone
+	a.mu.Unlock()
+	a.log().Error("storing the GitHub App in Qory Apiary failed for good: delete the App on GitHub, then press Set up in Qory Apiary again",
+		slog.Int64("app_id", gone.numericID), slog.String("slug", gone.slug), slog.String("settings_url", settings))
+}
+
+// pause waits d or until ctx is done, with wait when it is set.
+func (a *appSetup) pause(ctx context.Context, d time.Duration) error {
+	if a.wait != nil {
+		return a.wait(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stop waits for the tries of an upload under way, which end when serve stops.
+func (a *appSetup) stop() {
+	if a != nil {
+		a.tries.Wait()
+	}
+}
+
+// status is GET /setup/status, where the browser waits while the setup tries again to
+// store the App, which needs the session that set the App up: while the tries go on,
+// a page that says so and reloads itself every [statusEvery] seconds; once the App is
+// stored, the page that says it is set up; once every try failed, the page that says
+// to delete the App on GitHub. Both end the session.
+func (a *appSetup) status(w http.ResponseWriter, r *http.Request, _ url.Values) {
+	id, s, ok, err := a.session(r)
+	if err != nil {
+		a.failed(w, r, id, "session", err)
+		return
+	}
+	a.mu.Lock()
+	var p pendingUpload
+	if a.pending != nil {
+		p = *a.pending
+	}
+	a.mu.Unlock()
+	if !ok || !s.Uploading || p.app == nil || subtle.ConstantTimeCompare([]byte(p.session), []byte(sessionKey(id))) != 1 {
+		a.refuse(w, r, setupRefuseNoSession, "")
+		return
+	}
+	switch p.state {
+	case uploadStored:
+		a.endSession(w, id)
+		a.donePage(w, p.app, p.public)
+	case uploadFailed:
+		a.endSession(w, id)
+		plainPage(w, http.StatusBadGateway, pageNotStored+p.app.slug+pageNotStoredAt+p.app.settingsURL(a.GitHub.Web())+pageNotStoredEnd+uploadTime(p.until)+".")
+	default:
+		a.tryingPage(w, p)
+	}
+}
+
+// uploadTime is t as the status pages write it, in UTC to the minute.
+func uploadTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04") + " UTC" }
+
+// tryingPageHTML is the page the browser shows while the setup tries again to store the
+// App, which reloads itself.
+var tryingPageHTML = template.Must(template.New("trying").Parse(`<!doctype html>
+<meta charset="utf-8"><meta http-equiv="refresh" content="{{.Every}}"><title>qory-github</title>
+<p>{{.Line}}</p>
+<p>{{.Wait}}</p>
+`))
+
+// tryingPage answers the page that says the setup tries again to store the App of p.
+func (a *appSetup) tryingPage(w http.ResponseWriter, p pendingUpload) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusAccepted)
+	tryingPageHTML.Execute(w, map[string]any{
+		"Every": statusEvery,
+		"Line":  "GitHub created the App " + p.app.slug + ". Storing it in Qory Apiary failed, and this server tries again until " + uploadTime(p.until) + ".",
+		"Wait":  "Keep this page open: it reloads every " + strconv.Itoa(statusEvery) + " seconds and shows the result.",
+	})
+}
+
+// keep checks the App conv, as GitHub answered the code's exchange, and returns it, kept
+// in memory alone: its private key must be an RSA key, as qory-github setup takes one,
+// and no larger than Qory Apiary stores a secret; its slug, client id and client secret
+// must be ones serve takes and Qory Apiary stores; a webhook secret in the answer must
+// be one serve's receiver takes; and neither its key nor a secret may contain what
+// looks like an access key secret or a run key. An error never contains a secret. When
+// GitHub made the App no webhook secret, keep makes one and sets it on the App's
+// webhook; when GitHub does not confirm it, the App is used all the same, its webhook
+// secret not confirmed, which serve sets again at its next start, see [Run]. The
+// account that owns the App is GitHub's answer's, or the session's when the answer
+// names none serve takes, see [ownerOf].
 func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSession) (*app, error) {
 	pemBytes := bytes.TrimRight([]byte(conv.PEM), "\r\n")
-	if len(pemBytes)+1 > github.MaxKeyFile {
+	if len(pemBytes) > contracts.SecretValueMaxBytes {
 		return nil, errors.New(answerLargeKey)
 	}
 	key, err := github.ParseKey(pemBytes)
@@ -561,7 +809,7 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 	if err := noKeyInAnswer([]byte(conv.ClientSecret)); err != nil {
 		return nil, err
 	}
-	if !appIDShape.MatchString(conv.ClientID) || conv.ClientSecret == "" || len(conv.ClientSecret)+1 > maxClientSecretFile || strings.ContainsFunc(conv.ClientSecret, unkeepable) {
+	if !appIDShape.MatchString(conv.ClientID) || conv.ClientSecret == "" || len(conv.ClientSecret) > maxClientSecret || strings.ContainsFunc(conv.ClientSecret, unkeepable) {
 		return nil, errors.New(answerNoClient)
 	}
 	secret, confirmed := conv.WebhookSecret, true
@@ -580,14 +828,9 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 		}
 	}
 	owner, kind := ownerOf(conv, s)
-	k := keptApp{AppID: conv.ID, AppSlug: conv.Slug, ClientID: conv.ClientID, Owner: owner, OwnerKind: kind, WebhookActive: a.Active, WebhookSecretConfirmed: confirmed}
-	webhookSecret, clientSecret := []byte(secret), []byte(conv.ClientSecret)
-	if err := keepApp(a.StateDir, k, pemBytes, webhookSecret, clientSecret); err != nil {
-		return nil, err
-	}
 	return &app{
-		id: strconv.FormatInt(conv.ID, 10), slug: conv.Slug, clientID: conv.ClientID, key: key, webhookSecret: webhookSecret, clientSecret: clientSecret,
-		webhookActive: a.Active, kept: true, numericID: conv.ID, owner: owner, ownerKind: kind, confirmed: confirmed,
+		id: strconv.FormatInt(conv.ID, 10), numericID: conv.ID, slug: conv.Slug, clientID: conv.ClientID, pem: pemBytes, key: key,
+		webhookSecret: []byte(secret), clientSecret: []byte(conv.ClientSecret), webhookActive: a.Active, owner: owner, ownerKind: kind, confirmed: confirmed,
 	}, nil
 }
 
@@ -599,7 +842,7 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 const (
 	answerAccessKey        = "GitHub's answer holds what looks like an access key secret, qak_, which belongs nowhere in it"
 	answerRunKey           = "GitHub's answer holds what looks like a run key, qrk_, which belongs nowhere in it"
-	answerLargeKey         = "GitHub's answer holds a private key larger than setup can keep"
+	answerLargeKey         = "GitHub's answer contains a private key larger than setup can store in Qory Apiary"
 	answerNoSlug           = "GitHub's answer holds no App slug setup can keep"
 	answerNoClient         = "GitHub's answer holds no client id, or no client secret setup can keep"
 	answerBadWebhookSecret = "GitHub's answer holds a webhook secret qory-github-server serve cannot use"
@@ -618,8 +861,8 @@ func noKeyInAnswer(b []byte) error {
 	return errors.New(answerAccessKey)
 }
 
-// unkeepable is whether r is white space or a control character, which no secret serve
-// keeps holds.
+// unkeepable is whether r is white space or a control character, which no secret of
+// the App has.
 func unkeepable(r rune) bool { return r <= ' ' || r >= 0x7f }
 
 // ownerOf is the account that owns the App conv, as GitHub's answer names it, or the
@@ -872,8 +1115,8 @@ func (a *appSetup) take(ctx context.Context) bool {
 // release gives the lock's token back.
 func (a *appSetup) release() { <-a.lock }
 
-// markKept marks an App kept, or given by the settings, from the start: every setup
-// pass is refused.
+// markKept marks an App set up from the start, the one Qory Apiary delivered: every
+// setup pass is refused.
 func (a *appSetup) markKept() {
 	a.init()
 	a.lock <- struct{}{}
@@ -926,8 +1169,8 @@ func (a *appSetup) failed(w http.ResponseWriter, r *http.Request, id, what strin
 	a.refuse(w, r, setupRefuseFailed, id)
 }
 
-// step names the request's step for the log: setup, continue, account, created or
-// refused.
+// step names the request's step for the log: setup, continue, account, created,
+// refused or status.
 func (a *appSetup) step(r *http.Request) string {
 	switch r.URL.Path {
 	case a.route + "/continue":
@@ -939,6 +1182,8 @@ func (a *appSetup) step(r *http.Request) string {
 		return "created"
 	case a.route + "/refused":
 		return "refused"
+	case a.route + "/status":
+		return "status"
 	}
 	return "setup"
 }

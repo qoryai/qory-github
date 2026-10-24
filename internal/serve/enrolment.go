@@ -143,7 +143,7 @@ func (s Settings) checkEnrolmentSource() error {
 		return nil
 	}
 	src := source{s.env}
-	m := missingIn(groups[1], func(string) bool { return false })
+	m := missingIn(groups[0], func(string) bool { return false })
 	listed := make([]string, len(m))
 	for i, name := range m {
 		listed[i] = src.listed(name)
@@ -273,7 +273,7 @@ func loadKept(dir string, log *slog.Logger) (enrolment, error) {
 // keptKey reads the access key in the file at path in the state directory, as the
 // access key secret's file is read.
 func keptKey(path string) (*accesskey.Key, error) {
-	return secretSource{file: path, in: "the file " + filepath.Base(path) + " in the state directory", put: "the file", state: true}.accessKey()
+	return secretSource{file: path, in: "the file " + filepath.Base(path) + " in the state directory"}.accessKey()
 }
 
 // readPending reads the key in pendingKeyFile at path, and whether a file is there: a
