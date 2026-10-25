@@ -586,9 +586,9 @@ func (r *runner) upload(ctx context.Context, a *app) error {
 // has declared the adapter in that record: adapter-secrets.schema.json:5 has an
 // adapter that is set up but receives no secrets upload right after its start-up
 // body, and Qory Apiary returns 400 for a secret the source role of the record's
-// latest description does not list. A failed upload
-// is tried again, after a wait that doubles from [feedFirstBackoff] to
-// [feedMaxBackoff], until ctx is done; a permanent error, such as a 400, ends it.
+// latest description does not list. A failed upload is tried again, after a wait
+// that doubles from [feedFirstBackoff] to [feedMaxBackoff], until ctx is done; a
+// permanent error, such as a 400, ends it.
 // When the App is not stored, a line says so: the next start of serve finds no App,
 // and serves the App setup.
 func (r *runner) storeInNewRecord(ctx context.Context) {

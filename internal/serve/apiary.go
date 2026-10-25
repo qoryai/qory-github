@@ -199,13 +199,11 @@ type Apiary struct {
 	signer      accesskey.PublicKey
 	signerKnown bool
 
-	// getMu guards getSecond, the X-Qory-Timestamp of the latest GET in Unix seconds;
-	// getLoaded, whether getSecond was read from lastGet yet; and getAheadLogged,
-	// whether the line that getSecond is ahead of the clock was logged.
-	getMu          sync.Mutex
-	getSecond      int64
-	getLoaded      bool
-	getAheadLogged bool
+	// getMu guards getSecond, the X-Qory-Timestamp of the latest GET in Unix seconds,
+	// and getLoaded, whether getSecond was read from lastGet yet.
+	getMu     sync.Mutex
+	getSecond int64
+	getLoaded bool
 }
 
 // lastGetStore keeps the X-Qory-Timestamp of the latest GET in Unix seconds: load
@@ -252,32 +250,30 @@ func (a *Apiary) lastSigner() (accesskey.PublicKey, bool) {
 // getTime is the time a GET signs in its X-Qory-Timestamp: the clock's second, or a
 // second later than the latest GET's when that is later, whatever the GET's target.
 // The contract wants each GET of one instance to carry a later timestamp than the GET
-// before it, definitions.schema.json: Qory Apiary refuses a signature it has seen, and
-// an answer is bound to the GET's signature. The latest second is kept in lastGet
-// before the GET is sent, so after a restart no GET carries that second or an earlier
-// one. getTime never waits: a timestamp ahead of the clock is used at once, and, with
-// lastGet set, the first time the latest second is ahead of the clock, one line says
-// so. GETs take
-// their seconds one at a time, in the order they ask.
+// before it, definitions.schema.json: Qory Apiary returns 401 for a signature it has
+// seen, and an answer is bound to the GET's signature. The latest second is kept in
+// lastGet before the GET is sent, so after a restart no GET carries that second or an
+// earlier one. getTime never waits: a timestamp ahead of the clock is used at once.
+// When the second that the process's first GET reads from lastGet is ahead of the
+// clock, one line says so. GETs take their seconds one at a time, in the order they
+// ask.
 func (a *Apiary) getTime() (time.Time, error) {
 	a.getMu.Lock()
 	defer a.getMu.Unlock()
+	now := a.now().Unix()
 	if !a.getLoaded && a.lastGet != nil {
 		sec, err := a.lastGet.load()
 		if err != nil {
 			return time.Time{}, fmt.Errorf("reading the latest GET's timestamp from the store: %w", err)
 		}
+		if sec > now && a.Log != nil {
+			a.Log.Warn("the last GET's timestamp in the store is later than the clock, so serve continues from it; "+
+				"Qory Apiary returns 401 for a GET more than 300 seconds ahead of its clock",
+				slog.Int64("last_get_timestamp", sec), slog.Int64("clock", now))
+		}
 		a.getSecond = max(a.getSecond, sec)
 	}
 	a.getLoaded = true
-	now := a.now().Unix()
-	if a.getSecond > now && !a.getAheadLogged {
-		a.getAheadLogged = true
-		if a.Log != nil && a.lastGet != nil {
-			a.Log.Warn("the last GET's timestamp in the store is later than the clock, so serve continues from it",
-				slog.Int64("last_get_timestamp", a.getSecond), slog.Int64("clock", now))
-		}
-	}
 	sec := max(now, a.getSecond+1)
 	if a.lastGet != nil {
 		if err := a.lastGet.save(sec); err != nil {
@@ -552,7 +548,8 @@ type answer struct {
 // checks its signature under the pin, bound to this request's signature. A GET carries
 // and signs X-Qory-Timestamp, later than the GET before it, see [Apiary.getTime]; a
 // POST's signature covers its body. A 401 is never signed. An error is no answer; it
-// begins with what and never says a header, the body or a secret. Qory Apiary out of reach, or its answer unread, is an [Outage].
+// begins with what and never says a header, the body or a secret. Qory Apiary out of
+// reach, or its answer unread, is an [Outage].
 func (a *Apiary) send(ctx context.Context, what, method, target string, body []byte, max int64, timeout time.Duration) (*answer, error) {
 	return a.sendWith(ctx, a.current(), what, method, target, body, max, timeout)
 }

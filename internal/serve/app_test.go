@@ -400,13 +400,16 @@ func secondsFrom(at time.Time, n int) []string {
 
 // TestGETsInOneSecondHaveLaterTimestamps pins that GETs in one second, to
 // /v1/adapter/secrets and to /v1/grants, each carry a timestamp a second later than
-// the GET before, whatever its target, at once, with no wait: Qory Apiary refuses a
-// signature it has seen, and the contract wants each GET of an instance to carry a
-// later timestamp than the one before it.
+// the GET before, whatever its target, at once, with no wait, and log nothing: Qory
+// Apiary returns 401 for a signature it has seen, and the contract wants each GET of
+// an instance to carry a later timestamp than the one before it.
 func TestGETsInOneSecondHaveLaterTimestamps(t *testing.T) {
 	access := newKey(t)
 	f := newFakeApiary(t, access)
 	api := testApiary(t, f, access)
+	api.lastGet = storeLastGet{openStore(t, filepath.Join(t.TempDir(), "state"))}
+	var log syncBuffer
+	api.Log = slog.New(slog.NewJSONHandler(&log, nil))
 	now := time.Now().Truncate(time.Second).Add(400 * time.Millisecond)
 	var waits []time.Duration
 	api.Now = func() time.Time { return now }
@@ -430,13 +433,17 @@ func TestGETsInOneSecondHaveLaterTimestamps(t *testing.T) {
 	if len(waits) != 0 {
 		t.Errorf("waited %v, want no wait", waits)
 	}
+	if log.String() != "" {
+		t.Errorf("the log: %s, want nothing", log.String())
+	}
 }
 
 // TestARestartKeepsTheLatestGETsTimestamp pins that the latest GET's timestamp is
 // kept in the store, so a client started again on the store never sends a GET at or
 // before that second: with its clock a minute behind, the next GET carries the stored
-// second and one more, at once, with no wait, and one line, once, says so. A store it
-// cannot read stops the GET before it is sent.
+// second and one more, at once, with no wait. One line says so, at the first GET,
+// which reads the stored second ahead of the clock. A store it cannot read stops the
+// GET before it is sent.
 func TestARestartKeepsTheLatestGETsTimestamp(t *testing.T) {
 	access := newKey(t)
 	f := newFakeApiary(t, access)
@@ -481,7 +488,8 @@ func TestARestartKeepsTheLatestGETsTimestamp(t *testing.T) {
 	if len(waits) != 0 {
 		t.Errorf("waited %v, want no wait", waits)
 	}
-	line := `"level":"WARN","msg":"the last GET's timestamp in the store is later than the clock, so serve continues from it","last_get_timestamp":` +
+	line := `"level":"WARN","msg":"the last GET's timestamp in the store is later than the clock, so serve continues from it; ` +
+		`Qory Apiary returns 401 for a GET more than 300 seconds ahead of its clock","last_get_timestamp":` +
 		strconv.FormatInt(stored, 10) + `,"clock":` + strconv.FormatInt(now.Unix(), 10) + `}`
 	if strings.Count(log.String(), "WARN") != 1 || !strings.Contains(log.String(), line) || quiet.String() != "" {
 		t.Errorf("the log: %s; before the clock went back: %s", log.String(), quiet.String())

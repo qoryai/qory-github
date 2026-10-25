@@ -75,8 +75,9 @@ import (
 // again to store the App, for upload_retry_seconds and 900 seconds more at most; it
 // contains a random id, and the store keeps the session under the id's SHA-256. Every
 // end of a flow drops the cookie. serve reads no cookie but the two it sets, by name,
-// and logs no header: a cookie it did not set is never logged, kept or sent on. Every redirect's target is built from
-// the settings and the session, and a page says nothing the request carries.
+// and logs no header: a cookie it did not set is never logged, kept or sent on. Every
+// redirect's target is built from the settings and the session, and a page says
+// nothing the request carries.
 //
 // Once an App is set up, every setup pass is refused with a page that says the App is
 // set up already.
