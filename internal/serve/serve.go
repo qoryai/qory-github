@@ -507,8 +507,10 @@ loop:
 		r.confirmCancel()
 		<-r.confirmed
 	}
-	// A count of lines held back is logged before serve stops.
+	// The grant ends sent again stop once nothing starts one, and a count of lines held
+	// back is logged before serve stops.
 	if r.worker != nil {
+		r.adapter.stopEnds()
 		r.rc.stopLog()
 		r.adapter.stopLog()
 	}

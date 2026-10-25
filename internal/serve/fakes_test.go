@@ -104,6 +104,9 @@ type fakeApiary struct {
 	// refuse answers a POST, numbered from 1 among those to its route, when it returns a
 	// status other than 0.
 	refuse func(route string, n int) (int, string)
+	// unsigned, when set, sends a POST's answer, numbered as for refuse, with no
+	// signature when it returns true.
+	unsigned func(route string, n int) bool
 	// refuseGet answers a GET of the feed, numbered from 1, when it returns a status
 	// other than 0. hold, when set, holds every GET of the feed until its request is
 	// cancelled, as Qory Apiary holds a read while nothing follows the cursor.
@@ -136,7 +139,8 @@ type fakeApiary struct {
 	// testAdapterID before any.
 	node string
 	// grants is the fake's copy of the adapter's grants, the connection of each by its
-	// grant_ref, which GET /v1/grants answers and each report it takes adds to.
+	// grant_ref, which GET /v1/grants answers, each report it takes adds to, and each
+	// grant end it takes drops from.
 	grants map[string]string
 
 	mu       sync.Mutex
@@ -202,6 +206,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 		routeConnectionsDisconnect: "connections-disconnect.schema.json",
 		routeSecrets:               "adapter-secrets.schema.json",
 		routeGrants:                "grant.schema.json",
+		routeGrantsEnd:             "grant-end.schema.json",
 	} {
 		s, err := contracts.Compile(name)
 		if err != nil {
@@ -376,7 +381,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		body = f.page(r.URL.Query().Get("after"))
 	}
-	refuse, refuseGet := f.refuse, f.refuseGet
+	refuse, refuseGet, unsigned := f.refuse, f.refuseGet, f.unsigned
 	f.mu.Unlock()
 	// A start-up body's description counts once the body arrives, as Qory Apiary keeps
 	// it before it answers; a refusal puts the one before back.
@@ -406,6 +411,10 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var g contracts.Grant
 		json.Unmarshal(b, &g)
 		f.grant(g.GrantRef, g.ConnectionID)
+	case r.URL.Path == routeGrantsEnd && !refused:
+		var g contracts.GrantEnd
+		json.Unmarshal(b, &g)
+		f.ungrant(g.GrantRef)
 	}
 	if refuseGet != nil && r.Method == http.MethodGet {
 		if s, b := refuseGet(n); s != 0 {
@@ -415,7 +424,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if body != "" {
 		w.Header().Set("Content-Type", "application/json")
 	}
-	if status != http.StatusUnauthorized {
+	if status != http.StatusUnauthorized && (unsigned == nil || r.Method != http.MethodPost || !unsigned(r.URL.Path, n)) {
 		signer := f.server
 		if f.signer != nil {
 			signer = f.signer

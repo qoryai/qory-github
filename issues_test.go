@@ -365,13 +365,18 @@ func (f *fakeIssues) lister(t *testing.T, s Sink, logs *[]string) Lister {
 		Token:        func(context.Context) (string, error) { return fakeToken, nil },
 		Slug:         "qory-test",
 		ConnectionID: testConnection,
+		GrantRef:     testGrant,
 		Sink:         s,
 		Logf:         func(format string, args ...any) { *logs = append(*logs, fmt.Sprintf(format, args...)) },
 	}
 }
 
-// testConnection is the connection a test's listings name.
-const testConnection = "ac_0123456789abcdef"
+// testConnection is the connection a test's listings name, and testGrant the grant
+// their collections name.
+const (
+	testConnection = "ac_0123456789abcdef"
+	testGrant      = "42"
+)
 
 // widgets is the repository the listings' tests read, and widgetsID and widgetsRef its id
 // on GitHub and the ref of its collection, which that id is. gadgetsID is another's.
@@ -389,6 +394,9 @@ func repoJSON(id int, fullName, htmlURL string) map[string]any {
 	return map[string]any{"id": id, "node_id": "R_" + strconv.Itoa(id), "full_name": fullName, "html_url": htmlURL}
 }
 
+// TestListRepositoriesSendsTheCollectionsWithTheirTarget lists three repositories, one
+// with a URL the contract refuses, and checks the two others are sent, each with its
+// target and the grant_ref of the lister's grant.
 func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	f := &fakeIssues{pageSize: 1}
 	f.repos = append(f.repos, repoJSON(widgetsID, "acme/widgets", "https://github.com/acme/widgets"))
@@ -406,8 +414,8 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	}
 	got := s.reqs[0].(contracts.SourceCollections)
 	want := []contracts.Collection{
-		{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets", Target: &contracts.Target{System: host, Path: "acme/widgets"}},
-		{Ref: "1296270", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
+		{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets", GrantRef: testGrant, Target: &contracts.Target{System: host, Path: "acme/widgets"}},
+		{Ref: "1296270", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", GrantRef: testGrant, Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
 	}
 	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 || got.ConnectionID != testConnection {
 		t.Errorf("collections %+v", got)

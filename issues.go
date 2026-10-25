@@ -638,6 +638,9 @@ type Lister struct {
 	// ConnectionID is the connection in Qory Apiary the installation is linked to, which
 	// every part of [Lister.ListRepositories] names.
 	ConnectionID string
+	// GrantRef is the grant_ref of the installation's grant, which every collection of
+	// [Lister.ListRepositories] names: the grant that covers the collection.
+	GrantRef string
 	// Sink is where the requests go.
 	Sink Sink
 	// Logf logs what is skipped; nil is log.Printf.
@@ -796,6 +799,8 @@ const listingEnd = 10 * time.Second
 // its token or its first page, sends nothing, and neither does one whose part Qory
 // Apiary did not take, once that part carried every collection read.
 //
+// Each collection carries the grant_ref [Lister.GrantRef], the installation's grant.
+//
 // Each collection carries items false when GitHub answers its repository with
 // has_issues false, as for a repository with Issues turned off, and no items when
 // has_issues is true or absent, see [collectionOf]. GitHub's listing of the
@@ -889,6 +894,7 @@ func (l Lister) repositoryParts(ctx context.Context, emit func(context.Context, 
 		for _, r := range page.repos() {
 			var cuts []Cut
 			c := collectionOf(r)
+			c.GrantRef = l.GrantRef
 			c.Title = fit(&cuts, c.Ref, "title", c.Title, contractLimits().title)
 			c.Target = &contracts.Target{System: system, Path: r.FullName}
 			if why := checkCollection(c); why != "" {

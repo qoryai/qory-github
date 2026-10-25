@@ -74,6 +74,24 @@ type Adapter struct {
 	// collection's disconnect, and the signs that start a count over, see [presence].
 	presence presence
 
+	// heldBack are the installations a listing of which left collections out because
+	// Qory Apiary's copy of the grants did not have the installation's grant, see
+	// [reachSink], until a report of the grant is taken, see [Connect.reportSoon]. It
+	// is read and written under installMu.
+	heldBack map[int64]bool
+
+	// ends are the grant ends sent again, by installation, see [Adapter.endSoon], under
+	// endMu, with endsStopped, after which none starts. endCtx stops them all, by
+	// endStop, and endWG waits for them. endSleep, when set, waits between their tries;
+	// nil waits on a timer.
+	endMu       sync.Mutex
+	ends        map[int64]*grantEnding
+	endsStopped bool
+	endCtx      context.Context
+	endStop     context.CancelFunc
+	endWG       sync.WaitGroup
+	endSleep    func(ctx context.Context, d time.Duration) error
+
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most; envsOnce makes envs,
 	// which logs a push's failed reads of an environment definition the same way.
@@ -376,11 +394,15 @@ func (a *Adapter) logLeftOut(installation int64, n int) {
 // repository the part lists for the installation, with the listing's started_at, see
 // [claimReach], and once Qory Apiary takes a part, which it does once the connection is
 // made, it keeps the environment_ref the part sent for each collection, see
-// [keepEnvironment], and marks the installation's link live. The part is sent as it
-// is, every repository GitHub granted the installation in it, whether its claim took
-// the record or not.
+// [keepEnvironment], and marks the installation's link live. The part is sent with
+// every repository GitHub granted the installation in it, whether its claim took the
+// record or not, while Qory Apiary's copy of the grants has the installation's grant
+// for the connection. While it does not, as before Qory Apiary takes the grant's report,
+// see [Connect.reportSoon], the part is sent with no collection, and the listing is not
+// complete, see [reachSink.Collections].
 type reachSink struct {
 	github.Sink
+	adapter      *Adapter
 	st           *store.Store
 	installation int64
 	connection   string
@@ -388,33 +410,105 @@ type reachSink struct {
 	// that GitHub holds its repository, see [presence]: set for a part GitHub's listing
 	// read now, never for one kept and sent again.
 	seen *presence
+	// held is whether a part of the listing was sent without its collections, which
+	// every part of one listing shares: from then on no part of the listing says it is
+	// complete.
+	held *bool
 }
 
-// Collections claims each collection for the installation, with the listing's
-// started_at, or the zero time when it does not parse, sends them, and once Qory Apiary
-// took them keeps each one's environment_ref.
+// Collections sends one part of the listing. When Qory Apiary's copy of the grants does
+// not have the installation's grant for the connection, it leaves every collection out
+// of the part and notes the installation, see [Adapter.heldBack], so the report of the
+// grant, once taken, lists it again. Once a part of the listing left collections out,
+// no part of it says it is complete, so the listing disconnects none of the collections
+// it left out. It claims each collection the part sends for the installation, with the
+// listing's started_at, or the zero time when it does not parse, sends the part, and
+// once Qory Apiary took it keeps each collection's environment_ref. When Qory Apiary
+// refuses a part that has collections 400 invalid_request, as for a grant_ref its copy
+// of the grants does not have, it reads that copy again, see [Adapter.syncGrants], and
+// when the copy does not have the installation's grant for the connection, it sends the
+// part again, built anew, without its collections. When the copy has the grant, the
+// refusal has another cause, and the part is not sent again.
 func (s reachSink) Collections(ctx context.Context, req contracts.SourceCollections) error {
 	read, err := time.Parse(contracts.TimeLayout, req.Listing.StartedAt)
 	if err != nil {
 		read = time.Time{}
 	}
-	for _, c := range req.Collections {
-		if s.seen != nil {
+	if s.seen != nil {
+		for _, c := range req.Collections {
 			s.seen.repositorySeen(c.Ref)
 		}
-		if err := claimReach(s.st, c.Ref, s.installation, read); err != nil {
-			return err
+	}
+	sent, err := s.send(ctx, req, read)
+	if refusedAs(err, http.StatusBadRequest, codeInvalidRequest) && len(sent) > 0 && s.adapter != nil {
+		if serr := s.adapter.syncGrants(ctx); serr != nil {
+			return errors.Join(err, serr)
+		}
+		held, gerr := grantOf(s.st, s.installation)
+		if gerr != nil {
+			return errors.Join(err, gerr)
+		}
+		if held != s.connection {
+			sent, err = s.send(ctx, req, read)
 		}
 	}
-	if err := s.Sink.Collections(ctx, req); err != nil {
+	if err != nil {
 		return err
 	}
-	for _, c := range req.Collections {
+	for _, c := range sent {
 		if err := keepEnvironment(s.st, c.Ref, c.EnvironmentRef); err != nil {
 			return err
 		}
 	}
 	return goLive(s.st, s.installation, s.connection)
+}
+
+// send sends the part req, without its collections while Qory Apiary's copy of the
+// grants does not have the installation's grant for the connection, and not complete
+// once a part of the listing left collections out, see [reachSink.Collections]. It
+// claims each collection it sends first, and returns them.
+func (s reachSink) send(ctx context.Context, req contracts.SourceCollections, read time.Time) ([]contracts.Collection, error) {
+	installMu.Lock()
+	held, err := grantOf(s.st, s.installation)
+	if err == nil && held != s.connection && len(req.Collections) > 0 {
+		req.Collections = []contracts.Collection{}
+		if s.held != nil {
+			*s.held = true
+		}
+		if s.adapter != nil {
+			s.adapter.noteHeldBack(s.installation)
+		}
+	}
+	installMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if s.held != nil && *s.held {
+		req.Listing.Complete = false
+	}
+	for _, c := range req.Collections {
+		if err := claimReach(s.st, c.Ref, s.installation, read); err != nil {
+			return nil, err
+		}
+	}
+	return req.Collections, s.Sink.Collections(ctx, req)
+}
+
+// noteHeldBack notes that a listing of the installation left its collections out, see
+// [reachSink], for a caller that holds installMu.
+func (a *Adapter) noteHeldBack(installation int64) {
+	if a.heldBack == nil {
+		a.heldBack = map[int64]bool{}
+	}
+	a.heldBack[installation] = true
+}
+
+// takeHeldBack is whether a listing of the installation left its collections out since
+// the last call, see [reachSink], for a caller that holds installMu, and forgets it.
+func (a *Adapter) takeHeldBack(installation int64) bool {
+	held := a.heldBack[installation]
+	delete(a.heldBack, installation)
+	return held
 }
 
 // listRepositories sends Qory Apiary the repositories the installation reaches, as
@@ -637,7 +731,8 @@ func (a *Adapter) lister(installation int64, connection string) github.Lister {
 		Token:        func(ctx context.Context) (string, error) { return a.token(ctx, installation, 0, "") },
 		Slug:         a.Slug,
 		ConnectionID: connection,
-		Sink:         reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: connection, seen: &a.presence},
+		GrantRef:     grantRef(installation),
+		Sink:         reachSink{Sink: a.Sink, adapter: a, st: a.Store, installation: installation, connection: connection, seen: &a.presence, held: new(bool)},
 		Logf:         a.logf,
 		LogCut:       a.logCut,
 		LogLeftOut:   func(n int) { a.logLeftOut(installation, n) },
@@ -652,12 +747,15 @@ type firstKey struct {
 }
 
 // firstListing is a link's first listing as [Adapter.sendFirst] keeps it: its parts,
-// read from GitHub once, and next, the index of the first part the next try sends, the
-// first Qory Apiary has not taken, or 0 after a 403 connection_unknown, which only a
-// holder of the installation's lock reads or moves.
+// read from GitHub once; next, the index of the first part the next try sends, the
+// first Qory Apiary has not taken, or 0 after a 403 connection_unknown; and held,
+// whether a part Qory Apiary took was sent without its collections, see [reachSink],
+// false again after a 403 connection_unknown. Only a holder of the installation's lock
+// reads or moves next and held.
 type firstListing struct {
 	parts []contracts.SourceCollections
 	next  int
+	held  bool
 }
 
 // sendFirst sends the first listing of the installation's link l, for a caller that
@@ -718,11 +816,11 @@ func (a *Adapter) sendFirst(ctx context.Context, installation int64, l link) err
 		}
 		a.mu.Unlock()
 	}
-	sink := reachSink{Sink: a.Sink, st: a.Store, installation: installation, connection: l.Connection}
+	sink := reachSink{Sink: a.Sink, adapter: a, st: a.Store, installation: installation, connection: l.Connection, held: &f.held}
 	for ; f.next < len(f.parts); f.next++ {
 		if err := sink.Collections(ctx, f.parts[f.next]); err != nil {
 			if refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
-				f.next = 0
+				f.next, f.held = 0, false
 			}
 			return err
 		}
@@ -848,10 +946,12 @@ func (a *Adapter) deleted(ctx context.Context, d Delivery) error {
 // which a connect checks before it links, forgets what the adapter keeps in memory for
 // the installation, see [Adapter.forgetInstallation], its first listings kept, see
 // [Adapter.sendFirst], among them, and the record of [keepUnlinked], and, for a linked
-// installation, ends its connection, see [Adapter.endConnection], then drops what the
-// store keeps of the installation. It returns the connection it ended, or "" when the
-// installation was not linked, as once the webhook or a round ended it already. Each
-// step is one a repeat finds done, so a run that fails is run again whole.
+// installation, reports the end of its grant, see [Adapter.endGrant], which drops the
+// installation's link and the records of its collections once Qory Apiary has ended the
+// grant. The connection stays, with the links of other installations. It returns the
+// connection of the installation's link, or "" when the installation was not linked, as
+// once the webhook or a round ended it already. Each step is one a repeat finds done,
+// so a run that fails is run again whole.
 func (a *Adapter) endInstallation(ctx context.Context, installation int64) (string, error) {
 	unlock, err := a.lockInstallation(ctx, installation)
 	if err != nil {
@@ -869,12 +969,7 @@ func (a *Adapter) endInstallation(ctx context.Context, installation int64) (stri
 	if err != nil || !ok {
 		return "", err
 	}
-	if err := a.endConnection(ctx, l.Connection); err != nil {
-		return "", err
-	}
-	installMu.Lock()
-	defer installMu.Unlock()
-	if err := dropInstallation(a.Store, installation); err != nil {
+	if err := a.endGrant(ctx, installation, l); err != nil {
 		return "", err
 	}
 	return l.Connection, nil

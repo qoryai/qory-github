@@ -16,4 +16,4 @@ require (
 	golang.org/x/sys v0.48.0 // indirect
 )
 
-replace github.com/qoryai/integrations => /Users/voldy/code/qoryai/.work/Rocco/integrations-902978d
+replace github.com/qoryai/integrations => /Users/voldy/code/qoryai/.work/Frankie/integrations-d7d4094

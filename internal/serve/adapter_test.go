@@ -42,6 +42,27 @@ type wired struct {
 
 	mu    sync.Mutex
 	slept []time.Duration
+	// endWaits are the waits between a grant end's tries, see [wired.retryEnds].
+	endWaits []time.Duration
+}
+
+// retryEnds makes each wait between a grant end's tries, see [Adapter.endSoon], pass at
+// once and be kept in endWaits. Without it, a grant end is tried once, and its next
+// try waits until the test ends.
+func (w *wired) retryEnds() {
+	w.adapter.endSleep = func(_ context.Context, d time.Duration) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.endWaits = append(w.endWaits, d)
+		return nil
+	}
+}
+
+// endsDone waits until no grant end of the installation is tried again, see
+// [Adapter.endSoon].
+func (w *wired) endsDone(t *testing.T, installation int64) {
+	t.Helper()
+	eventually(t, "the grant end's tries", func() bool { return !w.adapter.ending(installation) })
 }
 
 func newWired(t *testing.T, dir string) *wired {
@@ -68,8 +89,13 @@ func newWired(t *testing.T, dir string) *wired {
 	w.adapter.Register(hs)
 	worker := &Worker{Store: st, Handlers: hs, Log: logger, Attempts: 3, Backoff: func(int) time.Duration { return time.Millisecond }}
 	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify, Handlers: hs, Linked: func(id int64) (bool, error) { return Linked(st, id) }}
+	w.adapter.endSleep = func(ctx context.Context, _ time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	worker.Start()
 	t.Cleanup(func() { worker.Stop(5 * time.Second) })
+	t.Cleanup(w.adapter.stopEnds)
 	w.mux = rc.Mux()
 	w.feed = &feed{apiary: w.client, adapter: w.adapter, store: st, publicURL: "https://qory-github.example.com", log: logger}
 	return w
@@ -656,7 +682,7 @@ func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 }
 
 // TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory deletes a
-// linked installation whose disconnect Qory Apiary answers 409 connection_ended, which
+// linked installation whose grant end Qory Apiary answers 409 connection_ended, which
 // forgets the connection's first listings, those of the installation still linked
 // among them, after the installation's are forgotten: the adapter's maps hold nothing
 // of it.
@@ -668,7 +694,7 @@ func TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory(t *t
 	w.adapter.generation(&w.adapter.firstGens, 42)
 	w.adapter.mu.Unlock()
 	w.apiary.refuse = func(route string, _ int) (int, string) {
-		if route == routeConnectionsDisconnect {
+		if route == routeGrantsEnd {
 			return 409, `{"error":"connection_ended"}`
 		}
 		return 0, ""
@@ -677,8 +703,8 @@ func TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory(t *t
 	if s := state(w.st, guid1); s != store.Done {
 		t.Fatalf("the deletion is %s", s)
 	}
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-		t.Errorf("%d disconnects sent", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends sent", n)
 	}
 	if held := w.adapter.heldFor(42); len(held) != 0 {
 		t.Errorf("the deleted installation's entries are kept in %v", held)
@@ -797,11 +823,12 @@ func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
 	}
 }
 
-// TestAnInstallationSuspendedThenDeletedEndsItsConnection suspends the installation,
-// which is logged and changes nothing, and deletes it, which ends its connection, one
-// POST /v1/connections/disconnect, and drops its link and its collections' records;
-// another installation's stay.
-func TestAnInstallationSuspendedThenDeletedEndsItsConnection(t *testing.T) {
+// TestAnInstallationSuspendedThenDeletedEndsItsGrant suspends the installation, which
+// is logged and changes nothing, and deletes it, which ends its grant, one POST
+// /v1/grants/end with its connection and its grant_ref and no disconnect of the
+// connection, and drops its grant, its link and its collections' records; another
+// installation's stay.
+func TestAnInstallationSuspendedThenDeletedEndsItsGrant(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	grantedLink(w.st, 42, testConnection, linkLive)
 	grantedLink(w.st, 43, otherConnection, linkLive)
@@ -822,12 +849,18 @@ func TestAnInstallationSuspendedThenDeletedEndsItsConnection(t *testing.T) {
 		t.Errorf("the log: %s", w.log.String())
 	}
 	w.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
-	sent := w.apiary.sent(routeConnectionsDisconnect)
-	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || len(sent[0].body) != 3 || len(w.apiary.sent(routeDisconnect)) != 0 {
+	sent := w.apiary.sent(routeGrantsEnd)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" || len(sent[0].body) != 4 || len(w.apiary.sent(routeDisconnect)) != 0 || len(w.apiary.sent(routeConnectionsDisconnect)) != 0 {
 		t.Errorf("sent %v", sent)
 	}
 	if ok, _ := Linked(w.st, 42); ok {
 		t.Error("the deleted installation is still linked")
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the deleted installation's grant is kept for %s", held)
+	}
+	if held, _ := grantOf(w.st, 43); held != otherConnection {
+		t.Errorf("another installation's grant is %q", held)
 	}
 	if ok, _ := Linked(w.st, 43); !ok {
 		t.Error("another installation is unlinked")
@@ -854,65 +887,163 @@ func TestAnInstallationSuspendedThenDeletedEndsItsConnection(t *testing.T) {
 	}
 }
 
-// TestADisconnectOfAConnectionIsSentAgainOn403 has Qory Apiary answer POST
-// /v1/connections/disconnect 403, as it answers one sent while the linked connect
-// return is being saved: it is sent again, built anew, after waits that double, until
-// a signed 204, a 409 connection_ended, or five tries, after which the 403 is logged
-// and the installation's records are dropped all the same.
-func TestADisconnectOfAConnectionIsSentAgainOn403(t *testing.T) {
-	for name, tc := range map[string]struct {
-		refuse func(n int) (int, string)
-		tries  int
+// TestEachAnswerToAGrantEndIsActedOn deletes the linked installation 42, whose grant
+// Qory Apiary's copy has, and has Qory Apiary answer its grant end in turn. The signed
+// 204, 409 grant_unknown and 409 connection_ended drop the grant, the link and the
+// collections' records at once. 403 connection_unknown, a 503 and an answer not signed
+// have the grant end sent again, built anew, after waits that double from 2 seconds to
+// a minute, until one of those. 403 forbidden and 400 invalid_request stop it with a
+// line, and the state stays.
+func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
+	unknown := func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	for _, tc := range []struct {
+		name     string
+		refuse   func(n int) (int, string)
+		unsigned int
+		tries    int
+		waits    []time.Duration
+		dropped  bool
+		line     string
 	}{
-		"204 at the third": {func(n int) (int, string) {
+		{name: "204", tries: 1, dropped: true},
+		{name: "grant_unknown", refuse: func(int) (int, string) { return 409, `{"error":"grant_unknown"}` }, tries: 1, dropped: true},
+		{name: "connection_ended", refuse: func(int) (int, string) { return 409, `{"error":"connection_ended"}` }, tries: 1, dropped: true},
+		{name: "connection_unknown, then 204", refuse: func(n int) (int, string) {
 			if n < 3 {
-				return 403, `{"error":"connection_unknown"}`
+				return unknown(n)
 			}
 			return 0, ""
-		}, 3},
-		"connection_ended at the second": {func(n int) (int, string) {
-			if n < 2 {
-				return 403, `{"error":"connection_unknown"}`
+		}, tries: 3, waits: []time.Duration{2 * time.Second, 4 * time.Second}, dropped: true},
+		{name: "connection_unknown eight times, then 204", refuse: func(n int) (int, string) {
+			if n < 9 {
+				return unknown(n)
 			}
-			return 409, `{"error":"connection_ended"}`
-		}, 2},
-		"403 that lasts": {func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }, 5},
+			return 0, ""
+		}, tries: 9, waits: []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute, time.Minute}, dropped: true},
+		{name: "503, then grant_unknown", refuse: func(n int) (int, string) {
+			if n == 1 {
+				return 503, `{"error":"unavailable"}`
+			}
+			return 409, `{"error":"grant_unknown"}`
+		}, tries: 2, waits: []time.Duration{2 * time.Second}, dropped: true},
+		{name: "not signed, then 204", unsigned: 1, tries: 2, waits: []time.Duration{2 * time.Second}, dropped: true},
+		{name: "forbidden", refuse: func(int) (int, string) { return 403, `{"error":"forbidden"}` }, tries: 1, line: "403 forbidden"},
+		{name: "invalid_request", refuse: func(int) (int, string) { return 400, `{"error":"invalid_request"}` }, tries: 1, line: "400 invalid_request"},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
-		grantedLink(w.st, 42, testConnection, linkPending)
+		w.retryEnds()
+		grantedLink(w.st, 42, testConnection, linkLive)
 		setReach(w.st, refOf("acme/widgets"), 42)
-		// Each try is built anew, with a later time: the waits between them pass.
+		linkCollection(w.st, refOf("acme/widgets"))
+		// Each try is built anew, with a later time.
 		now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
 		var clock sync.Mutex
 		w.client.Now = func() time.Time { clock.Lock(); defer clock.Unlock(); now = now.Add(time.Second); return now }
+		w.apiary.unsigned = func(route string, n int) bool { return route == routeGrantsEnd && n <= tc.unsigned }
 		w.apiary.refuse = func(route string, n int) (int, string) {
-			if route == routeConnectionsDisconnect {
+			if route == routeGrantsEnd && tc.refuse != nil {
 				return tc.refuse(n)
 			}
 			return 0, ""
 		}
 		w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
-		sent := w.apiary.sent(routeConnectionsDisconnect)
+		w.endsDone(t, 42)
+		sent := w.apiary.sent(routeGrantsEnd)
 		if len(sent) != tc.tries || state(w.st, guid1) != store.Done {
-			t.Errorf("%s: %d tries, %s", name, len(sent), state(w.st, guid1))
+			t.Errorf("%s: %d tries, %s", tc.name, len(sent), state(w.st, guid1))
 		}
-		for i := 1; i < len(sent); i++ {
-			if sent[i].signature == sent[i-1].signature {
-				t.Errorf("%s: a try is sent unchanged", name)
+		for i, r := range sent {
+			if r.body["connection_id"] != testConnection || r.body["grant_ref"] != "42" || (i > 0 && r.signature == sent[i-1].signature) {
+				t.Errorf("%s: try %d is %s", tc.name, i+1, r.raw)
 			}
 		}
-		want := []time.Duration{8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second}[:tc.tries-1]
 		w.mu.Lock()
-		if !reflect.DeepEqual(w.slept, want) {
-			t.Errorf("%s: slept %v", name, w.slept)
+		if !slices.Equal(w.endWaits, tc.waits) {
+			t.Errorf("%s: waited %v", tc.name, w.endWaits)
 		}
 		w.mu.Unlock()
-		if ok, _ := Linked(w.st, 42); ok {
-			t.Errorf("%s: still linked", name)
+		linked, _ := Linked(w.st, 42)
+		held, _ := grantOf(w.st, 42)
+		_, reached, _ := reachOf(w.st, refOf("acme/widgets"))
+		collection, _ := collectionLinked(w.st, refOf("acme/widgets"))
+		if linked == tc.dropped || (held == "") != tc.dropped || reached == tc.dropped || collection == tc.dropped {
+			t.Errorf("%s: linked %v, grant %q, reached %v, collection linked %v", tc.name, linked, held, reached, collection)
 		}
-		if refused := strings.Contains(w.log.String(), `"msg":"the disconnect is refused","connection":"`+testConnection+`"`); refused != (name == "403 that lasts") {
-			t.Errorf("%s: the log %s", name, w.log.String())
+		log := w.log.String()
+		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary refused the end of the installation's grant, so serve keeps its link","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
+			t.Errorf("%s: the log %s", tc.name, log)
 		}
+		if tc.dropped != strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link","installation":42`) {
+			t.Errorf("%s: the log %s", tc.name, log)
+		}
+		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
+			t.Errorf("%s: %d disconnects of the connection", tc.name, n)
+		}
+	}
+}
+
+// TestAGrantEndLeavesTheConnectionAndItsOtherInstallation links the installations 42
+// and 43 to one connection and deletes 42: the grant end names 42's grant alone, the
+// connection is not disconnected, and 43 keeps its link, its grant, its collection and
+// its deliveries, whose issue is sent; and once 43 is deleted too, the connection is
+// still not disconnected.
+func TestAGrantEndLeavesTheConnectionAndItsOtherInstallation(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	setReach(w.st, refOf("other/thing"), 43)
+	linkCollection(w.st, refOf("other/thing"))
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 1 || sent[0].body["grant_ref"] != "42" || sent[0].body["connection_id"] != testConnection {
+		t.Fatalf("the grant ends %v", sent)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("the deleted installation is still linked")
+	}
+	if l, ok, _ := linkOf(w.st, 43); !ok || l.Connection != testConnection || l.State != linkLive {
+		t.Errorf("the other installation's link %+v %v", l, ok)
+	}
+	if held, _ := grantOf(w.st, 43); held != testConnection {
+		t.Errorf("the other installation's grant is %q", held)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+		t.Error("the other installation's collection is unlinked")
+	}
+	w.deliver(t, "issues", guid2, issueEvent(43, "other/thing", "opened"))
+	if sent := w.apiary.sent(routeItems); len(sent) != 1 || sent[0].body["collection_ref"] != refOf("other/thing") {
+		t.Errorf("the other installation's items %v", sent)
+	}
+	w.deliver(t, "installation", guid3, map[string]any{"action": "deleted", "installation": map[string]any{"id": 43}})
+	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 2 || sent[1].body["grant_ref"] != "43" {
+		t.Errorf("the grant ends %v", sent)
+	}
+	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
+		t.Errorf("%d disconnects of the connection", n)
+	}
+}
+
+// TestAGrantNotInTheCopyIsNotEnded deletes the installation 42, linked pending while its
+// grant's report is still being sent, so Qory Apiary's copy of the grants does not have
+// its grant: no grant end is sent, its link and its collections' records are dropped,
+// and a line says so.
+func TestAGrantNotInTheCopyIsNotEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkPending)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 0 {
+		t.Errorf("%d grant ends", n)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("the deleted installation is still linked")
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/widgets")); ok {
+		t.Error("the deleted installation's repository is kept")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"Qory Apiary's copy of the grants does not contain the installation's grant, so serve sends no grant end and drops its link","installation":42,"connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
 	}
 }
 
@@ -1142,6 +1273,9 @@ func TestAListingOf250CollectionsIsSentInThreeParts(t *testing.T) {
 			w.gh.repos = append(w.gh.repos, "acme/repo-"+strconv.Itoa(i))
 		}
 		if refuse {
+			// Qory Apiary's copy has the grant, so the refusal has another cause, and
+			// part 2 is not sent again.
+			w.apiary.grant("42", testConnection)
 			w.apiary.refuse = func(route string, n int) (int, string) {
 				if route == routeCollections && n == 2 {
 					return 400, `{"error":"invalid_request"}`
@@ -3542,7 +3676,7 @@ func (w *wired) sendPart(t *testing.T, installation int64, connection string, st
 	t.Helper()
 	cs := []contracts.Collection{}
 	for _, n := range names {
-		cs = append(cs, contracts.Collection{Ref: refOf(n), Title: n, URL: "https://github.com/" + n})
+		cs = append(cs, contracts.Collection{Ref: refOf(n), Title: n, URL: "https://github.com/" + n, GrantRef: grantRef(installation)})
 	}
 	sink := reachSink{Sink: w.client, st: w.st, installation: installation, connection: connection}
 	req := contracts.SourceCollections{Version: contracts.Version, ConnectionID: connection, Collections: cs, Listing: contracts.Listing{ID: "listing-" + strconv.FormatInt(installation, 10) + "-" + contracts.FormatTime(started), Part: 1, StartedAt: contracts.FormatTime(started)}}
@@ -4062,6 +4196,7 @@ func TestAListingKeepsTheEnvironmentRefsQoryApiaryTook(t *testing.T) {
 	}
 
 	w.gh.envs[widgetsID] = envAfter
+	w.apiary.grant("42", testConnection)
 	w.apiary.refuse = func(route string, _ int) (int, string) {
 		if route == routeCollections {
 			return 400, `{"error":"invalid_request"}`

@@ -360,6 +360,20 @@ func (rig *connectRig) linked(t *testing.T, installation int64, connection, stat
 	}
 }
 
+// listAfterReport delays each answer to a page of the installation's repositories
+// until serve has the grant of 42 for testConnection in its copy, five seconds at most.
+// A connect reports the grant and lists the installation at the same time, and a
+// listing read before the report's 204 leaves the collections out, see [reachSink].
+func (rig *connectRig) listAfterReport() {
+	rig.gh.repoAfter = func(*fakeGitHub, int) {
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if c, err := grantOf(rig.st, 42); err == nil && c == testConnection {
+				return
+			}
+		}
+	}
+}
+
 func TestThePassIsCheckedStepByStep(t *testing.T) {
 	rig := newConnectRig(t)
 	now := time.Now().Truncate(time.Second)
@@ -732,6 +746,7 @@ func TestAConnectLinksTheInstallationPendingAndListsItAtOnce(t *testing.T) {
 	if _, err := rig.st.Get(nsUnlinked, "42"); err != nil || len(rig.apiary.sent(routeCollections)) != 0 {
 		t.Fatalf("the installation made on GitHub: %v, %d listings", err, len(rig.apiary.sent(routeCollections)))
 	}
+	rig.listAfterReport()
 	listed := make(chan struct{})
 	rig.apiary.refuse = func(route string, n int) (int, string) {
 		if route != routeCollections {
@@ -1559,6 +1574,12 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 		if r, ok, _ := replacedOf(rig.st, otherConnection); !ok || r.Installation != 42 {
 			t.Fatalf("the replaced connection %+v %v", r, ok)
 		}
+		// The connect's first listing for testConnection, refused 403 at each try, may
+		// have spent the waits' budget before the stop; the tries that follow start a
+		// new budget.
+		rig.mu.Lock()
+		rig.waits = nil
+		rig.mu.Unlock()
 		return rig
 	}
 	// empty checks every listing of the replaced connection from the one numbered from
@@ -2145,8 +2166,8 @@ func TestALockHeldPastLinkWaitGoesBackSourceUnavailable(t *testing.T) {
 // TestAnInstallationDeletedDuringAConnectIsNotLinked has GitHub delete acme's 42 while
 // a connect for it is under way: deleted before the connect links, the connect goes
 // back refused, grant_not_confirmed, and links nothing; deleted while the connect holds
-// the installation's lock, the deletion waits for it, then drops the link the connect
-// wrote, and ends its connection.
+// the installation's lock, the deletion waits for it, then ends the grant of the link
+// the connect wrote, POST /v1/grants/end, and drops the link.
 func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 	rig := newConnectRig(t)
 	rig.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
@@ -2187,8 +2208,8 @@ func TestAnInstallationDeletedDuringAConnectIsNotLinked(t *testing.T) {
 	unlock()
 	<-done
 	rig.linked(t, 42, "", "")
-	if sent := rig.apiary.sent(routeConnectionsDisconnect); len(sent) != 1 || sent[0].body["connection_id"] != testConnection {
-		t.Errorf("disconnects %v", sent)
+	if sent := rig.apiary.sent(routeGrantsEnd); len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" {
+		t.Errorf("grant ends %v", sent)
 	}
 	rig.c.stop()
 }

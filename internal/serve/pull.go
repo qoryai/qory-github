@@ -663,7 +663,7 @@ func (p *puller) installationRound(ctx context.Context, installation int64, targ
 // does not run, as one the installation's last round still runs for, changes nothing.
 func (p *puller) installationGone(ctx context.Context, attr slog.Attr, installation int64, since uint64, err error) {
 	if !p.adapter.presence.goneAgain(installation, since) {
-		p.log.Warn("GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round disconnects its connection unless GitHub shows the installation in between", attr, slog.String("error", err.Error()))
+		p.log.Warn("GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round ends its grant unless GitHub shows the installation in between", attr, slog.String("error", err.Error()))
 		return
 	}
 	p.ended(ctx, attr, installation)
@@ -672,8 +672,9 @@ func (p *puller) installationGone(ctx context.Context, attr slog.Attr, installat
 // ended ends what serve keeps of the installation, whose check GitHub answered 404 for
 // under the App's token, [github.ErrInstallationGone], in two rounds in a row, see
 // [puller.installationGone], as the webhook's deleted does, see
-// [Adapter.endInstallation]: its connection is disconnected and its link dropped, with a
-// line, and none of its collections is pulled. Only GitHub's 404 to the installation's
+// [Adapter.endInstallation]: serve reports the end of its grant to Qory Apiary, with a
+// line, drops its link once Qory Apiary has ended the grant, and pulls none of its
+// collections. Only GitHub's 404 to the installation's
 // check brings it: a 401, as for an App key GitHub does not take, or a suspension never
 // does. An installation the webhook ended already is passed with no line. A failure is
 // reported, see [puller.report], and the 404s stay counted, so the next round's 404
@@ -681,13 +682,13 @@ func (p *puller) installationGone(ctx context.Context, attr slog.Attr, installat
 func (p *puller) ended(ctx context.Context, attr slog.Attr, installation int64) {
 	connection, err := p.adapter.endInstallation(ctx, installation)
 	if err != nil {
-		p.report(ctx, attr, "ending a deleted installation's connection", err)
+		p.report(ctx, attr, "ending a deleted installation's grant", err)
 		return
 	}
 	p.adapter.presence.notGone(installation)
 	p.passed(attr)
 	if connection != "" {
-		p.log.Info("GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so its connection is disconnected and its link dropped", slog.Int64("installation", installation), slog.String("connection", connection))
+		p.log.Info("GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve reports the end of its grant to Qory Apiary", slog.Int64("installation", installation), slog.String("connection", connection))
 	}
 }
 

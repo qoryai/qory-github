@@ -2,6 +2,7 @@ package serve
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
 )
 
 // reportClock is a fake clock for a connect's grant report: each wait between the
@@ -69,9 +71,10 @@ func connectWith(t *testing.T, rig *connectRig, nonce string) {
 
 // TestAConnectReportsTheGrant pins that a connect's checked return reports the
 // installation's grant to Qory Apiary, POST /v1/grants, with the connection, the
-// installation's id as grant_ref and the pass's nonce, once, and that the grant Qory
-// Apiary takes is added to the store's copy, so the installation's deliveries are
-// handled once the linked connect return has expired too.
+// installation's id as grant_ref, its GitHub account's id and login as the account, and
+// the pass's nonce, once, and that the grant Qory Apiary takes is added to the store's
+// copy, so the installation's deliveries are handled once the linked connect return has
+// expired too.
 func TestAConnectReportsTheGrant(t *testing.T) {
 	rig, clock := reportRig(t)
 	nonce := newNonce()
@@ -80,6 +83,9 @@ func TestAConnectReportsTheGrant(t *testing.T) {
 	sent := rig.apiary.sent(routeGrants)
 	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" || sent[0].body["pass_nonce"] != nonce || sent[0].body["version"] != 1.0 {
 		t.Fatalf("reported %d times: %v", len(sent), sent)
+	}
+	if account, _ := sent[0].body["account"].(map[string]any); len(account) != 2 || account["ref"] != "500" || account["title"] != "acme" {
+		t.Errorf("the account %v", sent[0].body["account"])
 	}
 	if w := clock.waited(); len(w) != 0 {
 		t.Errorf("waited %v", w)
@@ -405,5 +411,155 @@ func TestACallServesOnlyAnInstallationTheCopyHolds(t *testing.T) {
 	checkAnswer(t, sendWork(), http.StatusOK, "run-credential-answer.schema.json", "")
 	if mints := rig.gh.mintsSoFar(); len(mints) != 3 {
 		t.Errorf("minted %d credentials, want 3", len(mints))
+	}
+}
+
+// TestAnAccountIsItsIDAndLogin pins the account a grant's report sends: the GitHub
+// account's id in decimal as ref and its login as title, and the ref as title for a
+// login that is not one line of 1 to 1024 characters the contract takes.
+func TestAnAccountIsItsIDAndLogin(t *testing.T) {
+	for login, title := range map[string]string{
+		"acme":                    "acme",
+		"octo-org":                "octo-org",
+		strings.Repeat("a", 1024): strings.Repeat("a", 1024),
+		strings.Repeat("a", 1025): "500",
+		"":                        "500",
+		"two\nlines":              "500",
+		"right\u202eleft":         "500",
+		"zero\u200bwidth":         "500",
+		"\xff":                    "500",
+	} {
+		got := accountOf(github.Account{Login: login, ID: 500, Type: "Organization"})
+		if got != (contracts.Account{Ref: "500", Title: title}) {
+			t.Errorf("%q: %+v, want the title %q", login, got, title)
+		}
+	}
+}
+
+// TestACollectionWaitsForItsGrantsReport pins that a connect's first listing, sent
+// while Qory Apiary has not taken the grant's report, contains no collection and is
+// not complete, and that once Qory Apiary takes the report the installation's
+// repositories are listed again, each collection with the installation's grant_ref,
+// complete.
+func TestACollectionWaitsForItsGrantsReport(t *testing.T) {
+	rig, _ := reportRig(t)
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		// The report is refused until a listing has reached Qory Apiary.
+		if route == routeGrants && len(rig.apiary.sent(routeCollections)) == 0 {
+			return http.StatusConflict, `{"error":"pass_unknown"}`
+		}
+		return 0, ""
+	}
+	connectWith(t, rig, newNonce())
+	eventually(t, "the second listing", func() bool { return len(rig.apiary.sent(routeCollections)) >= 2 })
+	rig.c.stop()
+	sent := rig.apiary.sent(routeCollections)
+	var first, second contracts.SourceCollections
+	json.Unmarshal(sent[0].raw, &first)
+	json.Unmarshal(sent[1].raw, &second)
+	if len(first.Collections) != 0 || first.Listing.Complete {
+		t.Errorf("the listing before the report is taken: %s", sent[0].raw)
+	}
+	if len(second.Collections) != 2 || !second.Listing.Complete || second.Listing.ID == first.Listing.ID {
+		t.Fatalf("the listing after the report is taken: %s", sent[1].raw)
+	}
+	for _, c := range second.Collections {
+		if c.GrantRef != "42" {
+			t.Errorf("the collection %s names the grant %q", c.Ref, c.GrantRef)
+		}
+	}
+	if n := len(sent); n != 2 {
+		t.Errorf("%d listings", n)
+	}
+}
+
+// TestAPartRefused400IsSentAgainAfterTheGrantsAreRead pins that a part Qory Apiary
+// refuses 400 invalid_request, as for a grant_ref its copy does not have, reads the
+// copy again, GET /v1/grants. When the copy does not have the grant, the part is sent
+// again, built anew, without its collections and not complete. When the copy has it,
+// the refusal has another cause: the part is not sent again, and the refusal is the
+// listing's error.
+func TestAPartRefused400IsSentAgainAfterTheGrantsAreRead(t *testing.T) {
+	for _, inCopy := range []bool{false, true} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkLive, Return: time.Now().Add(time.Minute).Unix()})
+		if inCopy {
+			w.apiary.grant("42", testConnection)
+		}
+		w.apiary.refuse = func(route string, n int) (int, string) {
+			if route == routeCollections && n == 1 {
+				return http.StatusBadRequest, `{"error":"invalid_request"}`
+			}
+			return 0, ""
+		}
+		err := w.adapter.listRepositories(context.Background(), 42)
+		if refused := refusedAs(err, http.StatusBadRequest, codeInvalidRequest); refused != inCopy {
+			t.Errorf("in the copy %v: err %v", inCopy, err)
+		}
+		if n := len(w.apiary.sent("GET " + routeGrants)); n != 1 {
+			t.Errorf("in the copy %v: the copy was read %d times", inCopy, n)
+		}
+		sent := w.apiary.sent(routeCollections)
+		if inCopy {
+			if len(sent) != 1 {
+				t.Errorf("in the copy: %d parts", len(sent))
+			}
+			continue
+		}
+		if len(sent) != 2 {
+			t.Fatalf("not in the copy: %d parts", len(sent))
+		}
+		var again contracts.SourceCollections
+		json.Unmarshal(sent[1].raw, &again)
+		if len(again.Collections) != 0 || again.Listing.Complete || again.Listing.Part != 1 {
+			t.Errorf("not in the copy: the part sent again %s", sent[1].raw)
+		}
+		if held, _ := grantOf(w.st, 42); held != "" {
+			t.Errorf("not in the copy: the grant is kept for %s", held)
+		}
+	}
+}
+
+// TestAConnectForTheAccountStopsItsGrantEnd pins that a grant end Qory Apiary answers
+// 503, sent again later, stops once a connect mints a linked connect return for the
+// GitHub account of its installation, acme: no try follows, and the deleted
+// installation's link stays, while the grant end of an installation on another account
+// is still sent again.
+func TestAConnectForTheAccountStopsItsGrantEnd(t *testing.T) {
+	rig, _ := reportRig(t)
+	grantedPutLink(rig.st, 99, link{Connection: otherConnection, State: linkLive, Account: acme.ID})
+	grantedPutLink(rig.st, 98, link{Connection: "ac_0000000000000002", State: linkLive, Account: alice.ID})
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	for _, id := range []int64{99, 98} {
+		if _, err := rig.adapter.endInstallation(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+		if !rig.adapter.ending(id) {
+			t.Fatalf("the grant end of %d is not sent again", id)
+		}
+	}
+	connectWith(t, rig, newNonce())
+	if rig.adapter.ending(99) {
+		t.Error("the grant end of the account's installation is still sent again")
+	}
+	if !rig.adapter.ending(98) {
+		t.Error("the grant end of another account's installation stopped")
+	}
+	if l, ok, _ := linkOf(rig.st, 99); !ok || l.Connection != otherConnection {
+		t.Errorf("the deleted installation's link %+v %v", l, ok)
+	}
+	if n := len(rig.apiary.sent(routeGrantsEnd)); n != 2 {
+		t.Errorf("%d grant ends", n)
+	}
+	if !strings.Contains(rig.log.String(), `"msg":"a connect for the account stops the end of its earlier installation's grant","installation":99`) {
+		t.Errorf("the log %s", rig.log.String())
+	}
+	if l, ok, _ := linkOf(rig.st, 42); !ok || l.Account != acme.ID {
+		t.Errorf("the connected installation's link %+v %v", l, ok)
 	}
 }

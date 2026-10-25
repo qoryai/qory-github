@@ -772,7 +772,9 @@ func (c *Connect) installed(w http.ResponseWriter, r *http.Request, q url.Values
 // sign-in: it checks that GitHub lists the installation among the person's, that GitHub
 // has not suspended it, that it grants the permissions the adapter needs, and that the
 // person administers its account, see [Connect.administers]; then it links the
-// installation to the session's connection, see [Connect.link]. The session ends
+// installation to the session's connection, see [Connect.link]. Once it has minted the
+// linked connect return, it stops each grant end being sent again for the account, see
+// [Adapter.stopEnd], and reports the grant, see [Connect.reportSoon]. The session ends
 // whatever the answer.
 func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Request, id string, s session, token string) {
 	installation := s.Candidate
@@ -817,7 +819,7 @@ func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Reque
 	// The connect return's expires_at has whole seconds, so expires is cut to one: the
 	// link, the return and the grant's report then end at the same moment.
 	expires := c.clock().Add(returnFor).Truncate(time.Second)
-	again, v, rf, err := c.link(ctx, installation, s, expires.Unix())
+	again, v, rf, err := c.link(ctx, installation, in.Account.ID, s, expires.Unix())
 	<-c.linking
 	if err != nil {
 		c.failed(w, r, id, "linking the installation", err)
@@ -836,7 +838,8 @@ func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		c.failed(w, r, id, "making the connect return", err)
 		return
 	}
-	c.reportSoon(installation, s.Connection, s.Nonce, expires)
+	c.Adapter.stopEnd(in.Account.ID)
+	c.reportSoon(installation, s.Connection, s.Nonce, accountOf(in.Account), expires)
 	c.listSoon(installation, s.Connection, again)
 	c.end(w, id)
 	c.log().LogAttrs(r.Context(), slog.LevelInfo, "connected", append(attrs, slog.Bool("again", again))...)
@@ -888,7 +891,8 @@ func (c *Connect) administers(ctx context.Context, token string, account github.
 	return false, nil
 }
 
-// link links the installation to the session's connection, pending, which the caller
+// link links the installation, on the GitHub account whose id is account, which the
+// link keeps, to the session's connection, pending, which the caller
 // does holding the linking token, and says whether the installation was linked to the
 // connection and live already, a re-connect; or the verdict, or the page, that refuses
 // it. An installation is linked to one connection at a time:
@@ -929,7 +933,7 @@ func (c *Connect) administers(ctx context.Context, token string, account github.
 // the linking token meanwhile, and past that, or ctx, refuses, source_unavailable. The
 // person administers the installation's account, which the caller checked, for each
 // connect anew.
-func (c *Connect) link(ctx context.Context, installation int64, s session, returnExpires int64) (bool, *verdict, *refusal, error) {
+func (c *Connect) link(ctx context.Context, installation, account int64, s session, returnExpires int64) (bool, *verdict, *refusal, error) {
 	newest, err := newestPass(c.Store, s.Connection)
 	if err != nil {
 		return false, nil, nil, err
@@ -965,6 +969,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		// A re-connect: a live link stays live, and a pending one takes the new return's
 		// expiry, which its last listing waits for.
 		l.Pass = max(l.Pass, s.Pass)
+		l.Account = account
 		if l.State == linkPending {
 			l.Return = returnExpires
 		}
@@ -1043,7 +1048,7 @@ func (c *Connect) link(ctx context.Context, installation int64, s session, retur
 		}
 		c.log().Info("a connect for another connection replaces the installation's pending link", slog.String("connection", old.Connection), slog.Int64("installation", installation))
 	}
-	if err := putLink(c.Store, installation, link{Connection: s.Connection, State: linkPending, Pass: s.Pass, Return: returnExpires}); err != nil {
+	if err := putLink(c.Store, installation, link{Connection: s.Connection, State: linkPending, Pass: s.Pass, Return: returnExpires, Account: account}); err != nil {
 		return false, nil, nil, err
 	}
 	c.Adapter.dropFirsts(installation, "")

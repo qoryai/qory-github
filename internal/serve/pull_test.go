@@ -1235,22 +1235,22 @@ func (f *fakeGitHub) repositoryReads() []string {
 
 // endedLine is the line of a round that ended the installation 42, linked to
 // testConnection.
-const endedLine = `"msg":"GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so its connection is disconnected and its link dropped","installation":42,"connection":"` + testConnection + `"`
+const endedLine = `"msg":"GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve reports the end of its grant to Qory Apiary","installation":42,"connection":"` + testConnection + `"`
 
 // goneOnceLine is the line of a round that met GitHub's first 404 in a row to the
 // installation 42's check.
-const goneOnceLine = `"level":"WARN","msg":"GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round disconnects its connection unless GitHub shows the installation in between","installation":42,"error":"`
+const goneOnceLine = `"level":"WARN","msg":"GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round ends its grant unless GitHub shows the installation in between","installation":42,"error":"`
 
 // goneOnceError is goneOnceLine with the error of a listing whose check GitHub
 // answered 404.
 const goneOnceError = goneOnceLine + `listing the installation's repositories: the installation token: GitHub refuses to mint the installation token: GitHub answers 404 for the installation under the App's token, as for an installation deleted"`
 
-// keptLinked checks the round changed nothing of the installation 42: no disconnect was
-// sent, and its link and acme/widgets's records stay.
+// keptLinked checks the round changed nothing of the installation 42: no grant end and
+// no disconnect was sent, and its link and acme/widgets's records stay.
 func keptLinked(t *testing.T, w *wired) {
 	t.Helper()
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
+		t.Errorf("%d grant ends and disconnects", n)
 	}
 	if l, ok, _ := linkOf(w.st, 42); !ok || l.State != linkLive {
 		t.Error("the link changed")
@@ -1263,14 +1263,14 @@ func keptLinked(t *testing.T, w *wired) {
 	}
 }
 
-// TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsConnection has GitHub answer the
+// TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsGrant has GitHub answer the
 // check of the installation 42 404 under the App's token, and runs rounds. The first
 // changes nothing, pulls nothing of 42 and logs that it met a first 404. The second:
-// one POST /v1/connections/disconnect names 42's connection, the link, the repository's
+// one POST /v1/grants/end names 42's connection and grant, the link, the repository's
 // records, the collection's link and its pull mark are dropped, GitHub's deletion is
 // kept, the adapter's memory holds nothing of 42, no collection is pulled, a line says
 // so, and the puller forgets the 404s it counted. A third round sends nothing more.
-func TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsConnection(t *testing.T) {
+func TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsGrant(t *testing.T) {
 	w, _, p, _ := pulling(t)
 	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart})
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
@@ -1291,7 +1291,7 @@ func TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsConnection(t *testing.
 	if gone, _ := w.adapter.presence.counts(); gone != 0 {
 		t.Errorf("the adapter keeps %d installations' 404s after the end", gone)
 	}
-	sent := w.apiary.sent(routeConnectionsDisconnect)
+	sent := w.apiary.sent(routeGrantsEnd)
 	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection {
 		t.Fatalf("sent %v", sent)
 	}
@@ -1330,8 +1330,8 @@ func TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsConnection(t *testing.
 	}
 	p.round(context.Background(), pullStart.Add(2*time.Hour), time.Hour)
 	p.rounds.Wait()
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-		t.Errorf("%d disconnects after a third round", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends after a third round", n)
 	}
 }
 
@@ -1378,15 +1378,15 @@ func TestA404AfterARoundThatPassesStillEndsTheInstallation(t *testing.T) {
 	p.busy = map[int64]bool{42: true}
 	p.mu.Unlock()
 	roundAt(p, clock, time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
-		t.Fatalf("%d disconnects in a round that passed", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 0 {
+		t.Fatalf("%d grant ends in a round that passed", n)
 	}
 	p.mu.Lock()
 	p.busy = nil
 	p.mu.Unlock()
 	roundAt(p, clock, 2*time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
 	}
 	if strings.Count(w.log.String(), endedLine) != 1 {
 		t.Errorf("the log %s", w.log.String())
@@ -1426,8 +1426,8 @@ func TestA404AtAPullStopsTheInstallationsRound(t *testing.T) {
 		t.Errorf("after the second round, the log %s", log)
 	}
 	roundAt(p, clock, 2*time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 || strings.Count(w.log.String(), endedLine) != 1 {
-		t.Errorf("%d disconnects; the log %s", n, w.log.String())
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 || strings.Count(w.log.String(), endedLine) != 1 {
+		t.Errorf("%d grant ends; the log %s", n, w.log.String())
 	}
 }
 
@@ -1466,8 +1466,8 @@ func TestASignOfTheInstallationBetweenRoundsStartsItsCountOver(t *testing.T) {
 			t.Errorf("%s: the log %s", tc.name, log)
 		}
 		roundAt(p, clock, 2*time.Hour)
-		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-			t.Errorf("%s: %d disconnects", tc.name, n)
+		if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+			t.Errorf("%s: %d grant ends", tc.name, n)
 		}
 	}
 }
@@ -1503,8 +1503,8 @@ func TestASignOfTheInstallationDuringARoundStartsItsCountOver(t *testing.T) {
 		t.Errorf("the log %s", log)
 	}
 	roundAt(p, clock, 2*time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
 	}
 }
 
@@ -1517,8 +1517,8 @@ func TestA401ToTheInstallationsCheckNeverDisconnects(t *testing.T) {
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installUnauthorized = true })
 	p.round(context.Background(), pullStart, time.Hour)
 	p.rounds.Wait()
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
+		t.Errorf("%d grant ends and disconnects", n)
 	}
 	if l, ok, _ := linkOf(w.st, 42); !ok || l.State != linkLive {
 		t.Error("the link changed")
@@ -1538,13 +1538,13 @@ func TestA401ToTheInstallationsCheckNeverDisconnects(t *testing.T) {
 	}
 }
 
-// TestAnInstallationDeletedByTheWebhookAndTheRoundIsDisconnectedOnce has GitHub's
+// TestAnInstallationDeletedByTheWebhookAndTheRoundIsEndedOnce has GitHub's
 // deletion of the installation 42 seen by its webhook and by the rounds, whose first
-// 404 ends nothing, in either order: one POST /v1/connections/disconnect in all, and the
+// 404 ends nothing, in either order: one POST /v1/grants/end in all, and the
 // one that comes second changes nothing; the webhook that comes second logs that the
 // installation is not linked, and the round that comes second never runs, since 42 is
 // no longer linked, and the puller forgets the round's first 404.
-func TestAnInstallationDeletedByTheWebhookAndTheRoundIsDisconnectedOnce(t *testing.T) {
+func TestAnInstallationDeletedByTheWebhookAndTheRoundIsEndedOnce(t *testing.T) {
 	deleted := map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}}
 	t.Run("the webhook first", func(t *testing.T) {
 		w, _, p, clock := pulling(t)
@@ -1552,8 +1552,8 @@ func TestAnInstallationDeletedByTheWebhookAndTheRoundIsDisconnectedOnce(t *testi
 		roundAt(p, clock, 0)
 		w.deliver(t, "installation", guid1, deleted)
 		roundAt(p, clock, time.Hour)
-		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-			t.Errorf("%d disconnects", n)
+		if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+			t.Errorf("%d grant ends", n)
 		}
 		if strings.Contains(w.log.String(), endedLine) {
 			t.Errorf("the round says it ended the installation: %s", w.log.String())
@@ -1571,8 +1571,8 @@ func TestAnInstallationDeletedByTheWebhookAndTheRoundIsDisconnectedOnce(t *testi
 		if s := state(w.st, guid1); s != store.Done {
 			t.Errorf("the delivery is %s", s)
 		}
-		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-			t.Errorf("%d disconnects", n)
+		if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+			t.Errorf("%d grant ends", n)
 		}
 		log := w.log.String()
 		if strings.Count(log, endedLine) != 1 || !strings.Contains(log, `"msg":"the installation is not linked to Qory Apiary, so the delivery is not handled","event":"installation","action":"deleted"`) {
@@ -1594,48 +1594,63 @@ func TestAnInstallationDeletedByTheWebhookAndTheRoundIsDisconnectedOnce(t *testi
 			}
 		})
 		wg.Wait()
-		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-			t.Errorf("%d disconnects", n)
+		if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+			t.Errorf("%d grant ends", n)
 		}
 	})
 }
 
-// TestADisconnectAfterAFailedDropIsTakenAsEnded has Qory Apiary answer the POST
-// /v1/connections/disconnect of the round that met GitHub's second 404 503: the link
-// stays and the failure is logged, and the next round, whose 404 is still the second in
-// a row, sends it again; Qory Apiary answers that one 409 connection_ended, as for a
-// connection that ended meanwhile, which is taken as the 204 is: the link is dropped
-// with no error line.
-func TestADisconnectAfterAFailedDropIsTakenAsEnded(t *testing.T) {
+// TestAGrantEndAfterA503IsSentAgainUntilConnectionEnded has Qory Apiary answer the
+// POST /v1/grants/end of the round that met GitHub's second 404 503: the link stays and
+// a line says the grant end is sent again; the next try, 2 seconds later, is answered
+// 409 connection_ended, as for a connection that ended meanwhile, which is taken as the
+// 204 is: the link is dropped with no error line, and the next round sends nothing.
+func TestAGrantEndAfterA503IsSentAgainUntilConnectionEnded(t *testing.T) {
 	w, _, p, clock := pulling(t)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
 	w.apiary.refuse = func(route string, n int) (int, string) {
 		switch {
-		case route != routeConnectionsDisconnect:
+		case route != routeGrantsEnd:
 			return 0, ""
 		case n == 1:
 			return 503, `{"error":"unavailable"}`
 		}
 		return 409, `{"error":"connection_ended"}`
 	}
+	retry := make(chan struct{})
+	w.adapter.endSleep = func(ctx context.Context, d time.Duration) error {
+		if d != grantFirstWait {
+			t.Errorf("waited %v", d)
+		}
+		select {
+		case <-retry:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	roundAt(p, clock, 0)
 	roundAt(p, clock, time.Hour)
 	if _, ok, _ := linkOf(w.st, 42); !ok {
 		t.Fatal("the link is dropped after a 503")
 	}
-	if !strings.Contains(w.log.String(), `"msg":"ending a deleted installation's connection failed","installation":42`) {
+	if !strings.Contains(w.log.String(), `"level":"WARN","msg":"reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later","installation":42,"connection":"`+testConnection+`"`) {
 		t.Errorf("the log %s", w.log.String())
 	}
-	before := strings.Count(w.log.String(), `"level":"ERROR"`)
-	roundAt(p, clock, 2*time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 2 || strings.Count(w.log.String(), goneOnceLine) != 1 {
-		t.Errorf("%d disconnects; the log %s", n, w.log.String())
+	close(retry)
+	w.endsDone(t, 42)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 2 {
+		t.Errorf("%d grant ends", n)
 	}
 	if _, ok, _ := linkOf(w.st, 42); ok {
 		t.Error("the link is kept after a 409 connection_ended")
 	}
-	if after := strings.Count(w.log.String(), `"level":"ERROR"`); after != before {
+	if strings.Contains(w.log.String(), `"level":"ERROR"`) {
 		t.Errorf("an error is logged: %s", w.log.String())
+	}
+	roundAt(p, clock, 2*time.Hour)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 2 {
+		t.Errorf("%d grant ends after the next round", n)
 	}
 }
 
@@ -1667,23 +1682,23 @@ func TestASignDuringTheListingBeforeIts404StartsTheCountOver(t *testing.T) {
 		t.Errorf("the log %s", log)
 	}
 	roundAt(p, clock, 2*time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 || strings.Count(w.log.String(), endedLine) != 1 {
-		t.Errorf("%d disconnects; the log %s", n, w.log.String())
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 || strings.Count(w.log.String(), endedLine) != 1 {
+		t.Errorf("%d grant ends; the log %s", n, w.log.String())
 	}
 }
 
 // TestAPendingLinkOfAnInstallationGitHubAnswers404ForIsEnded has GitHub answer the check
-// of the installation 42 404 while its link is pending: the second round sends the
-// disconnect, which Qory Apiary answers with the signed 204 for a pending connection,
-// and drops the link.
+// of the installation 42 404 while its link is pending and Qory Apiary's copy has its
+// grant: the second round sends the grant end, which Qory Apiary answers with the
+// signed 204, and drops the link.
 func TestAPendingLinkOfAnInstallationGitHubAnswers404ForIsEnded(t *testing.T) {
 	w, _, p, clock := pulling(t)
 	grantedLink(w.st, 42, testConnection, linkPending)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
 	roundAt(p, clock, 0)
 	roundAt(p, clock, time.Hour)
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 1 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
 	}
 	if _, ok, _ := linkOf(w.st, 42); ok {
 		t.Error("the pending link is kept")
@@ -1720,8 +1735,8 @@ func TestARoundOfASuspendedInstallationIsLoggedOnceAndPullsNothing(t *testing.T)
 	if strings.Count(log, line) != 1 || strings.Contains(log, "has failed for a day") {
 		t.Errorf("the log %s", log)
 	}
-	if n := len(w.apiary.sent(routeConnectionsDisconnect)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
-		t.Errorf("%d disconnects", n)
+	if n := len(w.apiary.sent(routeGrantsEnd)) + len(w.apiary.sent(routeDisconnect)); n != 0 {
+		t.Errorf("%d grant ends and disconnects", n)
 	}
 	if l, ok, _ := linkOf(w.st, 42); !ok || l.State != linkLive {
 		t.Error("the link changed")
@@ -2808,7 +2823,7 @@ func TestARefusedRepositoryReachedByAnotherInstallationIsNotDisconnected(t *test
 // TestAMintRefusedWithoutTheChecks404NeverEndsTheInstallation has GitHub refuse the
 // round's listing token for good without answering 404 to the installation's check: the
 // check answers 200 and the mint 404, or the check answers a login that is no login.
-// Neither ends the installation: no POST /v1/connections/disconnect is sent, the link
+// Neither ends the installation: no POST /v1/grants/end is sent, the link
 // and the records stay, and the listing's failure is logged as GitHub refusing the
 // token.
 func TestAMintRefusedWithoutTheChecks404NeverEndsTheInstallation(t *testing.T) {
@@ -2824,8 +2839,8 @@ func TestAMintRefusedWithoutTheChecks404NeverEndsTheInstallation(t *testing.T) {
 		setGitHub(w.gh, tc.set)
 		p.round(context.Background(), pullStart, time.Hour)
 		p.rounds.Wait()
-		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
-			t.Errorf("%s: %d disconnects", tc.name, n)
+		if n := len(w.apiary.sent(routeGrantsEnd)); n != 0 {
+			t.Errorf("%s: %d grant ends", tc.name, n)
 		}
 		if l, ok, _ := linkOf(w.st, 42); !ok || l.State != linkLive {
 			t.Errorf("%s: the link changed", tc.name)
@@ -2905,16 +2920,16 @@ func TestARefusedRepositoryWithNoMarkIsConfirmedAtEachRead(t *testing.T) {
 }
 
 // TestAnEndThatFailsStopsTheRound has GitHub answer 404 to the installation 42's check
-// in two rounds, and Qory Apiary answer the second's POST /v1/connections/disconnect
-// 503: no line says the connection is disconnected, the failure is logged, and none of
-// 42's collections is pulled in either round.
+// in two rounds, and Qory Apiary answer the second's POST /v1/grants/end 503: a line
+// says the grant end is sent again, the link stays, and none of 42's collections is
+// pulled in either round.
 func TestAnEndThatFailsStopsTheRound(t *testing.T) {
 	w, _, p, clock := pulling(t)
 	mark := pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart}
 	keepPulled(w.st, refOf("acme/widgets"), mark)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
 	w.apiary.refuse = func(route string, _ int) (int, string) {
-		if route == routeConnectionsDisconnect {
+		if route == routeGrantsEnd {
 			return 503, `{"error":"unavailable"}`
 		}
 		return 0, ""
@@ -2922,7 +2937,7 @@ func TestAnEndThatFailsStopsTheRound(t *testing.T) {
 	roundAt(p, clock, 0)
 	roundAt(p, clock, time.Hour)
 	log := w.log.String()
-	if strings.Contains(log, "so its connection is disconnected and its link dropped") || !strings.Contains(log, `"msg":"ending a deleted installation's connection failed","installation":42`) {
+	if strings.Count(log, endedLine) != 1 || !strings.Contains(log, `"msg":"reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later","installation":42`) {
 		t.Errorf("the log %s", log)
 	}
 	if _, ok, _ := linkOf(w.st, 42); !ok {

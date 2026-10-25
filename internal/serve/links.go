@@ -81,12 +81,15 @@ const (
 // later is the newer, see [Connect.link]. Return is when the linked connect return
 // minted for the link expires, in Unix seconds, or 0 when none was: a link pending past
 // it and [returnSkew] more is listed once more, and a 403 drops it, see
-// [Adapter.listConnection].
+// [Adapter.listConnection]. Account is the id of the GitHub account the installation is
+// on, as the connect that made the link read it, or 0 when none did: a connect for that
+// account stops the installation's grant end, see [Adapter.stopEnd].
 type link struct {
 	Connection string `json:"connection_id"`
 	State      string `json:"state"`
 	Pass       int64  `json:"pass_expires_at,omitempty"`
 	Return     int64  `json:"return_expires_at,omitempty"`
+	Account    int64  `json:"account_id,omitempty"`
 }
 
 // connectionShape is a connection's id, the contract's pattern.
@@ -109,7 +112,7 @@ func putLink(st *store.Store, installation int64, l link) error {
 	if installation <= 0 {
 		return errors.New("an installation's id is positive")
 	}
-	if !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 {
+	if !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 || l.Account < 0 {
 		return errors.New("a link names a connection and is pending or live")
 	}
 	b, err := json.Marshal(l)
@@ -143,7 +146,7 @@ func linkOf(st *store.Store, installation int64) (link, bool, error) {
 		return link{}, false, err
 	}
 	var l link
-	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 {
+	if json.Unmarshal(b, &l) != nil || !connectionShape.MatchString(l.Connection) || (l.State != linkPending && l.State != linkLive) || l.Pass < 0 || l.Return < 0 || l.Account < 0 {
 		return link{}, false, errors.New("the store's entry for an installation is not one")
 	}
 	return l, true, nil
