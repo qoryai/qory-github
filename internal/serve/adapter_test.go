@@ -970,7 +970,7 @@ func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 			t.Errorf("%s: linked %v, grant %q, reached %v, collection linked %v", tc.name, linked, held, reached, collection)
 		}
 		log := w.log.String()
-		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary refused the end of the installation's grant, so serve keeps its link","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
+		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary refused the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
 			t.Errorf("%s: the log %s", tc.name, log)
 		}
 		if tc.dropped != strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link","installation":42`) {
@@ -979,6 +979,105 @@ func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
 			t.Errorf("%s: %d disconnects of the connection", tc.name, n)
 		}
+	}
+}
+
+// TestARefusedGrantEndWaitsForAConnectOfItsAccount has Qory Apiary answer the end of
+// the grant of 42, on acme's account, 400 invalid_request, and of 43, on alice's, 403
+// forbidden: a second end of either sends nothing and keeps the link; a connect for
+// acme, [Adapter.stopEnd], lets the next end of 42 be sent, and 43's stays held.
+func TestARefusedGrantEndWaitsForAConnectOfItsAccount(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkLive, Account: acme.ID})
+	grantedPutLink(w.st, 43, link{Connection: otherConnection, State: linkLive, Account: alice.ID})
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		switch {
+		case route != routeGrantsEnd || n > 2:
+			return 0, ""
+		case n == 1:
+			return 400, `{"error":"invalid_request"}`
+		}
+		return 403, `{"error":"forbidden"}`
+	}
+	tries := func() map[any]int {
+		m := map[any]int{}
+		for _, s := range w.apiary.sent(routeGrantsEnd) {
+			m[s.body["grant_ref"]]++
+		}
+		return m
+	}
+	for round := 1; round <= 2; round++ {
+		for _, id := range []int64{42, 43} {
+			if c, err := w.adapter.endInstallation(context.Background(), id); err != nil || c == "" {
+				t.Fatalf("round %d, %d: %q %v", round, id, c, err)
+			}
+			if !w.adapter.endHeld(id) {
+				t.Errorf("round %d: the grant end of %d is not held", round, id)
+			}
+		}
+		if m := tries(); m["42"] != 1 || m["43"] != 1 {
+			t.Errorf("round %d: grant ends by grant_ref %v", round, m)
+		}
+	}
+	for _, id := range []int64{42, 43} {
+		if _, ok, _ := linkOf(w.st, id); !ok {
+			t.Errorf("the link of %d is dropped", id)
+		}
+	}
+	w.adapter.stopEnd(acme.ID)
+	if w.adapter.endHeld(42) || !w.adapter.endHeld(43) {
+		t.Errorf("after a connect for acme, held: 42 %v, 43 %v", w.adapter.endHeld(42), w.adapter.endHeld(43))
+	}
+	w.adapter.endInstallation(context.Background(), 42)
+	w.adapter.endInstallation(context.Background(), 43)
+	if m := tries(); m["42"] != 2 || m["43"] != 1 {
+		t.Errorf("after a connect for acme: grant ends by grant_ref %v", m)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link of 42 is kept after its grant end's 204")
+	}
+}
+
+// TestALastingConnectionUnknownStopsTheGrantEnd has Qory Apiary answer each end of the
+// grant of 42, linked live, 403 connection_unknown, an hour apart on the adapter's
+// clock: once the 403 has lasted a day, see [forbiddenFor], serve drops the connection
+// and the grant, and sends no more grant end.
+func TestALastingConnectionUnknownStopsTheGrantEnd(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.retryEnds()
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	var clock sync.Mutex
+	w.client.Now = func() time.Time { clock.Lock(); defer clock.Unlock(); now = now.Add(30 * time.Minute); return now }
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.endsDone(t, 42)
+	// Each try reads the clock twice: for the body's time and for the answer's.
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
+		t.Errorf("%d grant ends", n)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link is kept")
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant %q is kept", held)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the collection is still linked")
+	}
+	log := w.log.String()
+	if !strings.Contains(log, `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) ||
+		!strings.Contains(log, `"msg":"the installation's link was dropped with its connection, so serve drops its grant and sends no more grant end","installation":42`) {
+		t.Errorf("the log %s", log)
 	}
 }
 

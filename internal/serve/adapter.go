@@ -91,6 +91,9 @@ type Adapter struct {
 	endStop     context.CancelFunc
 	endWG       sync.WaitGroup
 	endSleep    func(ctx context.Context, d time.Duration) error
+	// endRefused are the grant ends Qory Apiary refused for good, by installation, under
+	// endMu, see [Adapter.endRefusedFor].
+	endRefused map[int64]refusedEnd
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most; envsOnce makes envs,

@@ -1239,7 +1239,7 @@ const endedLine = `"msg":"GitHub answers 404 for the installation under the App'
 
 // goneOnceLine is the line of a round that met GitHub's first 404 in a row to the
 // installation 42's check.
-const goneOnceLine = `"level":"WARN","msg":"GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round ends its grant unless GitHub shows the installation in between","installation":42,"error":"`
+const goneOnceLine = `"level":"WARN","msg":"GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round handles it as deleted unless GitHub shows the installation in between","installation":42,"error":"`
 
 // goneOnceError is goneOnceLine with the error of a listing whose check GitHub
 // answered 404.
@@ -2953,5 +2953,40 @@ func TestAnEndThatFailsStopsTheRound(t *testing.T) {
 	}
 	if m := markOf(t, w); !m.Since.Equal(mark.Since) {
 		t.Errorf("the collection is pulled: %+v", m)
+	}
+}
+
+// TestAGrantEndRefusedForGoodIsNotSentByLaterRounds has GitHub answer 404 to the
+// installation 42's check in four rounds, and Qory Apiary answer the grant end 403
+// forbidden: the second round sends it once, with a line, and the link stays; the
+// third and fourth rounds send no grant end and log no other line that the
+// installation is handled as deleted.
+func TestAGrantEndRefusedForGoodIsNotSentByLaterRounds(t *testing.T) {
+	w, _, p, clock := pulling(t)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.installGone = true })
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return 403, `{"error":"forbidden"}`
+		}
+		return 0, ""
+	}
+	roundAt(p, clock, 0)
+	roundAt(p, clock, time.Hour)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Fatalf("%d grant ends after two rounds", n)
+	}
+	roundAt(p, clock, 2*time.Hour)
+	roundAt(p, clock, 3*time.Hour)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends after four rounds", n)
+	}
+	if log := w.log.String(); strings.Count(log, endedLine) != 1 || strings.Count(log, `"msg":"Qory Apiary refused the end of the installation's grant`) != 1 {
+		t.Errorf("the log %s", log)
+	}
+	if _, ok, _ := linkOf(w.st, 42); !ok {
+		t.Error("the link is dropped")
+	}
+	if held, _ := grantOf(w.st, 42); held != testConnection {
+		t.Errorf("the grant is %q", held)
 	}
 }
