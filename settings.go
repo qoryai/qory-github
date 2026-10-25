@@ -85,10 +85,10 @@ type SourceRole struct {
 	// run-credential call reaches: resource, the repositories the call lists and no
 	// other.
 	CredentialScope string `json:"credential_scope,omitempty"`
-	// Apply is the most that a run's work credential reaches: the items of [Uses], with
-	// {target.path} in place of owner/name in each path. Qory Apiary fills
-	// {target.path} with the path of the run's target at the claim, and a credential for
-	// work outside the filled items fails Qory Apiary's check.
+	// Apply is the most that a run's work credential reaches: the items of [Uses], where
+	// each path that contains owner/name has {target.path} in its place. Qory Apiary
+	// fills {target.path} with the path of the run's target at the claim, and a
+	// credential for work outside the filled items fails Qory Apiary's check.
 	Apply []Apply `json:"apply,omitempty"`
 }
 
