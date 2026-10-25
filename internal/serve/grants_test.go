@@ -700,3 +700,92 @@ func TestAReportTakenDuringADeletionIsEnded(t *testing.T) {
 		t.Errorf("the grant %q is kept", held)
 	}
 }
+
+// everyHour sets the adapter's clock and the client's to one clock that each grant end
+// moves an hour on, and has each grant end return 403 connection_unknown.
+func everyHour(w *wired) {
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	var clock sync.Mutex
+	read := func() time.Time { clock.Lock(); defer clock.Unlock(); return now }
+	w.adapter.now, w.client.Now = read, read
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route != routeGrantsEnd {
+			return 0, ""
+		}
+		clock.Lock()
+		now = now.Add(time.Hour)
+		clock.Unlock()
+		return 403, `{"error":"connection_unknown"}`
+	}
+}
+
+// TestAnEndedConnectionDropsItsGrants pins that a connection serve takes as ended drops
+// the grants of that connection from the copy, and keeps those of another connection.
+func TestAnEndedConnectionDropsItsGrants(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	putGrant(w.st, 42, testConnection)
+	putGrant(w.st, 44, otherConnection)
+	if _, err := dropConnection(w.st, testConnection); err != nil {
+		t.Fatal(err)
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant of the ended connection is kept for %s", held)
+	}
+	if held, _ := grantOf(w.st, 44); held != otherConnection {
+		t.Errorf("the grant of another connection is %q", held)
+	}
+}
+
+// TestAnUnlinkedGrantEndStopsOnceItsConnectionEnds deletes 42 before serve has its
+// grant, see [deletedBeforeTheReport], while 43 is linked live to the same connection,
+// and has each grant end of 42 return 403 connection_unknown an hour apart: once 43's
+// link has counted the 403s for a day, see [noteAnswer], serve drops the connection
+// and its grants, and the grant end of 42 stops with them.
+func TestAnUnlinkedGrantEndStopsOnceItsConnectionEnds(t *testing.T) {
+	w := deletedBeforeTheReport(t)
+	w.retryEnds()
+	if err := grantedLink(w.st, 43, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.grant("43", testConnection)
+	everyHour(w)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.endsDone(t, 42)
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant of 42 is kept for %s", held)
+	}
+	if _, ok, _ := linkOf(w.st, 43); ok {
+		t.Error("the link of 43 is kept")
+	}
+	log := w.log.String()
+	if !strings.Contains(log, `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) || strings.Contains(log, "to the end of the grant of an installation that has no link") {
+		t.Errorf("the log %s", log)
+	}
+}
+
+// TestAnUnlinkedGrantEndStopsAfterADayOfConnectionUnknown deletes 42 before serve has
+// its grant, see [deletedBeforeTheReport], with no other link to the connection, and
+// has each grant end return 403 connection_unknown an hour apart: no live link counts
+// the 403s, so once they have lasted a day, see [forbiddenFor], serve drops the grant
+// from the copy, with a line, and sends no more grant end.
+func TestAnUnlinkedGrantEndStopsAfterADayOfConnectionUnknown(t *testing.T) {
+	w := deletedBeforeTheReport(t)
+	w.retryEnds()
+	everyHour(w)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.endsDone(t, 42)
+	// The first 403 comes at 13:00; the try that returns at 13:00 the next day is last.
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
+		t.Errorf("%d grant ends", n)
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant is kept for %s", held)
+	}
+	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary returned 403 connection_unknown for 24 hours to the end of the grant of an installation that has no link, so serve drops the grant and sends no more grant end","installation":42,"connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", log)
+	}
+}

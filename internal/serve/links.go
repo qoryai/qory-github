@@ -197,9 +197,10 @@ func connectionOf(st *store.Store, ref string) (string, error) {
 
 // dropConnection drops what the store keeps of the connection, which ended: the link of
 // each installation linked to it, and the records of the collections that installation
-// reaches, see [dropInstallation]. A link to another connection stays, so an answer
-// about a connection that a new connect has replaced since drops nothing. It says
-// whether it dropped a link.
+// reaches, see [dropInstallation], and each grant of the connection in Qory Apiary's
+// copy, see [nsGrants], since a connection that ended has no grant. A link or a grant
+// of another connection stays, so an answer about a connection that a new connect has
+// replaced since drops nothing of the new one. It says whether it dropped a link.
 func dropConnection(st *store.Store, connection string) (bool, error) {
 	installations, err := linkedTo(st, connection)
 	if err != nil {
@@ -224,7 +225,30 @@ func dropConnection(st *store.Store, connection string) (bool, error) {
 			return dropped, err
 		}
 	}
-	return dropped, nil
+	return dropped, dropGrantsOf(st, connection)
+}
+
+// dropGrantsOf drops each grant of connection from the copy, holding installMu.
+func dropGrantsOf(st *store.Store, connection string) error {
+	installMu.Lock()
+	defer installMu.Unlock()
+	var keys []string
+	err := st.Each(nsGrants, func(key string, v []byte) error {
+		var g grantEntry
+		if json.Unmarshal(v, &g) == nil && g.Connection == connection {
+			keys = append(keys, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := st.Delete(nsGrants, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // forbiddenFor is how long Qory Apiary answers 403 connection_unknown, and no 2xx, to

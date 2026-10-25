@@ -374,8 +374,9 @@ func (a *Adapter) endUnlinked(ctx context.Context, installation int64, connectio
 	if ctx.Err() != nil {
 		return err
 	}
-	if a.grantEnded(installation, connection, 0, false, err) {
-		a.endSoon(installation, connection, 0, false)
+	var since time.Time
+	if a.grantEnded(installation, connection, 0, false, &since, err) {
+		a.endSoon(installation, connection, 0, false, since)
 	}
 	return nil
 }
@@ -557,8 +558,8 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 	if ctx.Err() != nil {
 		return err
 	}
-	if a.grantEnded(installation, l.Connection, l.Account, true, err) {
-		a.endSoon(installation, l.Connection, l.Account, true)
+	if a.grantEnded(installation, l.Connection, l.Account, true, nil, err) {
+		a.endSoon(installation, l.Connection, l.Account, true, time.Time{})
 	}
 	return nil
 }
@@ -590,7 +591,9 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 // grantEnded acts on Qory Apiary's answer err to the end of the installation's grant,
 // which connection has, for the GitHub account whose id is account, and says whether to
 // send the grant end again. linked is whether the installation's link named connection
-// as the grant end began, false for a grant end of [Adapter.endUnlinked]:
+// as the grant end began, false for a grant end of [Adapter.endUnlinked]. since is when a
+// grant end of [Adapter.endUnlinked] first returned 403 connection_unknown, zero before
+// that, and nil for a linked grant end:
 //
 //   - the signed 204, or 409 grant_unknown, which means the copy has no such grant:
 //     serve drops the grant from the copy, and the installation's link with the records
@@ -602,7 +605,12 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 //     drops the connection's links as on 409 connection_ended, see [answeredIn]; once
 //     the installation's link no longer names connection, serve drops the grant from
 //     the copy and stops. A pending link is never dropped by 403s, so its grant end is
-//     sent again, at most [grantMaxWait] apart, until another step drops the link;
+//     sent again, at most [grantMaxWait] apart, until another step drops the link. A
+//     grant end of [Adapter.endUnlinked] stops once [Apiary.Ended] or [noteAnswer] has
+//     dropped the connection's grants from the copy, see [dropConnection]; and while no
+//     live link counts the 403s for the connection, see [connectionLive], once the 403
+//     has lasted [forbiddenFor] since *since, its first: serve then drops the grant from
+//     the copy, with a line, and stops;
 //   - a failure that may pass, no answer, a 5xx or an answer not signed: it returns
 //     true, so the grant end is sent again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it, keeps its
@@ -611,7 +619,7 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 //
 // It drops the grant from the copy whatever the link is, and drops the installation's
 // link only while the link names connection.
-func (a *Adapter) grantEnded(installation int64, connection string, account int64, linked bool, err error) bool {
+func (a *Adapter) grantEnded(installation int64, connection string, account int64, linked bool, since *time.Time, err error) bool {
 	attrs := []slog.Attr{slog.Int64("installation", installation), slog.String("connection", connection)}
 	switch {
 	case err == nil, refusedAs(err, http.StatusConflict, codeGrantUnknown), refusedAs(err, http.StatusConflict, codeConnectionEnded):
@@ -643,6 +651,23 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 			a.log().LogAttrs(context.Background(), slog.LevelInfo, "the installation's link was dropped with its connection, so serve drops its grant and sends no more grant end", attrs...)
 			return false
 		}
+		if !linked {
+			// The connection's grants were dropped as it ended, see [dropConnection].
+			if send, err := unlinkedGrant(a.Store, installation, connection); err == nil && !send {
+				return false
+			}
+		}
+		if !linked && since != nil && a.unlinkedLasted(connection, since) {
+			installMu.Lock()
+			derr := dropGrant(a.Store, installation, connection)
+			installMu.Unlock()
+			if derr != nil {
+				a.log().LogAttrs(context.Background(), slog.LevelError, "dropping the grant of an installation that has no link", append(attrs, slog.String("error", derr.Error()))...)
+				return false
+			}
+			a.log().LogAttrs(context.Background(), slog.LevelInfo, "Qory Apiary returned 403 connection_unknown for 24 hours to the end of the grant of an installation that has no link, so serve drops the grant and sends no more grant end", attrs...)
+			return false
+		}
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
 	case !IsPermanent(err) && !refusedFor(err):
@@ -661,8 +686,9 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 // link names another connection, or none, as after [Apiary.Ended] dropped it; once a
 // linked connect return is minted for account, the GitHub account of the grant, see
 // [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
-// installation has one grant end sent again at a time.
-func (a *Adapter) endSoon(installation int64, connection string, account int64, linked bool) {
+// installation has one grant end sent again at a time. linked and since are as for
+// [Adapter.grantEnded].
+func (a *Adapter) endSoon(installation int64, connection string, account int64, linked bool, since time.Time) {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()
 	a.initEnds()
@@ -682,7 +708,7 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64, 
 				return
 			}
 			wait = min(2*wait, grantMaxWait)
-			if !a.endAgain(ctx, installation, connection, account, linked) {
+			if !a.endAgain(ctx, installation, connection, account, linked, &since) {
 				return
 			}
 		}
@@ -690,10 +716,10 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64, 
 }
 
 // endAgain is one try of [Adapter.endSoon], holding the installation's lock, and says
-// whether to try again. linked is as for [Adapter.grantEnded]: a linked grant end stops
-// once the link no longer names connection, and one of [Adapter.endUnlinked] once the
-// installation has a link or the copy no longer has the grant for connection.
-func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64, linked bool) bool {
+// whether to try again. linked and since are as for [Adapter.grantEnded]: a linked grant
+// end stops once the link no longer names connection, and one of [Adapter.endUnlinked]
+// once the installation has a link or the copy no longer has the grant for connection.
+func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64, linked bool, since *time.Time) bool {
 	unlock, err := a.lockInstallation(ctx, installation)
 	if err != nil {
 		return false
@@ -715,7 +741,23 @@ func (a *Adapter) endAgain(ctx context.Context, installation int64, connection s
 	if ctx.Err() != nil {
 		return false
 	}
-	return a.grantEnded(installation, connection, account, linked, err)
+	if linked {
+		since = nil
+	}
+	return a.grantEnded(installation, connection, account, linked, since, err)
+}
+
+// unlinkedLasted notes in since the first 403 connection_unknown of a grant end of
+// [Adapter.endUnlinked], at the adapter's clock, and says whether that 403 has lasted
+// [forbiddenFor] while no live link counts the 403s for connection, see
+// [connectionLive]. While one does, [noteAnswer] decides, see [dropConnection].
+func (a *Adapter) unlinkedLasted(connection string, since *time.Time) bool {
+	now := a.clock()
+	if since.IsZero() {
+		*since = now
+	}
+	live, err := connectionLive(a.Store, connection)
+	return err == nil && !live && !now.Before(since.Add(forbiddenFor))
 }
 
 // initEnds makes what [Adapter.endSoon] keeps, for a caller that holds endMu.
