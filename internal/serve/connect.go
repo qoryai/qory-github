@@ -814,7 +814,9 @@ func (c *Connect) bind(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictBusy, attrs...)
 		return
 	}
-	expires := c.clock().Add(returnFor)
+	// The connect return's expires_at has whole seconds, so expires is cut to one: the
+	// link, the return and the grant's report then end at the same moment.
+	expires := c.clock().Add(returnFor).Truncate(time.Second)
 	again, v, rf, err := c.link(ctx, installation, s, expires.Unix())
 	<-c.linking
 	if err != nil {

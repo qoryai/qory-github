@@ -45,11 +45,12 @@ func (c *reportClock) waited() []time.Duration {
 	return slices.Clone(c.waits)
 }
 
-// reportRig is a connect rig whose Connect and adapter read a [reportClock].
+// reportRig is a connect rig whose Connect and adapter read a [reportClock], which
+// starts at a whole second.
 func reportRig(t *testing.T) (*connectRig, *reportClock) {
 	t.Helper()
 	rig := newConnectRig(t)
-	clock := &reportClock{t: time.Now()}
+	clock := &reportClock{t: time.Now().Truncate(time.Second)}
 	rig.c.now, rig.adapter.now, rig.c.reportSleep, rig.client.Now = clock.now, clock.now, clock.sleep, clock.now
 	return rig, clock
 }
@@ -160,6 +161,46 @@ func TestAGrantNeverTakenDropsTheLink(t *testing.T) {
 	}
 	if n := len(rig.apiary.sent(routeGrants)); n != 1 || len(clock.waited()) != 0 {
 		t.Errorf("reported %d times, waited %v", n, clock.waited())
+	}
+}
+
+// TestAGrantIsNotSentAfterTheReturnExpires pins that a report Qory Apiary refuses until
+// the linked connect return expires is sent last at that return's expires_at, a whole
+// second, when the connect starts half a second into a second.
+func TestAGrantIsNotSentAfterTheReturnExpires(t *testing.T) {
+	rig, clock := reportRig(t)
+	clock.t = clock.t.Add(500 * time.Millisecond)
+	var mu sync.Mutex
+	var at []time.Time
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route != routeGrants {
+			return 0, ""
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		at = append(at, clock.now())
+		return http.StatusForbidden, `{"error":"connection_unknown"}`
+	}
+	pass := signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), time.Now().Add(10*time.Minute)))
+	rig.secrets = append(rig.secrets, pass)
+	r := rig.backTo(t, rig.browser(t).connect(pass, "42"), testConnection)
+	if r.Outcome != outcomeLinked {
+		t.Fatalf("the connect return %+v", r)
+	}
+	expires, err := time.Parse(contracts.TimeLayout, r.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the link dropped", func() bool { _, ok, _ := linkOf(rig.st, 42); return !ok })
+	mu.Lock()
+	defer mu.Unlock()
+	if len(at) == 0 || !at[len(at)-1].Equal(expires) {
+		t.Errorf("reported at %v, the connect return expires at %v", at, expires)
+	}
+	for _, a := range at {
+		if a.After(expires) {
+			t.Errorf("reported at %v, after the connect return's expires_at %v", a, expires)
+		}
 	}
 }
 
