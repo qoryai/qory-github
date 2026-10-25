@@ -379,6 +379,93 @@ func setUpThrough(t *testing.T, apiary *fakeApiary, addr string) (string, *http.
 	return pass, resp, body
 }
 
+// firstWithout is the index among the fake's requests of the first start-up body
+// without setup_url, and that of the first upload of secrets the fake accepted, each
+// -1 when there is none.
+func firstWithout(f *fakeApiary) (declared, uploaded int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	declared, uploaded = -1, -1
+	accepted := 0
+	for i, rq := range f.requests {
+		if rq.method != http.MethodPost {
+			continue
+		}
+		if _, has := rq.body["setup_url"]; rq.target == routeAdapter && !has && declared < 0 {
+			declared = i
+		}
+		if rq.target == routeSecrets {
+			accepted++
+			if accepted > f.refusedUploads && uploaded < 0 {
+				uploaded = i
+			}
+		}
+	}
+	return declared, uploaded
+}
+
+// TestTheSetupDeclaresWithoutSetupURLOnlyAfterTheUpload pins the order of a first
+// setup: the start-up body without setup_url never comes before Qory Apiary accepts
+// the upload of the App, so Qory Apiary never shows the adapter set up with no
+// values. While the setup tries the upload again, and after every try failed, serve
+// sends no start-up body without setup_url.
+func TestTheSetupDeclaresWithoutSetupURLOnlyAfterTheUpload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refused int
+		stored  bool
+	}{{"stored on the fourth try", 3, true}, {"never stored", 1 << 30, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			access := newKey(t)
+			apiary := newFakeApiary(t, access)
+			apiary.noApp()
+			apiary.refusedUploads = tc.refused
+			apiary.refuse = func(route string, n int) (int, string) {
+				if route == routeSecrets && n <= tc.refused {
+					return http.StatusServiceUnavailable, ""
+				}
+				return 0, ""
+			}
+			gh := newSetupGitHub(t)
+			s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+			s.APIURL = gh.srv.URL
+			waits := 0
+			var mu sync.Mutex
+			opts := Options{feedSleep: shortSleep, refusalEvery: time.Nanosecond, uploadWait: func(ctx context.Context, _ time.Duration) error {
+				mu.Lock()
+				defer mu.Unlock()
+				// Six waits stand for the whole of upload_retry_seconds.
+				if waits++; waits > 6 {
+					return context.DeadlineExceeded
+				}
+				return ctx.Err()
+			}}
+			addr, log, stop := runWith(t, s, opts)
+			defer stop()
+			eventually(t, "declared with setup_url", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
+			// The first upload fails, so the browser goes to the status page.
+			if _, resp, body := setUpThrough(t, apiary, addr); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/setup/status" {
+				t.Fatalf("the end answered %d %v %s", resp.StatusCode, resp.Header, body)
+			}
+			if tc.stored {
+				eventually(t, "declared without setup_url", func() bool { d, _ := firstWithout(apiary); return d >= 0 })
+				if d, u := firstWithout(apiary); u < 0 || d < u {
+					t.Errorf("the start-up body without setup_url is request %d, the accepted upload %d", d, u)
+				}
+				return
+			}
+			eventually(t, "the setup failed for good", func() bool {
+				return strings.Contains(log.String(), "storing the GitHub App in Qory Apiary failed for good")
+			})
+			time.Sleep(200 * time.Millisecond)
+			if d, u := firstWithout(apiary); d >= 0 || u >= 0 || len(apiary.uploaded()) != 0 {
+				t.Errorf("the start-up body without setup_url is request %d, the accepted upload %d", d, u)
+			}
+		})
+	}
+}
+
 // TestTheDeclarationWithSetupURLIsAnsweredFirst pins the order at the setup's end. Qory
 // Apiary holds the declaration with setup_url under way open across the setup's
 // commit, and answers it once serve's stop of it starts to wait, or else when a

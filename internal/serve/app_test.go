@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -399,7 +400,7 @@ func secondsFrom(at time.Time, n int) []string {
 
 // TestGETsInOneSecondHaveLaterTimestamps pins that GETs in one second, to
 // /v1/adapter/secrets and to /v1/grants, each carry a timestamp a second later than
-// the GET before, whatever its target, and wait for that second: Qory Apiary refuses a
+// the GET before, whatever its target, at once, with no wait: Qory Apiary refuses a
 // signature it has seen, and the contract wants each GET of an instance to carry a
 // later timestamp than the one before it.
 func TestGETsInOneSecondHaveLaterTimestamps(t *testing.T) {
@@ -426,49 +427,69 @@ func TestGETsInOneSecondHaveLaterTimestamps(t *testing.T) {
 	if got, want := getTimestamps(f), secondsFrom(now, 3); !slices.Equal(got, want) {
 		t.Errorf("the GETs carry the timestamps %v, want %v", got, want)
 	}
-	if !slices.Equal(waits, []time.Duration{600 * time.Millisecond, 1600 * time.Millisecond}) {
-		t.Errorf("waited %v, want 600ms and 1.6s, until each GET's second", waits)
+	if len(waits) != 0 {
+		t.Errorf("waited %v, want no wait", waits)
 	}
 }
 
 // TestARestartKeepsTheLatestGETsTimestamp pins that the latest GET's timestamp is
 // kept in the store, so a client started again on the store never sends a GET at or
-// before that second, even with its clock behind it; and that a store it cannot read
-// stops the GET before it is sent.
+// before that second: with its clock a minute behind, the next GET carries the stored
+// second and one more, at once, with no wait, and one line, once, says so. A store it
+// cannot read stops the GET before it is sent.
 func TestARestartKeepsTheLatestGETsTimestamp(t *testing.T) {
 	access := newKey(t)
 	f := newFakeApiary(t, access)
 	dir := filepath.Join(t.TempDir(), "state")
 	st := openStore(t, dir)
 	now := time.Now().Truncate(time.Second).Add(400 * time.Millisecond)
-	started := func() *Apiary {
+	var waits []time.Duration
+	started := func(log *syncBuffer) *Apiary {
 		api := testApiary(t, f, access)
 		api.Now = func() time.Time { return now }
-		api.Sleep = func(context.Context, time.Duration) error { return nil }
+		api.Sleep = func(_ context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		}
 		api.lastGet = storeLastGet{st}
+		api.Log = slog.New(slog.NewJSONHandler(log, nil))
 		return api
 	}
 	ctx := context.Background()
-	if _, err := started().Secrets(ctx); err != nil {
+	var quiet syncBuffer
+	if _, err := started(&quiet).Secrets(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := started().Grants(ctx); err != nil {
+	if _, err := started(&quiet).Grants(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if b, err := st.Get(nsAdapter, keyLastGet); err != nil || string(b) != secondsFrom(now, 2)[1] {
+	stored := now.Unix() + 1
+	if b, err := st.Get(nsAdapter, keyLastGet); err != nil || string(b) != strconv.FormatInt(stored, 10) {
 		t.Errorf("the store keeps %q %v, want the second GET's timestamp", b, err)
 	}
 	now = now.Add(-time.Minute)
-	if _, err := started().Secrets(ctx); err != nil {
-		t.Fatal(err)
+	var log syncBuffer
+	behind := started(&log)
+	for range 2 {
+		if _, err := behind.Secrets(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got, want := getTimestamps(f), secondsFrom(now.Add(time.Minute), 3); !slices.Equal(got, want) {
+	if got, want := getTimestamps(f), secondsFrom(now.Add(time.Minute), 4); !slices.Equal(got, want) {
 		t.Errorf("the GETs carry the timestamps %v, want %v", got, want)
+	}
+	if len(waits) != 0 {
+		t.Errorf("waited %v, want no wait", waits)
+	}
+	line := `"level":"WARN","msg":"the last GET's timestamp in the store is later than the clock, so serve continues from it","last_get_timestamp":` +
+		strconv.FormatInt(stored, 10) + `,"clock":` + strconv.FormatInt(now.Unix(), 10) + `}`
+	if strings.Count(log.String(), "WARN") != 1 || !strings.Contains(log.String(), line) || quiet.String() != "" {
+		t.Errorf("the log: %s; before the clock went back: %s", log.String(), quiet.String())
 	}
 	if err := st.Put(nsAdapter, keyLastGet, []byte("soon"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := started().Secrets(ctx); err == nil || len(getTimestamps(f)) != 3 {
+	if _, err := started(&quiet).Secrets(ctx); err == nil || len(getTimestamps(f)) != 4 {
 		t.Errorf("a GET was sent with no timestamp to follow: %v", err)
 	}
 }

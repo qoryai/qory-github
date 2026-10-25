@@ -125,6 +125,9 @@ type fakeApiary struct {
 	secrets []contracts.SecretEntry
 	uploads []contracts.AdapterSecretsPlaintext
 	sealing func(doc map[string]any, keyID string)
+	// refusedUploads is how many uploads of secrets a test's refuse refuses first, for
+	// the test to count the accepted one.
+	refusedUploads int
 	// described are the secret names the source role of each adapter record's latest
 	// description lists, by the record's adapter id: an upload of a secret its
 	// record's list does not contain is refused, 400 invalid_request.

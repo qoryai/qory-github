@@ -475,7 +475,10 @@ loop:
 		case serveErr = <-r.served:
 			break loop
 		case kept := <-r.setUp:
-			// The declaration with setup_url ends before the one without starts.
+			// The App setup stored kept in Qory Apiary before it handed kept on, so the
+			// start-up body without setup_url follows the upload, as
+			// adapter-secrets.schema.json:5 orders it. The declaration with setup_url
+			// ends before the one without starts.
 			r.mu.Lock()
 			r.stop()
 			r.serveApp(kept, false)
@@ -580,8 +583,10 @@ func (r *runner) upload(ctx context.Context, a *app) error {
 // storeInNewRecord stores the App that waits in newRecordApp, if any, in the adapter
 // record of the enrolment in use, after a new enrolment made the adapter another
 // record in Qory Apiary, which stores no App. It runs once the change feed's reader
-// has declared the adapter in that record, since Qory Apiary returns 400 for a secret
-// the source role of the record's latest description does not list. A failed upload
+// has declared the adapter in that record: adapter-secrets.schema.json:5 has an
+// adapter that is set up but receives no secrets upload right after its start-up
+// body, and Qory Apiary returns 400 for a secret the source role of the record's
+// latest description does not list. A failed upload
 // is tried again, after a wait that doubles from [feedFirstBackoff] to
 // [feedMaxBackoff], until ctx is done; a permanent error, such as a 400, ends it.
 // When the App is not stored, a line says so: the next start of serve finds no App,

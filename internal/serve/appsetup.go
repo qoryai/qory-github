@@ -73,9 +73,9 @@ import (
 // The session's cookie, __Secure-qory_github_setup, is for <public_url>/setup alone,
 // HttpOnly, Secure and SameSite=Lax, for 900 seconds at most, or, while the setup tries
 // again to store the App, for upload_retry_seconds and 900 seconds more at most; it
-// contains a random id, and the store keeps the session under the id's SHA-256. Every end of a flow drops the
-// cookie. serve reads no cookie but the two it sets, by name, and logs no header: a cookie it
-// did not set is never logged, kept or sent on. Every redirect's target is built from
+// contains a random id, and the store keeps the session under the id's SHA-256. Every
+// end of a flow drops the cookie. serve reads no cookie but the two it sets, by name,
+// and logs no header: a cookie it did not set is never logged, kept or sent on. Every redirect's target is built from
 // the settings and the session, and a page says nothing the request carries.
 //
 // Once an App is set up, every setup pass is refused with a page that says the App is
@@ -631,7 +631,11 @@ func (a *appSetup) created(w http.ResponseWriter, r *http.Request, q url.Values)
 }
 
 // stored marks the App k set up, logs it, and hands it to serve, see [appSetup.setUp].
-// The lock is held.
+// It runs only after Qory Apiary accepted the upload of k, so serve sends its start-up
+// body without setup_url after that upload, and never while the setup tries again or
+// after every try failed, as adapter-secrets.schema.json:5 orders it. The upload
+// itself follows a start-up body: the setup pass that starts the flow comes from Qory
+// Apiary, which has setup_url from the start-up body with it. The lock is held.
 func (a *appSetup) stored(ctx context.Context, k *app) {
 	a.kept.Store(true)
 	a.log().LogAttrs(ctx, slog.LevelInfo, "the GitHub App is set up", slog.Int64("app_id", k.numericID), slog.String("slug", k.slug), slog.Bool("webhook_active", k.webhookActive))

@@ -42,7 +42,9 @@ change what the program does, and notes it under Upgrading.
   each start and at each page of the change feed that has a grant entry. serve handles
   the deliveries of an installation while that copy contains its grant, or until the
   connect return of its link expires, and drops the link of an installation the copy
-  does not contain.
+  does not contain. Qory Apiary's calls to the adapter work only for installations
+  under a grant that Qory Apiary holds; a call for any other installation gets 409
+  `grant_unknown`.
 - With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
   Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
   to `public_url` followed by `/v1/calls/`, such as
