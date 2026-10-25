@@ -913,3 +913,34 @@ func TestAConnectForTheAccountStopsAnUnlinkedGrantEnd(t *testing.T) {
 		t.Errorf("the grant is %q", held)
 	}
 }
+
+// TestAnUnlinkedGrantEndLogsNoLink deletes 42 before serve has its grant, see
+// [deletedBeforeTheReport], and has the grant end that the change feed's grant entry
+// starts return the signed 204, then, for another run, 403 forbidden: each line says
+// what serve does with the grant in the copy, and none mentions a link.
+func TestAnUnlinkedGrantEndLogsNoLink(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		line   string
+	}{
+		{name: "204", line: `"level":"INFO","msg":"the grant of an installation that has no link ended in Qory Apiary, so serve drops the grant from the copy","installation":42`},
+		{name: "forbidden", status: 403, line: `"level":"ERROR","msg":"Qory Apiary returned an error for the end of the grant of an installation that has no link that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart","installation":42`},
+	} {
+		w := deletedBeforeTheReport(t)
+		w.apiary.refuse = func(route string, _ int) (int, string) {
+			if route == routeGrantsEnd && tc.status != 0 {
+				return tc.status, `{"error":"forbidden"}`
+			}
+			return 0, ""
+		}
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		w.endsDone(t, 42)
+		log := w.log.String()
+		if !strings.Contains(log, tc.line) || strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link"`) || strings.Contains(log, "keeps its link") {
+			t.Errorf("%s: the log %s", tc.name, log)
+		}
+	}
+}

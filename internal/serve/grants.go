@@ -612,10 +612,10 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		}
 		installMu.Unlock()
 		if derr != nil {
-			a.log().LogAttrs(context.Background(), slog.LevelError, "dropping the link of an installation whose grant ended", append(attrs, slog.String("error", derr.Error()))...)
+			a.log().LogAttrs(context.Background(), slog.LevelError, pick(linked, "dropping the link of an installation whose grant ended", "dropping the grant of an installation that has no link"), append(attrs, slog.String("error", derr.Error()))...)
 			return false
 		}
-		a.log().LogAttrs(context.Background(), slog.LevelInfo, "the installation's grant ended in Qory Apiary, so serve drops its link", attrs...)
+		a.log().LogAttrs(context.Background(), slog.LevelInfo, pick(linked, "the installation's grant ended in Qory Apiary, so serve drops its link", "the grant of an installation that has no link ended in Qory Apiary, so serve drops the grant from the copy"), attrs...)
 		return false
 	case refusedAs(err, http.StatusForbidden, codeConnectionUnknown):
 		installMu.Lock()
@@ -646,8 +646,20 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		return true
 	}
 	a.refuseEnd(installation, connection, account)
-	a.log().LogAttrs(context.Background(), slog.LevelError, "Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart", append(attrs, slog.String("error", err.Error()))...)
+	a.log().LogAttrs(context.Background(), slog.LevelError, pick(linked,
+		"Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart",
+		"Qory Apiary returned an error for the end of the grant of an installation that has no link that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart"),
+		append(attrs, slog.String("error", err.Error()))...)
 	return false
+}
+
+// pick is linked's text when linked is set, and unlinked's otherwise, for a line of
+// [Adapter.grantEnded] that a grant end of [Adapter.endUnlinked] logs about no link.
+func pick(linked bool, linkedText, unlinkedText string) string {
+	if linked {
+		return linkedText
+	}
+	return unlinkedText
 }
 
 // endSoon sends the end of the installation's grant, which connection has, again, after
