@@ -583,3 +583,120 @@ func TestAConnectForTheAccountStopsItsGrantEnd(t *testing.T) {
 		t.Errorf("the connected installation's link %+v %v", l, ok)
 	}
 }
+
+// unlinkedEndLine is the line serve logs as it ends the grant of an installation
+// GitHub deleted that reached the copy after serve dropped its link.
+const unlinkedEndLine = `"msg":"Qory Apiary's copy of the grants has the grant of an installation GitHub deleted, so serve reports the end of the grant","installation":42,"connection":"` + testConnection + `"`
+
+// deletedBeforeTheReport links 42 to testConnection, live, while Qory Apiary's copy has
+// its grant and serve's does not, as when the report's 204 was lost, and deletes 42:
+// serve drops the link and sends no grant end.
+func deletedBeforeTheReport(t *testing.T) *wired {
+	t.Helper()
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if err := putLink(w.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.grant("42", testConnection)
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Fatal("the link is kept")
+	}
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 0 {
+		t.Fatalf("%d grant ends at the deletion", n)
+	}
+	w.apiary.changes = []contracts.Change{{Kind: contracts.ChangeGrant, ConnectionID: testConnection, GrantRef: "42", Status: "linked"}}
+	return w
+}
+
+// TestAGrantTheFeedAddsAfterItsInstallationWasDeletedIsEnded deletes 42 before serve
+// has its grant, see [deletedBeforeTheReport], and then reads the change feed's grant
+// entry: the copy the entry has serve read has the grant of a deleted installation, so
+// serve sends one grant end, with a line, and its 204 drops the grant from serve's
+// copy. A second read of the copy sends nothing.
+func TestAGrantTheFeedAddsAfterItsInstallationWasDeletedIsEnded(t *testing.T) {
+	w := deletedBeforeTheReport(t)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sent := w.apiary.sent(routeGrantsEnd)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" {
+		t.Fatalf("the grant ends %v", sent)
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant %q is kept", held)
+	}
+	if !strings.Contains(w.log.String(), unlinkedEndLine) {
+		t.Errorf("the log %s", w.log.String())
+	}
+	if err := w.adapter.syncGrants(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends after a second read", n)
+	}
+}
+
+// TestAGrantOfADeletedInstallationIsEndedOnceAtATime has the grant end of a deleted
+// installation's grant, see [deletedBeforeTheReport], return 503, so it is sent again
+// later: a second read of the copy, which still has the grant, starts no second set of
+// tries and sends nothing.
+func TestAGrantOfADeletedInstallationIsEndedOnceAtATime(t *testing.T) {
+	w := deletedBeforeTheReport(t)
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !w.adapter.ending(42) {
+		t.Fatal("the grant end is not sent again")
+	}
+	if err := w.adapter.syncGrants(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
+	}
+	if held, _ := grantOf(w.st, 42); held != testConnection {
+		t.Errorf("the grant is %q", held)
+	}
+}
+
+// TestAReportTakenDuringADeletionIsEnded deletes 42 while serve's copy does not have
+// its grant yet, and adds the grant to the copy, as a report's 204 does under
+// installMu, while the deletion waits for installMu: the deletion reads the copy under
+// installMu, so it finds the grant and sends the grant end.
+func TestAReportTakenDuringADeletionIsEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if err := putLink(w.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
+		t.Fatal(err)
+	}
+	installMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.adapter.endInstallation(context.Background(), 42)
+		done <- err
+	}()
+	// Give the deletion time to reach installMu.
+	time.Sleep(200 * time.Millisecond)
+	err := putGrant(w.st, 42, testConnection)
+	installMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 1 || sent[0].body["grant_ref"] != "42" {
+		t.Errorf("the grant ends %v", sent)
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant %q is kept", held)
+	}
+}

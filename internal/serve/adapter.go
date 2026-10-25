@@ -428,7 +428,7 @@ type reachSink struct {
 // listing's started_at, or the zero time when it does not parse, sends the part, and
 // once Qory Apiary took it keeps each collection's environment_ref. When a part that
 // has collections returns 400 invalid_request, as for a grant_ref Qory Apiary's copy
-// of the grants does not have, it reads that copy again, see [Adapter.syncGrants], and
+// of the grants does not have, it reads that copy again, see [Adapter.readGrants], and
 // when the copy does not have the installation's grant for the connection, it sends the
 // part again, built anew, without its collections. When the copy has the grant, the
 // refusal has another cause, and the part is not sent again.
@@ -444,7 +444,7 @@ func (s reachSink) Collections(ctx context.Context, req contracts.SourceCollecti
 	}
 	sent, err := s.send(ctx, req, read)
 	if refusedAs(err, http.StatusBadRequest, codeInvalidRequest) && len(sent) > 0 && s.adapter != nil {
-		if serr := s.adapter.syncGrants(ctx); serr != nil {
+		if _, _, serr := s.adapter.readGrants(ctx); serr != nil {
 			return errors.Join(err, serr)
 		}
 		held, gerr := grantOf(s.st, s.installation)

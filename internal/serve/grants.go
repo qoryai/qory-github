@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -261,24 +262,52 @@ func checkGrants(body []byte) (map[int64]string, error) {
 // does not hold for the link's connection, with the records of the collections it
 // reaches, see [dropInstallation], but for one whose grant's report may still be sent,
 // see [granted]. A grant of the copy whose installation has no link here stays in the
-// copy alone: serve lists an installation's repositories only after a connect.
+// copy alone: serve lists an installation's repositories only after a connect. When
+// GitHub deleted that installation, see [keepDeleted], as when the deletion came while
+// the grant's report was being sent or before its 204 arrived, serve ends the grant,
+// see [Adapter.endUnlinked].
 func (a *Adapter) syncGrants(ctx context.Context) error {
-	gs, ok := a.Sink.(grantSink)
-	if !ok {
-		return Permanent(errors.New("the sink cannot read the grants"))
-	}
-	g, err := gs.Grants(ctx)
+	g, ends, err := a.readGrants(ctx)
 	if err != nil {
 		return err
 	}
+	for _, id := range ends {
+		if err := a.endUnlinked(ctx, id, g[id]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readGrants is [Adapter.syncGrants] without the grant ends: it returns the copy it
+// kept, and the installations of the copy that have no link and that GitHub deleted.
+// A caller that holds an installation's lock, as a listing does, uses it, since a
+// grant end takes another installation's lock.
+func (a *Adapter) readGrants(ctx context.Context) (map[int64]string, []int64, error) {
+	gs, ok := a.Sink.(grantSink)
+	if !ok {
+		return nil, nil, Permanent(errors.New("the sink cannot read the grants"))
+	}
+	g, err := gs.Grants(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	ends, err := a.keepGrants(g)
+	return g, ends, err
+}
+
+// keepGrants is the part of [Adapter.syncGrants] that holds installMu: it keeps g in
+// place of the store's copy, drops the links g does not hold, and returns the
+// installations of g that have no link and that GitHub deleted.
+func (a *Adapter) keepGrants(g map[int64]string) ([]int64, error) {
 	installMu.Lock()
 	defer installMu.Unlock()
 	if err := replaceGrants(a.Store, g); err != nil {
-		return err
+		return nil, err
 	}
 	var drop []int64
 	now := a.clock().Unix()
-	err = a.Store.Each(nsInstallations, func(key string, v []byte) error {
+	err := a.Store.Each(nsInstallations, func(key string, v []byte) error {
 		var l link
 		id, err := strconv.ParseInt(key, 10, 64)
 		if err != nil || json.Unmarshal(v, &l) != nil {
@@ -290,15 +319,77 @@ func (a *Adapter) syncGrants(ctx context.Context) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, id := range drop {
 		if err := dropInstallation(a.Store, id); err != nil {
-			return err
+			return nil, err
 		}
 		a.log().Info("Qory Apiary's copy of the grants does not contain the installation for its connection, so serve drops its link", slog.Int64("installation", id))
 	}
+	var ends []int64
+	for id := range g {
+		_, linked, err := linkOf(a.Store, id)
+		if err != nil {
+			return nil, err
+		}
+		gone, err := wasDeleted(a.Store, id)
+		if err != nil {
+			return nil, err
+		}
+		if !linked && gone {
+			ends = append(ends, id)
+		}
+	}
+	slices.Sort(ends)
+	return ends, nil
+}
+
+// endUnlinked ends the grant of the installation, which connection has in Qory
+// Apiary's copy, after GitHub deleted the installation and serve dropped its link, see
+// [Adapter.syncGrants]: it sends the grant end and acts on the answer as
+// [Adapter.endGrant] does, holding the installation's lock. It sends nothing while the
+// grant end is being sent again, or after Qory Apiary returned an error that a retry
+// does not change to it, see [Adapter.endRefusedFor], or once the installation has a
+// link, or the copy no longer has the grant for connection. A request stopped by ctx
+// is the error.
+func (a *Adapter) endUnlinked(ctx context.Context, installation int64, connection string) error {
+	unlock, err := a.lockInstallation(ctx, installation)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if a.ending(installation) || a.endRefusedFor(installation, connection) {
+		return nil
+	}
+	if send, err := unlinkedGrant(a.Store, installation, connection); err != nil || !send {
+		return err
+	}
+	es, ok := a.Sink.(grantEndSink)
+	if !ok {
+		return Permanent(errors.New("the sink cannot end a grant"))
+	}
+	a.log().Info("Qory Apiary's copy of the grants has the grant of an installation GitHub deleted, so serve reports the end of the grant", slog.Int64("installation", installation), slog.String("connection", connection))
+	err = es.EndGrant(ctx, connection, installation)
+	if ctx.Err() != nil {
+		return err
+	}
+	if a.grantEnded(installation, connection, 0, false, err) {
+		a.endSoon(installation, connection, 0, false)
+	}
 	return nil
+}
+
+// unlinkedGrant is whether the installation has no link and the copy has its grant for
+// connection, read under installMu.
+func unlinkedGrant(st *store.Store, installation int64, connection string) (bool, error) {
+	installMu.Lock()
+	defer installMu.Unlock()
+	if _, ok, err := linkOf(st, installation); err != nil || ok {
+		return false, err
+	}
+	held, err := grantOf(st, installation)
+	return err == nil && held == connection, err
 }
 
 // reportSoon reports the installation's grant for account to Qory Apiary, linked to
@@ -449,44 +540,57 @@ type grantEnding struct {
 // being sent again, see [Connect.reportSoon], it sends no grant end: it drops the
 // installation's link and the records of the collections it reaches, see
 // [dropInstallation], and the report stops at its next try, since GitHub deleted the
-// installation, see [keepDeleted].
+// installation, see [keepDeleted]. A grant that reaches the copy after that drop is
+// ended when serve next reads the copy, see [Adapter.syncGrants].
 func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) error {
 	if a.ending(installation) || a.endRefusedFor(installation, l.Connection) {
 		return nil
 	}
-	held, err := grantOf(a.Store, installation)
-	if err != nil {
+	if dropped, err := a.dropUngranted(installation, l.Connection); err != nil || dropped {
 		return err
-	}
-	if held != l.Connection {
-		installMu.Lock()
-		defer installMu.Unlock()
-		if now, ok, err := linkOf(a.Store, installation); err != nil || !ok || now.Connection != l.Connection {
-			return err
-		}
-		if err := dropInstallation(a.Store, installation); err != nil {
-			return err
-		}
-		a.log().Info("Qory Apiary's copy of the grants does not contain the installation's grant, so serve sends no grant end and drops its link", slog.Int64("installation", installation), slog.String("connection", l.Connection))
-		return nil
 	}
 	es, ok := a.Sink.(grantEndSink)
 	if !ok {
 		return Permanent(errors.New("the sink cannot end a grant"))
 	}
-	err = es.EndGrant(ctx, l.Connection, installation)
+	err := es.EndGrant(ctx, l.Connection, installation)
 	if ctx.Err() != nil {
 		return err
 	}
-	if a.grantEnded(installation, l.Connection, l.Account, err) {
-		a.endSoon(installation, l.Connection, l.Account)
+	if a.grantEnded(installation, l.Connection, l.Account, true, err) {
+		a.endSoon(installation, l.Connection, l.Account, true)
 	}
 	return nil
 }
 
+// dropUngranted drops the installation's link to connection, with the records of the
+// collections it reaches, see [dropInstallation], when the copy does not have the
+// installation's grant for connection, and returns whether to send no grant end: true
+// after that drop, and when the link no longer names connection. It reads the copy and drops the link
+// under installMu, so a report's 204, which adds the grant to the copy under installMu
+// only while the link names connection, see [Connect.reportSoon], comes either before
+// the read, and the grant end is sent, or after the drop, and adds nothing.
+func (a *Adapter) dropUngranted(installation int64, connection string) (bool, error) {
+	installMu.Lock()
+	defer installMu.Unlock()
+	held, err := grantOf(a.Store, installation)
+	if err != nil || held == connection {
+		return false, err
+	}
+	if now, ok, err := linkOf(a.Store, installation); err != nil || !ok || now.Connection != connection {
+		return err == nil, err
+	}
+	if err := dropInstallation(a.Store, installation); err != nil {
+		return false, err
+	}
+	a.log().Info("Qory Apiary's copy of the grants does not contain the installation's grant, so serve sends no grant end and drops its link", slog.Int64("installation", installation), slog.String("connection", connection))
+	return true, nil
+}
+
 // grantEnded acts on Qory Apiary's answer err to the end of the installation's grant,
 // which connection has, for the GitHub account whose id is account, and says whether to
-// send the grant end again:
+// send the grant end again. linked is whether the installation's link named connection
+// as the grant end began, false for a grant end of [Adapter.endUnlinked]:
 //
 //   - the signed 204, or 409 grant_unknown, which means the copy has no such grant:
 //     serve drops the grant from the copy, and the installation's link with the records
@@ -507,7 +611,7 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 //
 // It drops the grant from the copy whatever the link is, and drops the installation's
 // link only while the link names connection.
-func (a *Adapter) grantEnded(installation int64, connection string, account int64, err error) bool {
+func (a *Adapter) grantEnded(installation int64, connection string, account int64, linked bool, err error) bool {
 	attrs := []slog.Attr{slog.Int64("installation", installation), slog.String("connection", connection)}
 	switch {
 	case err == nil, refusedAs(err, http.StatusConflict, codeGrantUnknown), refusedAs(err, http.StatusConflict, codeConnectionEnded):
@@ -526,7 +630,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 	case refusedAs(err, http.StatusForbidden, codeConnectionUnknown):
 		installMu.Lock()
 		l, ok, derr := linkOf(a.Store, installation)
-		gone := derr == nil && (!ok || l.Connection != connection)
+		gone := derr == nil && linked && (!ok || l.Connection != connection)
 		if gone {
 			derr = dropGrant(a.Store, installation, connection)
 		}
@@ -558,7 +662,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 // linked connect return is minted for account, the GitHub account of the grant, see
 // [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
 // installation has one grant end sent again at a time.
-func (a *Adapter) endSoon(installation int64, connection string, account int64) {
+func (a *Adapter) endSoon(installation int64, connection string, account int64, linked bool) {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()
 	a.initEnds()
@@ -578,7 +682,7 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64) 
 				return
 			}
 			wait = min(2*wait, grantMaxWait)
-			if !a.endAgain(ctx, installation, connection, account) {
+			if !a.endAgain(ctx, installation, connection, account, linked) {
 				return
 			}
 		}
@@ -586,15 +690,21 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64) 
 }
 
 // endAgain is one try of [Adapter.endSoon], holding the installation's lock, and says
-// whether to try again.
-func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64) bool {
+// whether to try again. linked is as for [Adapter.grantEnded]: a linked grant end stops
+// once the link no longer names connection, and one of [Adapter.endUnlinked] once the
+// installation has a link or the copy no longer has the grant for connection.
+func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64, linked bool) bool {
 	unlock, err := a.lockInstallation(ctx, installation)
 	if err != nil {
 		return false
 	}
 	defer unlock()
-	l, ok, err := linkOf(a.Store, installation)
-	if err != nil || !ok || l.Connection != connection {
+	if linked {
+		l, ok, err := linkOf(a.Store, installation)
+		if err != nil || !ok || l.Connection != connection {
+			return false
+		}
+	} else if send, err := unlinkedGrant(a.Store, installation, connection); err != nil || !send {
 		return false
 	}
 	es, ok := a.Sink.(grantEndSink)
@@ -605,7 +715,7 @@ func (a *Adapter) endAgain(ctx context.Context, installation int64, connection s
 	if ctx.Err() != nil {
 		return false
 	}
-	return a.grantEnded(installation, connection, account, err)
+	return a.grantEnded(installation, connection, account, linked, err)
 }
 
 // initEnds makes what [Adapter.endSoon] keeps, for a caller that holds endMu.
