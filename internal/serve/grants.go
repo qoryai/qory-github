@@ -648,7 +648,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 	a.refuseEnd(installation, connection, account)
 	a.log().LogAttrs(context.Background(), slog.LevelError, pick(linked,
 		"Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart",
-		"Qory Apiary returned an error for the end of the grant of an installation that has no link that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart"),
+		"The end of the grant of an installation that has no link failed with an error from Qory Apiary that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart"),
 		append(attrs, slog.String("error", err.Error()))...)
 	return false
 }
@@ -662,16 +662,26 @@ func pick(linked bool, linkedText, unlinkedText string) string {
 	return unlinkedText
 }
 
-// endSoon sends the end of the installation's grant, which connection has, again, after
-// [Adapter.grantEnded] returned true for the first try: after a wait that doubles from
-// [grantFirstWait] to [grantMaxWait], as for a grant's report, each try holding the
-// installation's lock, until grantEnded returns false. It stops once the installation's
-// link names another connection, or none, as after [Apiary.Ended] dropped it; once a
-// linked connect return is minted for account, the GitHub account of the grant, see
-// [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
-// installation has one grant end sent again at a time. linked is as for
-// [Adapter.grantEnded]. With now set, the first try goes at once, with no wait before
-// it, as for [Adapter.endUnlinked]. It returns whether it started the tries.
+// endSoon starts the tries of the end of the installation's grant, which connection
+// has, in the background, each try holding the installation's lock, see
+// [Adapter.endAgain]. linked is as for [Adapter.grantEnded].
+//
+// Without now, as for a linked grant end whose first try in [Adapter.endGrant] made
+// grantEnded return true, it waits before each try. With now, as for
+// [Adapter.endUnlinked], it makes the first try at once and waits before each later
+// one. The waits double from [grantFirstWait] to [grantMaxWait], as for a grant's
+// report.
+//
+// The tries stop once grantEnded returns false. A linked grant end also stops once the
+// installation's link names another connection, or none, as after [Apiary.Ended]
+// dropped it. An unlinked one also stops once the installation has a link, or the copy
+// no longer has the grant for connection. Both stop once a linked connect return is
+// minted for account, the GitHub account of the grant, see [Adapter.stopEnd], and once
+// [Adapter.stopEnds] has run. A stop changes no state.
+//
+// One installation has one grant end sent again at a time: endSoon starts nothing while
+// the installation's tries run, or once stopEnds has run. It returns whether it started
+// the tries.
 func (a *Adapter) endSoon(installation int64, connection string, account int64, linked, now bool) bool {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()

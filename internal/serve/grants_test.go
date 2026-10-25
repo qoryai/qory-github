@@ -925,7 +925,7 @@ func TestAnUnlinkedGrantEndLogsNoLink(t *testing.T) {
 		line   string
 	}{
 		{name: "204", line: `"level":"INFO","msg":"the grant of an installation that has no link ended in Qory Apiary, so serve drops the grant from the copy","installation":42`},
-		{name: "forbidden", status: 403, line: `"level":"ERROR","msg":"Qory Apiary returned an error for the end of the grant of an installation that has no link that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart","installation":42`},
+		{name: "forbidden", status: 403, line: `"level":"ERROR","msg":"The end of the grant of an installation that has no link failed with an error from Qory Apiary that a retry does not change, so serve keeps the grant in the copy and sends no more grant end for it until a connect for its account or a restart","installation":42`},
 	} {
 		w := deletedBeforeTheReport(t)
 		w.apiary.refuse = func(route string, _ int) (int, string) {
