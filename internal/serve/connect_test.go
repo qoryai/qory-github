@@ -1648,7 +1648,10 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 
 	// A 204: the replaced connection was made meanwhile, and is ended.
 	rig = replace(t)
+	// A request of the stopped connect may still be in the fake's handler.
+	rig.apiary.mu.Lock()
 	rig.apiary.refuse = nil
+	rig.apiary.mu.Unlock()
 	before = len(rig.apiary.sent(routeCollections))
 	if err := rig.adapter.listConnection(context.Background(), 42, otherConnection); err != nil {
 		t.Fatal(err)

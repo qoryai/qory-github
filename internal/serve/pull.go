@@ -669,12 +669,11 @@ func (p *puller) installationGone(ctx context.Context, attr slog.Attr, installat
 	p.ended(ctx, attr, installation)
 }
 
-// ended ends what serve keeps of the installation, whose check GitHub answered 404 for
-// under the App's token, [github.ErrInstallationGone], in two rounds in a row, see
-// [puller.installationGone], as the webhook's deleted does, see
-// [Adapter.endInstallation]: serve ends its grant, with a line, and pulls none of its
-// collections. Only GitHub's 404 to the installation's
-// check brings it: a 401, as for an App key GitHub does not take, or a suspension never
+// ended handles the installation, whose check GitHub answered 404 for under the App's
+// token, [github.ErrInstallationGone], in two rounds in a row, see
+// [puller.installationGone], as deleted, the way the webhook's deleted does, see
+// [Adapter.endInstallation], with a line, and pulls none of its collections. Only
+// GitHub's 404 to the installation's check brings it: a 401, as for an App key GitHub does not take, or a suspension never
 // does. An installation the webhook ended already is passed with no line. A failure is
 // reported, see [puller.report], and the 404s stay counted, so the next round's 404
 // tries again.
@@ -687,7 +686,7 @@ func (p *puller) ended(ctx context.Context, attr slog.Attr, installation int64) 
 	p.adapter.presence.notGone(installation)
 	p.passed(attr)
 	if connection != "" {
-		p.log.Info("GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve ends its grant", slog.Int64("installation", installation), slog.String("connection", connection))
+		p.log.Info("GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve handles it as deleted", slog.Int64("installation", installation), slog.String("connection", connection))
 	}
 }
 

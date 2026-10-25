@@ -1235,7 +1235,7 @@ func (f *fakeGitHub) repositoryReads() []string {
 
 // endedLine is the line of a round that ended the installation 42, linked to
 // testConnection.
-const endedLine = `"msg":"GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve ends its grant","installation":42,"connection":"` + testConnection + `"`
+const endedLine = `"msg":"GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve handles it as deleted","installation":42,"connection":"` + testConnection + `"`
 
 // goneOnceLine is the line of a round that met GitHub's first 404 in a row to the
 // installation 42's check.
