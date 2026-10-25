@@ -478,15 +478,17 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 	if ctx.Err() != nil {
 		return err
 	}
-	if a.grantEnded(installation, l.Connection, l.Account, err) {
-		a.endSoon(installation, l.Connection, l.Account)
+	var since time.Time
+	if a.grantEnded(installation, l.Connection, l.Account, err, &since) {
+		a.endSoon(installation, l.Connection, l.Account, since)
 	}
 	return nil
 }
 
 // grantEnded acts on Qory Apiary's answer err to the end of the installation's grant,
 // which connection has, for the GitHub account whose id is account, and says whether to
-// send the grant end again:
+// send the grant end again. since is when Qory Apiary first answered this grant end's
+// tries 403 connection_unknown, on the adapter's clock, zero before the first:
 //
 //   - the signed 204, or 409 grant_unknown, which says the copy has no such grant:
 //     serve drops the grant from the copy, and the installation's link with the records
@@ -494,10 +496,13 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 //   - 409 connection_ended: [Apiary.Ended] has dropped the connection's links and their
 //     collections' records, and serve drops the grant from the copy;
 //   - 403 connection_unknown: it says to send the grant end again, until the 403 has
-//     lasted [forbiddenFor] for a live connection, see [noteAnswer], which drops the
-//     connection's links as on 409 connection_ended, see [answeredIn]; once the
-//     installation's link no longer names connection, serve drops the grant from the
-//     copy and stops;
+//     lasted [forbiddenFor] since since, whatever the link's state, as a pending link's
+//     is when its first listing was never taken: serve then takes the connection as
+//     ended for the installation, and drops the grant from the copy, and the
+//     installation's link with the records of its collections. A live link may be
+//     dropped first, by the 403s that [noteAnswer] counts for the connection, see
+//     [answeredIn]; once the installation's link no longer names connection, serve
+//     drops the grant from the copy and stops;
 //   - a failure that may pass, no answer, a 5xx or an answer not signed: it says to
 //     send the grant end again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it, keeps its
@@ -506,7 +511,7 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 //
 // It drops the grant from the copy whatever the link is, and drops the installation's
 // link only while the link names connection.
-func (a *Adapter) grantEnded(installation int64, connection string, account int64, err error) bool {
+func (a *Adapter) grantEnded(installation int64, connection string, account int64, err error, since *time.Time) bool {
 	attrs := []slog.Attr{slog.Int64("installation", installation), slog.String("connection", connection)}
 	switch {
 	case err == nil, refusedAs(err, http.StatusConflict, codeGrantUnknown), refusedAs(err, http.StatusConflict, codeConnectionEnded):
@@ -538,6 +543,24 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 			a.log().LogAttrs(context.Background(), slog.LevelInfo, "the installation's link was dropped with its connection, so serve drops its grant and sends no more grant end", attrs...)
 			return false
 		}
+		now := a.clock()
+		if since.IsZero() {
+			*since = now
+		}
+		if !now.Before(since.Add(forbiddenFor)) {
+			installMu.Lock()
+			derr := dropGrant(a.Store, installation, connection)
+			if l, ok, lerr := linkOf(a.Store, installation); derr == nil && lerr == nil && ok && l.Connection == connection {
+				derr = dropInstallation(a.Store, installation)
+			}
+			installMu.Unlock()
+			if derr != nil {
+				a.log().LogAttrs(context.Background(), slog.LevelError, "dropping the link of an installation whose connection is taken as ended", append(attrs, slog.String("error", derr.Error()))...)
+				return false
+			}
+			a.log().LogAttrs(context.Background(), slog.LevelInfo, "Qory Apiary answered connection_unknown to the end of the installation's grant for a day, so serve takes the connection as ended and drops the grant and the installation's link", attrs...)
+			return false
+		}
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
 	case !IsPermanent(err) && !refusedFor(err):
@@ -557,8 +580,10 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 // names another connection, or none, as after [Apiary.Ended] dropped it; once a linked
 // connect return is minted for account, the GitHub account of the grant, see
 // [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
-// installation has one grant end sent again at a time.
-func (a *Adapter) endSoon(installation int64, connection string, account int64) {
+// installation has one grant end sent again at a time. since is when Qory Apiary first
+// answered the grant end 403 connection_unknown, zero when it has not, see
+// [Adapter.grantEnded].
+func (a *Adapter) endSoon(installation int64, connection string, account int64, since time.Time) {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()
 	a.initEnds()
@@ -578,7 +603,7 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64) 
 				return
 			}
 			wait = min(2*wait, grantMaxWait)
-			if !a.endAgain(ctx, installation, connection, account) {
+			if !a.endAgain(ctx, installation, connection, account, &since) {
 				return
 			}
 		}
@@ -586,8 +611,8 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64) 
 }
 
 // endAgain is one try of [Adapter.endSoon], holding the installation's lock, and says
-// whether to try again.
-func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64) bool {
+// whether to try again. since is as for [Adapter.grantEnded].
+func (a *Adapter) endAgain(ctx context.Context, installation int64, connection string, account int64, since *time.Time) bool {
 	unlock, err := a.lockInstallation(ctx, installation)
 	if err != nil {
 		return false
@@ -605,7 +630,7 @@ func (a *Adapter) endAgain(ctx context.Context, installation int64, connection s
 	if ctx.Err() != nil {
 		return false
 	}
-	return a.grantEnded(installation, connection, account, err)
+	return a.grantEnded(installation, connection, account, err, since)
 }
 
 // initEnds makes what [Adapter.endSoon] keeps, for a caller that holds endMu.

@@ -1038,6 +1038,55 @@ func TestARefusedGrantEndWaitsForAConnectOfItsAccount(t *testing.T) {
 	}
 }
 
+// TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown has Qory Apiary answer
+// each end of the grant of 42, whose link is pending, as when its first listing was
+// never taken, 403 connection_unknown, an hour apart on the adapter's clock: the 403s
+// of a pending link count toward nothing in [noteAnswer], and once they have lasted a
+// day since the first, see [forbiddenFor], serve drops the grant, the link and the
+// collection's records, and sends no more grant end.
+func TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.retryEnds()
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Date(2026, 10, 15, 12, 10, 0, 0, time.UTC).Unix()})
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	var clock sync.Mutex
+	w.adapter.now = func() time.Time { clock.Lock(); defer clock.Unlock(); return now }
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route != routeGrantsEnd {
+			return 0, ""
+		}
+		clock.Lock()
+		now = now.Add(time.Hour)
+		clock.Unlock()
+		return 403, `{"error":"connection_unknown"}`
+	}
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.endsDone(t, 42)
+	// The first 403 comes at 13:00; the try answered at 13:00 the next day is the last.
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
+		t.Errorf("%d grant ends", n)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link is kept")
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant %q is kept", held)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/widgets")); ok {
+		t.Error("the repository's installation is kept")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the collection is still linked")
+	}
+	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary answered connection_unknown to the end of the installation's grant for a day, so serve takes the connection as ended and drops the grant and the installation's link","installation":42,"connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", log)
+	}
+}
+
 // TestALastingConnectionUnknownStopsTheGrantEnd has Qory Apiary answer each end of the
 // grant of 42, linked live, 403 connection_unknown, an hour apart on the adapter's
 // clock: once the 403 has lasted a day, see [forbiddenFor], serve drops the connection
