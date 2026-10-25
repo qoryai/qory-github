@@ -20,6 +20,8 @@ change what the program does, and notes it under Upgrading.
   from GitHub's API quotes the code, the error shows `[the code]` in its place.
 - Building `qory-github` from source needs Go 1.27.3, up from 1.27.1: the integrations
   and Forager modules it builds against require it.
+- Deleting the GitHub App from an account ends that account's grant in Qory Apiary. The
+  connection stays.
 
 ## [0.2.1] - 2026-10-24
 
