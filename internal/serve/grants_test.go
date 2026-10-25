@@ -670,36 +670,50 @@ func TestAGrantOfADeletedInstallationIsEndedOnceAtATime(t *testing.T) {
 	}
 }
 
-// TestAReportTakenDuringADeletionIsEnded deletes 42 while serve's copy does not have
-// its grant yet, and adds the grant to the copy, as a report's 204 does under
-// installMu, while the deletion waits for installMu: the deletion reads the copy under
-// installMu, so it finds the grant and sends the grant end.
-func TestAReportTakenDuringADeletionIsEnded(t *testing.T) {
+// TestAReportTakenDuringADeletionLeavesNoGrantBehind deletes 42 while serve's copy does
+// not have its grant yet, and adds the grant to the copy as a report's 204 does, see
+// [Connect.reportSoon], right after the deletion reads the copy: under installMu, and
+// only while 42's link names the connection. The deletion reads the copy and drops the
+// link under installMu, so the report comes after the drop and adds nothing, and no
+// grant of 42 stays in the copy without a grant end.
+func TestAReportTakenDuringADeletionLeavesNoGrantBehind(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	if err := putLink(w.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
 		t.Fatal(err)
 	}
-	installMu.Lock()
-	done := make(chan error, 1)
-	go func() {
-		_, err := w.adapter.endInstallation(context.Background(), 42)
-		done <- err
-	}()
-	// Give the deletion time to reach installMu.
-	time.Sleep(200 * time.Millisecond)
-	err := putGrant(w.st, 42, testConnection)
-	installMu.Unlock()
-	if err != nil {
+	report := func() {
+		if l, ok, _ := linkOf(w.st, 42); ok && l.Connection == testConnection {
+			putGrant(w.st, 42, testConnection)
+		}
+	}
+	reported := make(chan struct{})
+	var once sync.Once
+	w.adapter.grantRead = func() {
+		once.Do(func() {
+			// While the deletion holds installMu, the report waits for it.
+			if installMu.TryLock() {
+				report()
+				installMu.Unlock()
+				close(reported)
+				return
+			}
+			go func() {
+				installMu.Lock()
+				report()
+				installMu.Unlock()
+				close(reported)
+			}()
+		})
+	}
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 1 || sent[0].body["grant_ref"] != "42" {
-		t.Errorf("the grant ends %v", sent)
-	}
+	<-reported
 	if held, _ := grantOf(w.st, 42); held != "" {
-		t.Errorf("the grant %q is kept", held)
+		t.Errorf("the grant is kept for %s, with %d grant ends", held, len(w.apiary.sent(routeGrantsEnd)))
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link is kept")
 	}
 }
 

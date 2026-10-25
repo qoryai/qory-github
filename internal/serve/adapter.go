@@ -94,6 +94,8 @@ type Adapter struct {
 	// endRefused are the grant ends for which Qory Apiary returned an error that a
 	// retry does not change, by installation, under endMu, see [Adapter.endRefusedFor].
 	endRefused map[int64]refusedEnd
+	// grantRead, when set, is called once [Adapter.dropUngranted] has read the copy.
+	grantRead func()
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
 	// receiver logs its refusals, once each refusalEvery at most; envsOnce makes envs,

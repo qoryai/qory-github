@@ -558,6 +558,9 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 	installMu.Lock()
 	defer installMu.Unlock()
 	held, err := grantOf(a.Store, installation)
+	if a.grantRead != nil {
+		a.grantRead()
+	}
 	if err != nil || held == connection {
 		return false, err
 	}
