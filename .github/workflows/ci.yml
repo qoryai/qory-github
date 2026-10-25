@@ -17,4 +17,6 @@ jobs:
     # shows, so that pull request's run is skipped. Every push, and any other pull
     # request, a fork's next among them, runs.
     if: github.event_name != 'pull_request' || github.head_ref != 'next' || github.event.pull_request.head.repo.full_name != github.repository
-    uses: qoryai/integrations/.github/workflows/go.yml@v0.3.0
+    # A main commit of integrations, for Go 1.27.3, until its release; then the release
+    # tag.
+    uses: qoryai/integrations/.github/workflows/go.yml@5f92b11673052874cd1e2f9fbf246a230d50dd16

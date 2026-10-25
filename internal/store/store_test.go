@@ -1,0 +1,402 @@
+package store
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// clock is a time a test sets and moves.
+type clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *clock) Add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+func open(t *testing.T, dir string, c *clock) *Store {
+	t.Helper()
+	s, err := Open(dir, Options{Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func delivery(guid string, installation int64) Delivery {
+	return Delivery{GUID: guid, Event: "issues", Action: "opened", InstallationID: installation, Body: []byte(`{"action":"opened"}`)}
+}
+
+const (
+	guid1 = "72d3162e-cc78-11e3-81ab-4c9367dc0958"
+	guid2 = "8a1e6b40-0f6c-11ef-9d3a-0242ac120002"
+	guid3 = "9b2f7c51-1a7d-11ef-8e4b-0242ac120003"
+)
+
+func TestADeliveryIsKeptOnceAndPendingUntilSettled(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	d, added, err := s.AddDelivery(delivery(guid1, 7))
+	if err != nil || !added || d.Seq != 1 || d.State != Pending || !d.Received.Equal(c.now) {
+		t.Fatalf("%+v %v %v", d, added, err)
+	}
+	again, added, err := s.AddDelivery(delivery(guid1, 7))
+	if err != nil || added || again.Seq != 1 {
+		t.Fatalf("a repeat GUID: %+v %v %v", again, added, err)
+	}
+	s.AddDelivery(delivery(guid2, 8))
+	s.AddDelivery(delivery(guid3, 7))
+	pending, err := s.Pending()
+	if err != nil || len(pending) != 3 || pending[0].GUID != guid1 || pending[1].GUID != guid2 || pending[2].GUID != guid3 || pending[0].Body != nil {
+		t.Fatalf("pending %+v %v", pending, err)
+	}
+	if err := s.MarkDone(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkFailed(2); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.Load(1); err != nil || d.State != Done || d.Body != nil {
+		t.Errorf("done: %+v %v", d, err)
+	}
+	if d, err := s.Load(2); err != nil || d.State != Failed || string(d.Body) != `{"action":"opened"}` {
+		t.Errorf("failed: %+v %v", d, err)
+	}
+	if pending, _ := s.Pending(); len(pending) != 1 || pending[0].Seq != 3 {
+		t.Errorf("pending %+v", pending)
+	}
+	if _, err := s.Load(42); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err %v", err)
+	}
+	if _, err := s.Lookup("none"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err %v", err)
+	}
+}
+
+func TestPendingDeliveriesSurviveAReopen(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir, Options{Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.AddDelivery(delivery(guid1, 7))
+	s.AddDelivery(delivery(guid2, 7))
+	s.MarkDone(1)
+	s.Close()
+	s = open(t, dir, c)
+	pending, err := s.Pending()
+	if err != nil || len(pending) != 1 || pending[0].GUID != guid2 {
+		t.Fatalf("pending %+v %v", pending, err)
+	}
+	if _, added, _ := s.AddDelivery(delivery(guid1, 7)); added {
+		t.Error("a GUID kept before the reopen is taken again")
+	}
+	if d, _, _ := s.AddDelivery(delivery(guid3, 7)); d.Seq != 3 {
+		t.Errorf("the next number is %d, want 3", d.Seq)
+	}
+}
+
+func TestAGUIDExpiresSevenDaysAfterItIsReceived(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	s.AddDelivery(delivery(guid1, 7))
+	s.AddDelivery(delivery(guid2, 7))
+	s.MarkDone(1)
+	c.Add(DeliveryRetention - time.Second)
+	if n, err := s.Sweep(); err != nil || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if _, added, _ := s.AddDelivery(delivery(guid1, 7)); added {
+		t.Error("a GUID is taken again before seven days")
+	}
+	c.Add(time.Second)
+	if n, err := s.Sweep(); err != nil || n != 1 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if _, err := s.Lookup(guid1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an expired GUID is found: %v", err)
+	}
+	if _, err := s.Lookup(guid2); err != nil {
+		t.Errorf("a pending delivery expired: %v", err)
+	}
+	if d, added, err := s.AddDelivery(delivery(guid1, 7)); err != nil || !added || d.Seq != 3 {
+		t.Errorf("an expired GUID is not taken again: %+v %v %v", d, added, err)
+	}
+}
+
+func TestAValueIsKeptUnderItsNamespaceUntilItExpires(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	if err := s.Put("tokens", "42", []byte("a"), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put("other", "42", []byte("b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.Get("tokens", "42"); err != nil || string(v) != "a" {
+		t.Errorf("%q %v", v, err)
+	}
+	if _, err := s.Get("tokens", "43"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err %v", err)
+	}
+	if _, err := s.Get("none", "42"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err %v", err)
+	}
+	c.Add(time.Hour)
+	if _, err := s.Get("tokens", "42"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("an expired value: %v", err)
+	}
+	if _, err := s.Sweep(); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.Get("other", "42"); err != nil || string(v) != "b" {
+		t.Errorf("a value with no expiry: %q %v", v, err)
+	}
+	if err := s.Delete("other", "42"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get("other", "42"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a deleted value: %v", err)
+	}
+	if err := s.Put("", "k", nil, 0); err == nil {
+		t.Error("an empty namespace is taken")
+	}
+	if err := s.Put("ns", "k", nil, -time.Second); err == nil {
+		t.Error("a negative time to live is taken")
+	}
+}
+
+func TestPutNewKeepsAValueOnlyWhereNoneIs(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir, Options{Now: c.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := s.PutNew("nonces", "n1", []byte("a"), time.Minute); err != nil || !kept {
+		t.Fatalf("%v %v", kept, err)
+	}
+	if kept, err := s.PutNew("nonces", "n1", []byte("b"), time.Minute); err != nil || kept {
+		t.Fatalf("a second value is kept: %v %v", kept, err)
+	}
+	if v, _ := s.Get("nonces", "n1"); string(v) != "a" {
+		t.Errorf("the value is %q", v)
+	}
+	// What PutNew kept survives a reopen, and is taken again only once it expired.
+	s.Close()
+	s = open(t, dir, c)
+	if kept, _ := s.PutNew("nonces", "n1", []byte("b"), time.Minute); kept {
+		t.Error("a value kept before the reopen is replaced")
+	}
+	c.Add(time.Minute)
+	if kept, err := s.PutNew("nonces", "n1", []byte("b"), time.Minute); err != nil || !kept {
+		t.Errorf("an expired value is not replaced: %v %v", kept, err)
+	}
+	if _, err := s.PutNew("nonces", "n2", nil, 0); err == nil {
+		t.Error("a value without a time to live is taken")
+	}
+	// Of many calls for one key at once, one keeps its value.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	kept := 0
+	for range 20 {
+		wg.Go(func() {
+			if ok, err := s.PutNew("nonces", "n3", nil, time.Minute); err == nil && ok {
+				mu.Lock()
+				kept++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if kept != 1 {
+		t.Errorf("%d calls kept their value", kept)
+	}
+}
+
+func TestEachWalksANamespaceWithoutWhatExpired(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	s.Put("ns", "b", []byte("2"), 0)
+	s.Put("ns", "a", []byte("1"), 0)
+	s.Put("ns", "c", []byte("3"), time.Minute)
+	s.Put("other", "d", []byte("4"), 0)
+	c.Add(time.Minute)
+	var got []string
+	if err := s.Each("ns", func(k string, v []byte) error { got = append(got, k+"="+string(v)); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, " ") != "a=1 b=2" {
+		t.Errorf("walked %v", got)
+	}
+	stop := errors.New("stop")
+	n := 0
+	if err := s.Each("ns", func(string, []byte) error { n++; return stop }); err != stop || n != 1 {
+		t.Errorf("err %v after %d", err, n)
+	}
+	if err := s.Each("none", func(string, []byte) error { return stop }); err != nil {
+		t.Errorf("an empty namespace: %v", err)
+	}
+}
+
+func TestTheStoreIsOnlyItsOwners(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "state")
+	c := &clock{now: time.Now()}
+	s := open(t, dir, c)
+	for path, want := range map[string]os.FileMode{dir: 0o700, filepath.Join(dir, FileName): 0o600} {
+		if info, err := os.Stat(path); err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s: %v %v, want %s", path, info.Mode().Perm(), err, want)
+		}
+	}
+	if _, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "open in another process") {
+		t.Errorf("a second open: %v", err)
+	}
+	s.Close()
+
+	open := filepath.Join(parent, "open")
+	os.Mkdir(open, 0o755)
+	os.Chmod(open, 0o755)
+	if _, err := Open(open, Options{}); err == nil || !strings.Contains(err.Error(), "group or others have permissions on it; make it 0700") {
+		t.Errorf("a directory others read: %v", err)
+	}
+	link := filepath.Join(parent, "link")
+	os.Symlink(dir, link)
+	for _, path := range []string{link, link + "/", link + "//"} {
+		if _, err := Open(path, Options{}); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("the link %s: %v", path, err)
+		}
+	}
+	// link/. is refused as link/ is, though by its last part.
+	for _, path := range []string{link + "/.", link + "/./", dir + "/.", dir + "/sub/.."} {
+		if _, err := Open(path, Options{}); err == nil || !strings.Contains(err.Error(), path+" ends in . or ..") {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
+	file := filepath.Join(parent, "file")
+	os.WriteFile(file, nil, 0o600)
+	if _, err := Open(file, Options{}); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("a file: %v", err)
+	}
+	loose := filepath.Join(parent, "loose")
+	os.Mkdir(loose, 0o700)
+	os.WriteFile(filepath.Join(loose, FileName), nil, 0o644)
+	os.Chmod(filepath.Join(loose, FileName), 0o644)
+	if _, err := Open(loose, Options{}); err == nil || !strings.Contains(err.Error(), "the store") || !strings.Contains(err.Error(), "make it 0600") {
+		t.Errorf("a store file others read: %v", err)
+	}
+}
+
+func TestAStoreFileReplacedBetweenTheOpensIsRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	other := filepath.Join(t.TempDir(), "other.db")
+	os.WriteFile(other, nil, 0o600)
+	betweenOpens = func(path string) {
+		os.Remove(path)
+		os.Symlink(other, path)
+	}
+	defer func() { betweenOpens = func(string) {} }()
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "was replaced") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("err %v", err)
+	}
+	// The new file is made beside the store's and renamed over it, so both exist at once
+	// and their inodes differ on every system.
+	betweenOpens = func(path string) {
+		os.WriteFile(path+".new", nil, 0o600)
+		os.Rename(path+".new", path)
+	}
+	dir = filepath.Join(t.TempDir(), "state")
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "was replaced") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("a new file: %v", err)
+	}
+	// A file removed and created again can be given the freed inode and pass as the one
+	// checked; it is still held to what the first open checked. The same file made 0640
+	// stands for one.
+	betweenOpens = func(path string) {
+		os.Chmod(path, 0o640)
+	}
+	dir = filepath.Join(t.TempDir(), "state")
+	if s, err := Open(dir, Options{}); err == nil || !strings.Contains(err.Error(), "the store "+filepath.Join(dir, FileName)+" is -rw-r-----: group or others have permissions on it; make it 0600") {
+		if s != nil {
+			s.Close()
+		}
+		t.Errorf("the same inode made 0640: %v", err)
+	}
+}
+
+func TestSetOwnerDropsAnotherOwnersStateAlone(t *testing.T) {
+	c := &clock{now: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	s := open(t, filepath.Join(t.TempDir(), "state"), c)
+	drop := Owner{Namespaces: []string{"links", "none"}, Keys: map[string][]string{"meta": {"cursor", "absent"}}}
+	if prev, dropped, err := s.SetOwner("meta", "owner", "a", drop); err != nil || prev != "" || dropped != nil {
+		t.Fatalf("%q %v %v", prev, dropped, err)
+	}
+	for _, kv := range [][2]string{{"links", "1"}, {"meta", "cursor"}, {"meta", "kept"}, {"other", "k"}} {
+		if err := s.Put(kv[0], kv[1], []byte("v"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Put("links", "2", []byte("v"), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// The same owner drops nothing.
+	if prev, dropped, err := s.SetOwner("meta", "owner", "a", drop); err != nil || prev != "a" || dropped != nil {
+		t.Fatalf("%q %v %v", prev, dropped, err)
+	}
+	if _, err := s.Get("links", "1"); err != nil {
+		t.Errorf("the same owner dropped a value: %v", err)
+	}
+	// Another drops what drop names, counting no value that expired, and keeps the rest.
+	c.Add(2 * time.Hour)
+	prev, dropped, err := s.SetOwner("meta", "owner", "b", drop)
+	if err != nil || prev != "a" || len(dropped) != 2 || dropped["links"] != 1 || dropped["meta"] != 1 {
+		t.Fatalf("%q %v %v", prev, dropped, err)
+	}
+	for _, kv := range [][2]string{{"links", "1"}, {"links", "2"}, {"meta", "cursor"}} {
+		if _, err := s.Get(kv[0], kv[1]); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s %s is kept: %v", kv[0], kv[1], err)
+		}
+	}
+	for _, kv := range [][2]string{{"meta", "kept"}, {"other", "k"}} {
+		if _, err := s.Get(kv[0], kv[1]); err != nil {
+			t.Errorf("%s %s is dropped: %v", kv[0], kv[1], err)
+		}
+	}
+	if v, err := s.Get("meta", "owner"); err != nil || string(v) != "b" {
+		t.Errorf("the owner %q %v", v, err)
+	}
+	// The owner's namespace may be among those dropped whole.
+	whole := Owner{Namespaces: []string{"self"}}
+	s.SetOwner("self", "owner", "a", whole)
+	if _, _, err := s.SetOwner("self", "owner", "b", whole); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.Get("self", "owner"); err != nil || string(v) != "b" {
+		t.Errorf("the owner %q %v", v, err)
+	}
+	if _, _, err := s.SetOwner("meta", "owner", "", drop); err == nil {
+		t.Error("an empty owner is taken")
+	}
+}

@@ -1,0 +1,1281 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"maps"
+	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/qoryai/integrations/contracts"
+)
+
+// Qory Apiary refuses a whole request when one field in it breaks the contract's
+// limits, [contractLimits], and cuts nothing, so the adapter never sends a field that
+// does. A text past its limit is cut to the limit, as [cut] says, and the cut is logged
+// as a [Cut]: a title, a body, a person's name, a label and a collection's title. A cut
+// of an item's title, body or filed_by.name, or of a comment's body or author.name, is
+// named in its truncated too. A state_reason past its limit is dropped, never cut. An
+// empty label is dropped, a label the same as one before it, once cut, is dropped, and
+// the labels past the most an item has are left out, which is logged too; a label cut
+// and the labels left out are named labels in the item's truncated. A collection's
+// title, cut, is logged only, since the contract's collection has no truncated. A field
+// that cannot be cut into the contract, a ref, a URL, a target's path, an empty title
+// or a time that is not RFC 3339, skips its item, comment or collection, which is
+// logged by its ref, never by its text, and the rest are sent. A request is at most
+// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
+// collections.
+
+// timeWidth stands for a request's time while the request is sized: the sink sets the
+// time as it sends the request, and every time the wire carries, in
+// contracts.TimeLayout's form, is as long as the layout itself.
+const timeWidth = contracts.TimeLayout
+
+// The most pages a listing reads: a repository's open issues, see
+// [Lister.ListOpenIssuesComplete]; one issue's comments; and the installation's
+// repositories. A listing that would read more stops, as does one whose next page
+// repeats a page it read.
+const (
+	maxIssuePages      = 2000
+	maxCommentPages    = 100
+	maxRepositoryPages = 1000
+)
+
+// workItemMarker begins the comment the App writes on an issue that is work in
+// Qory Apiary, see [Client.ApplyChange]. Such a comment by the App's bot is the
+// adapter's, not the issue's, so it is never sent; the same words in a comment by anyone
+// else are that person's comment.
+const workItemMarker = "<!-- qory:work-item "
+
+// Sink is where the wire's requests go: Qory Apiary's client, or a test's. Each method
+// sends one request and returns once Qory Apiary took it. A request comes without its
+// time, which the sink sets as it sends it. A request is at most 1 MiB as
+// encoding/json's Marshal writes it, compact, its time set; a sink that encodes it
+// otherwise, indented for one, may exceed that.
+type Sink interface {
+	// Collections sends POST /v1/source-collections.
+	Collections(ctx context.Context, req contracts.SourceCollections) error
+	// Items sends POST /v1/source-items.
+	Items(ctx context.Context, req contracts.SourceItems) error
+	// Comments sends POST /v1/source-items/comments.
+	Comments(ctx context.Context, req contracts.SourceItemComments) error
+	// Disconnect sends POST /v1/sources/disconnect.
+	Disconnect(ctx context.Context, req contracts.SourcesDisconnect) error
+}
+
+// The fields of GitHub's answers and webhook payloads the adapter reads; the rest is
+// ignored.
+type (
+	ghUser struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	}
+	ghLabel struct {
+		Name string `json:"name"`
+	}
+	ghRepo struct {
+		ID       int64  `json:"id"`
+		NodeID   string `json:"node_id"`
+		FullName string `json:"full_name"`
+		HTMLURL  string `json:"html_url"`
+		// HasIssues is GitHub's has_issues, false when Issues are turned off for the
+		// repository, and nil when the answer has no has_issues, which is taken as on,
+		// see [ghRepo.issuesOn]. A collection of a repository whose has_issues is false
+		// has items false, see [collectionOf].
+		HasIssues *bool `json:"has_issues"`
+	}
+	ghIssue struct {
+		Number      int64     `json:"number"`
+		Title       string    `json:"title"`
+		Body        *string   `json:"body"`
+		State       string    `json:"state"`
+		StateReason *string   `json:"state_reason"`
+		HTMLURL     string    `json:"html_url"`
+		Labels      []ghLabel `json:"labels"`
+		User        *ghUser   `json:"user"`
+		Comments    int       `json:"comments"`
+		CreatedAt   string    `json:"created_at"`
+		UpdatedAt   string    `json:"updated_at"`
+		// PullRequest is set whenever the key is there, even null: GitHub lists pull
+		// requests among issues and marks them with it.
+		PullRequest json.RawMessage `json:"pull_request"`
+	}
+	ghComment struct {
+		ID        int64   `json:"id"`
+		HTMLURL   string  `json:"html_url"`
+		Body      *string `json:"body"`
+		User      *ghUser `json:"user"`
+		CreatedAt string  `json:"created_at"`
+		UpdatedAt string  `json:"updated_at"`
+	}
+)
+
+// WebHost is the system an item's target names: the website of the API the client
+// reaches, github.com for GitHub's, and for a test the loopback host. It is the host
+// lower-cased and without its port, as the contract's pattern for a system takes it.
+func (c Client) WebHost() string {
+	u, err := url.Parse(c.base())
+	if err != nil || u.Hostname() == APIHost {
+		return GitHost
+	}
+	h := strings.ToLower(u.Hostname())
+	if !contractLimits().system.MatchString(h) {
+		// CheckAPIURL admits only GitHub's API or a loopback host, and a loopback
+		// address such as ::1 does not fit the contract's pattern for a host name, so
+		// the system is localhost, which does and names the same machine.
+		return "localhost"
+	}
+	return h
+}
+
+// Cut is a text cut to the contract's limit, for the log: the ref of its item, comment
+// or collection, the field, and its length before the cut, in characters, or in labels
+// for the labels past the most an item has. It never holds the text.
+type Cut struct {
+	Ref, Field string
+	Length     int
+}
+
+// fit is s with every U+0000 dropped, since the integration contract refuses U+0000 in
+// a text, then cut to n characters, and when it is cut, a [Cut] of the field of ref
+// added to cuts, its length the text's without U+0000. A text that only loses U+0000 is
+// not a cut.
+func fit(cuts *[]Cut, ref, field, s string, n int) string {
+	s = withoutNUL(s)
+	if !tooLong(s, n) {
+		return s
+	}
+	*cuts = append(*cuts, Cut{Ref: ref, Field: field, Length: utf8.RuneCountInString(s)})
+	return cut(s, n)
+}
+
+// truncatedField is a name the contract's truncated takes, and the fields of the
+// [Cut]s it names, as [fit] and [labelsOf] call them.
+type truncatedField struct {
+	name string
+	cuts []string
+}
+
+// The names the contract's truncated takes, on an item and on a comment, in the order
+// its schema lists them. An item's labels names a label cut to the limit of a label
+// and the labels past the most an item has, left out.
+var (
+	itemTruncated = []truncatedField{
+		{"title", []string{"title"}},
+		{"body", []string{"body"}},
+		{"filed_by.name", []string{"filed_by.name"}},
+		{"labels", []string{"label", "labels"}},
+	}
+	commentTruncated = []truncatedField{
+		{"body", []string{"body"}},
+		{"author.name", []string{"author.name"}},
+	}
+)
+
+// truncatedOf is the names among fields whose cuts are among cuts, each once in the
+// order of fields, for an item's or a comment's truncated; nil when cuts holds none of
+// them, so truncated is left out.
+func truncatedOf(cuts []Cut, fields []truncatedField) []string {
+	var out []string
+	for _, f := range fields {
+		if slices.ContainsFunc(cuts, func(c Cut) bool { return slices.Contains(f.cuts, c.Field) }) {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
+// authorOf is who a user is on the wire, the field of ref: a bot is an automation,
+// anyone else a person. The name is fitted to the contract's limit. A user GitHub no
+// longer has, or one without a login, is its ghost.
+func authorOf(u *ghUser, cuts *[]Cut, ref, field string) contracts.Person {
+	p := contracts.Person{Kind: KindPerson}
+	if u != nil {
+		p.Name = fit(cuts, ref, field, u.Login, contractLimits().name)
+		if u.Type == "Bot" {
+			p.Kind = KindAutomation
+		}
+	}
+	if p.Name == "" {
+		p.Name = "ghost"
+	}
+	return p
+}
+
+// A collection's ref is its repository's id on GitHub, in decimal, and an item's ref is
+// the repository's id, #, and the issue's number, such as 1296269#42: GitHub gives
+// neither again, and a repository renamed or transferred keeps its id, where its
+// owner/name changes. A comment's ref is the comment's id. The collection's title, its
+// URL and its target's path, and an item's URL, still name the repository as GitHub
+// does, owner/name.
+
+// idShape is a repository's id, or an issue's number, in a ref: decimal digits alone,
+// with no sign and no leading zero, which [parseID] holds to the range of an int64.
+var idShape = regexp.MustCompile(`^[1-9][0-9]{0,18}$`)
+
+// parseID is the positive id s writes, by [idShape], or false.
+func parseID(s string) (int64, bool) {
+	if !idShape.MatchString(s) {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+// CollectionRef is the ref of the collection of the repository whose id is id, or ""
+// for an id that is not positive, which [checkRef] refuses.
+func CollectionRef(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
+}
+
+// itemRef is the ref of the item of the issue number of the repository whose id is id,
+// or "" when either is not positive, which [checkRef] refuses.
+func itemRef(id, number int64) string {
+	if id <= 0 || number <= 0 {
+		return ""
+	}
+	return CollectionRef(id) + "#" + strconv.FormatInt(number, 10)
+}
+
+// ParseCollectionRef is the id of the repository the collection ref names, or false
+// when ref is not one: decimal digits alone, with no sign and no leading zero, within an
+// int64.
+func ParseCollectionRef(ref string) (int64, bool) {
+	return parseID(ref)
+}
+
+// ParseItemRef is the id of the repository and the issue's number the item ref names,
+// or false when ref is not one: a collection's ref, #, and the number, each decimal
+// digits alone, with no sign and no leading zero, within an int64.
+func ParseItemRef(ref string) (id, number int64, ok bool) {
+	repo, num, found := strings.Cut(ref, "#")
+	if !found {
+		return 0, 0, false
+	}
+	id, ok1 := parseID(repo)
+	number, ok2 := parseID(num)
+	if !ok1 || !ok2 {
+		return 0, 0, false
+	}
+	return id, number, true
+}
+
+// collectionOf is a repository's issues as a collection, without a target. A listing
+// fits its title to the contract's limit; an event sends only its ref. Items points to
+// false when the repository's has_issues is false, as GitHub answers for a repository
+// with Issues turned off, so the listing says the collection has no items, and Qory
+// Apiary takes it as not linked; it is nil when has_issues is true or absent, so the
+// collection has items, see [ghRepo.issuesOn].
+func collectionOf(r ghRepo) contracts.Collection {
+	c := contracts.Collection{Ref: CollectionRef(r.ID), URL: r.HTMLURL, Title: r.FullName}
+	if !r.issuesOn() {
+		c.Items = new(false)
+	}
+	return c
+}
+
+// labelsOf are the labels of the issue ref as the contract takes them: each fitted to
+// the limit of a label, an empty one dropped, one the same as a label before it, once
+// cut, dropped, so the first is kept and they are unique, and none past the most labels
+// an item has, which is a [Cut] of labels. A label cut and the labels left out are
+// named labels in the item's truncated, see [truncatedOf].
+func labelsOf(ls []ghLabel, cuts *[]Cut, ref string) []string {
+	lim := contractLimits()
+	labels := make([]string, 0, min(len(ls), lim.labels))
+	seen := make(map[string]bool, cap(labels))
+	for _, l := range ls {
+		if len(labels) == lim.labels {
+			*cuts = append(*cuts, Cut{Ref: ref, Field: "labels", Length: len(ls)})
+			break
+		}
+		name := fit(cuts, ref, "label", l.Name, lim.label)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		labels = append(labels, name)
+	}
+	return labels
+}
+
+// stateReasons words GitHub's reasons an issue is closed for.
+var stateReasons = map[string]string{"completed": "Completed", "not_planned": "Not planned", "duplicate": "Duplicate"}
+
+// stateReason is why a closed issue is closed, in words, or nil: an open issue has no
+// reason, and a reason without words is left out, as is one whose words are past the
+// contract's limit of state_reason, which is dropped, never cut.
+func stateReason(state string, reason *string) *string {
+	if state != StateClosed || reason == nil {
+		return nil
+	}
+	if w, ok := stateReasons[*reason]; ok && !tooLong(w, contractLimits().stateReason) {
+		return &w
+	}
+	return nil
+}
+
+// utc is a time GitHub says, in RFC 3339 and UTC.
+func utc(s string) (string, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "", false
+	}
+	return t.UTC().Format(time.RFC3339), true
+}
+
+// itemOf is an issue of the repository r as an item whose target is on system, or why
+// it is skipped, and the texts cut to fit it. The item's key is the issue's number as
+// GitHub shows it, # and the number in decimal, such as #42.
+func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut) {
+	lim := contractLimits()
+	var cuts []Cut
+	ref := itemRef(r.ID, is.Number)
+	state := StateOpen
+	if is.State == StateClosed {
+		state = StateClosed
+	}
+	body := ""
+	if is.Body != nil {
+		body = *is.Body
+	}
+	it := contracts.Item{
+		Ref:          ref,
+		URL:          is.HTMLURL,
+		Key:          "#" + strconv.FormatInt(is.Number, 10),
+		Title:        fit(&cuts, ref, "title", is.Title, lim.title),
+		Body:         fit(&cuts, ref, "body", body, lim.body),
+		BodyFormat:   FormatMarkdown,
+		Type:         "issue",
+		State:        state,
+		StateReason:  stateReason(state, is.StateReason),
+		Labels:       labelsOf(is.Labels, &cuts, ref),
+		FiledBy:      authorOf(is.User, &cuts, ref, "filed_by.name"),
+		CommentCount: max(is.Comments, 0),
+		Target:       &contracts.Target{System: system, Path: r.FullName},
+	}
+	var ok1, ok2 bool
+	it.CreatedAt, ok1 = utc(is.CreatedAt)
+	it.UpdatedAt, ok2 = utc(is.UpdatedAt)
+	switch {
+	case !ok1 || !ok2:
+		return it, "a time is not RFC 3339", nil
+	case it.Title == "":
+		return it, "its title is empty", nil
+	}
+	if why := checkRef(it.Ref); why != "" {
+		return it, why, nil
+	}
+	if why := checkPath(it.Target.Path); why != "" {
+		return it, why, nil
+	}
+	if why := checkURL(it.URL); why != "" {
+		return it, why, nil
+	}
+	it.Truncated = truncatedOf(cuts, itemTruncated)
+	return it, "", cuts
+}
+
+// commentOf is a comment as the wire says it, or why it is skipped, and the texts cut
+// to fit it.
+func commentOf(c ghComment) (contracts.Comment, string, []Cut) {
+	var cuts []Cut
+	ref := strconv.FormatInt(c.ID, 10)
+	body := ""
+	if c.Body != nil {
+		body = *c.Body
+	}
+	sc := contracts.Comment{
+		Ref:        ref,
+		URL:        c.HTMLURL,
+		Author:     authorOf(c.User, &cuts, ref, "author.name"),
+		Body:       fit(&cuts, ref, "body", body, contractLimits().body),
+		BodyFormat: FormatMarkdown,
+	}
+	var ok1, ok2 bool
+	sc.CreatedAt, ok1 = utc(c.CreatedAt)
+	sc.UpdatedAt, ok2 = utc(c.UpdatedAt)
+	if !ok1 || !ok2 {
+		return sc, "a time is not RFC 3339", nil
+	}
+	if why := checkRef(sc.Ref); why != "" {
+		return sc, why, nil
+	}
+	if why := checkURL(sc.URL); why != "" {
+		return sc, why, nil
+	}
+	sc.Truncated = truncatedOf(cuts, commentTruncated)
+	return sc, "", cuts
+}
+
+// checkCollection is why a collection is skipped, or "". A listing has fitted its
+// title to the contract's limit, and an event sends only its ref.
+func checkCollection(c contracts.Collection) string {
+	if c.Title == "" {
+		return "its title is empty"
+	}
+	if why := checkRef(c.Ref); why != "" {
+		return why
+	}
+	if c.Target != nil {
+		if why := checkPath(c.Target.Path); why != "" {
+			return why
+		}
+	}
+	return checkURL(c.URL)
+}
+
+func checkRef(ref string) string {
+	if n := contractLimits().ref; ref == "" || tooLong(ref, n) {
+		return fmt.Sprintf("a ref is empty or longer than %d characters", n)
+	}
+	return ""
+}
+
+func checkPath(path string) string {
+	if n := contractLimits().path; path == "" || tooLong(path, n) {
+		return fmt.Sprintf("its target's path is empty or longer than %d characters", n)
+	}
+	return ""
+}
+
+func checkURL(s string) string {
+	u, err := url.Parse(s)
+	if n := contractLimits().url; err != nil || u.Scheme != "https" || u.Host == "" || tooLong(s, n) {
+		return fmt.Sprintf("its URL is not https or is longer than %d characters", n)
+	}
+	return ""
+}
+
+// size is how many bytes v is in JSON, as encoding/json writes it.
+func size(v any) int {
+	b, _ := json.Marshal(v)
+	return len(b)
+}
+
+// sized is how many bytes a request is in JSON once the sink sets its time.
+func sized[R contracts.SourceCollections | contracts.SourceItems | contracts.SourceItemComments](req R) int {
+	switch r := any(&req).(type) {
+	case *contracts.SourceCollections:
+		r.Time = timeWidth
+	case *contracts.SourceItems:
+		r.Time = timeWidth
+	case *contracts.SourceItemComments:
+		r.Time = timeWidth
+	}
+	return size(req)
+}
+
+// Skipped is an item or a comment left out because Qory Apiary would refuse it: its ref,
+// and why, never its text.
+type Skipped struct {
+	Ref, Why string
+}
+
+// ToSend is what a webhook's event becomes: the requests to send, in order, items
+// before comments, and what was skipped and what was cut, for the log.
+type ToSend struct {
+	Items    []contracts.SourceItems
+	Comments []contracts.SourceItemComments
+	Skipped  []Skipped
+	Cut      []Cut
+}
+
+// addItem adds an item of collection c to t, and the texts cut to fit it, unless it is
+// to be skipped.
+func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, cuts []Cut) {
+	if cw := checkCollection(c); why == "" && cw != "" {
+		why = "its collection: " + cw
+	}
+	req := contracts.SourceItems{Version: contracts.Version, CollectionRef: c.Ref, Items: []contracts.Item{it}}
+	if why == "" && sized(req) > contracts.MaxRequest {
+		why = "it is larger than a request may be"
+	}
+	if why != "" {
+		t.Skipped = append(t.Skipped, Skipped{Ref: it.Ref, Why: why})
+		return
+	}
+	t.Items = append(t.Items, req)
+	t.Cut = append(t.Cut, cuts...)
+}
+
+// IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
+// target's system, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
+// unlabeled send the issue as it is now, and deleted sends it closed. Transferred sends
+// the issue closed in the repository it left and, when active says the repository it
+// went to is one Qory Apiary reads, by the ref of its collection, the issue it became
+// there. Every other action, and an event for a pull request, sends nothing. It does no
+// I/O.
+func IssuesWebhook(payload []byte, system string, active func(collectionRef string) bool) (ToSend, error) {
+	var ev struct {
+		Action     string  `json:"action"`
+		Issue      ghIssue `json:"issue"`
+		Repository ghRepo  `json:"repository"`
+		Changes    struct {
+			NewIssue      *ghIssue `json:"new_issue"`
+			NewRepository *ghRepo  `json:"new_repository"`
+		} `json:"changes"`
+	}
+	var t ToSend
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return t, fmt.Errorf("the issues event is not JSON GitHub sends: %w", err)
+	}
+	if ev.Issue.PullRequest != nil {
+		return t, nil
+	}
+	switch ev.Action {
+	case "opened", "reopened", "edited", "closed", "labeled", "unlabeled":
+	case "deleted", "transferred":
+		ev.Issue.State, ev.Issue.StateReason = StateClosed, nil
+	default:
+		return t, nil
+	}
+	it, why, cuts := itemOf(system, ev.Repository, ev.Issue)
+	t.addItem(collectionOf(ev.Repository), it, why, cuts)
+	if ev.Action != "transferred" || ev.Changes.NewIssue == nil || ev.Changes.NewRepository == nil {
+		return t, nil
+	}
+	coll := collectionOf(*ev.Changes.NewRepository)
+	if coll.Ref == "" || active == nil || !active(coll.Ref) {
+		return t, nil
+	}
+	it, why, cuts = itemOf(system, *ev.Changes.NewRepository, *ev.Changes.NewIssue)
+	t.addItem(coll, it, why, cuts)
+	return t, nil
+}
+
+// IssueCommentWebhook is what an issue_comment event, GitHub's webhook payload, becomes;
+// slug is the App's, whose bot writes the work item comment. Created and edited send the
+// comment, and deleted sends it deleted. A comment on a pull request, the work item
+// comment by the App's bot, and every other action send nothing. It does no I/O.
+func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
+	var ev struct {
+		Action     string    `json:"action"`
+		Issue      ghIssue   `json:"issue"`
+		Comment    ghComment `json:"comment"`
+		Repository ghRepo    `json:"repository"`
+	}
+	var t ToSend
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return t, fmt.Errorf("the issue_comment event is not JSON GitHub sends: %w", err)
+	}
+	if ev.Issue.PullRequest != nil || workItemComment(ev.Comment, slug) {
+		return t, nil
+	}
+	switch ev.Action {
+	case "created", "edited", "deleted":
+	default:
+		return t, nil
+	}
+	// A deleted comment is sent without its body, so the size limits never lose a
+	// deletion.
+	if ev.Action == "deleted" {
+		ev.Comment.Body = nil
+	}
+	c, why, cuts := commentOf(ev.Comment)
+	c.Deleted = ev.Action == "deleted"
+	coll := collectionOf(ev.Repository)
+	req := contracts.SourceItemComments{
+		Version:  contracts.Version,
+		ItemRef:  itemRef(ev.Repository.ID, ev.Issue.Number),
+		Comments: []contracts.Comment{c},
+	}
+	if cw := checkCollection(coll); why == "" && cw != "" {
+		why = "its collection: " + cw
+	}
+	if iw := checkRef(req.ItemRef); why == "" && iw != "" {
+		why = "its item: " + iw
+	}
+	if why == "" && sized(req) > contracts.MaxRequest {
+		why = "it is larger than a request may be"
+	}
+	if why != "" {
+		t.Skipped = append(t.Skipped, Skipped{Ref: c.Ref, Why: why})
+		return t, nil
+	}
+	t.Comments = append(t.Comments, req)
+	t.Cut = append(t.Cut, cuts...)
+	return t, nil
+}
+
+// workItemComment is whether c is the App's work item comment: written by the App's bot,
+// slug[bot] of type Bot, and beginning with the marker. Logins are ASCII, so EqualFold
+// folds ASCII's cases alone.
+func workItemComment(c ghComment, slug string) bool {
+	return slug != "" && c.User != nil && c.User.Type == "Bot" && strings.EqualFold(c.User.Login, slug+"[bot]") && c.Body != nil && strings.HasPrefix(*c.Body, workItemMarker)
+}
+
+// Lister lists what one installation of the App reaches on GitHub and sends it to
+// Qory Apiary.
+type Lister struct {
+	// Client reaches GitHub's API.
+	Client Client
+	// Pacer is the installation's, shared with every other caller for it; nil is one
+	// for each listing.
+	Pacer *Pacer
+	// Token returns an installation token for the listing: for
+	// [Lister.ListOpenIssuesComplete] and [Lister.ListChanged] one that reads the
+	// repository's issues, such as [Client.MintInstallationToken] mints, and for
+	// [Lister.ListRepositories], [Lister.ReadRepositories] and
+	// [Lister.ReadEnvironmentRef] one that reads which repositories the installation
+	// reaches and their contents, such as [Client.MintListingToken] mints. It
+	// is called before every request, so it keeps a token until shortly before it
+	// expires.
+	Token func(context.Context) (string, error)
+	// Slug is the App's, whose bot writes the work item comment.
+	Slug string
+	// ConnectionID is the connection in Qory Apiary the installation is linked to, which
+	// every part of [Lister.ListRepositories] names.
+	ConnectionID string
+	// GrantRef is the grant_ref of the installation's grant, which every collection of
+	// [Lister.ListRepositories] names: the grant that covers the collection.
+	GrantRef string
+	// Sink is where the requests go.
+	Sink Sink
+	// Logf logs what is skipped; nil is log.Printf.
+	Logf func(format string, args ...any)
+	// LogCut logs a text cut to the contract's limit, one call for each; nil logs it
+	// with Logf.
+	LogCut func(Cut)
+	// LogLeftOut logs a listing of the installation's repositories that left out n
+	// collections whose environment definition it could not read, one call for each
+	// listing that left any out; nil logs it with Logf. It is given the count alone.
+	LogLeftOut func(n int)
+}
+
+func (l Lister) logf(format string, args ...any) {
+	if l.Logf != nil {
+		l.Logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+// logCuts logs each of cuts.
+func (l Lister) logCuts(cuts []Cut) {
+	for _, c := range cuts {
+		if l.LogCut != nil {
+			l.LogCut(c)
+			continue
+		}
+		l.logf("cut the %s of %s, %d long, to the contract's limit", c.Field, c.Ref, c.Length)
+	}
+}
+
+// get reads one page with a fresh token and returns the next page's path.
+func (l Lister) get(ctx context.Context, p *Pacer, what, path string, out any) (string, error) {
+	token, err := l.Token(ctx)
+	if err != nil {
+		return "", fmt.Errorf("%s: the installation token: %w", what, &tokenError{err})
+	}
+	return l.Client.get(ctx, p, true, what, path, token, out)
+}
+
+// tokenError is the error of a listing's token, so GitHub's answer to the mint is never
+// taken for its answer to the listing's request.
+type tokenError struct{ err error }
+
+func (e *tokenError) Error() string { return e.err.Error() }
+func (e *tokenError) Unwrap() error { return e.err }
+
+// ErrRepositoryGone is wrapped in the error of a listing whose repository GitHub
+// answers is gone, [Gone], as it answers the read of the repository by its id: a 404 or
+// a 410, deleted or out of the App's reach, as after a transfer to an account the
+// installation is not on, though never after a rename, which keeps the id and the
+// reach; or a 301 or a 308, a redirect of that request by the id, which the adapter
+// never follows. A page of what changed in the repository, which is asked for once that
+// read passed, wraps it for a 404, a 301 or a 308 as well, but not for a 410, which
+// wraps [ErrIssuesOff]. Asking again does not change it. The listing of open issues,
+// which GraphQL reads by owner/name, never wraps it.
+var ErrRepositoryGone = errors.New("the repository is deleted or out of the App's reach, or GitHub redirects a request by its id")
+
+// ErrIssuesOff is wrapped in the error of a page of what changed in a repository, its
+// issues or its comments, that GitHub answers 410, as it answers for a repository with
+// Issues turned off, once the read of the repository by its id passed; and in the error
+// of a page of the listing of open issues that GraphQL answers with hasIssuesEnabled
+// false. [Lister.ListChanged] and [Lister.ListOpenIssuesComplete] take it as Issues
+// turned off for the repository on GitHub: each returns nil, or the error of sending
+// what it read before it, so neither returns it; each says the line it logs.
+var ErrIssuesOff = errors.New("Issues are turned off for the repository on GitHub")
+
+// answeredGone is whether err is GitHub's answer to a listing's request, not to its
+// token's mint, that what was asked for is gone, [Gone]: a 404 or a 410, or a redirect,
+// a 301 or a 308.
+func answeredGone(err error) bool {
+	var t *tokenError
+	return Gone(err) && !errors.As(err, &t)
+}
+
+// repositoryGone is err, wrapping [ErrRepositoryGone] when GitHub answered a request by
+// the repository's id that the repository is deleted or out of the App's reach, or
+// redirected that request.
+func repositoryGone(err error) error {
+	if answeredGone(err) {
+		return fmt.Errorf("%w: %w", ErrRepositoryGone, err)
+	}
+	return err
+}
+
+// changedGone is the error of a request for a page of what changed in a repository
+// whose read by its id passed: err, wrapping [ErrIssuesOff] when GitHub answered the
+// request, not its token's mint, 410, as it answers for a repository with Issues turned
+// off, and otherwise as [repositoryGone] says, so a 404, a 301 or a 308 wraps
+// [ErrRepositoryGone].
+func changedGone(err error) error {
+	var e *answerError
+	if answeredGone(err) && errors.As(err, &e) && e.status == http.StatusGone {
+		return fmt.Errorf("%w: %w", ErrIssuesOff, err)
+	}
+	return repositoryGone(err)
+}
+
+// issuesOn is whether Issues are on for the repository as GitHub answered it: true
+// unless its has_issues is false.
+func (r ghRepo) issuesOn() bool { return r.HasIssues == nil || *r.HasIssues }
+
+// pages keeps a listing to at most max pages, none read twice.
+type pages struct {
+	what string
+	max  int
+	seen map[string]bool
+}
+
+// read is whether the page at path may be read.
+func (p *pages) read(path string) error {
+	if p.seen[path] {
+		return fmt.Errorf("%s: GitHub's next page repeats one already read", p.what)
+	}
+	if len(p.seen) == p.max {
+		return fmt.Errorf("%s: GitHub has more than %d pages, which a listing never reads", p.what, p.max)
+	}
+	if p.seen == nil {
+		p.seen = map[string]bool{}
+	}
+	p.seen[path] = true
+	return nil
+}
+
+// A REST listing reads the next page GitHub's Link header names. GitHub documents its
+// REST listings as paged by number, and a page's contents shift when an earlier one
+// loses an entry, so a listing by number can miss one. GitHub's REST listing of issues,
+// as GitHub answers it today, names its next page by a cursor, after, as well as by
+// number, but GitHub's documentation still describes page numbers alone, so the adapter
+// does not rely on that cursor: the listing of open issues reads them by GraphQL's
+// cursor instead, which does not skip one, and says it is complete unless it skipped an
+// item, see [Lister.ListOpenIssuesComplete]. The listings of an issue's comments never
+// say they are complete: they add and update what they see, never drop what they do
+// not, and a comment's deletion comes from webhooks' events alone. A listing of the
+// installation's repositories says it is complete when GitHub answers it with one page
+// and it skips none, which nothing can shift, see [Lister.ListRepositories].
+
+// listingEnd is how long the request that ends a listing stopped early may take,
+// even when the listing stopped because its context is done.
+const listingEnd = 10 * time.Second
+
+// ListRepositories lists the repositories the installation reaches, as collections of
+// the connection [Lister.ConnectionID], which every part names, in parts of at most 100
+// collections and 1 MiB, and reads at most 1,000 pages. Each part is sent as it fills.
+// When GitHub answers with one page, up to 100 repositories, nothing can shift, so the
+// last part says the listing is complete, and Qory Apiary disconnects a repository of
+// that connection the installation no longer reaches; unless a repository was skipped,
+// which then must not be disconnected, so that listing is not complete. A listing of
+// more than one page never says it is complete, since a repository removed from the
+// installation while it is listed shifts the pages after it: that is a limit, and such a
+// removal reaches Qory Apiary only by the installation_repositories event that says it
+// was removed. A listing stopped early, by an error or its context, sends the
+// collections it read that no part carried, in one part, never complete, and sends no
+// part when there are none: so a listing that fails before its first part is read, at
+// its token or its first page, sends nothing, and neither does one whose part Qory
+// Apiary did not take, once that part carried every collection read.
+//
+// Each collection carries the grant_ref [Lister.GrantRef], the installation's grant.
+//
+// Each collection carries items false when GitHub answers its repository with
+// has_issues false, as for a repository with Issues turned off, and no items when
+// has_issues is true or absent, see [collectionOf]. GitHub's listing of the
+// installation's repositories answers has_issues for each, and no webhook is relied on
+// for it: a change of whether Issues are on reaches Qory Apiary with the next listing
+// that includes the repository.
+//
+// Each collection carries its environment_ref, read by GraphQL for each page of up to
+// 100 repositories in one request, see [Lister.environments]; one with none carries
+// none. A collection whose environment definition the listing could not read, one
+// GraphQL answers with an error, as null or not at all, or a whole request that failed,
+// is left out of every part, and the last part says the listing is not complete, so
+// Qory Apiary disconnects none of the collections it left out and changes neither their
+// record nor their environment_ref; the listing logs how many it left out, once, by
+// [Lister.LogLeftOut]. A rate limit GraphQL answers is waited out, and one that holds
+// through every try, or a 401, stops the listing.
+func (l Lister) ListRepositories(ctx context.Context) error {
+	if l.Sink == nil || l.Token == nil {
+		return errors.New("the lister has no sink or no token")
+	}
+	end, err := l.repositoryParts(ctx, l.Sink.Collections)
+	if err == nil || len(end.Collections) == 0 {
+		return err
+	}
+	// A page that failed after collections were read leaves them to the part that ends
+	// the listing there, which says it is not complete.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
+	defer cancel()
+	return errors.Join(err, l.Sink.Collections(ctx, end))
+}
+
+// ReadRepositories reads the listing [Lister.ListRepositories] sends, every page of it,
+// and returns its parts, the same parts under the same rules, in order, and sends none:
+// each part names the one listing's id and started_at, which is taken before the first
+// request to GitHub. A read that fails, or is stopped, before every page is read
+// returns no part. So the caller sends the parts itself, and may send one again,
+// unchanged but for its time, which the sink sets, when Qory Apiary did not take it.
+func (l Lister) ReadRepositories(ctx context.Context) ([]contracts.SourceCollections, error) {
+	if l.Token == nil {
+		return nil, errors.New("the lister has no token")
+	}
+	var parts []contracts.SourceCollections
+	if _, err := l.repositoryParts(ctx, func(_ context.Context, req contracts.SourceCollections) error {
+		parts = append(parts, req)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+// repositoryParts reads the installation's repositories, see [Lister.ListRepositories],
+// and hands each part to emit as it fills, the last once every page is read. On an
+// error, a read's or emit's, it stops and returns the error and the part that would end
+// the listing there: the collections not yet handed on, if any, numbered after the last
+// part handed on, not complete.
+func (l Lister) repositoryParts(ctx context.Context, emit func(context.Context, contracts.SourceCollections) error) (contracts.SourceCollections, error) {
+	p := l.pacerOr()
+	// The listing starts before its first request to GitHub: Qory Apiary disconnects
+	// what a complete listing left out and did not hear of since it started, so a
+	// later start would drop a collection that changed meanwhile.
+	listing := contracts.Listing{ID: randomHex(), StartedAt: contracts.FormatTime(p.now())}
+	system := l.Client.WebHost()
+	var pending []contracts.Collection
+	skipped := false
+	// leftOut counts the collections whose environment definition the listing could not
+	// read, which it leaves out of every part, and which leave it not complete.
+	leftOut := 0
+	defer func() {
+		if leftOut > 0 {
+			l.logLeftOut(leftOut)
+		}
+	}()
+	part := func(complete bool) contracts.SourceCollections {
+		listing.Part++
+		listing.Complete = complete
+		req := contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: pending, Listing: listing}
+		if req.Collections == nil {
+			req.Collections = []contracts.Collection{}
+		}
+		pending = nil
+		return req
+	}
+	envelope := sized(contracts.SourceCollections{Version: contracts.Version, ConnectionID: l.ConnectionID, Collections: []contracts.Collection{}, Listing: contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	used := envelope
+	stop := func(err error) (contracts.SourceCollections, error) {
+		return part(false), err
+	}
+	read, err := l.repositoryPages(ctx, p, func(page repositoryPage) (bool, error) {
+		var listed []listedRepo
+		for _, r := range page.repos() {
+			var cuts []Cut
+			c := collectionOf(r)
+			c.GrantRef = l.GrantRef
+			c.Title = fit(&cuts, c.Ref, "title", c.Title, contractLimits().title)
+			c.Target = &contracts.Target{System: system, Path: r.FullName}
+			if why := checkCollection(c); why != "" {
+				if c.Ref == "" {
+					// No ref names it, so the line names the repository as GitHub does.
+					l.logf("skipped the collection of the repository %q: GitHub answers it without an id, or with one that is not positive", r.FullName)
+				} else {
+					l.logf("skipped the collection %s: %s", c.Ref, why)
+				}
+				skipped = true
+				continue
+			}
+			listed = append(listed, listedRepo{coll: c, cuts: cuts, repo: envRepo{id: r.ID, node: r.NodeID}})
+		}
+		refs, err := l.environmentsOf(ctx, p, listed)
+		if err != nil {
+			return true, err
+		}
+		for _, x := range listed {
+			env, ok := refs[x.repo.id]
+			if !ok {
+				leftOut++
+				continue
+			}
+			c := x.coll
+			c.EnvironmentRef = env
+			n := size(c)
+			if envelope+n > contracts.MaxRequest {
+				l.logf("skipped the collection %s: %s", c.Ref, orTooLarge(""))
+				skipped = true
+				continue
+			}
+			l.logCuts(x.cuts)
+			if len(pending) == contractLimits().collections || used+n+1 > contracts.MaxRequest {
+				if err := emit(ctx, part(false)); err != nil {
+					return true, err
+				}
+				used = envelope
+			}
+			pending = append(pending, c)
+			used += n + 1
+		}
+		return false, nil
+	})
+	if err != nil {
+		return stop(err)
+	}
+	if err := emit(ctx, part(read == 1 && !skipped && leftOut == 0)); err != nil {
+		return stop(err)
+	}
+	return contracts.SourceCollections{}, nil
+}
+
+// repositoryPage is a page of the installation's repositories as GitHub answers it:
+// Repositories is nil when the page holds no repositories key, or holds it null, and
+// TotalCount when it holds no total_count, or holds it null.
+type repositoryPage struct {
+	Repositories *[]ghRepo `json:"repositories"`
+	TotalCount   *int64    `json:"total_count"`
+}
+
+// repos is the page's repositories, none when it holds none.
+func (p repositoryPage) repos() []ghRepo {
+	if p.Repositories == nil {
+		return nil
+	}
+	return *p.Repositories
+}
+
+// repositoryPages reads the installation's repositories, GET /installation/repositories,
+// a page at a time with a fresh token from l.Token, each page the one GitHub's Link
+// header names, at most 1,000 pages and none twice, and hands each page to page, in
+// order, until page says to stop or returns an error, or every page is read. It returns
+// how many pages it read, and the first error: a request's, or one page returned.
+func (l Lister) repositoryPages(ctx context.Context, p *Pacer, page func(page repositoryPage) (stop bool, err error)) (int, error) {
+	const what = "listing the installation's repositories"
+	read := pages{what: what, max: maxRepositoryPages}
+	path := "/installation/repositories?per_page=100"
+	for path != "" {
+		if err := read.read(path); err != nil {
+			return len(read.seen), err
+		}
+		var got repositoryPage
+		next, err := l.get(ctx, p, what, path, &got)
+		if err != nil {
+			return len(read.seen), err
+		}
+		if stop, err := page(got); stop || err != nil {
+			return len(read.seen), err
+		}
+		path = next
+	}
+	return len(read.seen), nil
+}
+
+// ListedRepositories is the ids of the repositories the installation's list of the
+// repositories it reaches holds, GET /installation/repositories, every page read with
+// l.Token as [Lister.ListRepositories] reads it. A page that fails, or a listing of
+// more pages than a listing reads, is the error, and the list is none; so is a page
+// that holds no repositories or no total_count, a total_count that changes from one
+// page to the next, and pages that name more or fewer repositories, each counted once,
+// than total_count once every page is read, since a page whose contents shifted while
+// the list was read can miss one. Nothing is sent and nothing is kept.
+func (l Lister) ListedRepositories(ctx context.Context) (map[int64]bool, error) {
+	if l.Token == nil {
+		return nil, errors.New("the lister has no token")
+	}
+	const what = "listing the installation's repositories"
+	var total *int64
+	ids := map[int64]bool{}
+	_, err := l.repositoryPages(ctx, l.pacerOr(), func(page repositoryPage) (bool, error) {
+		switch {
+		case page.Repositories == nil || page.TotalCount == nil:
+			return true, fmt.Errorf("%s: GitHub's page holds no list or no count of repositories", what)
+		case total == nil:
+			total = page.TotalCount
+		case *page.TotalCount != *total:
+			return true, fmt.Errorf("%s: GitHub's count of the installation's repositories changed while its pages were read", what)
+		}
+		for _, r := range *page.Repositories {
+			ids[r.ID] = true
+		}
+		return false, nil
+	})
+	switch {
+	case err != nil:
+		return nil, err
+	case int64(len(ids)) != *total:
+		return nil, fmt.Errorf("%s: GitHub counts %d repositories, and its pages name %d", what, *total, len(ids))
+	}
+	return ids, nil
+}
+
+// listedRepo is a repository a page of the listing names, as a collection, the texts cut
+// to fit it, and what its environment definition is read by.
+type listedRepo struct {
+	coll contracts.Collection
+	cuts []Cut
+	repo envRepo
+}
+
+// environmentsOf reads the environment_ref of each repository of listed, in GraphQL
+// requests of at most [environmentsPerRequest], see [Lister.environments], and returns
+// those it read by the repository's id. A repository without a node id is not read. A
+// request that fails leaves every repository it names unread, and the listing goes on;
+// unless its context is done, GitHub answered 401, as for a token it no longer takes, or
+// a rate limit held through every try, which stop the listing with that error.
+func (l Lister) environmentsOf(ctx context.Context, p *Pacer, listed []listedRepo) (map[int64]string, error) {
+	const what = "reading the environment definitions (.devcontainer or .devcontainer.json) of the installation's repositories"
+	refs := map[int64]string{}
+	var batch []envRepo
+	flush := func() error {
+		got, _, err := l.environments(ctx, p, what, batch)
+		batch = batch[:0]
+		if err != nil {
+			if ctx.Err() != nil || Unauthorized(err) || errors.Is(err, errStillLimited) {
+				return err
+			}
+			return nil
+		}
+		maps.Copy(refs, got)
+		return nil
+	}
+	for _, x := range listed {
+		if x.repo.node == "" {
+			continue
+		}
+		batch = append(batch, x.repo)
+		if len(batch) == environmentsPerRequest {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(batch) > 0 {
+		if err := flush(); err != nil {
+			return nil, err
+		}
+	}
+	return refs, nil
+}
+
+// logLeftOut logs a listing that left out n collections whose environment definition
+// it could not read.
+func (l Lister) logLeftOut(n int) {
+	if l.LogLeftOut != nil {
+		l.LogLeftOut(n)
+		return
+	}
+	l.logf("left out %d collections whose environment definition (.devcontainer or .devcontainer.json) could not be read; the listing is not complete, and the next listing reads them again", n)
+}
+
+// orTooLarge is why, or, when why is empty, that the collection is larger than a request may be.
+func orTooLarge(why string) string {
+	if why == "" {
+		return "it is larger than a request may be"
+	}
+	return why
+}
+
+func (l Lister) pacerOr() *Pacer {
+	if l.Pacer != nil {
+		return l.Pacer
+	}
+	return &Pacer{}
+}
+
+// listed is an item of a listing and what its comments are read by.
+type listed struct {
+	item     contracts.Item
+	number   int64
+	comments int
+}
+
+// openParts sends the open issues a listing reads to Qory Apiary, in parts of at most
+// 100 items and 1 MiB, and after each part the comments of its items; see
+// [Lister.ListOpenIssuesComplete].
+type openParts struct {
+	l       Lister
+	p       *Pacer
+	system  string
+	listing contracts.Listing
+	coll    contracts.Collection
+	pending []listed
+	// envelope is the size of a part without items, and used the size of the part
+	// pending.
+	envelope, used int
+	// ended is whether the last part is sent, or there was none to send.
+	ended bool
+	// skipped is whether an item was left out, which a listing that says it is complete
+	// never does, since Qory Apiary would close it.
+	skipped bool
+}
+
+// openParts starts sending the parts of listing, the open issues of the collection coll.
+func (l Lister) openParts(p *Pacer, listing contracts.Listing, coll contracts.Collection) *openParts {
+	o := &openParts{l: l, p: p, system: l.Client.WebHost(), listing: listing, coll: coll}
+	o.envelope = sized(contracts.SourceItems{Version: contracts.Version, CollectionRef: coll.Ref, Items: []contracts.Item{}, Listing: &contracts.Listing{ID: listing.ID, Part: 1 << 31, StartedAt: listing.StartedAt}})
+	o.used = o.envelope
+	return o
+}
+
+// add adds the open issue is of the repository r to the part pending, or skips and
+// logs it. A part that is full first goes, with its items' comments.
+func (o *openParts) add(ctx context.Context, r ghRepo, is ghIssue) error {
+	it, why, cuts := itemOf(o.system, r, is)
+	n := size(it)
+	if why == "" && o.envelope+n > contracts.MaxRequest {
+		why = "it is larger than a request may be"
+	}
+	if why != "" {
+		o.l.logf("skipped the item %s: %s", it.Ref, why)
+		o.skipped = true
+		return nil
+	}
+	o.l.logCuts(cuts)
+	if len(o.pending) == contractLimits().items || o.used+n+1 > contracts.MaxRequest {
+		sent, err := o.send(ctx, false, false)
+		if err != nil {
+			return err
+		}
+		if err := o.l.listComments(ctx, o.p, o.coll.Ref, sent); err != nil {
+			return err
+		}
+	}
+	o.pending = append(o.pending, listed{item: it, number: is.Number, comments: is.Comments})
+	o.used += n + 1
+	return nil
+}
+
+// send sends the part pending, which complete says is the complete listing's last, and
+// returns its items. last marks the listing's last part. Nothing pending sends nothing,
+// unless the part is the complete listing's last. [openParts.add] leaves an item
+// pending once one is added, so nothing is pending then only when the listing found no
+// open issue: its one part, without items, says the repository has none.
+func (o *openParts) send(ctx context.Context, last, complete bool) ([]listed, error) {
+	if len(o.pending) == 0 && !complete {
+		o.ended = last
+		return nil, nil
+	}
+	o.listing.Part++
+	part := o.listing
+	part.Complete = complete
+	req := contracts.SourceItems{Version: contracts.Version, CollectionRef: o.coll.Ref, Items: make([]contracts.Item, 0, len(o.pending)), Listing: &part}
+	for _, x := range o.pending {
+		req.Items = append(req.Items, x.item)
+	}
+	sent := o.pending
+	o.pending, o.used = nil, o.envelope
+	if err := o.l.Sink.Items(ctx, req); err != nil {
+		return nil, err
+	}
+	o.ended = last
+	return sent, nil
+}
+
+// end sends the last part, which says the listing is complete when complete does, and
+// then its items' comments.
+func (o *openParts) end(ctx context.Context, complete bool) error {
+	sent, err := o.send(ctx, true, complete)
+	if err != nil {
+		return o.stop(ctx, err)
+	}
+	return o.l.listComments(ctx, o.p, o.coll.Ref, sent)
+}
+
+// stop ends a listing stopped early by err: the items read and not sent go as its last
+// part, which never says it is complete, even once ctx is done.
+func (o *openParts) stop(ctx context.Context, err error) error {
+	if o.ended {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), listingEnd)
+	defer cancel()
+	_, end := o.send(ctx, false, false)
+	return errors.Join(err, end)
+}
+
+// listComments reads and sends the comments of the items of the collection collRef, a
+// repository's id, that have any; GitHub's API reaches the repository by that id,
+// /repositories/{id}. An item's comments are read oldest first, by REST's pages, which
+// GitHub documents by number, and a comment deleted while they are read can shift the
+// pages after it, so no request says they are complete.
+func (l Lister) listComments(ctx context.Context, p *Pacer, collRef string, items []listed) error {
+items:
+	for _, x := range items {
+		if x.comments <= 0 {
+			continue
+		}
+		req := contracts.SourceItemComments{Version: contracts.Version, ItemRef: x.item.Ref, Comments: []contracts.Comment{}}
+		envelope := sized(req)
+		used := envelope
+		what := "listing the comments on " + x.item.Ref
+		read := pages{what: what, max: maxCommentPages}
+		path := "/repositories/" + collRef + "/issues/" + strconv.FormatInt(x.number, 10) + "/comments?per_page=100"
+		for path != "" {
+			if err := read.read(path); err != nil {
+				return err
+			}
+			var page []ghComment
+			next, err := l.get(ctx, p, what, path, &page)
+			if answeredGone(err) {
+				// The issue was deleted or moved while it was listed: its comments are
+				// left, and the listing goes on.
+				l.logf("skipped the comments on %s: GitHub answers that the issue is gone or moved", x.item.Ref)
+				continue items
+			}
+			if err != nil {
+				return err
+			}
+			for _, c := range page {
+				if workItemComment(c, l.Slug) {
+					continue
+				}
+				sc, why, cuts := commentOf(c)
+				n := size(sc)
+				if why == "" && envelope+n > contracts.MaxRequest {
+					why = "it is larger than a request may be"
+				}
+				if why != "" {
+					l.logf("skipped the comment %s on %s: %s", sc.Ref, x.item.Ref, why)
+					continue
+				}
+				l.logCuts(cuts)
+				if len(req.Comments) == contractLimits().comments || used+n+1 > contracts.MaxRequest {
+					if err := l.Sink.Comments(ctx, req); err != nil {
+						return err
+					}
+					req.Comments, used = []contracts.Comment{}, envelope
+				}
+				req.Comments = append(req.Comments, sc)
+				used += n + 1
+			}
+			path = next
+		}
+		if len(req.Comments) == 0 {
+			continue
+		}
+		if err := l.Sink.Comments(ctx, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}

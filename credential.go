@@ -94,7 +94,8 @@ type Answer struct {
 }
 
 // Apply is one entry of an [Answer]: hosts, how the token is set on them, and the
-// paths of theirs the run may request.
+// paths of theirs the run may request. In [SourceRole.Apply], each path that contains
+// owner/name has {target.path} in its place.
 type Apply struct {
 	Hosts    []string `json:"hosts"`
 	Scheme   string   `json:"scheme"`
@@ -134,6 +135,14 @@ type Client struct {
 	HTTP *http.Client
 	// Now is the clock the App's token is issued by; nil is time.Now.
 	Now func() time.Time
+	// UserAgent is the User-Agent of every request; empty is qory-github.
+	UserAgent string
+	// Checked, when set, is called with the installation's id each time GitHub answers
+	// 200 to its check, GET /app/installations/{id} with the App's token, which
+	// [Client.MintInstallationToken] and [Client.MintListingToken] ask first, and
+	// [Client.Mint] when the request names the installation: GitHub holds the
+	// installation then, suspended or not.
+	Checked func(installation int64)
 }
 
 // Request is what one token is minted for.
@@ -148,6 +157,11 @@ type Request struct {
 	InstallationID int64
 	// Repositories are what the token covers, one owner's.
 	Repositories []Repository
+	// RepositoryIDs are what the token covers too, by GitHub's ids of the repositories,
+	// which GitHub's mint takes as repository_ids: [Client.MintInstallationToken] reads
+	// them, for a repository the adapter knows by its id alone, and [Client.Mint] does
+	// not, so a run's token covers the repositories named and no other.
+	RepositoryIDs []int64
 	// Permissions are what the token may do; nil is [DefaultPermissions].
 	Permissions map[string]string
 }
@@ -197,7 +211,13 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 	}
 	id := req.InstallationID
 	if id != 0 {
-		if err := c.checkInstallation(ctx, jwt, id, req.Repositories); err != nil {
+		// A run's token is checked for the account alone: an installation GitHub answers
+		// 404 for is refused as one of another account, and a suspended one goes on to
+		// GitHub's mint, which answers for it.
+		if _, err := c.checkInstallation(ctx, jwt, id, req.Repositories); err != nil {
+			if err == ErrInstallationGone {
+				err = errNotTheOwners
+			}
 			return nil, err
 		}
 	}
@@ -275,33 +295,39 @@ func moved(err error) error {
 // one GitHub gives, ASCII letters, digits and hyphens, and is compared with the owner's
 // in either case of ASCII alone, as GitHub compares logins: compared as Unicode folds
 // case, the Kelvin sign, U+212A, would be a k. An installation GitHub does not know of
-// the App, a 404, is refused the same way, and a redirect with a separate error.
-func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) error {
+// the App, a 404, is refused with [ErrInstallationGone], and a redirect with a separate
+// error; any other error, a 401 among them, is the request's. It says whether GitHub
+// answers the installation as suspended, with suspended_at set.
+func (c Client) checkInstallation(ctx context.Context, jwt string, id int64, repos []Repository) (suspended bool, err error) {
 	var got struct {
 		Account struct {
 			Login string `json:"login"`
 		} `json:"account"`
+		SuspendedAt *string `json:"suspended_at"`
 	}
-	err := c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got)
+	err = c.call(ctx, "checking installation_id", http.MethodGet, "/app/installations/"+strconv.FormatInt(id, 10), jwt, nil, http.StatusOK, &got)
 	var answered *answerError
 	switch {
 	case errors.As(err, &answered) && answered.redirect():
-		return errCheckRedirected
+		return false, errCheckRedirected
 	case errors.As(err, &answered) && answered.status == http.StatusNotFound:
-		return errNotTheOwners
+		return false, ErrInstallationGone
 	case err != nil:
-		return err
+		return false, err
+	}
+	if c.Checked != nil {
+		c.Checked(id)
 	}
 	if !ownerShape.MatchString(got.Account.Login) {
-		return errNotTheOwners
+		return false, errNotTheOwners
 	}
 	for _, r := range repos {
 		// Both are ASCII, so EqualFold folds ASCII's cases alone.
 		if !ownerShape.MatchString(r.Owner) || !strings.EqualFold(got.Account.Login, r.Owner) {
-			return errNotTheOwners
+			return false, errNotTheOwners
 		}
 	}
-	return nil
+	return got.SuspendedAt != nil, nil
 }
 
 // apiURLShape is the API a token is minted through: the settings schema's pattern for
@@ -333,6 +359,14 @@ func CheckAPIURL(api string) error {
 	return nil
 }
 
+// userAgent is the User-Agent of the client's requests, qory-github when none is set.
+func (c Client) userAgent() string {
+	if c.UserAgent == "" {
+		return "qory-github"
+	}
+	return c.UserAgent
+}
+
 // base is the API's base URL, [APIURL] when none is set.
 func (c Client) base() string {
 	if c.API == "" {
@@ -342,7 +376,8 @@ func (c Client) base() string {
 }
 
 // call makes one request to the API, the one what names, such as "minting the
-// installation token", and decodes the answer. It refuses an API [CheckAPIURL] refuses
+// installation token", and decodes the answer into out; a nil out reads the status
+// alone and decodes nothing. It refuses an API [CheckAPIURL] refuses
 // before anything is sent, so every request, a mint's and setup's, goes to GitHub's API
 // alone. It follows no redirect, whatever client it is handed, so neither the App's token
 // nor setup's code goes on to where one points: a redirect is an answer like another,
@@ -369,7 +404,7 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "qory-github")
+	req.Header.Set("User-Agent", c.userAgent())
 	if jwt != "" {
 		req.Header.Set("Authorization", "Bearer "+jwt)
 	}
@@ -397,6 +432,9 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		}
 		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
 	}
+	if out == nil {
+		return nil
+	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
 	}
@@ -413,6 +451,39 @@ type answerError struct {
 
 func (e *answerError) Error() string {
 	return fmt.Sprintf("%s: GitHub answered %d: %s", e.what, e.status, e.message)
+}
+
+// Forbidden is whether err, or an error it wraps, is GitHub's 403 to a request made with
+// a token: an installation token, the App's, or a person's token from GitHub's sign-in.
+// The 403 is a refusal, such as of a write or of a read the token may not make, or a
+// secondary rate limit. A mint's 403, to the App's token, is one.
+func Forbidden(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.status == http.StatusForbidden
+}
+
+// Unauthorized is whether err, or an error it wraps, is GitHub's 401 to a request
+// made with a token, an installation token or the App's, as GitHub answers a token it
+// no longer takes, so a caller that keeps tokens drops the one it used. A 401 to a
+// mint, or to the installation's check, is GitHub's to the App's token.
+func Unauthorized(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.status == http.StatusUnauthorized
+}
+
+// Gone is whether err, or an error it wraps, is GitHub's answer that what was asked
+// for is not where it was: 404 or 410, gone or out of the token's reach, or 301 or
+// 308, moved by a rename or a transfer, which no request to the same place changes.
+func Gone(err error) bool {
+	var e *answerError
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch e.status {
+	case http.StatusNotFound, http.StatusGone, http.StatusMovedPermanently, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 // redirect is whether the answer is a redirect, a 3xx.

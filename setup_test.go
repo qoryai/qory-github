@@ -9,10 +9,12 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -484,5 +486,241 @@ func TestSetupNeverSaysTheCodeItExchanges(t *testing.T) {
 		if strings.Contains(err.Error(), v) {
 			t.Errorf("the error contains %q: %v", v, err)
 		}
+	}
+}
+
+// TestTheManifestIsAsItWas pins [Manifest] byte for byte: private, no webhook, no
+// events, contents and pull requests write, metadata read.
+func TestTheManifestIsAsItWas(t *testing.T) {
+	b, err := json.Marshal(Manifest("qory-github-test", "http://127.0.0.1:1/callback"))
+	want := `{"default_events":[],"default_permissions":{"contents":"write","metadata":"read","pull_requests":"write"},"hook_attributes":{"active":false,"url":"https://github.com/qoryai/qory-github"},"name":"qory-github-test","public":false,"redirect_url":"http://127.0.0.1:1/callback","url":"https://github.com/qoryai/qory-github"}`
+	if err != nil || string(b) != want {
+		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+}
+
+// TestServeManifestIsAsItWas pins what [serveManifest] makes of [Manifest] byte for
+// byte: public when it is asked to be, Connect's URLs, no description, a webhook that
+// is active at serve's webhook path, its events and its permissions; and private, the
+// rest the same, when it is not.
+func TestServeManifestIsAsItWas(t *testing.T) {
+	m := Manifest("qory-github-test", "http://127.0.0.1:1/callback")
+	serveManifest(m, "https://github.example.com", true)
+	b, err := json.Marshal(m)
+	want := `{"callback_urls":["https://github.example.com/v1/connect/authorized"],` +
+		`"default_events":["issues","issue_comment","repository","workflow_run","pull_request","push"],` +
+		`"default_permissions":{"actions":"write","administration":"read","checks":"write","contents":"write","issues":"write","members":"read","metadata":"read","pull_requests":"write"},` +
+		`"hook_attributes":{"active":true,"url":"https://github.example.com/v1/events"},` +
+		`"name":"qory-github-test","public":true,"redirect_url":"http://127.0.0.1:1/callback","request_oauth_on_install":false,` +
+		`"setup_on_update":true,"setup_url":"https://github.example.com/v1/connect/return","url":"https://github.com/qoryai/qory-github"}`
+	if err != nil || string(b) != want {
+		t.Errorf("the manifest is\n%s\nwant\n%s", b, want)
+	}
+	m = Manifest("qory-github-test", "http://127.0.0.1:1/callback")
+	serveManifest(m, "https://github.example.com", false)
+	b, err = json.Marshal(m)
+	if want := strings.Replace(want, `"public":true`, `"public":false`, 1); err != nil || string(b) != want {
+		t.Errorf("the private manifest is\n%s\nwant\n%s", b, want)
+	}
+}
+
+// pageAndAnswers runs s and returns setup's local page, byte for byte, its form's
+// action, and the bodies of the answers to a redirect without the state and to a
+// request for the page under another host than the listener's, and that address.
+func pageAndAnswers(t *testing.T, s Setup) (body, action, badRedirect, misdirected, host string) {
+	t.Helper()
+	local, wait, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wait()
+	get := func(u, host string, status int) string {
+		req, _ := http.NewRequest("GET", u, nil)
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != status {
+			t.Errorf("GET %s for %q answered %d, want %d", u, host, resp.StatusCode, status)
+		}
+		return string(b)
+	}
+	body = get(local, "", http.StatusOK)
+	action, _ = readPage(t, local)
+	u, _ := url.Parse(local)
+	return body, action, get(origin(local)+"/callback?code=abc&state=wrong", "", http.StatusBadRequest), get(local, "qory.attacker.test:"+u.Port(), http.StatusMisdirectedRequest), u.Host
+}
+
+// setupPage is setup's local page, byte for byte, with the form's action and the
+// manifest's value as the page has them, escaped.
+func setupPage(action, manifest string) string {
+	return `<!doctype html>
+<meta charset="utf-8"><title>qory-github setup</title>
+<form id="f" method="post" action="` + action + `">
+<input type="hidden" name="manifest" value="` + manifest + `">
+<button type="submit">Create the GitHub App</button>
+</form>
+<script>document.getElementById("f").submit()</script>
+`
+}
+
+// TestSetupsPageAndAnswersNameQoryGitHub pins setup's local page and its answers to a
+// redirect without the state and to another host, byte for byte.
+func TestSetupsPageAndAnswersNameQoryGitHub(t *testing.T) {
+	s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: Client{API: unreachable(t)}, Wait: time.Millisecond}
+	body, _, bad, misdirected, host := pageAndAnswers(t, s)
+	action := regexp.MustCompile(`action="([^"]+)"`).FindStringSubmatch(body)
+	value := regexp.MustCompile(`name="manifest" value="([^"]+)"`).FindStringSubmatch(body)
+	if action == nil || value == nil || body != setupPage(action[1], value[1]) {
+		t.Errorf("the page is\n%s", body)
+	}
+	if want := "qory-github answers only GitHub's redirect containing the state it sent and a code\n"; bad != want {
+		t.Errorf("a redirect without the state is answered %q, want %q", bad, want)
+	}
+	if want := "qory-github answers only requests to " + host + "\n"; misdirected != want {
+		t.Errorf("another host is answered %q, want %q", misdirected, want)
+	}
+}
+
+// hookRequests are the Authorization headers and bodies of the PATCH /app/hook/config
+// requests f received.
+func (f *fakeGitHub) hookRequests() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.hookAuth), slices.Clone(f.hookBodies)
+}
+
+// TestSetupKeepsNoWebhookSecret pins that setup sets nothing on the App and writes no
+// file beside the key, whether GitHub's answer holds a webhook secret or not.
+func TestSetupKeepsNoWebhookSecret(t *testing.T) {
+	for _, handed := range []string{"", "a-webhook-secret-github-made-0123"} {
+		f := &fakeGitHub{webhookSecret: handed}
+		dir := t.TempDir()
+		app, err := Setup{KeyFile: filepath.Join(dir, "app.pem"), Client: serve(t, f)}.exchange(context.Background(), "abc")
+		if err != nil || app.ID != 123456 {
+			t.Errorf("%q: app %+v, err %v", handed, app, err)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+			t.Errorf("%q: the directory holds %v", handed, entries)
+		}
+		if _, bodies := f.hookRequests(); len(bodies) != 0 {
+			t.Errorf("%q: setup set a webhook secret", handed)
+		}
+	}
+}
+
+// TestTheExchangeAfterTheApprovalHasATimeout pins that the exchange is not bound by
+// what is left of the wait for the person's approval, that it is bound by
+// afterApprovalTimeout, and that it still ends when the caller's context does.
+func TestTheExchangeAfterTheApprovalHasATimeout(t *testing.T) {
+	// An approval near the end of the wait: the answer takes longer than the wait.
+	f := &fakeGitHub{exchangeDelay: 300 * time.Millisecond}
+	s := Setup{Name: "qory-github-test", KeyFile: filepath.Join(t.TempDir(), "app.pem"), Web: "https://github.com", Client: serve(t, f), Wait: 200 * time.Millisecond}
+	local, wait, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, _ := readPage(t, local)
+	u, _ := url.Parse(action)
+	resp, err := http.Get(origin(local) + "/callback?state=" + u.Query().Get("state") + "&code=abc")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("the redirect answered %v %v", resp.StatusCode, err)
+	}
+	if app, err := wait(); err != nil || app.ID != 123456 {
+		t.Fatalf("a late approval: app %+v, err %v", app, err)
+	}
+
+	// The exchange has afterApprovalTimeout alone.
+	defer func(d time.Duration) { afterApprovalTimeout = d }(afterApprovalTimeout)
+	afterApprovalTimeout = 100 * time.Millisecond
+	slowExchange := &fakeGitHub{exchangeDelay: time.Second}
+	s = Setup{KeyFile: filepath.Join(t.TempDir(), "app.pem"), Client: serve(t, slowExchange)}
+	if _, err := s.exchange(context.Background(), "abc"); err == nil || !strings.HasPrefix(err.Error(), "exchanging the code for the App: GitHub's API could not be reached: ") {
+		t.Errorf("a slow exchange: err %v", err)
+	}
+
+	// The caller's context still ends it.
+	afterApprovalTimeout = time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s = Setup{KeyFile: filepath.Join(t.TempDir(), "app.pem"), Client: serve(t, &fakeGitHub{})}
+	if _, err := s.exchange(ctx, "abc"); err == nil || !strings.HasPrefix(err.Error(), "exchanging the code for the App: GitHub's API could not be reached: ") {
+		t.Errorf("a cancelled context: err %v", err)
+	}
+}
+
+// TestAnAccountIsLookedUpWithoutAToken looks handles up with a fake GitHub and pins
+// the answers: an organisation and a user by their login as GitHub writes it, and
+// ErrNoAccount for GitHub's 404 and for an account of another kind; a handle not of
+// GitHub's shape is never sent; any other answer is an error that says what failed.
+// No request carries a token.
+func TestAnAccountIsLookedUpWithoutAToken(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.EscapedPath())
+		if r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/users/ACME":
+			io.WriteString(w, `{"login":"acme","type":"Organization"}`)
+		case "/users/octocat":
+			io.WriteString(w, `{"login":"octocat","type":"User"}`)
+		case "/users/mona-bot":
+			io.WriteString(w, `{"login":"mona-bot","type":"Bot"}`)
+		case "/users/other":
+			io.WriteString(w, `{"login":"someone-else","type":"User"}`)
+		case "/users/kelvin":
+			io.WriteString(w, `{"login":"\u212Aelvin","type":"User"}`)
+		case "/users/down":
+			w.WriteHeader(http.StatusBadGateway)
+			io.WriteString(w, `{"message":"Bad Gateway"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"message":"Not Found"}`)
+		}
+	}))
+	defer srv.Close()
+	c := Client{API: srv.URL}
+	for _, tc := range []struct{ handle, login, kind string }{
+		{"ACME", "acme", AccountOrganization},
+		{"octocat", "octocat", AccountUser},
+	} {
+		login, kind, err := c.Account(context.Background(), tc.handle)
+		if login != tc.login || kind != tc.kind || err != nil {
+			t.Errorf("%s: %q %q %v", tc.handle, login, kind, err)
+		}
+	}
+	// "other" answers another account's login, and "kelvin" one whose K is the Kelvin
+	// sign, which folds to k in Unicode alone.
+	for _, handle := range []string{"nobody", "mona-bot", "other", "kelvin"} {
+		if _, _, err := c.Account(context.Background(), handle); err != ErrNoAccount {
+			t.Errorf("%s: %v", handle, err)
+		}
+	}
+	paths = nil
+	for _, handle := range []string{"", "-acme", "acme-", "ac--me", "acme/x", "acme x", "../acme", "acme%2F", "\u00e9", strings.Repeat("a", 40)} {
+		if _, _, err := c.Account(context.Background(), handle); err != ErrNoAccount {
+			t.Errorf("%q: %v", handle, err)
+		}
+	}
+	if _, _, err := c.Account(context.Background(), strings.Repeat("a", 39)); err != ErrNoAccount || len(paths) != 1 {
+		t.Fatalf("39 letters: %v, %v", err, paths)
+	}
+	if paths[0] != "GET /users/"+strings.Repeat("a", 39) {
+		t.Errorf("handles not of GitHub's shape were sent: %v", paths)
+	}
+	if _, _, err := c.Account(context.Background(), "down"); err == nil || err.Error() != "looking up the GitHub account: GitHub answered 502: Bad Gateway" {
+		t.Errorf("down: %v", err)
+	}
+	tr := &sentTransport{}
+	if _, _, err := (Client{API: "https://ghe.acme.example", HTTP: &http.Client{Transport: tr}}).Account(context.Background(), "acme"); err == nil || tr.sent {
+		t.Errorf("another API: %v, sent %v", err, tr.sent)
 	}
 }

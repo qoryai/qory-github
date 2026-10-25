@@ -103,6 +103,61 @@
         "github.com",
         "api.github.com"
       ]
+    },
+    "source": {
+      "description": "Brings in the tickets of the repositories an organisation installs the GitHub App on.",
+      "item_noun": {
+        "one": "issue",
+        "other": "issues"
+      },
+      "collection_noun": {
+        "one": "repository",
+        "other": "repositories"
+      },
+      "program": "qory-github-server",
+      "setup": {
+        "command": "qory-github-server serve --settings /etc/qory-github/serve.json",
+        "help": "Click Set up in Qory Apiary to open the server's setup page. Enter the GitHub account for the App, an organisation or a user. GitHub then opens with the App filled in, named qory- and that account's handle, which you can change. The server stores the App's keys in Qory Apiary."
+      },
+      "start": "qory-github-server serve --settings /etc/qory-github/serve.json",
+      "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",
+      "access": "These are the repositories GitHub lets this installation reach. To add or remove one, change the installation's repository access on GitHub.",
+      "disconnect": "To uninstall GitHub, remove its installation on GitHub.",
+      "secrets": [
+        "app",
+        "private-key",
+        "webhook-secret",
+        "client-secret"
+      ],
+      "credential_scope": "resource",
+      "apply": [
+        {
+          "hosts": [
+            "github.com"
+          ],
+          "scheme": "basic",
+          "username": "x-access-token",
+          "paths": [
+            "/{target.path}.git/*",
+            "/{target.path}/*"
+          ]
+        },
+        {
+          "hosts": [
+            "api.github.com"
+          ],
+          "scheme": "bearer",
+          "paths": [
+            "/repos/{target.path}",
+            "/repos/{target.path}/*",
+            "/graphql"
+          ]
+        }
+      ]
     }
-  }
+  },
+  "egress_hosts": [
+    "github.com",
+    "api.github.com"
+  ]
 }

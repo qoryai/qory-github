@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net/http"
@@ -18,8 +19,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -27,9 +29,8 @@ import (
 	"unicode"
 
 	"github.com/qoryai/integrations/conformance"
-	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
-	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/qoryai/qory-github/internal/ownerfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -372,41 +373,18 @@ func TestAFailureFromGitHubIsOneLine(t *testing.T) {
 	}
 }
 
-// TestOneLine pins how an error's text is written on its line: a line break as a space,
-// every other control character, a line or paragraph separator, a bidirectional
-// formatting character and a byte that is not UTF-8 escaped, and the rest as it is.
-func TestOneLine(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{"the settings are invalid: /permissions/contents: value must be one of 'read', 'write'", "the settings are invalid: /permissions/contents: value must be one of 'read', 'write'"},
-		{`/permissions/"a\u2028b": a quote " and a backslash \ stay`, `/permissions/"a\u2028b": a quote " and a backslash \ stay`},
-		{"one\ntwo\r\nthree", "one two three"},
-		{"a\rb\tc\x00d\x1be\x7ff", `a\rb\tc\x00d\x1be\x7ff`},
-		{"a\u0085b\u009bc\u2028d\u2029e", `a\u0085b\u009bc\u2028d\u2029e`},
-		{"a\x85b\xffc", `a\x85b\xffc`},
-		{"GitHub – Ölsardine ✓", "GitHub – Ölsardine ✓"},
-		{"acme\u202epohs", `acme\u202epohs`},
-		{"a\u202ab\u202bc\u202cd\u202de\u202ef", `a\u202ab\u202bc\u202cd\u202de\u202ef`},
-		{"a\u2066b\u2067c\u2068d\u2069e", `a\u2066b\u2067c\u2068d\u2069e`},
-		{"a\u200eb\u200fc\u061cd", `a\u200eb\u200fc\u061cd`},
-		// The characters beside them are left as they are: a zero-width joiner, U+200D, an
-		// Arabic letter, U+0628, a narrow no-break space, U+202F, and U+2065 and U+206A.
-		{"a\u200db\u0628c\u202fd\u2065e\u206af", "a\u200db\u0628c\u202fd\u2065e\u206af"},
-	} {
-		if got := oneLine(tc.in); got != tc.want {
-			t.Errorf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
 // TestDescribeConformsAndIsPinned checks what describe prints against the integration
 // contract and pins it to testdata/describe.json, so a change to the description is a
 // change to that file too. The contract's fixture fixtures/github.json is the
-// description of 0.1.0, an example of the contract's; this copy is the program's.
+// description of 0.1.0, an example of the contract's; this copy is the program's. The
+// pinned copy is describe's with QORY_FEATURES naming factory, the source role in it;
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins the other.
 func TestDescribeConformsAndIsPinned(t *testing.T) {
 	// The pinned copy is the description of a build with no version, whatever version
 	// the test binary's build info contains.
 	defer func(v string) { version = v }(version)
 	version = "dev"
+	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
 	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
@@ -429,73 +407,248 @@ func TestDescribeConformsAndIsPinned(t *testing.T) {
 	}
 }
 
-// TestProgramVersionFallsBackToTheModuleVersion pins the program's version: the one
-// set with ldflags first, as it is given, then the module version go install records,
-// a release or a pseudo-version, without its leading v, as the integration contract
-// reports a release's version, which the contract's schema accepts, and "dev" for a
-// build whose module version is (devel) or empty, or with no build info.
-func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
-	pseudo := "0.2.1-0.20261006195344-0f167ba9a536"
-	for _, tc := range []struct {
-		ldflags, module string
-		info            bool
-		want            string
-	}{
-		{"1.2.3", "v0.1.0", true, "1.2.3"},
-		{"v1.2.3", "v0.1.0", true, "v1.2.3"},
-		{"", "v0.1.0", true, "0.1.0"},
-		{"", "v" + pseudo, true, pseudo},
-		{"", "v1", true, "1"},
-		{"", "0.1.0", true, "0.1.0"},
-		{"", "vv0.1.0", true, "vv0.1.0"},
-		{"", "version", true, "version"},
-		{"", "v", true, "v"},
-		{"", "(devel)", true, "dev"},
-		{"", "", true, "dev"},
-		{"", "", false, "dev"},
-	} {
-		read := func() (*debug.BuildInfo, bool) {
-			if !tc.info {
-				return nil, false
-			}
-			return &debug.BuildInfo{Main: debug.Module{Path: "github.com/qoryai/qory-github", Version: tc.module}}, true
+// TestDescribeLeavesTheSourceRoleOutWithoutFactory pins that describe, where
+// QORY_FEATURES does not name factory, prints testdata/describe.json without its source
+// role and nothing else changed, and that the description still conforms.
+func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
+	defer func(v string) { version = v }(version)
+	version = "dev"
+	pinned, err := os.ReadFile("../../testdata/describe.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d github.Description
+	if err := json.Unmarshal(pinned, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Roles.Source == nil {
+		t.Fatal("testdata/describe.json has no source role")
+	}
+	d.Roles.Source = nil
+	want, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, features := range []string{"", "observability", "all"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+			t.Fatalf("QORY_FEATURES=%q: exit %d: %s", features, code, errs.String())
 		}
-		if got := programVersion(tc.ldflags, read); got != tc.want {
-			t.Errorf("ldflags %q, module %q, build info %v: %q, want %q", tc.ldflags, tc.module, tc.info, got, tc.want)
+		if err := conformance.Description(out.Bytes()); err != nil {
+			t.Errorf("QORY_FEATURES=%q: %v", features, err)
 		}
-	}
-	schema, err := contracts.Compile("description.schema.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := json.Marshal(github.Describe(pseudo))
-	if err != nil {
-		t.Fatal(err)
-	}
-	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := schema.Validate(doc); err != nil {
-		t.Errorf("the contract refuses the pseudo-version %s: %v", pseudo, err)
+		var doc struct {
+			Roles map[string]json.RawMessage `json:"roles"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := doc.Roles["source"]; ok {
+			t.Errorf("QORY_FEATURES=%q: describe names the source role", features)
+		}
+		if out.String() != string(want)+"\n" {
+			t.Errorf("QORY_FEATURES=%q: describe prints\n%s\nwant testdata/describe.json without its source role:\n%s", features, out.String(), want)
+		}
 	}
 }
 
-// fakeGitHub answers the manifest flow's exchange with the App 123456 and a key.
+// TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
+// names factory, names the source role, qory-github-server, with every member the
+// integration contract requires, item_noun, issue and issues, collection_noun,
+// repository and repositories, secrets, the four the adapter stores in Qory Apiary,
+// credential_scope and apply, and that the contract's schema, as conformance compiles
+// it, checks that role: the description without any one member the contract requires,
+// or with a member the schema refuses, does not conform.
+func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
+	t.Setenv("QORY_FEATURES", "factory")
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"describe"}, &out, &errs); code != 0 || errs.Len() != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+	if err := conformance.Description(out.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	roles, _ := doc["roles"].(map[string]any)
+	source, ok := roles["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("describe names no source role: %s", out.String())
+	}
+	members := []string{"description", "program", "setup", "start", "connect", "access", "disconnect"}
+	for _, m := range members {
+		if _, ok := source[m]; !ok {
+			t.Errorf("the source role has no %s", m)
+		}
+	}
+	if len(source) != len(members)+5 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+5, source)
+	}
+	if got := fmt.Sprint(source["secrets"]); got != "[app private-key webhook-secret client-secret]" {
+		t.Errorf("the source role's secrets are %s, want app, private-key, webhook-secret and client-secret", got)
+	}
+	if source["credential_scope"] != "resource" {
+		t.Errorf("the source role's credential_scope is %v, want resource: one credential covers the repositories the run-credential call lists", source["credential_scope"])
+	}
+	if noun, _ := source["item_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "issue" || noun["other"] != "issues" {
+		t.Errorf("the source role's item_noun is %v, want issue and issues", source["item_noun"])
+	}
+	if noun, _ := source["collection_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "repository" || noun["other"] != "repositories" {
+		t.Errorf("the source role's collection_noun is %v, want repository and repositories", source["collection_noun"])
+	}
+	if source["program"] != "qory-github-server" {
+		t.Errorf("the source role's program is %v, want qory-github-server", source["program"])
+	}
+	if start, _ := source["start"].(string); !strings.HasPrefix(start, "qory-github-server serve --settings ") {
+		t.Errorf("the source role's start is %q, want qory-github-server serve --settings", start)
+	}
+	if setup, _ := source["setup"].(map[string]any); setup == nil || !strings.HasPrefix(fmt.Sprint(setup["command"]), "qory-github-server serve --settings ") {
+		t.Errorf("the source role's setup is %v, want the command qory-github-server serve --settings", source["setup"])
+	}
+
+	// changed is describe's output with the source role changed by change.
+	changed := func(change func(source map[string]any)) []byte {
+		var d map[string]any
+		if err := json.Unmarshal(out.Bytes(), &d); err != nil {
+			t.Fatal(err)
+		}
+		change(d["roles"].(map[string]any)["source"].(map[string]any))
+		b, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	refused := map[string]func(map[string]any){
+		"an unknown member":         func(s map[string]any) { s["extra"] = "x" },
+		"a program with a space":    func(s map[string]any) { s["program"] = "qory github" },
+		"a line with a line break":  func(s map[string]any) { s["connect"] = "one\ntwo" },
+		"a line with a bidi mark":   func(s map[string]any) { s["access"] = "a‏b" },
+		"a line of 301 characters":  func(s map[string]any) { s["disconnect"] = strings.Repeat("a", 301) },
+		"a command not ASCII":       func(s map[string]any) { s["start"] = "qory-github-server serve --settings FILÉ" },
+		"a setup without its help":  func(s map[string]any) { delete(s["setup"].(map[string]any), "help") },
+		"a setup command too long":  func(s map[string]any) { s["setup"].(map[string]any)["command"] = strings.Repeat("a", 201) },
+		"an empty catalogue line":   func(s map[string]any) { s["description"] = "" },
+		"a setup that is a command": func(s map[string]any) { s["setup"] = "qory-github setup" },
+		"an item noun in capitals":  func(s map[string]any) { s["item_noun"].(map[string]any)["one"] = "Issue" },
+		"an item noun without one":  func(s map[string]any) { delete(s["item_noun"].(map[string]any), "one") },
+		"an item noun and items":    func(s map[string]any) { s["items"] = false },
+		"a collection noun in capitals": func(s map[string]any) {
+			s["collection_noun"].(map[string]any)["other"] = "Repositories"
+		},
+		"a collection noun without other": func(s map[string]any) {
+			delete(s["collection_noun"].(map[string]any), "other")
+		},
+		"a collection noun with an unknown member": func(s map[string]any) {
+			s["collection_noun"].(map[string]any)["few"] = "repos"
+		},
+		"a secret name in capitals": func(s map[string]any) { s["secrets"] = []any{"App"} },
+		"a secret named twice":      func(s map[string]any) { s["secrets"] = []any{"app", "app"} },
+		"no secret in the list":     func(s map[string]any) { s["secrets"] = []any{} },
+		"an apply host outside egress_hosts": func(s map[string]any) {
+			s["apply"].([]any)[0].(map[string]any)["hosts"] = []any{"gist.github.com"}
+		},
+		"an apply path with a * after the target": func(s map[string]any) {
+			s["apply"].([]any)[0].(map[string]any)["paths"] = []any{"/{target.path}*"}
+		},
+	}
+	for _, m := range members {
+		refused["no "+m] = func(s map[string]any) { delete(s, m) }
+	}
+	for name, change := range refused {
+		if err := conformance.Description(changed(change)); err == nil {
+			t.Errorf("the contract accepts the source role with %s", name)
+		}
+	}
+}
+
+// fakeGitHub answers the manifest flow's exchange with the App 123456 and a key, and
+// PATCH /app/hook/config as [fakeHook] says, recording the secrets it is sent.
 func fakeGitHub(t *testing.T) string {
 	t.Helper()
 	_, pemBytes := keyFile(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch && r.URL.Path == "/app/hook/config" {
+			var body struct {
+				Secret string `json:"secret"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			fakeHook.Lock()
+			defer fakeHook.Unlock()
+			fakeHook.sent = append(fakeHook.sent, body.Secret)
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				w.WriteHeader(http.StatusUnauthorized)
+				io.WriteString(w, `{"message":"A JSON web token could not be decoded"}`)
+				return
+			}
+			if fakeHook.status != 0 {
+				w.WriteHeader(fakeHook.status)
+				io.WriteString(w, `{"message":"Server Error"}`)
+				return
+			}
+			io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/v1/events"}`)
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/app-manifests/abc/conversions" {
 			http.NotFound(w, r)
 			return
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes)})
+		answer := map[string]any{"id": 123456, "slug": "qory-github-test", "client_id": "Iv1.test", "html_url": "https://github.com/apps/qory-github-test", "pem": string(pemBytes), "webhook_secret": nil}
+		if fakeClientSecret != "" {
+			answer["client_secret"] = fakeClientSecret
+		}
+		fakeHook.Lock()
+		if fakeHook.handed != "" {
+			answer["webhook_secret"] = fakeHook.handed
+		}
+		fakeHook.Unlock()
+		json.NewEncoder(w).Encode(answer)
 	}))
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
+
+// fakeHook is how fakeGitHub answers for the App's webhook: handed is the exchange's
+// webhook_secret, empty for null, and status that of PATCH /app/hook/config, zero for
+// 200; sent are the secrets each PATCH set.
+var fakeHook struct {
+	sync.Mutex
+	handed string
+	status int
+	sent   []string
+}
+
+// hookSent are the secrets fakeGitHub was sent since the test began, and the test
+// resets fakeHook when it ends.
+func hookSent(t *testing.T) []string {
+	t.Helper()
+	fakeHook.Lock()
+	defer fakeHook.Unlock()
+	return slices.Clone(fakeHook.sent)
+}
+
+// resetHook resets fakeHook now and when the test ends.
+func resetHook(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		fakeHook.Lock()
+		defer fakeHook.Unlock()
+		fakeHook.handed, fakeHook.status, fakeHook.sent = "", 0, nil
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// testClientSecret is the client secret GitHub hands out with the App.
+const testClientSecret = "a-client-secret-of-the-app"
+
+// fakeClientSecret is the client secret fakeGitHub answers with; empty, it answers
+// without one.
+var fakeClientSecret = testClientSecret
 
 // approve is the browser and the person: it reads the local page's state and follows
 // GitHub's redirect with a code.
@@ -684,28 +837,6 @@ func TestSetupPrintsWhereAMovedKeyIs(t *testing.T) {
 	}
 }
 
-// TestSetupPrintsWhereAKeyWhoseSyncFailedIs pins the line setup prints when the key file
-// was written and its sync failed, for the error setup's exchange moves the key with
-// (the github package's TestSetupSyncsTheKeyFileBeforeItClosesIt fails a file's sync
-// with EIO and checks the key goes beside it): the file could not be written or synced.
-// A file that could not be written for another reason keeps the line it has.
-func TestSetupPrintsWhereAKeyWhoseSyncFailedIs(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "github-app.pem")
-	beside := file + ".0123456789abcdef"
-	for _, tc := range []struct {
-		moved error
-		want  string
-	}{
-		{fmt.Errorf("the key file could not be synced to disk: %w", &fs.PathError{Op: "sync", Path: file, Err: syscall.EIO}), "\nThe key is in " + beside + ", since " + file + " could not be written or synced: input/output error.\n"},
-		{fmt.Errorf("the key file: %w", &fs.PathError{Op: "write", Path: file, Err: syscall.ENOSPC}), "\nThe key is in " + beside + ", since " + file + " could not be written: " + syscall.ENOSPC.Error() + ".\n"},
-		{fmt.Errorf("the key file: %w", &fs.PathError{Op: "open", Path: file, Err: syscall.EACCES}), "\nThe key is in " + beside + ", since " + file + " could not be written: " + syscall.EACCES.Error() + ".\n"},
-	} {
-		if got := movedLine(beside, file, tc.moved); got != tc.want {
-			t.Errorf("%v: setup prints %q, want %q", tc.moved, got, tc.want)
-		}
-	}
-}
-
 // TestTheReadmesShowWhatSetupPrints pins README.md to what setup prints for its default
 // key file: the declaration and the policy, and no credential definition.
 func TestTheReadmesShowWhatSetupPrints(t *testing.T) {
@@ -790,5 +921,205 @@ func TestNoCommandIsUsage(t *testing.T) {
 	var out, errs bytes.Buffer
 	if code := run(context.Background(), nil, &out, &errs); code != 2 || !strings.Contains(errs.String(), "usage:") {
 		t.Errorf("exit %d: %s", code, errs.String())
+	}
+}
+
+// usageBefore is the usage as it was before serve and access-key, which it is whatever
+// QORY_FEATURES says.
+const usageBefore = `qory-github mints GitHub App access tokens for Qory's gateway. The agent works on
+GitHub and never holds the access token.
+
+usage:
+  qory-github <command> [flags]
+
+commands:
+  describe     Print the integration's description, for qory
+  credential   Mint an access token for a run's repositories
+  setup        Create the GitHub App and write its private key
+
+qory-github <command> -h prints a command's help.
+
+More: https://github.com/qoryai/qory-github/blob/main/README.md
+`
+
+// TestQoryGithubHasNoServeOrAccessKey pins that serve and access-key, which are
+// qory-github-server's, are in no usage of qory-github and are answered as commands it
+// does not know, whatever QORY_FEATURES says, factory on among them.
+func TestQoryGithubHasNoServeOrAccessKey(t *testing.T) {
+	for _, features := range []string{"", "all", "all-security,factory", "factory2", "factory,all", "factory", "observability, factory ", " factory,"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), nil, &out, &errs); code != 2 || errs.String() != usageBefore || out.Len() != 0 {
+			t.Errorf("QORY_FEATURES=%q: exit %d, usage:\n%s", features, code, errs.String())
+		}
+		for _, args := range [][]string{
+			{"serve"}, {"serve", "-h"}, {"serve", "--settings", "/none.json"},
+			{"access-key"}, {"access-key", "-h"}, {"access-key", "enrol", "-h"}, {"access-key", "enrol", "--secret-file", "/none", "https://apiary.example.com", "qec_0"},
+		} {
+			var out, errs bytes.Buffer
+			if code := run(context.Background(), args, &out, &errs); code != 2 || errs.String() != usageBefore || out.Len() != 0 {
+				t.Errorf("QORY_FEATURES=%q %v: exit %d, %q", features, args, code, errs.String())
+			}
+		}
+	}
+}
+
+// setupWhole runs setup whole, with the flags args after the fake API and the App's
+// name, as the command line does, approving in place of the browser and person. It
+// returns the exit status, what setup printed on stdout and stderr, and the manifest
+// the page posts.
+func setupWhole(t *testing.T, args ...string) (int, string, string, string) {
+	t.Helper()
+	code, out, errs, manifest, _ := setupRun(t, append([]string{"--name", "qory-github-test"}, args...)...)
+	return code, out, errs, manifest
+}
+
+// setupRun is setupWhole without the App's name, and returns as well the action of the
+// page's form, where the manifest goes; manifest and action are empty when no page was
+// opened.
+func setupRun(t *testing.T, args ...string) (int, string, string, string, string) {
+	t.Helper()
+	var manifest, action string
+	saved := opener
+	t.Cleanup(func() { opener = saved })
+	opener = func(local string) error {
+		resp, err := http.Get(local)
+		if err != nil {
+			return err
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		m := regexp.MustCompile(`name="manifest" value="([^"]+)"`).FindSubmatch(b)
+		if m == nil {
+			return fmt.Errorf("the page contains no manifest:\n%s", b)
+		}
+		manifest = html.UnescapeString(string(m[1]))
+		if a := regexp.MustCompile(`action="([^"]+)"`).FindSubmatch(b); a != nil {
+			action = html.UnescapeString(string(a[1]))
+		}
+		return approve(local)
+	}
+	var out, errs bytes.Buffer
+	code := run(context.Background(), append([]string{"setup", "--api-url", fakeGitHub(t)}, args...), &out, &errs)
+	return code, out.String(), errs.String(), manifest, action
+}
+
+// setupPrinted is what setup printed at ce7d970, before Connect, for the App 123456
+// whose key is in file.
+func setupPrinted(t *testing.T, file string) string {
+	t.Helper()
+	integrations, policy, err := declaration(123456, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `The App 123456 (qory-github-test) is created, and its private key is in ` + file + `.
+
+Install it on the repositories your agents work on:
+  https://github.com/apps/qory-github-test/installations/new
+
+Then declare the integration in the machine's configuration, ~/.config/qory/forager.yaml:
+
+` + integrations + `
+qory expands the declaration into the gateway's credential github. A run's policy selects it
+with the repositories the run works on, and allows GitHub's hosts beside the others the
+run reaches:
+
+` + policy
+}
+
+// manifestBefore is the manifest setup posted at ce7d970, before Connect, with the
+// redirect URL redirect.
+func manifestBefore(redirect string) string {
+	return `{"default_events":[],"default_permissions":{"contents":"write","metadata":"read","pull_requests":"write"},"hook_attributes":{"active":false,"url":"https://github.com/qoryai/qory-github"},"name":"qory-github-test","public":false,"redirect_url":"` + redirect + `","url":"https://github.com/qoryai/qory-github"}`
+}
+
+// setupFlagsBefore are setup's flags as -h printed them at ce7d970.
+const setupFlagsBefore = `flags:
+  -api-url string
+    	GitHub's API: https://api.github.com, or for a test http or https on a loopback host (default "https://api.github.com")
+  -key-file string
+    	where the private key is written (default ~/.config/qory/github-app.pem)
+  -name string
+    	the App's name (default qory-github- and six random hex digits)
+  -org string
+    	create the App under this organisation
+  -web-url string
+    	GitHub's website: https://github.com, or for a test http or https on a loopback host (default "https://github.com")
+`
+
+// TestSetupIsAsItWas pins that, whatever QORY_FEATURES says, setup takes the flags it
+// took, posts the manifest it posted and prints what it printed before Connect, keeps
+// no client secret and sets no webhook secret; and that it takes no --public-url.
+func TestSetupIsAsItWas(t *testing.T) {
+	resetHook(t)
+	for _, features := range []string{"", "all", "factory"} {
+		t.Setenv("QORY_FEATURES", features)
+		dir := t.TempDir()
+		file := filepath.Join(dir, "github-app.pem")
+		code, out, errs, manifest := setupWhole(t, "--key-file", file)
+		first, printed, _ := strings.Cut(out, "\n\n")
+		page := strings.TrimPrefix(first, "Approve the App in the browser. If none opened, open ")
+		if code != 0 || errs != "" || printed != setupPrinted(t, file) || page == first {
+			t.Errorf("QORY_FEATURES=%q: exit %d, stderr %q, setup prints\n%s", features, code, errs, out)
+		}
+		u, _ := url.Parse(page)
+		if manifest != manifestBefore(u.Scheme+"://"+u.Host+"/callback") {
+			t.Errorf("QORY_FEATURES=%q: the manifest %s", features, manifest)
+		}
+		entries, _ := os.ReadDir(dir)
+		if len(entries) != 1 || strings.Contains(out, testClientSecret) {
+			t.Errorf("QORY_FEATURES=%q: the directory holds %v", features, entries)
+		}
+		if sent := hookSent(t); len(sent) != 0 {
+			t.Errorf("QORY_FEATURES=%q: setup set %d webhook secrets", features, len(sent))
+		}
+		// The App's name is qory-github- and six random hex digits by default.
+		_, _, _, manifest, _ = setupRun(t, "--key-file", filepath.Join(dir, "other.pem"))
+		var m struct{ Name string }
+		if json.Unmarshal([]byte(manifest), &m); !regexp.MustCompile(`^qory-github-[0-9a-f]{6}$`).MatchString(m.Name) {
+			t.Errorf("QORY_FEATURES=%q: the default name is %q", features, m.Name)
+		}
+		var help bytes.Buffer
+		run(context.Background(), []string{"setup", "-h"}, &bytes.Buffer{}, &help)
+		_, flags, _ := strings.Cut(help.String(), "\nflags:\n")
+		flags, _, _ = strings.Cut(flags, "\nexamples:")
+		if "flags:\n"+flags != setupFlagsBefore {
+			t.Errorf("QORY_FEATURES=%q: setup -h prints the flags\n%s", features, flags)
+		}
+		var out2, errs2 bytes.Buffer
+		if code := run(context.Background(), []string{"setup", "--public-url", "https://qory-github.example.com"}, &out2, &errs2); code != 1 || !strings.Contains(errs2.String(), "flag provided but not defined: -public-url") {
+			t.Errorf("QORY_FEATURES=%q: --public-url: exit %d, %q", features, code, errs2.String())
+		}
+	}
+}
+
+// othersFile is a file's info as Stat gives it, 0600 and another user's.
+type othersFile struct{ fs.FileInfo }
+
+func (othersFile) Mode() fs.FileMode { return 0o600 }
+func (othersFile) Sys() any          { return &syscall.Stat_t{Uid: uint32(os.Geteuid() + 1)} }
+
+// TestAnotherUsersFileNamesQoryGithub pins that a key file that belongs to another user
+// is refused with an error that names qory-github, as it did before qory-github-server.
+func TestAnotherUsersFileNamesQoryGithub(t *testing.T) {
+	err := ownerfile.Check(othersFile{}, "the private key file /k.pem")
+	if want := "the private key file /k.pem belongs to another user than the one qory-github runs as"; err == nil || err.Error() != want {
+		t.Errorf("err %v, want %q", err, want)
+	}
+}
+
+// TestSetupHelpIsAsItWas pins setup's whole -h output, byte for byte, to
+// testdata/setup-help.txt, whatever QORY_FEATURES says.
+func TestSetupHelpIsAsItWas(t *testing.T) {
+	want, err := os.ReadFile("testdata/setup-help.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, features := range []string{"", "all", "factory"} {
+		t.Setenv("QORY_FEATURES", features)
+		var out, help bytes.Buffer
+		if code := run(context.Background(), []string{"setup", "-h"}, &out, &help); code != 2 || out.Len() != 0 || help.String() != string(want) {
+			t.Errorf("QORY_FEATURES=%q: exit %d, setup -h prints\n%s\nwant\n%s", features, code, help.String(), want)
+		}
 	}
 }

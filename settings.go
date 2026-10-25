@@ -26,8 +26,8 @@ import (
 var description []byte
 
 // Description is the integration's description, contracts/integration/v1: its name,
-// the domains it works with, the settings it takes as a JSON Schema, and the roles it
-// plays.
+// the domains it works with, the settings it takes as a JSON Schema, the roles it plays,
+// and the hosts its runs reach.
 type Description struct {
 	Version     int    `json:"version"`
 	Name        string `json:"name"`
@@ -39,11 +39,15 @@ type Description struct {
 	// Settings is the settings schema, the private key marked writeOnly, the secret.
 	Settings json.RawMessage `json:"settings"`
 	Roles    Roles           `json:"roles"`
+	// EgressHosts are the hosts the integration's runs reach: github.com and
+	// api.github.com. The contract requires them to cover Roles.Credential.Hosts.
+	EgressHosts []string `json:"egress_hosts,omitempty"`
 }
 
 // Roles are the roles the program plays.
 type Roles struct {
 	Credential *CredentialRole `json:"credential,omitempty"`
+	Source     *SourceRole     `json:"source,omitempty"`
 }
 
 // CredentialRole is the gateway's credential adapter: the argument a policy defines, and
@@ -53,7 +57,60 @@ type CredentialRole struct {
 	Hosts    []string `json:"hosts"`
 }
 
-// Describe is the description, with the program's version.
+// SourceRole is the source adapter, qory-github-server: the lines Qory Apiary shows,
+// verbatim and as plain text, to set it up, start it, install it, change which
+// repositories it reaches and uninstall it, and the words it names the source's items
+// and collections by, as description.json holds them. [Describe]
+// always holds it; qory-github describe prints it only where QORY_FEATURES names
+// factory, and qory-github-server serve sends it in the description it declares at
+// each start.
+type SourceRole struct {
+	Description string `json:"description"`
+	// ItemNoun is what Qory Apiary calls one of the source's items and many of them:
+	// issue and issues.
+	ItemNoun *Noun `json:"item_noun,omitempty"`
+	// CollectionNoun is what Qory Apiary calls one of the source's collections and many
+	// of them: repository and repositories.
+	CollectionNoun *Noun      `json:"collection_noun,omitempty"`
+	Program        string     `json:"program"`
+	Setup          SourceStep `json:"setup"`
+	Start          string     `json:"start"`
+	Connect        string     `json:"connect"`
+	Access         string     `json:"access"`
+	Disconnect     string     `json:"disconnect"`
+	// Secrets are the names of the secrets qory-github-server stores in Qory Apiary:
+	// the App, its private key, its webhook secret and its client secret.
+	Secrets []string `json:"secrets,omitempty"`
+	// CredentialScope is how far one credential the adapter answers to Qory Apiary's
+	// run-credential call reaches: resource, the repositories the call lists and no
+	// other.
+	CredentialScope string `json:"credential_scope,omitempty"`
+	// Apply is the most that a run's work credential reaches: the items of [Uses], where
+	// each path that contains owner/name has {target.path} in its place. Qory Apiary
+	// fills {target.path} with the path of the run's target at the claim, and a
+	// credential for work outside the filled items fails Qory Apiary's check.
+	Apply []Apply `json:"apply,omitempty"`
+}
+
+// Noun is the source's words for one thing, One, and for more than one, Other, which
+// Qory Apiary shows where it names those things: the source's items or its collections.
+type Noun struct {
+	One   string `json:"one"`
+	Other string `json:"other"`
+}
+
+// SourceStep is the one step that prepares the source side: the command a person runs,
+// and one line on what it asks and what it does.
+type SourceStep struct {
+	Command string `json:"command"`
+	Help    string `json:"help"`
+}
+
+// Describe is the description, with the program's version: description.json whole, its
+// source role among its roles. It is the one source of both documents that carry the
+// description: what qory-github describe prints, which leaves the source role out
+// unless QORY_FEATURES names factory, and the description qory-github-server serve
+// sends Qory Apiary at each start, POST /v1/adapter, which is always whole.
 func Describe(programVersion string) Description {
 	var d Description
 	if err := json.Unmarshal(description, &d); err != nil {

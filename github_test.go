@@ -66,12 +66,33 @@ type fakeGitHub struct {
 	installations map[string]int64 // owner/name -> installation id
 	accounts      map[int64]string // installation id -> the login of its account
 	status        int              // the mint's status; zero is 201
+	message       string           // the message of a mint's status; "" is "Bad credentials"
+	checkStatus   int              // the installation's check's status; zero answers as accounts says
+	suspended     map[int64]bool   // installation id -> answered with suspended_at set
 	mu            sync.Mutex
 	auth          []string
 	mint          map[string]any
 	mintPath      string
 	lookups       []string
 	checks        []string // the installations' paths read
+	webhookSecret string   // the exchange's webhook_secret; empty answers null
+	hookStatus    int      // the status of PATCH /app/hook/config; zero is 200
+	hookAuth      []string // the Authorization of each PATCH /app/hook/config
+	hookBodies    []string // the body of each PATCH /app/hook/config
+	hookEcho      bool     // a failing PATCH /app/hook/config says the body it received
+	hookAnswer    string   // the body of PATCH /app/hook/config's 200, when set; "" is GitHub's
+	hookNoBody    bool     // PATCH /app/hook/config answers 200 with no body
+	// exchangeDelay and hookDelay are how long the exchange's answer and PATCH
+	// /app/hook/config's take, or until the request is given up.
+	exchangeDelay, hookDelay time.Duration
+}
+
+// delay waits d, or until r is given up.
+func delay(r *http.Request, d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-r.Context().Done():
+	}
 }
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -93,25 +114,62 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.checks = append(f.checks, r.URL.Path)
 		id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/app/installations/"), 10, 64)
 		login, ok := f.accounts[id]
+		if f.checkStatus != 0 {
+			w.WriteHeader(f.checkStatus)
+			io.WriteString(w, `{"message":"Bad credentials"}`)
+			return
+		}
 		if !ok {
 			w.WriteHeader(404)
 			io.WriteString(w, `{"message":"Not Found"}`)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"id": id, "account": map[string]any{"login": login, "type": "Organization"}})
+		var suspendedAt any
+		if f.suspended[id] {
+			suspendedAt = "2026-10-01T00:00:00Z"
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": id, "account": map[string]any{"login": login, "type": "Organization"}, "suspended_at": suspendedAt})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app/installations/"):
 		f.mintPath = r.URL.Path
 		json.NewDecoder(r.Body).Decode(&f.mint)
 		if f.status != 0 {
 			w.WriteHeader(f.status)
-			io.WriteString(w, `{"message":"Bad credentials"}`)
+			message := f.message
+			if message == "" {
+				message = "Bad credentials"
+			}
+			json.NewEncoder(w).Encode(map[string]string{"message": message})
 			return
 		}
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]any{"token": fakeToken, "expires_at": "2026-09-25T21:00:00Z"})
 	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/app-manifests/"):
+		delay(r, f.exchangeDelay)
 		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": nil})
+		var webhookSecret any
+		if f.webhookSecret != "" {
+			webhookSecret = f.webhookSecret
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": 123456, "slug": "qory-github-test", "html_url": "https://github.com/apps/qory-github-test", "client_id": "Iv1.test", "pem": string(keyPEM(f.t)), "client_secret": "not-kept", "webhook_secret": webhookSecret})
+	case r.Method == "PATCH" && r.URL.Path == "/app/hook/config":
+		delay(r, f.hookDelay)
+		b, _ := io.ReadAll(r.Body)
+		f.hookAuth = append(f.hookAuth, r.Header.Get("Authorization"))
+		f.hookBodies = append(f.hookBodies, string(b))
+		if f.hookStatus != 0 {
+			w.WriteHeader(f.hookStatus)
+			message := "Resource not accessible by integration"
+			if f.hookEcho {
+				message = "Invalid request: " + string(b)
+			}
+			json.NewEncoder(w).Encode(map[string]string{"message": message})
+			return
+		}
+		if f.hookAnswer != "" || f.hookNoBody {
+			io.WriteString(w, f.hookAnswer)
+			return
+		}
+		io.WriteString(w, `{"content_type":"json","insecure_ssl":"0","secret":"********","url":"https://qory-github.example.com/v1/events"}`)
 	default:
 		w.WriteHeader(404)
 	}
@@ -457,6 +515,30 @@ func TestTheAnswerIsTheGatewaysCredentialDocument(t *testing.T) {
 	}
 }
 
+// TestTheSourceApplyIsUsesForTheTarget pins the source role's apply to [Uses]: filled
+// with a run's target, owner/name, it is what Uses returns for that one repository, so
+// the credential of a run-credential call for work on the target fits inside it.
+func TestTheSourceApplyIsUsesForTheTarget(t *testing.T) {
+	repos, err := ParseRepositories("acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filled []Apply
+	for _, a := range Describe("").Roles.Source.Apply {
+		var paths []string
+		for _, p := range a.Paths {
+			paths = append(paths, strings.Replace(p, "{target.path}", "acme/widgets", 1))
+		}
+		a.Paths = paths
+		filled = append(filled, a)
+	}
+	got, _ := json.Marshal(filled)
+	want, _ := json.Marshal(Uses(repos))
+	if string(got) != string(want) {
+		t.Errorf("the source role's apply, filled with acme/widgets, is\n%s\nwant Uses for acme/widgets\n%s", got, want)
+	}
+}
+
 func TestOneRunsRepositoriesShareAnOwner(t *testing.T) {
 	for _, arg := range []string{"acme/shop,other/lib", "acme/shop,acme/shop", "acme", "acme/", "/shop", "acme/..", "acme/shop.git", "ac me/shop", "-acme/shop", "acme/shop/x"} {
 		if _, err := ParseRepositories(arg); err == nil {
@@ -721,7 +803,7 @@ func TestAKeyFileIsReadFromWhatWasOpened(t *testing.T) {
 	sub := filepath.Join(dir, "dir.pem")
 	os.Mkdir(sub, 0o700)
 	large := filepath.Join(dir, "large.pem")
-	os.WriteFile(large, append(keyPEM(t), make([]byte, maxKeyFile)...), 0o600)
+	os.WriteFile(large, append(keyPEM(t), make([]byte, MaxKeyFile)...), 0o600)
 	for path, want := range map[string]string{
 		link:                           "symbolic link",
 		fifo:                           "not a regular file",
@@ -738,6 +820,56 @@ func TestAKeyFileIsReadFromWhatWasOpened(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s: the read waits", filepath.Base(path))
+		}
+	}
+}
+
+// TestAKeyFilesPathIsOpenedAsItIsGiven pins what release 0.2.0 does with each of these
+// paths, its errors word for word: the path is opened as it is given, so the system
+// resolves each .. through the links before it, linkdir/../k.pem reaching b/k.pem, and
+// a trailing slash opens no file.
+func TestAKeyFilesPathIsOpenedAsItIsGiven(t *testing.T) {
+	root := t.TempDir()
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	os.MkdirAll(filepath.Join(b, "c"), 0o700)
+	os.Mkdir(a, 0o700)
+	os.WriteFile(filepath.Join(a, "k.pem"), keyPEM(t), 0o600)
+	other, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(b, "k.pem"), pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(other)}), 0o600)
+	os.Symlink("k.pem", filepath.Join(a, "link.pem"))
+	os.WriteFile(filepath.Join(a, "loose.pem"), keyPEM(t), 0o644)
+	os.Chmod(filepath.Join(a, "loose.pem"), 0o644)
+	os.Symlink("../b/c", filepath.Join(a, "linkdir"))
+	t.Chdir(a)
+	notDir, noFile := syscall.ENOTDIR.Error(), syscall.ENOENT.Error()
+	for _, tc := range []struct {
+		path string
+		want *rsa.PrivateKey
+		err  string
+	}{
+		{"k.pem", key(t), ""},
+		{"k.pem/", nil, "the private key file: open k.pem/: " + notDir},
+		{"missing/../k.pem", nil, "the private key file: open missing/../k.pem: " + noFile},
+		{"a/../../a/k.pem", nil, "the private key file: open a/../../a/k.pem: " + noFile},
+		{"link.pem", nil, "the private key file link.pem is a symbolic link; use the path of the file itself"},
+		{"link.pem/", nil, "the private key file: open link.pem/: " + notDir},
+		{"loose.pem", nil, "the private key file loose.pem is -rw-r--r--: group or others have permissions on it; make it 0600"},
+		{"loose.pem/", nil, "the private key file: open loose.pem/: " + notDir},
+		{"linkdir", nil, "the private key file linkdir is a symbolic link; use the path of the file itself"},
+		{"linkdir/", nil, "the private key file linkdir/ is not a regular file"},
+		{"linkdir/../k.pem", other, ""},
+		{"none.pem", nil, "the private key file: open none.pem: " + noFile},
+	} {
+		k, err := ReadKeyFile(tc.path)
+		got := ""
+		if err != nil {
+			got = err.Error()
+		}
+		if got != tc.err || (tc.want == nil) != (k == nil) || (k != nil && !k.Equal(tc.want)) {
+			t.Errorf("%s: key %v, err %q, want %q", tc.path, k != nil, got, tc.err)
 		}
 	}
 }
@@ -765,6 +897,9 @@ func TestTheDescriptionSaysWhatThePackageDoes(t *testing.T) {
 	}
 	if strings.Join(d.Roles.Credential.Hosts, " ") != GitHost+" "+APIHost {
 		t.Errorf("hosts %v", d.Roles.Credential.Hosts)
+	}
+	if strings.Join(d.EgressHosts, " ") != GitHost+" "+APIHost {
+		t.Errorf("egress hosts %v", d.EgressHosts)
 	}
 	if strings.Join(d.Domains, " ") != "software" {
 		t.Errorf("domains %v", d.Domains)

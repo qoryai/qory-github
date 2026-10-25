@@ -1,0 +1,4581 @@
+package serve
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/store"
+)
+
+// wired is the adapter whole: a receiver and a worker with the adapter's handlers, the
+// change feed's reader, Qory Apiary's client, a fake Qory Apiary and a fake GitHub.
+type wired struct {
+	st      *store.Store
+	access  *accesskey.Key
+	apiary  *fakeApiary
+	gh      *fakeGitHub
+	client  *Apiary
+	adapter *Adapter
+	feed    *feed
+	mux     http.Handler
+	log     *syncBuffer
+
+	mu    sync.Mutex
+	slept []time.Duration
+	// endWaits are the waits between a grant end's tries, see [wired.retryEnds].
+	endWaits []time.Duration
+}
+
+// retryEnds makes each wait between a grant end's tries, see [Adapter.endSoon], pass at
+// once and be kept in endWaits. Without it, a grant end is tried once, and its next
+// try waits until the test ends.
+func (w *wired) retryEnds() {
+	w.adapter.endSleep = func(_ context.Context, d time.Duration) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.endWaits = append(w.endWaits, d)
+		return nil
+	}
+}
+
+// endsDone waits until no grant end of the installation is tried again, see
+// [Adapter.endSoon].
+func (w *wired) endsDone(t *testing.T, installation int64) {
+	t.Helper()
+	eventually(t, "the grant end's tries", func() bool { return !w.adapter.ending(installation) })
+}
+
+func newWired(t *testing.T, dir string) *wired {
+	t.Helper()
+	st := openStore(t, dir)
+	access := newKey(t)
+	w := &wired{st: st, access: access, apiary: newFakeApiary(t, access), gh: newFakeGitHub(t), log: &syncBuffer{}}
+	logger := slog.New(slog.NewJSONHandler(w.log, nil))
+	w.client = w.apiary.client(access)
+	w.client.Log = logger
+	w.client.Unlinked = func(ref string, began uint64) { unlinkSince(st, ref, began) }
+	w.client.Ended = endedIn(st, logger)
+	w.client.Answered = answeredIn(st, logger)
+	w.client.ConnectionOf = func(ref string) string { c, _ := connectionOf(st, ref); return c }
+	w.client.Sleep = func(_ context.Context, d time.Duration) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.slept = append(w.slept, d)
+		return nil
+	}
+	w.adapter = &Adapter{Store: st, GitHub: github.Client{API: w.gh.srv.URL}, AppID: "1", Key: appKey(), Slug: testSlug, Sink: w.client, Log: logger}
+	w.client.Ended = w.adapter.forgetEnded(w.client.Ended)
+	hs := &Handlers{}
+	w.adapter.Register(hs)
+	worker := &Worker{Store: st, Handlers: hs, Log: logger, Attempts: 3, Backoff: func(int) time.Duration { return time.Millisecond }}
+	rc := &Receiver{Secret: []byte(secret), Store: st, Log: logger, Stored: worker.Notify, Handlers: hs, Linked: func(id int64) (bool, error) { return Linked(st, id) }}
+	w.adapter.endSleep = func(ctx context.Context, _ time.Duration) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	worker.Start()
+	t.Cleanup(func() { worker.Stop(5 * time.Second) })
+	t.Cleanup(w.adapter.stopEnds)
+	w.mux = rc.Mux()
+	w.feed = &feed{apiary: w.client, adapter: w.adapter, store: st, publicURL: "https://qory-github.example.com", log: logger}
+	return w
+}
+
+// deliver sends GitHub's delivery of event with body and waits until it is handled.
+func (w *wired) deliver(t *testing.T, event, guid string, body map[string]any) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	if rec := post(w.mux, event, guid, string(b), sign(string(b))); rec.Code != http.StatusAccepted {
+		t.Fatalf("%s: status %d", event, rec.Code)
+	}
+	eventually(t, event+" handled", func() bool { s := state(w.st, guid); return s == store.Done || s == store.Failed })
+}
+
+// issueEvent is an issues event of the installation on an issue of repo.
+func issueEvent(installation int64, repo, action string) map[string]any {
+	is := ghIssue(1, 0)
+	is["html_url"] = "https://github.com/" + repo + "/issues/1"
+	return map[string]any{
+		"action": action, "installation": map[string]any{"id": installation}, "issue": is,
+		"repository": map[string]any{"id": repoID(repo), "full_name": repo, "html_url": "https://github.com/" + repo},
+	}
+}
+
+// refsOf are the collection refs of the repositories names, owner/name, see [refOf].
+func refsOf(names ...string) []string {
+	refs := []string{}
+	for _, n := range names {
+		refs = append(refs, refOf(n))
+	}
+	return refs
+}
+
+// TestAnIssueIsSentOnlyForALinkedInstallationAndCollection delivers an issue of a
+// linked collection, which is one signed POST /v1/source-items with its time, then one
+// of a collection that is not linked, and one of an installation that is not linked,
+// which send nothing.
+func TestAnIssueIsSentOnlyForALinkedInstallationAndCollection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	linkCollection(w.st, widgetsRef)
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	sent := w.apiary.sent(routeItems)
+	if len(sent) != 1 {
+		t.Fatalf("%d items requests", len(sent))
+	}
+	var req contracts.SourceItems
+	json.Unmarshal(sent[0].raw, &req)
+	if req.CollectionRef != refOf("acme/widgets") || len(req.Items) != 1 || req.Items[0].Ref != itemOf("acme/widgets", 1) || req.Listing != nil || !timeShape.MatchString(req.Time) {
+		t.Errorf("sent %s", sent[0].raw)
+	}
+	if tm, _ := time.Parse(time.RFC3339, req.Time); time.Since(tm).Abs() > time.Minute {
+		t.Errorf("the time %s", req.Time)
+	}
+	w.deliver(t, "issues", guid2, issueEvent(42, "acme/gadgets", "opened"))
+	// The installation 43 is not linked: its delivery is answered and not kept.
+	b, _ := json.Marshal(issueEvent(43, "acme/widgets", "opened"))
+	if rec := post(w.mux, "issues", guid3, string(b), sign(string(b))); rec.Code != http.StatusAccepted || state(w.st, guid3) != "" {
+		t.Errorf("%d %q", rec.Code, state(w.st, guid3))
+	}
+	if n := len(w.apiary.sent(routeItems)); n != 1 {
+		t.Errorf("%d items requests", n)
+	}
+	if !strings.Contains(w.log.String(), "the collection is not linked") || !strings.Contains(w.log.String(), `"guid":"`+guid3+`","outcome":"not_linked"`) {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestACommentIsSentForALinkedCollection delivers a comment on an issue of a linked
+// collection.
+func TestACommentIsSentForALinkedCollection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	linkCollection(w.st, refOf("acme/widgets"))
+	ev := issueEvent(42, "acme/widgets", "created")
+	ev["comment"] = map[string]any{"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
+	w.deliver(t, "issue_comment", guid1, ev)
+	sent := w.apiary.sent(routeComments)
+	if len(sent) != 1 || sent[0].body["item_ref"] != itemOf("acme/widgets", 1) {
+		t.Fatalf("sent %v", sent)
+	}
+}
+
+// TestRepositoriesAddedListsTheCollections delivers installation_repositories added,
+// and checks the listing reaches Qory Apiary, complete, read with a token that reads
+// metadata and contents, and that each repository's installation is kept.
+func TestRepositoriesAddedListsTheCollections(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "added", "installation": map[string]any{"id": 42}, "repositories_added": []any{map[string]any{"id": gadgetsID, "full_name": "acme/gadgets"}}})
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 1 {
+		t.Fatalf("%d collections requests", len(sent))
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[0].raw, &req)
+	if len(req.Collections) != 2 || req.Collections[0].Ref != widgetsRef || !req.Listing.Complete || req.Listing.Part != 1 || req.Collections[0].Target == nil {
+		t.Errorf("sent %s", sent[0].raw)
+	}
+	// The collections are named by their repositories' ids; their titles, URLs and
+	// targets name the repositories as GitHub does.
+	want := []contracts.Collection{
+		{Ref: widgetsRef, Title: "acme/widgets", URL: "https://github.com/acme/widgets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/widgets"}},
+		{Ref: gadgetsRef, Title: "acme/gadgets", URL: "https://github.com/acme/gadgets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/gadgets"}},
+	}
+	for i, c := range req.Collections {
+		if c.Ref != want[i].Ref || c.Title != want[i].Title || c.URL != want[i].URL || c.Target == nil || *c.Target != *want[i].Target {
+			t.Errorf("collection %d: %+v, want %+v", i, c, want[i])
+		}
+	}
+	for _, ref := range []string{widgetsRef, gadgetsRef} {
+		if inst, ok, err := reachOf(w.st, ref); inst != 42 || !ok || err != nil {
+			t.Errorf("%s: %d %v %v", ref, inst, ok, err)
+		}
+	}
+	if len(w.gh.mints) != 1 || w.gh.mints[0] != `{"permissions":{"contents":"read","metadata":"read"}}` {
+		t.Errorf("mints %v", w.gh.mints)
+	}
+	if strings.Contains(w.log.String(), ghToken) {
+		t.Errorf("the log carries the token")
+	}
+}
+
+// TestRepositoriesRemovedAreDisconnected delivers installation_repositories removed.
+func TestRepositoriesRemovedAreDisconnected(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/old"), 42)
+	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{map[string]any{"id": oldID, "full_name": "acme/old"}}})
+	sent := w.apiary.sent(routeDisconnect)
+	if len(sent) != 1 || sent[0].body["collection_ref"] != refOf("acme/old") || sent[0].body["connection_id"] != testConnection || len(sent[0].body) != 4 {
+		t.Fatalf("sent %v", sent)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok {
+		t.Error("the removed repository's installation is kept")
+	}
+	if len(w.apiary.sent(routeCollections)) != 1 {
+		t.Error("the repositories are not listed again")
+	}
+}
+
+// TestADisconnectNamesTheConnectionOfTheInstallationsLink delivers
+// installation_repositories removed for two repositories serve listed for the
+// installation 42, and moves the record of the second to the installation 9, linked to
+// another connection, once Qory Apiary has the first disconnect: each disconnect names
+// 42's connection, which the collections were listed under, never the connection the
+// repository's record names as it is sent.
+func TestADisconnectNamesTheConnectionOfTheInstallationsLink(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	setReach(w.st, refOf("acme/old"), 42)
+	setReach(w.st, refOf("acme/gone"), 42)
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeDisconnect && n == 1 {
+			setReach(w.st, refOf("acme/gone"), 9)
+		}
+		return 0, ""
+	}
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/old", "acme/gone"}))
+	sent := w.apiary.sent(routeDisconnect)
+	if len(sent) != 2 {
+		t.Fatalf("sent %v", sent)
+	}
+	for i, ref := range refsOf("acme/old", "acme/gone") {
+		if sent[i].body["collection_ref"] != ref || sent[i].body["connection_id"] != testConnection {
+			t.Errorf("disconnect %d: %s", i+1, sent[i].raw)
+		}
+	}
+}
+
+// lastListed are the refs of the collections the last listing sent Qory Apiary, one
+// part.
+func (w *wired) lastListed(t *testing.T) []string {
+	t.Helper()
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) == 0 {
+		t.Fatal("no listing is sent")
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[len(sent)-1].raw, &req)
+	if !req.Listing.Complete || req.Listing.Part != 1 {
+		t.Errorf("the listing is not complete in one part: %s", sent[len(sent)-1].raw)
+	}
+	var refs []string
+	for _, c := range req.Collections {
+		refs = append(refs, c.Ref)
+	}
+	return refs
+}
+
+// installed sets the repositories the fake GitHub lists for the installation 42.
+func (f *fakeGitHub) installed(repos ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos = repos
+}
+
+// repositoriesEvent is an installation_repositories event of the installation 42: action
+// with the repository selection selection, the repositories added and those removed.
+func repositoriesEvent(action, selection string, added, removed []string) map[string]any {
+	list := func(names []string) []any {
+		out := []any{}
+		for _, n := range names {
+			out = append(out, map[string]any{"id": repoID(n), "full_name": n, "name": n[strings.Index(n, "/")+1:], "private": false})
+		}
+		return out
+	}
+	return map[string]any{
+		"action": action, "installation": map[string]any{"id": 42}, "repository_selection": selection,
+		"repositories_added": list(added), "repositories_removed": list(removed),
+	}
+}
+
+// disconnected are the collections of the disconnects Qory Apiary was sent, from the one
+// numbered from on, counted from 0; a disconnect that names a reason, which none does,
+// shows it.
+func (w *wired) disconnected(from int) []string {
+	var got []string
+	for _, r := range w.apiary.sent(routeDisconnect)[from:] {
+		ref := r.body["collection_ref"].(string)
+		if reason, ok := r.body["reason"]; ok {
+			ref += fmt.Sprintf(" reason %v", reason)
+		}
+		got = append(got, ref)
+	}
+	return got
+}
+
+// TestASelectionSwitchedToAllRepositoriesIsListed switches an installation that GitHub
+// gave a selection of repositories to all of the account's, which GitHub delivers as
+// installation_repositories added, repository_selection all, with each repository the
+// installation now reaches beside the selection: the installation is listed again, the
+// new repositories in it, each kept as reached by the installation, and nothing is
+// disconnected.
+func TestASelectionSwitchedToAllRepositoriesIsListed(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.gh.installed("acme/widgets")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "selected", []string{"acme/widgets"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets")) {
+		t.Fatalf("listed %v", got)
+	}
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("added", "all", []string{"acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")) {
+		t.Errorf("listed %v", got)
+	}
+	for _, ref := range refsOf("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs") {
+		if inst, ok, err := reachOf(w.st, ref); inst != 42 || !ok || err != nil {
+			t.Errorf("%s: %d %v %v", ref, inst, ok, err)
+		}
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if s := state(w.st, guid2); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+}
+
+// TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers switches an installation
+// on all of the account's repositories to a selection, which GitHub delivers as
+// installation_repositories removed, repository_selection selected, with each
+// repository left out: each is disconnected, removed, and forgotten, and the
+// installation is listed again with the selection alone.
+func TestAllRepositoriesSwitchedToASelectionDisconnectsTheOthers(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools", "acme/docs")
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets", "acme/tools", "acme/docs"}, nil))
+	w.gh.installed("acme/gadgets")
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/widgets", "acme/tools", "acme/docs"}))
+	if got := w.disconnected(0); !slices.Equal(got, refsOf("acme/widgets", "acme/tools", "acme/docs")) {
+		t.Errorf("disconnected %v", got)
+	}
+	for _, ref := range refsOf("acme/widgets", "acme/tools", "acme/docs") {
+		if _, ok, _ := reachOf(w.st, ref); ok {
+			t.Errorf("%s: the removed repository's installation is kept", ref)
+		}
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("acme/gadgets")); inst != 42 || !ok {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/gadgets")) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestRemovingARepositoryNeverKnownIsHarmless removes from the installation a
+// repository serve never listed, and one the store holds as another installation's:
+// no disconnect is sent for either, the delivery is done, the repositories serve knows
+// stay as they were, and the installation is listed again.
+func TestRemovingARepositoryNeverKnownIsHarmless(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	setReach(w.st, refOf("acme/gadgets"), 42)
+	setReach(w.st, refOf("octo-org/tools"), 43)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("removed", "selected", nil, []string{"acme/never", "octo-org/tools"}))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	for name, want := range map[string]int64{"acme/widgets": 42, "acme/gadgets": 42, "octo-org/tools": 43} {
+		if inst, ok, _ := reachOf(w.st, refOf(name)); inst != want || !ok {
+			t.Errorf("%s: %d %v", name, inst, ok)
+		}
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/never")); ok {
+		t.Error("acme/never is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets")) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestAChangeOfRepositoriesListsWithANewToken lists the installation, which keeps its
+// listing token, then delivers installation_repositories added and removed in turn:
+// each drops the installation's tokens, so each listing after a change reads with a
+// token minted after it, and another installation's token is kept.
+func TestAChangeOfRepositoriesListsWithANewToken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.adapter.mu.Lock()
+	w.adapter.tokens["43 "+refOf("octo-org/tools")+" read"] = github.InstallationToken{Token: "another", ExpiresAt: time.Now().Add(time.Hour)}
+	w.adapter.mu.Unlock()
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/gadgets"}, nil))
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/gadgets"}))
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	if len(mints) != 3 {
+		t.Errorf("%d listing tokens minted, want 3: %v", len(mints), mints)
+	}
+	w.adapter.mu.Lock()
+	_, kept := w.adapter.tokens["43 "+refOf("octo-org/tools")+" read"]
+	w.adapter.mu.Unlock()
+	if !kept {
+		t.Error("another installation's token is dropped")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 3 {
+		t.Errorf("%d listings", n)
+	}
+}
+
+// TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas adds and removes
+// repositories in turn, a selection grown, switched to all and back to a selection, and
+// checks after each that the listing and the repositories kept are the installation's
+// and that each repository removed is disconnected once.
+func TestRepositoriesAddedAndRemovedInTurnEndInTheSetGitHubHas(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	guids := []string{guid1, guid2, guid3, "a4c5d6e7-1b2c-11ef-8f4b-0242ac120004", "b5d6e7f8-1c2d-11ef-8f4b-0242ac120005"}
+	for i, step := range []struct {
+		action, selection string
+		added, removed    []string
+		repos             []string
+		disconnected      []string
+	}{
+		{"added", "selected", []string{"acme/widgets"}, nil, []string{"acme/widgets"}, nil},
+		{"added", "selected", []string{"acme/gadgets"}, nil, []string{"acme/widgets", "acme/gadgets"}, nil},
+		{"removed", "selected", nil, []string{"acme/widgets"}, []string{"acme/gadgets"}, []string{"acme/widgets"}},
+		{"added", "all", []string{"acme/widgets", "acme/tools"}, nil, []string{"acme/widgets", "acme/gadgets", "acme/tools"}, nil},
+		{"removed", "selected", nil, []string{"acme/gadgets", "acme/tools"}, []string{"acme/widgets"}, []string{"acme/gadgets", "acme/tools"}},
+	} {
+		before := len(w.apiary.sent(routeDisconnect))
+		w.gh.installed(step.repos...)
+		w.deliver(t, "installation_repositories", guids[i], repositoriesEvent(step.action, step.selection, step.added, step.removed))
+		if got := w.lastListed(t); !slices.Equal(got, refsOf(step.repos...)) {
+			t.Errorf("step %d: listed %v, want %v", i+1, got, step.repos)
+		}
+		if got := w.disconnected(before); !slices.Equal(got, refsOf(step.disconnected...)) {
+			t.Errorf("step %d: disconnected %v, want %v", i+1, got, step.disconnected)
+		}
+		refs, _ := reachedBy(w.st, 42)
+		slices.Sort(refs)
+		want := slices.Sorted(slices.Values(refsOf(step.repos...)))
+		if !slices.Equal(refs, want) {
+			t.Errorf("step %d: kept %v, want %v", i+1, refs, want)
+		}
+	}
+}
+
+// TestEveryTokenServeMintsIsNarrowedToItsStep lists an installation's repositories,
+// fills a collection and applies a work item's change, each step serve mints a token
+// for, and pins every mint: each names its permissions, since a mint that names none
+// is granted every permission the installation has, and none asks for one the App
+// holds for steps serve does not take with an installation token, so an App with more
+// permissions does not widen serve's tokens. The listing reads metadata and contents,
+// which its environment definitions need, on every repository, naming none; the fill
+// reads issues and the change writes them, on one repository.
+func TestEveryTokenServeMintsIsNarrowedToItsStep(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.deliver(t, "installation_repositories", guid1, repositoriesEvent("added", "all", []string{"acme/widgets", "acme/gadgets"}, nil))
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, refOf("acme/widgets"))
+	if err := w.adapter.fill(context.Background(), refOf("acme/widgets")); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	want := []string{
+		`{"permissions":{"contents":"read","metadata":"read"}}`,
+		`{"permissions":{"issues":"read"},"repository_ids":[` + widgetsRef + `]}`,
+		`{"permissions":{"issues":"write"},"repository_ids":[` + widgetsRef + `]}`,
+	}
+	if !slices.Equal(mints, want) {
+		t.Errorf("mints\n%s\nwant\n%s", strings.Join(mints, "\n"), strings.Join(want, "\n"))
+	}
+	for _, m := range mints {
+		var body struct {
+			Permissions   map[string]string `json:"permissions"`
+			RepositoryIDs []int64           `json:"repository_ids"`
+		}
+		if err := json.Unmarshal([]byte(m), &body); err != nil || len(body.Permissions) == 0 {
+			t.Errorf("a mint names no permission: %s", m)
+		}
+		if level, ok := body.Permissions["contents"]; ok && (level != "read" || body.RepositoryIDs != nil || body.Permissions["metadata"] != "read") {
+			t.Errorf("a mint other than the listing's asks for contents, or the listing's for more than read: %s", m)
+		}
+		for _, wider := range []string{"pull_requests", "actions", "checks", "administration", "members"} {
+			if _, ok := body.Permissions[wider]; ok {
+				t.Errorf("a mint asks for %s: %s", wider, m)
+			}
+		}
+	}
+}
+
+// holdMint is a transport that holds the first mint of an installation token until
+// release is closed, once it has closed minting, and passes every other request on.
+type holdMint struct {
+	once             *sync.Once
+	minting, release chan struct{}
+}
+
+func (h holdMint) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/access_tokens") {
+		held := false
+		h.once.Do(func() { held = true })
+		if held {
+			close(h.minting)
+			<-h.release
+		}
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestATokenMintedAcrossAForgetIsNotKept holds a mint of the installation's listing
+// token in flight while its tokens are dropped: the token is handed to the request
+// that minted it, and not kept, so the next request mints again; a token minted after
+// the drop is kept.
+func TestATokenMintedAcrossAForgetIsNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
+	w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+	type result struct {
+		token string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		tok, err := w.adapter.token(context.Background(), 42, 0, "")
+		done <- result{tok, err}
+	}()
+	<-h.minting
+	w.adapter.forgetTokens(42)
+	close(h.release)
+	if r := <-done; r.token != ghToken || r.err != nil {
+		t.Fatalf("the token minted in flight: %v", r.err)
+	}
+	w.adapter.mu.Lock()
+	n := len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d tokens kept, the one minted across the drop among them", n)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.adapter.token(context.Background(), 42, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	w.adapter.mu.Lock()
+	n = len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if mints != 2 || n != 1 {
+		t.Errorf("%d mints and %d tokens kept, want 2 and 1", mints, n)
+	}
+}
+
+// heldFor names the adapter's maps that hold an entry for the installation.
+func (a *Adapter) heldFor(installation int64) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var held []string
+	for key := range a.tokens {
+		if strings.HasPrefix(key, strconv.FormatInt(installation, 10)+" ") {
+			held = append(held, "tokens")
+			break
+		}
+	}
+	for k := range a.firsts {
+		if k.installation == installation {
+			held = append(held, "firsts")
+			break
+		}
+	}
+	if _, ok := a.gens[installation]; ok {
+		held = append(held, "gens")
+	}
+	if _, ok := a.firstGens[installation]; ok {
+		held = append(held, "firstGens")
+	}
+	if _, ok := a.pacers[installation]; ok {
+		held = append(held, "pacers")
+	}
+	if _, ok := a.installs[installation]; ok {
+		held = append(held, "installs")
+	}
+	return held
+}
+
+// TestAnInstallationDeletedLeavesNothingOfItInMemory has the adapter keep, for two
+// installations, a token, a first listing, a pacer and their generations, and hold the
+// other's lock, then GitHub deletes one: the adapter's maps hold nothing of it, and the
+// other's entries stay; the other's lock goes once it is given back.
+func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	for _, id := range []int64{42, 9} {
+		w.adapter.pacer(id)
+		w.adapter.mu.Lock()
+		w.adapter.generation(&w.adapter.gens, id)
+		w.adapter.generation(&w.adapter.firstGens, id)
+		if w.adapter.tokens == nil {
+			w.adapter.tokens = map[string]github.InstallationToken{}
+		}
+		w.adapter.tokens[strconv.FormatInt(id, 10)+" "+widgetsRef+" read"] = github.InstallationToken{Token: ghToken, ExpiresAt: time.Now().Add(time.Hour)}
+		if w.adapter.firsts == nil {
+			w.adapter.firsts = map[firstKey]*firstListing{}
+		}
+		w.adapter.firsts[firstKey{id, testConnection}] = &firstListing{}
+		w.adapter.mu.Unlock()
+	}
+	unlock, err := w.adapter.lockInstallation(context.Background(), 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := []string{"tokens", "firsts", "gens", "firstGens", "pacers", "installs"}
+	if held := w.adapter.heldFor(9); !slices.Equal(held, all) {
+		t.Fatalf("the other installation's entries %v, want %v", held, all)
+	}
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if s := state(w.st, guid1); s != store.Done {
+		t.Fatalf("the deletion is %s", s)
+	}
+	if held := w.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
+	}
+	if held := w.adapter.heldFor(9); !slices.Equal(held, all) {
+		t.Errorf("the other installation's entries %v, want %v", held, all)
+	}
+	unlock()
+	if held := w.adapter.heldFor(9); slices.Contains(held, "installs") {
+		t.Errorf("the other installation's lock is kept once it is given back: %v", held)
+	}
+}
+
+// TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory deletes a
+// linked installation whose grant end returns 409 connection_ended, which
+// forgets the connection's first listings, those of the installation still linked
+// among them, after the installation's are forgotten: the adapter's maps hold nothing
+// of it.
+func TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.adapter.mu.Lock()
+	w.adapter.generation(&w.adapter.gens, 42)
+	w.adapter.generation(&w.adapter.firstGens, 42)
+	w.adapter.mu.Unlock()
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return 409, `{"error":"connection_ended"}`
+		}
+		return 0, ""
+	}
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if s := state(w.st, guid1); s != store.Done {
+		t.Fatalf("the deletion is %s", s)
+	}
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends sent", n)
+	}
+	if held := w.adapter.heldFor(42); len(held) != 0 {
+		t.Errorf("the deleted installation's entries are kept in %v", held)
+	}
+}
+
+// TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept holds a mint of the
+// installation's listing token, and a read of a pending link's first listing, while
+// GitHub deletes the installation, and after the deletion, before the read in flight
+// ends: nothing more; a move of the generation, which makes no generation again; or a
+// reader that takes a generation, which is a new one, never one given before the
+// deletion. The token is handed to the request that minted it, and the listing is
+// sent, and neither is kept: the adapter's maps hold nothing of the installation but,
+// after a reader, the generation it took.
+func TestAReadInFlightAcrossAnInstallationsDeletionIsNotKept(t *testing.T) {
+	deleted := map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}}
+	for _, after := range []string{"nothing", "a move", "a reader"} {
+		t.Run("token, then "+after, func(t *testing.T) {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			h := holdMint{once: &sync.Once{}, minting: make(chan struct{}), release: make(chan struct{})}
+			w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+			done := make(chan error, 1)
+			go func() {
+				_, err := w.adapter.token(context.Background(), 42, 0, "")
+				done <- err
+			}()
+			<-h.minting
+			w.deliver(t, "installation", guid1, deleted)
+			var want []string
+			switch after {
+			case "a move":
+				w.adapter.forgetTokens(42)
+			case "a reader":
+				w.adapter.mu.Lock()
+				w.adapter.generation(&w.adapter.gens, 42)
+				w.adapter.mu.Unlock()
+				want = []string{"gens"}
+			}
+			close(h.release)
+			if err := <-done; err != nil {
+				t.Fatalf("the token minted in flight: %v", err)
+			}
+			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
+				t.Errorf("the installation's entries %v, want %v", held, want)
+			}
+		})
+		t.Run("first listing, then "+after, func(t *testing.T) {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkPending)
+			var derr error
+			var want []string
+			w.gh.envAfter = func(*fakeGitHub) {
+				// GitHub has answered the page and its environment definitions, the read's
+				// last request; now GitHub deletes the installation.
+				derr = w.adapter.deleted(context.Background(), Delivery{Event: "installation", Action: "deleted", InstallationID: 42})
+				switch after {
+				case "a move":
+					w.adapter.dropFirsts(42, "")
+				case "a reader":
+					w.adapter.mu.Lock()
+					w.adapter.generation(&w.adapter.firstGens, 42)
+					w.adapter.mu.Unlock()
+					want = []string{"firstGens"}
+				}
+			}
+			// The read runs without the installation's lock, which a try of the listing
+			// holds, so the deletion lands while GitHub is read.
+			if err := w.adapter.sendFirst(context.Background(), 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()}); err != nil || derr != nil {
+				t.Fatalf("the listing: %v; the deletion: %v", err, derr)
+			}
+			if n := len(w.apiary.sent(routeCollections)); n != 1 {
+				t.Errorf("%d parts sent", n)
+			}
+			if held := w.adapter.heldFor(42); !slices.Equal(held, want) {
+				t.Errorf("the installation's entries %v, want %v", held, want)
+			}
+		})
+	}
+}
+
+// TestDeliveriesOfAnEventWithoutAHandlerAreNotKept posts many deliveries of
+// pull_request and workflow_run, and one of an event GitHub may add, which no handler
+// takes: each is answered 202, as a delivery kept is, and logged unhandled, and the
+// store keeps none of them, so the next delivery kept is the first.
+func TestDeliveriesOfAnEventWithoutAHandlerAreNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	body := `{"action":"opened","installation":{"id":42},"repository":{"full_name":"acme/widgets"}}`
+	var guids []string
+	for i := range 200 {
+		event := []string{"pull_request", "workflow_run"}[i%2]
+		if i == 199 {
+			event = "some_future_event"
+		}
+		guid := fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i)
+		guids = append(guids, guid)
+		if rec := post(w.mux, event, guid, body, sign(body)); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: status %d", event, rec.Code)
+		}
+	}
+	for _, guid := range guids {
+		if d, err := w.st.Lookup(guid); err == nil {
+			t.Fatalf("%s %s is kept", d.Event, guid)
+		}
+	}
+	if pending, err := w.st.Pending(); err != nil || len(pending) != 0 {
+		t.Errorf("pending %d %v", len(pending), err)
+	}
+	if n := strings.Count(w.log.String(), `"outcome":"unhandled"`); n != 200 {
+		t.Errorf("%d deliveries logged unhandled", n)
+	}
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	if d, err := w.st.Lookup(guid1); err != nil || d.Seq != 1 {
+		t.Errorf("the delivery kept next is %d: %v", d.Seq, err)
+	}
+}
+
+// TestAnInstallationSuspendedThenDeletedEndsItsGrant suspends the installation, which
+// is logged and changes nothing, and deletes it, which ends its grant, one POST
+// /v1/grants/end with its connection and its grant_ref and no disconnect of the
+// connection, and drops its grant, its link and its collections' records; another
+// installation's stay.
+func TestAnInstallationSuspendedThenDeletedEndsItsGrant(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, otherConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	setReach(w.st, refOf("acme/gadgets"), 42)
+	setReach(w.st, refOf("other/thing"), 43)
+	linkCollection(w.st, refOf("acme/widgets"))
+	keepPulled(w.st, refOf("acme/widgets"), pullMark{Since: time.Now()})
+	linkCollection(w.st, refOf("other/thing"))
+	w.deliver(t, "installation", guid1, map[string]any{"action": "suspend", "installation": map[string]any{"id": 42}})
+	if n := w.apiary.count(); n != 0 {
+		t.Errorf("a suspend sent %d requests", n)
+	}
+	if l, ok, _ := linkOf(w.st, 42); !ok || l.State != linkLive {
+		t.Error("a suspend changed the link")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"GitHub suspended the installation, so its link stays and it is read again later","installation":42`) {
+		t.Errorf("the log: %s", w.log.String())
+	}
+	w.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	sent := w.apiary.sent(routeGrantsEnd)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" || len(sent[0].body) != 4 || len(w.apiary.sent(routeDisconnect)) != 0 || len(w.apiary.sent(routeConnectionsDisconnect)) != 0 {
+		t.Errorf("sent %v", sent)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("the deleted installation is still linked")
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the deleted installation's grant is kept for %s", held)
+	}
+	if held, _ := grantOf(w.st, 43); held != otherConnection {
+		t.Errorf("another installation's grant is %q", held)
+	}
+	if ok, _ := Linked(w.st, 43); !ok {
+		t.Error("another installation is unlinked")
+	}
+	if refs, _ := reachedBy(w.st, 42); len(refs) != 0 {
+		t.Errorf("the deleted installation's repositories are kept: %v", refs)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the deleted installation's collection is still linked")
+	}
+	if m, _ := pulledOf(w.st, refOf("acme/widgets")); !m.Since.IsZero() {
+		t.Error("the deleted installation's collection's pulls are kept")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+		t.Error("another installation's collection is unlinked")
+	}
+	// Its deliveries are not kept any more.
+	b, _ := json.Marshal(map[string]any{"action": "unsuspend", "installation": map[string]any{"id": 42}})
+	if rec := post(w.mux, "installation", guid3, string(b), sign(string(b))); rec.Code != http.StatusAccepted || state(w.st, guid3) != "" {
+		t.Errorf("%d %q", rec.Code, state(w.st, guid3))
+	}
+	if len(w.apiary.sent(routeCollections)) != 0 {
+		t.Error("an unlinked installation is listed")
+	}
+}
+
+// TestEachAnswerToAGrantEndIsActedOn deletes the linked installation 42, whose grant
+// Qory Apiary's copy has, and has the fake return each answer to its grant end in turn.
+// The signed 204, 409 grant_unknown and 409 connection_ended drop the grant, the link
+// and the collections' records at once. 403 connection_unknown, a 503 and an answer not
+// signed have the grant end sent again, built anew, after waits that double from 2
+// seconds to a minute, until one of those. 403 forbidden and 400 invalid_request stop
+// it with a line, and the state stays.
+func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
+	unknown := func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	for _, tc := range []struct {
+		name     string
+		refuse   func(n int) (int, string)
+		unsigned int
+		tries    int
+		waits    []time.Duration
+		dropped  bool
+		line     string
+	}{
+		{name: "204", tries: 1, dropped: true},
+		{name: "grant_unknown", refuse: func(int) (int, string) { return 409, `{"error":"grant_unknown"}` }, tries: 1, dropped: true},
+		{name: "connection_ended", refuse: func(int) (int, string) { return 409, `{"error":"connection_ended"}` }, tries: 1, dropped: true},
+		{name: "connection_unknown, then 204", refuse: func(n int) (int, string) {
+			if n < 3 {
+				return unknown(n)
+			}
+			return 0, ""
+		}, tries: 3, waits: []time.Duration{2 * time.Second, 4 * time.Second}, dropped: true},
+		{name: "connection_unknown eight times, then 204", refuse: func(n int) (int, string) {
+			if n < 9 {
+				return unknown(n)
+			}
+			return 0, ""
+		}, tries: 9, waits: []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute, time.Minute}, dropped: true},
+		{name: "503, then grant_unknown", refuse: func(n int) (int, string) {
+			if n == 1 {
+				return 503, `{"error":"unavailable"}`
+			}
+			return 409, `{"error":"grant_unknown"}`
+		}, tries: 2, waits: []time.Duration{2 * time.Second}, dropped: true},
+		{name: "not signed, then 204", unsigned: 1, tries: 2, waits: []time.Duration{2 * time.Second}, dropped: true},
+		{name: "forbidden", refuse: func(int) (int, string) { return 403, `{"error":"forbidden"}` }, tries: 1, line: "403 forbidden"},
+		{name: "invalid_request", refuse: func(int) (int, string) { return 400, `{"error":"invalid_request"}` }, tries: 1, line: "400 invalid_request"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		w.retryEnds()
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, refOf("acme/widgets"), 42)
+		linkCollection(w.st, refOf("acme/widgets"))
+		// Each try is built anew, with a later time.
+		now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+		var clock sync.Mutex
+		w.client.Now = func() time.Time { clock.Lock(); defer clock.Unlock(); now = now.Add(time.Second); return now }
+		w.apiary.unsigned = func(route string, n int) bool { return route == routeGrantsEnd && n <= tc.unsigned }
+		w.apiary.refuse = func(route string, n int) (int, string) {
+			if route == routeGrantsEnd && tc.refuse != nil {
+				return tc.refuse(n)
+			}
+			return 0, ""
+		}
+		w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+		w.endsDone(t, 42)
+		sent := w.apiary.sent(routeGrantsEnd)
+		if len(sent) != tc.tries || state(w.st, guid1) != store.Done {
+			t.Errorf("%s: %d tries, %s", tc.name, len(sent), state(w.st, guid1))
+		}
+		for i, r := range sent {
+			if r.body["connection_id"] != testConnection || r.body["grant_ref"] != "42" || (i > 0 && r.signature == sent[i-1].signature) {
+				t.Errorf("%s: try %d is %s", tc.name, i+1, r.raw)
+			}
+		}
+		w.mu.Lock()
+		if !slices.Equal(w.endWaits, tc.waits) {
+			t.Errorf("%s: waited %v", tc.name, w.endWaits)
+		}
+		w.mu.Unlock()
+		linked, _ := Linked(w.st, 42)
+		held, _ := grantOf(w.st, 42)
+		_, reached, _ := reachOf(w.st, refOf("acme/widgets"))
+		collection, _ := collectionLinked(w.st, refOf("acme/widgets"))
+		if linked == tc.dropped || (held == "") != tc.dropped || reached == tc.dropped || collection == tc.dropped {
+			t.Errorf("%s: linked %v, grant %q, reached %v, collection linked %v", tc.name, linked, held, reached, collection)
+		}
+		log := w.log.String()
+		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
+			t.Errorf("%s: the log %s", tc.name, log)
+		}
+		if tc.dropped != strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link","installation":42`) {
+			t.Errorf("%s: the log %s", tc.name, log)
+		}
+		if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
+			t.Errorf("%s: %d disconnects of the connection", tc.name, n)
+		}
+	}
+}
+
+// TestARefusedGrantEndWaitsForAConnectOfItsAccount has the end of the grant of 42, on
+// acme's account, return 400 invalid_request, and of 43, on alice's, 403 forbidden: a
+// second end of either sends nothing and keeps the link; a connect for acme,
+// [Adapter.stopEnd], lets the next end of 42 be sent, and 43's stays held.
+func TestARefusedGrantEndWaitsForAConnectOfItsAccount(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkLive, Account: acme.ID})
+	grantedPutLink(w.st, 43, link{Connection: otherConnection, State: linkLive, Account: alice.ID})
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		switch {
+		case route != routeGrantsEnd || n > 2:
+			return 0, ""
+		case n == 1:
+			return 400, `{"error":"invalid_request"}`
+		}
+		return 403, `{"error":"forbidden"}`
+	}
+	tries := func() map[any]int {
+		m := map[any]int{}
+		for _, s := range w.apiary.sent(routeGrantsEnd) {
+			m[s.body["grant_ref"]]++
+		}
+		return m
+	}
+	for round := 1; round <= 2; round++ {
+		for _, id := range []int64{42, 43} {
+			if c, err := w.adapter.endInstallation(context.Background(), id); err != nil || c == "" {
+				t.Fatalf("round %d, %d: %q %v", round, id, c, err)
+			}
+			if !w.adapter.endHeld(id) {
+				t.Errorf("round %d: the grant end of %d is not held", round, id)
+			}
+		}
+		if m := tries(); m["42"] != 1 || m["43"] != 1 {
+			t.Errorf("round %d: grant ends by grant_ref %v", round, m)
+		}
+	}
+	for _, id := range []int64{42, 43} {
+		if _, ok, _ := linkOf(w.st, id); !ok {
+			t.Errorf("the link of %d is dropped", id)
+		}
+	}
+	w.adapter.stopEnd(acme.ID)
+	if w.adapter.endHeld(42) || !w.adapter.endHeld(43) {
+		t.Errorf("after a connect for acme, held: 42 %v, 43 %v", w.adapter.endHeld(42), w.adapter.endHeld(43))
+	}
+	w.adapter.endInstallation(context.Background(), 42)
+	w.adapter.endInstallation(context.Background(), 43)
+	if m := tries(); m["42"] != 2 || m["43"] != 1 {
+		t.Errorf("after a connect for acme: grant ends by grant_ref %v", m)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link of 42 is kept after its grant end's 204")
+	}
+}
+
+// TestAGrantEndOfAPendingLinkIsNeverDroppedBy403s has each end of the grant of 42,
+// whose link is pending, as when its first listing was never taken, return 403
+// connection_unknown, an hour apart on the adapter's clock and on the client's: past a
+// day, see [forbiddenFor], the grant end is still sent again, at most a minute apart,
+// and the link, the grant and the collection's records stay, since a pending link is
+// never dropped by 403s.
+func TestAGrantEndOfAPendingLinkIsNeverDroppedBy403s(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.retryEnds()
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Date(2026, 10, 15, 12, 10, 0, 0, time.UTC).Unix()})
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	var clock sync.Mutex
+	read := func() time.Time { clock.Lock(); defer clock.Unlock(); return now }
+	w.adapter.now, w.client.Now = read, read
+	const tries = 30
+	past := make(chan struct{})
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route != routeGrantsEnd {
+			return 0, ""
+		}
+		clock.Lock()
+		now = now.Add(time.Hour)
+		clock.Unlock()
+		if n == tries {
+			close(past)
+		}
+		return 403, `{"error":"connection_unknown"}`
+	}
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-past:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%d grant ends", len(w.apiary.sent(routeGrantsEnd)))
+	}
+	if !w.adapter.ending(42) {
+		t.Error("the grant end is no longer sent again")
+	}
+	w.adapter.stopEnds()
+	if l, ok, _ := linkOf(w.st, 42); !ok || l.Connection != testConnection || l.State != linkPending {
+		t.Errorf("the link %+v %v", l, ok)
+	}
+	if held, _ := grantOf(w.st, 42); held != testConnection {
+		t.Errorf("the grant is %q", held)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/widgets")); !ok {
+		t.Error("the repository's installation is dropped")
+	}
+	w.mu.Lock()
+	for _, d := range w.endWaits {
+		if d > time.Minute {
+			t.Errorf("waited %v", d)
+		}
+	}
+	w.mu.Unlock()
+}
+
+// TestALastingConnectionUnknownStopsTheGrantEnd has each end of the grant of 42, linked
+// live, return 403 connection_unknown, an hour apart on the adapter's clock: once the
+// 403 has lasted a day, see [forbiddenFor], serve drops the connection and the grant,
+// and sends no more grant end.
+func TestALastingConnectionUnknownStopsTheGrantEnd(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.retryEnds()
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	var clock sync.Mutex
+	w.client.Now = func() time.Time { clock.Lock(); defer clock.Unlock(); now = now.Add(30 * time.Minute); return now }
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if _, err := w.adapter.endInstallation(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.endsDone(t, 42)
+	// Each try reads the clock twice: for the body's time and for the answer's.
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
+		t.Errorf("%d grant ends", n)
+	}
+	if _, ok, _ := linkOf(w.st, 42); ok {
+		t.Error("the link is kept")
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant %q is kept", held)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the collection is still linked")
+	}
+	log := w.log.String()
+	if !strings.Contains(log, `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) ||
+		!strings.Contains(log, `"msg":"the installation's link was dropped with its connection, so serve drops its grant and sends no more grant end","installation":42`) {
+		t.Errorf("the log %s", log)
+	}
+}
+
+// TestAGrantEndLeavesTheConnectionAndItsOtherInstallation links the installations 42
+// and 43 to one connection and deletes 42: the grant end names 42's grant alone, the
+// connection is not disconnected, and 43 keeps its link, its grant, its collection and
+// its deliveries, whose issue is sent; and once 43 is deleted too, the connection is
+// still not disconnected.
+func TestAGrantEndLeavesTheConnectionAndItsOtherInstallation(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	setReach(w.st, refOf("other/thing"), 43)
+	linkCollection(w.st, refOf("other/thing"))
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 1 || sent[0].body["grant_ref"] != "42" || sent[0].body["connection_id"] != testConnection {
+		t.Fatalf("the grant ends %v", sent)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("the deleted installation is still linked")
+	}
+	if l, ok, _ := linkOf(w.st, 43); !ok || l.Connection != testConnection || l.State != linkLive {
+		t.Errorf("the other installation's link %+v %v", l, ok)
+	}
+	if held, _ := grantOf(w.st, 43); held != testConnection {
+		t.Errorf("the other installation's grant is %q", held)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+		t.Error("the other installation's collection is unlinked")
+	}
+	w.deliver(t, "issues", guid2, issueEvent(43, "other/thing", "opened"))
+	if sent := w.apiary.sent(routeItems); len(sent) != 1 || sent[0].body["collection_ref"] != refOf("other/thing") {
+		t.Errorf("the other installation's items %v", sent)
+	}
+	w.deliver(t, "installation", guid3, map[string]any{"action": "deleted", "installation": map[string]any{"id": 43}})
+	if sent := w.apiary.sent(routeGrantsEnd); len(sent) != 2 || sent[1].body["grant_ref"] != "43" {
+		t.Errorf("the grant ends %v", sent)
+	}
+	if n := len(w.apiary.sent(routeConnectionsDisconnect)); n != 0 {
+		t.Errorf("%d disconnects of the connection", n)
+	}
+}
+
+// TestAGrantNotInTheCopyIsNotEnded deletes the installation 42, linked pending while its
+// grant's report is still being sent, so Qory Apiary's copy of the grants does not have
+// its grant: no grant end is sent, its link and its collections' records are dropped,
+// and a line says so.
+func TestAGrantNotInTheCopyIsNotEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	Link(w.st, 42, testConnection, linkPending)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.deliver(t, "installation", guid1, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 0 {
+		t.Errorf("%d grant ends", n)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("the deleted installation is still linked")
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/widgets")); ok {
+		t.Error("the deleted installation's repository is kept")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"Qory Apiary's copy of the grants does not contain the installation's grant, so serve sends no grant end and drops its link","installation":42,"connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAStoreThatFailsToReadAnEndedConnectionsLinksIsLogged ends a connection while
+// the store, closed, fails every read: the failure is logged, ended runs, and the
+// connection's first listing kept is forgotten all the same.
+func TestAStoreThatFailsToReadAnEndedConnectionsLinksIsLogged(t *testing.T) {
+	st := openStore(t, filepath.Join(t.TempDir(), "state"))
+	log := &syncBuffer{}
+	a := &Adapter{Store: st, Log: slog.New(slog.NewJSONHandler(log, nil))}
+	a.firsts = map[firstKey]*firstListing{{42, testConnection}: {}}
+	st.Close()
+	var ended []string
+	a.forgetEnded(func(connection string) { ended = append(ended, connection) })(testConnection)
+	if !slices.Equal(ended, []string{testConnection}) {
+		t.Errorf("ended %v", ended)
+	}
+	if !strings.Contains(log.String(), `"level":"ERROR","msg":"reading the installations linked to an ended connection","connection":"`+testConnection+`","error":"`) {
+		t.Errorf("the log: %s", log.String())
+	}
+	if a.keptFirst(42, testConnection) {
+		t.Error("the connection's first listing is kept")
+	}
+}
+
+// TestCommentsAnsweredConnectionEndedOrSuspended has Qory Apiary answer comments on an
+// item of acme/widgets with a signed 409 connection_ended or connection_suspended:
+// ended drops the link of the installation linked to the connection and its
+// collections' records, as it does for any request of the connection, and suspended
+// changes nothing. Each is a refusal for good, and neither is taken for
+// collection_not_linked: no line says the comments are dropped for it. Another
+// connection's records stay.
+func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, code := range []string{codeConnectionEnded, codeConnectionSuspended} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		grantedLink(w.st, 43, otherConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		setReach(w.st, refOf("other/thing"), 43)
+		linkCollection(w.st, widgetsRef)
+		linkCollection(w.st, refOf("other/thing"))
+		w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"` + code + `"}` }
+		err := w.client.Comments(context.Background(), comments)
+		if !IsPermanent(err) || !refusedAs(err, http.StatusConflict, code) {
+			t.Errorf("%s: err %v", code, err)
+		}
+		if n := len(w.apiary.sent(routeComments)); n != 1 {
+			t.Errorf("%s: %d comments requests", code, n)
+		}
+		ended := code == codeConnectionEnded
+		if ok, _ := Linked(w.st, 42); ok == ended {
+			t.Errorf("%s: linked %v", code, ok)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); ok == ended {
+			t.Errorf("%s: the collection linked %v", code, ok)
+		}
+		if _, ok, _ := reachOf(w.st, widgetsRef); ok == ended {
+			t.Errorf("%s: the repository's installation kept %v", code, ok)
+		}
+		if ok, _ := Linked(w.st, 43); !ok {
+			t.Errorf("%s: another connection's installation is unlinked", code)
+		}
+		if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+			t.Errorf("%s: another connection's collection is unlinked", code)
+		}
+		if strings.Contains(w.log.String(), "Qory Apiary answered collection_not_linked to the comments, so they are dropped") {
+			t.Errorf("%s: logged as collection_not_linked: %s", code, w.log.String())
+		}
+	}
+}
+
+// TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
+// answer a listing and an item 409 connection_ended or connection_suspended, and a
+// disconnect 409 connection_suspended: ended drops the link of the installation linked
+// to the connection and its collections' records, and only that connection's; suspended
+// changes nothing. Each is a refusal for good, sent again on the periodic check. A
+// disconnect is never answered connection_ended: the contract answers a ref with no live
+// collection with the signed 204, and of the 409s only connection_suspended applies.
+func TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing(t *testing.T) {
+	for _, code := range []string{"connection_ended", "connection_suspended"} {
+		for _, send := range []string{"listing", "items", "disconnect"} {
+			if code == "connection_ended" && send == "disconnect" {
+				continue
+			}
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			grantedLink(w.st, 43, otherConnection, linkLive)
+			setReach(w.st, refOf("acme/widgets"), 42)
+			setReach(w.st, refOf("other/thing"), 43)
+			linkCollection(w.st, refOf("acme/widgets"))
+			linkCollection(w.st, refOf("other/thing"))
+			w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"` + code + `"}` }
+			var err error
+			switch send {
+			case "listing":
+				err = w.adapter.listRepositories(context.Background(), 42)
+			case "items":
+				err = w.client.Items(context.Background(), widgetsItem())
+			case "disconnect":
+				err = w.client.Disconnect(context.Background(), contracts.SourcesDisconnect{Version: 1, ConnectionID: testConnection, CollectionRef: refOf("acme/widgets")})
+			}
+			if !IsPermanent(err) || !strings.Contains(err.Error(), "409 "+code) {
+				t.Errorf("%s, %s: err %v", code, send, err)
+			}
+			ended := code == "connection_ended"
+			if ok, _ := Linked(w.st, 42); ok == ended {
+				t.Errorf("%s, %s: linked %v", code, send, ok)
+			}
+			if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok == ended {
+				t.Errorf("%s, %s: the collection linked %v", code, send, ok)
+			}
+			if _, ok, _ := reachOf(w.st, refOf("acme/widgets")); ok == ended && send != "listing" {
+				t.Errorf("%s, %s: the repository's installation kept %v", code, send, ok)
+			}
+			if ok, _ := Linked(w.st, 43); !ok {
+				t.Errorf("%s, %s: another connection's installation is unlinked", code, send)
+			}
+			if ok, _ := collectionLinked(w.st, refOf("other/thing")); !ok {
+				t.Errorf("%s, %s: another connection's collection is unlinked", code, send)
+			}
+		}
+	}
+	// A connection_ended about a connection the installation is no longer linked to
+	// drops nothing.
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	if dropped, err := dropConnection(w.st, otherConnection); dropped || err != nil {
+		t.Errorf("dropped %v, %v", dropped, err)
+	}
+	if ok, _ := Linked(w.st, 42); !ok {
+		t.Error("unlinked")
+	}
+}
+
+// TestAListingNamesTheConnectionAndMakesItsLinkLive lists a pending installation's
+// repositories: each part names the link's connection, a 403 leaves the link pending
+// while its connect return lives, and a signed 204 makes it live.
+func TestAListingNamesTheConnectionAndMakesItsLinkLive(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.apiary.refuse = func(_ string, n int) (int, string) {
+		if n <= 1 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listRepositories(context.Background(), 42); !refusedAs(err, 403, "") {
+		t.Errorf("err %v", err)
+	}
+	if l, _, _ := linkOf(w.st, 42); l.State != linkPending {
+		t.Errorf("a 403 made the link %s", l.State)
+	}
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if l, _, _ := linkOf(w.st, 42); l.State != linkLive || l.Connection != testConnection {
+		t.Errorf("the link %+v", l)
+	}
+	for _, r := range w.apiary.sent(routeCollections) {
+		if r.body["connection_id"] != testConnection {
+			t.Errorf("sent %s", r.raw)
+		}
+	}
+	// An installation not linked is not listed.
+	if err := w.adapter.listRepositories(context.Background(), 43); err != nil || len(w.apiary.sent(routeCollections)) != 2 {
+		t.Errorf("err %v, %d listings", err, len(w.apiary.sent(routeCollections)))
+	}
+}
+
+// TestDeliveriesOfAnInstallationNotLinkedAreNotKept sends many deliveries of an
+// installation that is not linked, of each event, and checks each is answered 202 and
+// none is kept, but the installation event's created and deleted, which are. An event
+// no handler takes is logged unhandled, before its installation is looked at.
+func TestDeliveriesOfAnInstallationNotLinkedAreNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	events := []struct {
+		event string
+		body  map[string]any
+	}{
+		{"issues", issueEvent(43, "acme/widgets", "opened")},
+		{"issue_comment", issueEvent(43, "acme/widgets", "created")},
+		{"installation_repositories", map[string]any{"action": "added", "installation": map[string]any{"id": 43}}},
+		{"installation", map[string]any{"action": "suspend", "installation": map[string]any{"id": 43}}},
+		{"workflow_run", map[string]any{"action": "completed", "installation": map[string]any{"id": 43}}},
+		{"ping", map[string]any{"zen": "Keep it logically awesome."}},
+	}
+	for i := range 300 {
+		e := events[i%len(events)]
+		b, _ := json.Marshal(e.body)
+		if rec := post(w.mux, e.event, fmt.Sprintf("00000000-0000-4000-8000-%012d", i), string(b), sign(string(b))); rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: %d", e.event, rec.Code)
+		}
+	}
+	if n := len(pending(t, w.st)); n != 0 {
+		t.Errorf("%d deliveries pending", n)
+	}
+	for i := range 300 {
+		if s := state(w.st, fmt.Sprintf("00000000-0000-4000-8000-%012d", i)); s != "" {
+			t.Fatalf("delivery %d is kept, %s", i, s)
+		}
+	}
+	notLinked, unhandled := strings.Count(w.log.String(), `"outcome":"not_linked"`), strings.Count(w.log.String(), `"outcome":"unhandled"`)
+	if notLinked != 200 || unhandled != 100 || w.apiary.count() != 0 {
+		t.Errorf("%d lines not_linked, %d unhandled, %d requests", notLinked, unhandled, w.apiary.count())
+	}
+	// The installation event's created and deleted are kept, and a linked
+	// installation's deliveries.
+	w.deliver(t, "installation", guid1, map[string]any{"action": "created", "installation": map[string]any{"id": 43}})
+	w.deliver(t, "installation", guid2, map[string]any{"action": "deleted", "installation": map[string]any{"id": 43}})
+	w.deliver(t, "issues", guid3, issueEvent(42, "acme/widgets", "opened"))
+}
+
+// TestAListingOf250CollectionsIsSentInThreeParts lists 250 repositories, which GitHub
+// answers in one page, and checks the three parts: 100, 100 and 50, one listing id and
+// start, and complete on the last alone. With part 2 refused, no part says complete.
+func TestAListingOf250CollectionsIsSentInThreeParts(t *testing.T) {
+	for _, refuse := range []bool{false, true} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		w.gh.repos = nil
+		for i := range 250 {
+			w.gh.repos = append(w.gh.repos, "acme/repo-"+strconv.Itoa(i))
+		}
+		if refuse {
+			// Qory Apiary's copy has the grant, so the refusal has another cause, and
+			// part 2 is not sent again.
+			w.apiary.grant("42", testConnection)
+			w.apiary.refuse = func(route string, n int) (int, string) {
+				if route == routeCollections && n == 2 {
+					return 400, `{"error":"invalid_request"}`
+				}
+				return 0, ""
+			}
+		}
+		err := w.adapter.listRepositories(context.Background(), 42)
+		if refuse != (err != nil) || refuse != IsPermanent(err) {
+			t.Fatalf("refused %v: err %v", refuse, err)
+		}
+		var parts []string
+		var first contracts.Listing
+		for i, r := range w.apiary.sent(routeCollections) {
+			var req contracts.SourceCollections
+			json.Unmarshal(r.raw, &req)
+			if i == 0 {
+				first = req.Listing
+			}
+			if req.Listing.ID != first.ID || req.Listing.StartedAt != first.StartedAt || req.Listing.Part != i+1 {
+				t.Errorf("part %d: listing %+v, first %+v", i+1, req.Listing, first)
+			}
+			parts = append(parts, strconv.Itoa(len(req.Collections))+" "+strconv.FormatBool(req.Listing.Complete))
+		}
+		want := "100 false, 100 false, 50 true"
+		if refuse {
+			// Part 2 is refused, and it carried every collection read, so no part ends
+			// the listing: none says it is complete.
+			want = "100 false, 100 false"
+		}
+		if strings.Join(parts, ", ") != want {
+			t.Errorf("refused %v: parts %v", refuse, parts)
+		}
+	}
+}
+
+// TestTheFeedLinksACollectionAndFillsIt reads a feed that links a collection, which
+// sends its open issues, and then unlinks it.
+func TestTheFeedLinksACollectionAndFillsIt(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.issues = []map[string]any{ghIssue(1, 0), ghIssue(2, 0)}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); !ok {
+		t.Error("the collection is not linked")
+	}
+	sent := w.apiary.sent(routeItems)
+	if len(sent) != 1 {
+		t.Fatalf("%d items requests", len(sent))
+	}
+	var req contracts.SourceItems
+	json.Unmarshal(sent[0].raw, &req)
+	if req.CollectionRef != refOf("acme/widgets") || len(req.Items) != 2 || req.Listing == nil || !req.Listing.Complete {
+		t.Errorf("filled with %s", sent[0].raw)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "unlinked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the collection is still linked")
+	}
+	if gets := w.apiary.sent("GET " + routeChanges); len(gets) != 2 || gets[0].target != routeChanges || gets[1].target != routeChanges+"?after=c_1" {
+		t.Errorf("read %v", gets)
+	}
+}
+
+// TestTextsPastTheContractsLimitsReachQoryApiaryValid fills a collection from GitHub's
+// API on a loopback host and port, and delivers an event, whose issue has a label of 101
+// characters and a filer of 300, and whose comment has an author of 300, and checks
+// every body reaches Qory Apiary as the contract takes it: the fake checks each against
+// the contract's schema, and the texts are cut and the system is the host alone. The
+// cuts are logged by ref, field and length, never by their text, throttled, and the
+// count held back is logged when the log stops.
+func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	if !strings.Contains(strings.TrimPrefix(w.gh.srv.URL, "http://"), ":") {
+		t.Fatalf("GitHub's API is at %s, without a port", w.gh.srv.URL)
+	}
+	is := ghIssue(1, 1)
+	is["labels"] = []any{map[string]any{"name": strings.Repeat("a", 101)}}
+	is["user"] = map[string]any{"login": strings.Repeat("n", 300), "type": "User"}
+	w.gh.issues = []map[string]any{is}
+	w.gh.comments[1] = []map[string]any{{
+		"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.",
+		"user": map[string]any{"login": strings.Repeat("m", 300), "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+	}}
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ev := issueEvent(42, "acme/widgets", "edited")
+	ev["issue"] = is
+	w.deliver(t, "issues", guid1, ev)
+	items := w.apiary.sent(routeItems)
+	if len(items) != 2 {
+		t.Fatalf("%d items requests", len(items))
+	}
+	for _, sent := range items {
+		var req contracts.SourceItems
+		json.Unmarshal(sent.raw, &req)
+		it := req.Items[0]
+		if len(req.Items) != 1 || !reflect.DeepEqual(it.Labels, []string{strings.Repeat("a", 100)}) || it.FiledBy.Name != strings.Repeat("n", 100) || it.Target == nil || it.Target.System != "127.0.0.1" {
+			t.Errorf("sent %s", sent.raw)
+		}
+	}
+	comments := w.apiary.sent(routeComments)
+	if len(comments) != 1 {
+		t.Fatalf("%d comments requests", len(comments))
+	}
+	var req contracts.SourceItemComments
+	json.Unmarshal(comments[0].raw, &req)
+	if len(req.Comments) != 1 || req.Comments[0].Author.Name != strings.Repeat("m", 100) {
+		t.Errorf("sent %s", comments[0].raw)
+	}
+	w.adapter.stopLog()
+	logged := w.log.String()
+	if !strings.Contains(logged, `"msg":"cut to the contract's limit","ref":"`+widgetsRef+`#1","field":"label","length":101`) || !strings.Contains(logged, `"msg":"cuts dropped","cuts_dropped":`) {
+		t.Errorf("the log: %s", logged)
+	}
+	if strings.Contains(logged, strings.Repeat("a", 100)) || strings.Contains(logged, strings.Repeat("n", 100)) || strings.Contains(logged, strings.Repeat("m", 100)) {
+		t.Errorf("a text is logged: %s", logged)
+	}
+}
+
+// TestTheFeedTakesInAWorkItemOnceThroughAReplay reads a work item taken in, which
+// labels the issue and comments once, and reads the feed again from the start, which
+// posts no second comment; and stores the sync interval, clamped.
+func TestTheFeedTakesInAWorkItemOnceThroughAReplay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	sixty, day := 60, 86400
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeSync, Interval: &sixty},
+	)
+	for range 2 {
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.st.Delete(nsAdapter, keyCursor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	posted := w.gh.postedComments()
+	if len(posted) != 1 || !strings.HasPrefix(posted[0], "<!-- qory:work-item wi_42 -->") || len(w.gh.labelled) != 2 {
+		t.Errorf("posted %q, labelled %v", posted, w.gh.labelled)
+	}
+	if !strings.Contains(strings.Join(w.gh.mints, " "), `{"permissions":{"issues":"write"},"repository_ids":[`+widgetsRef+`]}`) {
+		t.Errorf("mints %v", w.gh.mints)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+		t.Errorf("the interval %s", v)
+	}
+	for interval, want := range map[*int]string{nil: "3600", &day: "86400"} {
+		if err := w.feed.apply(context.Background(), contracts.Change{Kind: contracts.ChangeSync, Interval: interval}); err != nil {
+			t.Fatal(err)
+		}
+		if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != want {
+			t.Errorf("the interval %s, want %s", v, want)
+		}
+	}
+}
+
+// TestAFeedEntryThatFailsForGoodIsPassed reads a work item of a repository no listing
+// named and a collection whose ref is not a repository's id, both logged and passed, so the
+// cursor moves, and the store holds no link for the bad ref.
+func TestAFeedEntryThatFailsForGoodIsPassed(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/unknown", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "", Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: strings.Repeat("a", 300), Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: "acme", Status: "unlinked"},
+	)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_4" {
+		t.Errorf("the cursor %q", c)
+	}
+	logged := w.log.String()
+	if !strings.Contains(logged, "no installation is known") || strings.Count(logged, "the collection's ref is not a repository's id") != 3 || len(w.gh.requests) != 0 {
+		t.Errorf("the log %s, GitHub %v", logged, w.gh.requests)
+	}
+	n := 0
+	w.st.Each(nsCollections, func(string, []byte) error { n++; return nil })
+	if n != 0 {
+		t.Errorf("%d collections stored", n)
+	}
+}
+
+// TestAnEntryWhoseRefIsNotAnIDIsRefusedBeforeGitHub reads work items and collections
+// whose refs are not a repository's id, and #, and an issue's number for a work item:
+// letters, empty, a leading zero, a sign, past an int64, without #, with a second #, a
+// path, and owner/name. Each fails for good and is passed, the cursor moves, the store
+// holds no link, and GitHub is asked nothing, though the installation that reaches
+// acme/widgets, whose id some of them write with a leading zero or a sign, is linked: no
+// path is built from the ref's text.
+func TestAnEntryWhoseRefIsNotAnIDIsRefusedBeforeGitHub(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	items := []string{"widgets#7", "", "#7", widgetsRef + "#", "0" + widgetsRef + "#7", widgetsRef + "#07", "+" + widgetsRef + "#7", "-" + widgetsRef + "#7", widgetsRef + "#-7", "9223372036854775808#7", widgetsRef + "#9223372036854775808", widgetsRef, widgetsRef + "#7#8", "../" + widgetsRef + "#7", widgetsRef + "/../#7", "acme/widgets#7", "0#7", widgetsRef + "#0", " " + widgetsRef + "#7"}
+	collections := []string{"widgets", "", "0" + widgetsRef, "+" + widgetsRef, "-" + widgetsRef, "9223372036854775808", widgetsRef + "#7", "acme/widgets", "acme", "0", widgetsRef + " ", "../" + widgetsRef}
+	var chs []contracts.Change
+	for _, ref := range items {
+		chs = append(chs, contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: ref, Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+	}
+	for _, ref := range collections {
+		chs = append(chs, contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: ref, Status: "linked"})
+	}
+	w.apiary.add(chs...)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_"+strconv.Itoa(len(chs)) {
+		t.Errorf("the cursor %q", c)
+	}
+	logged := w.log.String()
+	if n := strings.Count(logged, "the change's ref is not a repository's id, #, and an issue's number"); n != len(items) {
+		t.Errorf("%d work items refused, want %d: %s", n, len(items), logged)
+	}
+	if n := strings.Count(logged, "the collection's ref is not a repository's id"); n != len(collections) {
+		t.Errorf("%d collections refused, want %d: %s", n, len(collections), logged)
+	}
+	w.gh.mu.Lock()
+	asked := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if len(asked) != 0 {
+		t.Errorf("GitHub was asked %v", asked)
+	}
+	n := 0
+	w.st.Each(nsCollections, func(string, []byte) error { n++; return nil })
+	if n != 0 {
+		t.Errorf("%d collections stored", n)
+	}
+}
+
+// TestATakeInAndAnUndoReachGitHubByTheRepositoryID applies a work item taken in and then
+// undone whose ref is acme/widgets's id and the issue's number: each request reaches the
+// repository through its id, /repositories/{id}, none by owner/name, and the token that
+// writes the issue is minted for the repository's id alone.
+func TestATakeInAndAnUndoReachGitHubByTheRepositoryID(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: widgetsRef + "#7", Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: widgetsRef + "#7", Status: "undone", URL: "https://apiary.example.com/work-items/wi_42"},
+	)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(w.log.String(), "a change of the feed failed") {
+		t.Errorf("the log %s", w.log.String())
+	}
+	w.gh.mu.Lock()
+	asked := slices.Clone(w.gh.requests)
+	mints := slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	const repo = "/repositories/" + widgetsRef
+	var reached []string
+	for _, r := range asked {
+		if !strings.Contains(r, " /app/") {
+			reached = append(reached, r)
+		}
+	}
+	want := []string{
+		"POST " + repo + "/labels",
+		"POST " + repo + "/issues/7/labels",
+		"GET " + repo + "/issues/7/comments?per_page=100",
+		"POST " + repo + "/issues/7/comments",
+		"DELETE " + repo + "/issues/7/labels/qory",
+	}
+	if !slices.Equal(reached, want) {
+		t.Errorf("GitHub was asked\n%s\nwant\n%s", strings.Join(reached, "\n"), strings.Join(want, "\n"))
+	}
+	if !slices.Equal(mints, []string{`{"permissions":{"issues":"write"},"repository_ids":[` + widgetsRef + `]}`}) {
+		t.Errorf("mints %v", mints)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 || !strings.HasPrefix(posted[0], "<!-- qory:work-item wi_42 -->") {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// reachedGitHub are the requests GitHub was asked, but for the App's and its token's,
+// under /app/, in order.
+func reachedGitHub(f *fakeGitHub) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, r := range f.requests {
+		if !strings.Contains(r, " /app/") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestAFillReadsTheNameByTheIDAndListsByIt fills acme/widgets by its ref, the
+// repository's id: it reads the repository by that id, GET /repositories/{id}, and then
+// asks GraphQL for the name that read gave, and nothing else, with one token minted for
+// the repository's id; the listing is sent and complete, and the fill's start kept.
+func TestAFillReadsTheNameByTheIDAndListsByIt(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	if err := w.adapter.fill(context.Background(), widgetsRef); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"GET /repositories/" + widgetsRef, "POST /graphql"}
+	if got := reachedGitHub(w.gh); !slices.Equal(got, want) {
+		t.Errorf("GitHub was asked %v, want %v", got, want)
+	}
+	w.gh.mu.Lock()
+	asked, mints := slices.Clone(w.gh.gqlAsked), slices.Clone(w.gh.mints)
+	w.gh.mu.Unlock()
+	if !slices.Equal(asked, []string{"acme/widgets"}) {
+		t.Errorf("GraphQL was asked for %v", asked)
+	}
+	if !slices.Equal(mints, []string{`{"permissions":{"issues":"read"},"repository_ids":[` + widgetsRef + `]}`}) {
+		t.Errorf("mints %v", mints)
+	}
+	sent := w.apiary.sent(routeItems)
+	if len(sent) != 1 || sent[0].body["collection_ref"] != widgetsRef || !strings.Contains(string(sent[0].raw), `"complete":true`) {
+		t.Errorf("sent %+v", sent)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() {
+		t.Error("the fill's start is not kept")
+	}
+}
+
+// TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain fills acme/widgets while GraphQL
+// answers, for the name read by the id, a repository whose id is another, as when the
+// name came to name another repository between the two requests, one with no id, or
+// NOT_FOUND, as when the name came to name none: the fill sends nothing, no item and no
+// complete listing, keeps no start, and fails with an error that passes, not for good
+// and not as a repository gone, so the change feed tries it again.
+func TestAFillWhoseNameNamesAnotherRepositoryIsTriedAgain(t *testing.T) {
+	for _, id := range []any{gadgetsRef, nil, "not found"} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		w.gh.issues = []map[string]any{ghIssue(1, 0)}
+		if id == "not found" {
+			w.gh.gqlNotFound = true
+		} else {
+			w.gh.gqlIDSet, w.gh.gqlID = true, id
+		}
+		err := w.adapter.fill(context.Background(), widgetsRef)
+		if err == nil || IsPermanent(err) || errors.Is(err, github.ErrRepositoryGone) {
+			t.Errorf("%v: err %v", id, err)
+		}
+		if n := len(w.apiary.sent(routeItems)); n != 0 {
+			t.Errorf("%v: %d items requests", id, n)
+		}
+		if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+			t.Errorf("%v: kept %+v", id, m)
+		}
+		want := []string{"GET /repositories/" + widgetsRef, "POST /graphql"}
+		if got := reachedGitHub(w.gh); !slices.Equal(got, want) {
+			t.Errorf("%v: GitHub was asked %v, want %v", id, got, want)
+		}
+	}
+}
+
+// TestAFillWhoseReadFailsSendsNothing fills acme/widgets while GitHub fails the read of
+// the repository by its id: a 404 or a 410, which by the id says the repository is
+// deleted or out of the App's reach, as after a transfer to an account the installation
+// is not on, never after a rename, fails it for good as a repository gone, and says so;
+// a 500 fails it with an error that passes. Either way GraphQL is never asked, nothing
+// is sent and no start is kept.
+func TestAFillWhoseReadFailsSendsNothing(t *testing.T) {
+	const goneText = "the repository is deleted or out of the App's reach, or GitHub redirects a request by its id"
+	for _, status := range []int{404, 410, 500} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		w.gh.issues = []map[string]any{ghIssue(1, 0)}
+		w.gh.readStatus = status
+		err := w.adapter.fill(context.Background(), widgetsRef)
+		gone := status == 404 || status == 410
+		if err == nil || IsPermanent(err) != gone || errors.Is(err, github.ErrRepositoryGone) != gone || strings.Contains(err.Error(), goneText) != gone {
+			t.Errorf("%d: err %v", status, err)
+		}
+		w.gh.mu.Lock()
+		pages := w.gh.gqlPages
+		w.gh.mu.Unlock()
+		if pages != 0 || len(w.apiary.sent(routeItems)) != 0 {
+			t.Errorf("%d: GraphQL asked %d times; %d items requests", status, pages, len(w.apiary.sent(routeItems)))
+		}
+		if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+			t.Errorf("%d: kept %+v", status, m)
+		}
+	}
+}
+
+// TestARepositoryRemovedIsFoundByItsID delivers installation_repositories removed whose
+// repository GitHub names by an id the store holds, under a name no listing gave, and
+// one it names by owner/name alone: the first is disconnected by its id and forgotten,
+// and the second, whose id the event leaves out, is not, though the store holds its
+// repository.
+func TestARepositoryRemovedIsFoundByItsID(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/old"), 42)
+	setReach(w.st, gadgetsRef, 42)
+	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{
+		map[string]any{"id": oldID, "full_name": "acme/elsewhere"},
+		map[string]any{"full_name": "acme/gadgets"},
+	}})
+	if got := w.disconnected(0); !slices.Equal(got, refsOf("acme/old")) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok {
+		t.Error("the removed repository's installation is kept")
+	}
+	if inst, ok, _ := reachOf(w.st, gadgetsRef); !ok || inst != 42 {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+}
+
+// TestAnEntryForAnIssueOrARepositoryGoneIsPassed reads a work item whose issue GitHub
+// answers 404, one in a repository GitHub answers 301, a linked collection whose
+// repository GitHub answers 404 or 301, and a work item and a linked collection of a
+// repository the installation no longer reaches, whose token's mint GitHub answers 422,
+// each before an entry serve can apply, and checks each is passed, the entry after it
+// applied and the cursor moved.
+func TestAnEntryForAnIssueOrARepositoryGoneIsPassed(t *testing.T) {
+	for name, gone := range map[string]contracts.Change{
+		"a work item whose issue is gone":       {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_8", Ref: itemOf("acme/widgets", 8), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_8"},
+		"a work item whose repository moved":    {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_9", Ref: itemOf("acme/moved", 9), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_9"},
+		"a collection whose repository is gone": {Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/gone"), Status: "linked"},
+		"a collection whose repository moved":   {Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/moved"), Status: "linked"},
+		"a collection out of reach":             {Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/old"), Status: "linked"},
+		"a work item out of reach":              {Kind: contracts.ChangeWorkItem, WorkItemID: "wi_10", Ref: itemOf("acme/old", 9), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_10"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		for _, repo := range []string{"acme/widgets", "acme/moved", "acme/old", "acme/gone"} {
+			setReach(w.st, refOf(repo), 42)
+		}
+		w.apiary.add(gone, contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+			t.Errorf("%s: the cursor %q", name, c)
+		}
+		if posted := w.gh.postedComments(); len(posted) != 1 || !strings.HasPrefix(posted[0], "<!-- qory:work-item wi_42 -->") {
+			t.Errorf("%s: posted %q", name, posted)
+		}
+		if !strings.Contains(w.log.String(), "a change of the feed failed, and is passed") {
+			t.Errorf("%s: the log %s", name, w.log.String())
+		}
+	}
+}
+
+// TestAFillLosesOnlyTheCommentsOfAnIssueGone links a collection of 150 open issues, the
+// first of which GitHub answers 404 for its comments, and checks every issue is sent,
+// the others' comments too, and the entry passes.
+func TestAFillLosesOnlyTheCommentsOfAnIssueGone(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.goneComments = 1
+	for i := 1; i <= 150; i++ {
+		w.gh.issues = append(w.gh.issues, ghIssue(i, 1))
+		w.gh.comments[i] = []map[string]any{{
+			"id": 1000 + i, "html_url": "https://github.com/acme/widgets/issues/" + strconv.Itoa(i) + "#issuecomment-1", "body": "c",
+			"user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+		}}
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	items := 0
+	for _, r := range w.apiary.sent(routeItems) {
+		items += len(r.body["items"].([]any))
+	}
+	if comments := len(w.apiary.sent(routeComments)); items != 150 || comments != 149 {
+		t.Errorf("%d items, %d comments requests", items, comments)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	if !strings.Contains(w.log.String(), "skipped the comments on "+widgetsRef+"#1: GitHub answers that the issue is gone or moved") {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAnEntryIsPassedOnceItHasFailedForADay links a collection whose issues GitHub
+// answers 502, on a clock that moves on between the reads, and checks the entry keeps
+// the cursor until it has failed for a day, and is then logged and passed, the entry
+// after it applied.
+func TestAnEntryIsPassedOnceItHasFailedForADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.issuesDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"}, contracts.Change{Kind: contracts.ChangeSync})
+	for _, d := range []time.Duration{0, time.Hour, 22*time.Hour + 59*time.Minute} {
+		now = now.Add(d)
+		err := w.feed.step(context.Background())
+		if err == nil || IsPermanent(err) || !strings.Contains(err.Error(), "GitHub answered 502") {
+			t.Fatalf("after %v: err %v", d, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v: the cursor is kept", d)
+		}
+	}
+	now = now.Add(time.Minute)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "3600" {
+		t.Errorf("the entry after it is not applied: %q", v)
+	}
+	if !strings.Contains(w.log.String(), `"level":"ERROR","msg":"a change of the feed has failed for a day, and is passed","kind":"collection"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestTwoEntriesThatFailOnOnePageArePassedEachAfterADay serves a page of two entries
+// GitHub answers 502 for, a linked collection and a take in, and a sync entry, on a
+// clock that moves a day between reads, and checks each failing entry is passed a day
+// after that entry's first failure, the first not tried again, and the cursor moves once
+// the sync is applied.
+func TestTwoEntriesThatFailOnOnePageArePassedEachAfterADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.reposDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeSync},
+	)
+	read := func(what string, passed bool) {
+		t.Helper()
+		err := w.feed.step(context.Background())
+		cursor, _ := w.st.Get(nsAdapter, keyCursor)
+		if passed && (err != nil || string(cursor) != "c_3") || !passed && (err == nil || !strings.Contains(err.Error(), "502") || len(cursor) != 0) {
+			t.Fatalf("%s: err %v, cursor %q", what, err, cursor)
+		}
+	}
+	read("the collection fails", false)
+	now = now.Add(23 * time.Hour)
+	read("the collection fails 23 hours later", false)
+	now = now.Add(time.Hour)
+	read("the collection is passed, and the take in fails", false)
+	now = now.Add(23 * time.Hour)
+	read("the take in fails 23 hours later", false)
+	now = now.Add(time.Hour)
+	read("the take in is passed, and the sync applied", true)
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "3600" {
+		t.Errorf("the sync is not applied: %q", v)
+	}
+	logged := w.log.String()
+	if strings.Count(logged, "a change of the feed has failed for a day, and is passed") != 2 || !strings.Contains(logged, `"kind":"collection"`) || !strings.Contains(logged, `"kind":"work_item"`) {
+		t.Errorf("the log %s", logged)
+	}
+}
+
+// TestAnOutageOfTheFeedDoesNotCountTowardADay has an entry fail, then the feed's reads
+// fail for a day, then the entry fail again, and checks it is not passed then, only once
+// its failures, the outage left out, add up to a day.
+func TestAnOutageOfTheFeedDoesNotCountTowardADay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.issuesDown = true
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
+	if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+		t.Fatalf("err %v", err)
+	}
+	down := true
+	w.apiary.mu.Lock()
+	w.apiary.refuseGet = func(int) (int, string) {
+		if down {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	for range 25 {
+		now = now.Add(time.Hour)
+		if err := w.feed.step(context.Background()); !IsOutage(err) {
+			t.Fatalf("err %v", err)
+		}
+	}
+	w.apiary.mu.Lock()
+	down = false
+	w.apiary.mu.Unlock()
+	if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+		t.Fatalf("the entry is passed after the feed's outage: err %v", err)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("the cursor is kept")
+	}
+	// The entry failed an hour before the outage: a day of its failures is 23 hours
+	// after the outage.
+	now = now.Add(22 * time.Hour)
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the entry is passed before a day of its failures")
+	}
+	now = now.Add(time.Hour)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+}
+
+// TestAFeedEntryThatMayPassKeepsTheCursor links a collection whose fill Qory Apiary
+// answers 500, and checks the step fails and the cursor stays, so the entry is read
+// again.
+func TestAFeedEntryThatMayPassKeepsTheCursor(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeItems {
+			return 500, `{"error":"internal"}`
+		}
+		return 0, ""
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"})
+	err := w.feed.step(context.Background())
+	if err == nil || IsPermanent(err) || !IsOutage(err) {
+		t.Errorf("err %v", err)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+}
+
+// TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole serves a page whose last entry
+// has a kind, or a status, serve does not know, and checks none of the page is
+// applied, its cursor is not kept, and the refusal is logged with the cursor it was
+// read after and the entry's kind and status; then serves a page serve knows, which
+// moves the feed on.
+func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
+	for _, bad := range []contracts.Change{
+		{Kind: "label", Status: "added"},
+		{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "shelved", URL: "https://apiary.example.com/work-items/wi_42"},
+		{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "archived"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/gadgets"), Status: "linked"}, bad)
+		var u *unknownChange
+		if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.after != "c_1" || u.kind != bad.Kind || u.status != bad.Status {
+			t.Errorf("%s %s: err %v", bad.Kind, bad.Status, err)
+		}
+		if ok, _ := collectionLinked(w.st, refOf("acme/gadgets")); ok {
+			t.Errorf("%s %s: an entry of the refused page is applied", bad.Kind, bad.Status)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+			t.Errorf("%s %s: the cursor %q", bad.Kind, bad.Status, c)
+		}
+		// run logs the refusal and waits, then reads the same cursor again.
+		ctx, cancel := context.WithCancel(context.Background())
+		var waits []time.Duration
+		after := -1
+		w.feed.sleep = func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			switch {
+			case d == feedFirstBackoff && after < 0:
+				// Qory Apiary's next answer is one serve knows.
+				w.apiary.mu.Lock()
+				w.apiary.changes = w.apiary.changes[:2]
+				w.apiary.mu.Unlock()
+				after = 0
+			case after >= 0:
+				// The floor before that read, then the floor after it, which stops.
+				if after++; after == 2 {
+					cancel()
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
+		w.feed.run(ctx)
+		cancel()
+		logged := w.log.String()
+		want := `"level":"ERROR","msg":"an answer of the change feed holds an entry serve does not know, so none of it is applied","after":"c_1","kind":"` + bad.Kind + `","status":"` + bad.Status + `"`
+		if !strings.Contains(logged, want) {
+			t.Errorf("%s %s: the log %s", bad.Kind, bad.Status, logged)
+		}
+		if !slices.Contains(waits, feedFirstBackoff) {
+			t.Errorf("%s %s: waited %v", bad.Kind, bad.Status, waits)
+		}
+		if ok, _ := collectionLinked(w.st, refOf("acme/gadgets")); !ok {
+			t.Errorf("%s %s: the page that followed is not applied", bad.Kind, bad.Status)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+			t.Errorf("%s %s: the cursor %q", bad.Kind, bad.Status, c)
+		}
+		gets := w.apiary.sent("GET " + routeChanges)
+		if len(gets) < 3 || gets[1].target != routeChanges+"?after=c_1" || gets[2].target != routeChanges+"?after=c_1" {
+			t.Errorf("%s %s: read %v", bad.Kind, bad.Status, gets)
+		}
+	}
+}
+
+// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose kind and status are long,
+// and checks the refusal keeps 64 characters of each.
+func TestAnUnknownEntrysKindAndStatusAreCut(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100), Status: strings.Repeat("s", 100)})
+	var u *unknownChange
+	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != strings.Repeat("ü", 64) || u.status != strings.Repeat("s", 64) {
+		t.Errorf("err %v", err)
+	}
+}
+
+// TestTheFeedWaitsFromItsLastRequest has Qory Apiary answer the feed's first read 429,
+// which the read waits out and sends again a second later, and checks the next read
+// waits a second from that retry, not from the step's start.
+func TestTheFeedWaitsFromItsLastRequest(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	var mu sync.Mutex
+	now := time.Now()
+	w.client.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	w.client.Sleep = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+		return nil
+	}
+	w.apiary.refuseGet = func(n int) (int, string) {
+		if n == 1 {
+			return 429, `{"error":"rate_limited"}`
+		}
+		return 0, ""
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits []time.Duration
+	w.feed.sleep = func(ctx context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		cancel()
+		return ctx.Err()
+	}
+	w.feed.run(ctx)
+	if len(waits) != 1 || waits[0] != feedFloor {
+		t.Errorf("waited %v", waits)
+	}
+	if gets := w.apiary.sent("GET " + routeChanges); len(gets) != 2 {
+		t.Errorf("read %d times", len(gets))
+	}
+}
+
+// TestTheFeedStopsDuringALongRead has Qory Apiary hold the feed's read, and checks run
+// returns soon after its context is done.
+func TestTheFeedStopsDuringALongRead(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.hold = true
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { w.feed.run(ctx); close(done) }()
+	eventually(t, "the read is held", func() bool { return len(w.apiary.sent("GET "+routeChanges)) == 1 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return")
+	}
+}
+
+// TestA409OnCommentsIsFinalForThatRequestOnly has Qory Apiary answer a webhook's
+// comments 409 collection_not_linked, as it answers comments on an item it holds no
+// item for, and checks that request alone is dropped: it is sent once, logged at Info
+// with the item and the collection and no token or body, and the delivery is done; the
+// collection stays linked, so the next item and comment are sent, and a pull runs and
+// sends its items and comments. A 409 collection_not_linked to items still unlinks.
+func TestA409OnCommentsIsFinalForThatRequestOnly(t *testing.T) {
+	w, f, p, clock := pulling(t)
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeComments && n == 1 {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	comment := func(id int) map[string]any {
+		ev := issueEvent(42, "acme/widgets", "created")
+		ev["comment"] = map[string]any{"id": id, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-" + strconv.Itoa(id), "body": "A body that is never logged.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
+		return ev
+	}
+	w.deliver(t, "issue_comment", guid1, comment(5))
+	if n := len(w.apiary.sent(routeComments)); n != 1 || state(w.st, guid1) != store.Done {
+		t.Errorf("%d comments requests, %s", n, state(w.st, guid1))
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Fatal("a 409 to comments unlinked the collection")
+	}
+	line := `"level":"INFO","msg":"Qory Apiary answered collection_not_linked to the comments, so they are dropped","item":"` + itemOf("acme/widgets", 1) + `","collection":"` + widgetsRef + `"`
+	if log := w.log.String(); strings.Count(log, line) != 1 || strings.Contains(log, "the request is refused") || strings.Contains(log, "never logged") {
+		t.Errorf("the log: %s", log)
+	}
+	// The next item and comment of the repository are sent.
+	w.deliver(t, "issues", guid2, issueEvent(42, "acme/widgets", "edited"))
+	w.deliver(t, "issue_comment", guid3, comment(6))
+	if items, comments := len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)); items != 1 || comments != 2 {
+		t.Errorf("then %d items and %d comments requests", items, comments)
+	}
+	// And a pull runs.
+	keepPulled(w.st, widgetsRef, pullMark{Since: pullStart.Add(-time.Hour), Listed: pullStart.Add(-time.Hour)})
+	w.gh.issues = []map[string]any{ghIssue(1, 1)}
+	f.comments = []map[string]any{repoComment(11, 1)}
+	clock.t = pullStart
+	if err := p.pull(context.Background(), widgetsRef, 42, &listedRepositories{}); err != nil {
+		t.Fatal(err)
+	}
+	if items, comments := len(w.apiary.sent(routeItems)), len(w.apiary.sent(routeComments)); items != 2 || comments != 3 {
+		t.Errorf("after the pull, %d items and %d comments requests", items, comments)
+	}
+	if strings.Contains(w.log.String(), ghToken) {
+		t.Error("the log holds the token")
+	}
+	// A 409 collection_not_linked to items unlinks the collection.
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeItems {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	if err := w.client.Items(context.Background(), widgetsItem()); !refusedAs(err, 409, codeCollectionNotLinked) || !IsPermanent(err) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); ok {
+		t.Error("a 409 to items left the collection linked")
+	}
+}
+
+// TestAFillCarriesOnPastA409OnComments fills acme/widgets, 150 open issues in two
+// parts, while Qory Apiary answers the comments on issue 1, sent after the first part,
+// 409 collection_not_linked: the fill carries on, sends the comments on issue 101 and
+// the second part, which says the listing is complete, and passes; its mark is kept,
+// the collection stays linked, and the comments dropped are logged once.
+func TestAFillCarriesOnPastA409OnComments(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	for n := 1; n <= 150; n++ {
+		comments := 0
+		if n == 1 || n == 101 {
+			comments = 1
+			w.gh.comments[n] = []map[string]any{{
+				"id": 5000 + n, "html_url": "https://github.com/acme/widgets/issues/" + strconv.Itoa(n) + "#issuecomment-" + strconv.Itoa(5000+n), "body": "Same here.",
+				"user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z",
+			}}
+		}
+		w.gh.issues = append(w.gh.issues, ghIssue(n, comments))
+	}
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeComments && n == 1 {
+			return 409, `{"error":"collection_not_linked"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.fill(context.Background(), widgetsRef); err != nil {
+		t.Fatal(err)
+	}
+	var parts []contracts.Listing
+	items := 0
+	for _, r := range w.apiary.sent(routeItems) {
+		var req contracts.SourceItems
+		json.Unmarshal(r.raw, &req)
+		items += len(req.Items)
+		if req.Listing != nil {
+			parts = append(parts, *req.Listing)
+		}
+	}
+	if len(parts) != 2 || parts[0].Complete || !parts[1].Complete || items != 150 {
+		t.Errorf("%d items in parts %+v", items, parts)
+	}
+	var on []string
+	for _, r := range w.apiary.sent(routeComments) {
+		on = append(on, r.body["item_ref"].(string))
+	}
+	if want := []string{itemOf("acme/widgets", 1), itemOf("acme/widgets", 101)}; !slices.Equal(on, want) {
+		t.Errorf("comments sent on %v, want %v", on, want)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() || m.Listed.IsZero() {
+		t.Errorf("kept %+v", m)
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Error("a 409 to comments unlinked the collection")
+	}
+	if n := strings.Count(w.log.String(), "Qory Apiary answered collection_not_linked to the comments, so they are dropped"); n != 1 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// TestA409ForARequestBeforeALinkKeepsTheLink has the change feed unlink and link the
+// collection again while a request for it is answered 409 collection_not_linked, and
+// checks the link stored after the request began stands.
+func TestA409ForARequestBeforeALinkKeepsTheLink(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	linkCollection(w.st, refOf("acme/widgets"))
+	w.apiary.refuse = func(string, int) (int, string) {
+		unlinkCollection(w.st, refOf("acme/widgets"))
+		linkCollection(w.st, refOf("acme/widgets"))
+		return 409, `{"error":"collection_not_linked"}`
+	}
+	if err := w.client.Items(context.Background(), widgetsItem()); !IsPermanent(err) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); !ok {
+		t.Error("a 409 for a request that began before the link unlinked the collection")
+	}
+}
+
+// TestAGitHub401DropsTheInstallationsTokens has GitHub answer a fill 401, and checks
+// the installation's tokens are dropped, so the next request mints a new one.
+func TestAGitHub401DropsTheInstallationsTokens(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.unauthorized = true
+	if err := w.adapter.fill(context.Background(), refOf("acme/widgets")); !github.Unauthorized(err) {
+		t.Fatalf("err %v", err)
+	}
+	w.adapter.mu.Lock()
+	n := len(w.adapter.tokens)
+	w.adapter.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d tokens kept", n)
+	}
+	w.gh.mu.Lock()
+	w.gh.unauthorized = false
+	w.gh.mu.Unlock()
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, refOf("acme/widgets"))
+	if err := w.adapter.fill(context.Background(), refOf("acme/widgets")); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.gh.mints) != 2 {
+		t.Errorf("%d tokens minted, want 2", len(w.gh.mints))
+	}
+}
+
+// TestAnAdapterPrintsNoTokenAndNoKey prints an adapter that keeps a token with every
+// verb, and checks neither the token nor the App's key is printed.
+func TestAnAdapterPrintsNoTokenAndNoKey(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	w.gh.issues = []map[string]any{ghIssue(1, 0)}
+	linkCollection(w.st, refOf("acme/widgets"))
+	if err := w.adapter.fill(context.Background(), refOf("acme/widgets")); err != nil {
+		t.Fatal(err)
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x"} {
+		out := fmt.Sprintf(verb, w.adapter)
+		if strings.Contains(out, ghToken) || strings.Contains(out, appKey().D.String()) || strings.Contains(out, fmt.Sprintf("%x", ghToken)) {
+			t.Errorf("%s prints %s", verb, out)
+		}
+	}
+	if got := fmt.Sprintf("%+v", w.adapter); got != `serve.Adapter{AppID: "1", Slug: "qory-test", tokens: 1 kept}` {
+		t.Errorf("printed %s", got)
+	}
+}
+
+// TestTheCursorSurvivesARestart reads the feed, closes the store, opens it again, and
+// checks the next read starts after the cursor kept.
+func TestTheCursorSurvivesARestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	w := newWired(t, dir)
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.st.Close()
+	st, err := store.Open(dir, store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	f := &feed{apiary: w.client, adapter: w.adapter, store: st, log: slog.New(slog.DiscardHandler)}
+	if err := f.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gets := w.apiary.sent("GET " + routeChanges); len(gets) != 2 || gets[1].target != routeChanges+"?after=c_1" {
+		t.Errorf("read %v", gets)
+	}
+}
+
+// TestAnAnswerNotSignedUnderThePinIsRefused has Qory Apiary sign its answers under a
+// key the pin does not list, and checks no answer is used: a POST fails, not for good,
+// and the feed's page is refused and its cursor not kept.
+func TestAnAnswerNotSignedUnderThePinIsRefused(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.signer = newKey(t)
+	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
+	linkCollection(w.st, refOf("acme/widgets"))
+	err := w.client.Items(context.Background(), widgetsItem())
+	if err == nil || IsPermanent(err) || !strings.Contains(err.Error(), "is not signed under a key of apiary_public_key") {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); !ok {
+		t.Error("an unsigned refusal unlinked the collection")
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Error("the feed's page is used")
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+}
+
+// TestASuccessNotSignedUnderThePinIsAnOutage has Qory Apiary answer a POST with its
+// success, a 204 and no body, signed under a key the pin does not list, and checks the
+// answer is not taken as a success: the POST fails as an [Outage], not for good.
+func TestASuccessNotSignedUnderThePinIsAnOutage(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.signer = newKey(t)
+	linkCollection(w.st, refOf("acme/widgets"))
+	err := w.client.Items(context.Background(), widgetsItem())
+	if err == nil || !IsOutage(err) || IsPermanent(err) || !strings.Contains(err.Error(), "204, is not signed under a key of apiary_public_key") {
+		t.Errorf("err %v", err)
+	}
+	if got := w.apiary.sent("/v1/source-items"); len(got) != 1 {
+		t.Errorf("sent %d", len(got))
+	}
+}
+
+// TestTheFeedRefusesAnotherRevision checks a page of another revision, or none, is
+// refused and its cursor not kept.
+func TestTheFeedRefusesAnotherRevision(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	two := 2
+	w.apiary.revision = &two
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+	if err := w.feed.step(context.Background()); err == nil || !strings.Contains(err.Error(), "revision 1") {
+		t.Errorf("err %v", err)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+	for body, want := range map[string]string{
+		`{"version":1,"cursor":"c_1","changes":[]}`:                                                   "revision 1",
+		`{"version":1,"revision":1,"cursor":"c_1","changes":[],"more":true}`:                          "not the feed's document",
+		`{"version":2,"revision":1,"cursor":"c_1","changes":[]}`:                                      "version 1",
+		`{"version":1,"revision":1,"cursor":"","changes":[]}`:                                         "cursor",
+		`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null,"x":1}]}`: "not the feed's document",
+	} {
+		if _, err := checkChanges([]byte(body)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err %v", body, err)
+		}
+	}
+	if ch, err := checkChanges([]byte(`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null}]}`)); err != nil || ch.Revision != 1 || len(ch.Changes) != 1 {
+		t.Errorf("%+v %v", ch, err)
+	}
+}
+
+// TestQoryApiarysRefusals checks what each refusal is: permanent, held, waited out or
+// one that may pass.
+func TestQoryApiarysRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		status          int
+		body            string
+		permanent, held bool
+	}{
+		{400, `{"error":"invalid_request"}`, true, false},
+		{400, `{"error":"unsupported_contract_version"}`, true, false},
+		{403, `{"error":"forbidden"}`, true, false},
+		{413, `{}`, true, false},
+		{409, `{"error":"collection_not_linked"}`, true, false},
+		{401, `{"error":"unauthorized"}`, false, true},
+		{404, `{"error":"not_found"}`, false, false},
+		{422, `{}`, false, false},
+		{500, `oops`, false, false},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		linkCollection(w.st, refOf("acme/widgets"))
+		w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
+		err := w.client.Items(context.Background(), widgetsItem())
+		if err == nil || IsPermanent(err) != tc.permanent || IsHeld(err) != tc.held || !strings.Contains(err.Error(), strconv.Itoa(tc.status)) {
+			t.Errorf("%d %s: err %v", tc.status, tc.body, err)
+		}
+		if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok == (tc.status == 409) {
+			t.Errorf("%d %s: linked %v", tc.status, tc.body, ok)
+		}
+	}
+	// A 401 is logged once a minute at most, with a hint.
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.refuse = func(string, int) (int, string) { return 401, `{"error":"unauthorized"}` }
+	for range 3 {
+		w.client.Disconnect(context.Background(), contracts.SourcesDisconnect{Version: 1, ConnectionID: testConnection, CollectionRef: refOf("acme/widgets")})
+	}
+	if n := strings.Count(w.log.String(), "answered 401"); n != 1 || !strings.Contains(w.log.String(), "is approved, and that this machine's clock is right") {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// TestA429IsWaitedOutAndBuiltAgain has Qory Apiary refuse a request 429 once, and
+// checks the wait is its Retry-After, and the request sent again is built again.
+func TestA429IsWaitedOutAndBuiltAgain(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.refuse = func(_ string, n int) (int, string) {
+		if n == 1 {
+			return 429, `{"error":"rate_limited"}`
+		}
+		return 0, ""
+	}
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	w.client.Now = func() time.Time { now = now.Add(time.Second); return now }
+	if err := w.client.Disconnect(context.Background(), contracts.SourcesDisconnect{Version: 1, ConnectionID: testConnection, CollectionRef: refOf("acme/widgets")}); err != nil {
+		t.Fatal(err)
+	}
+	sent := w.apiary.sent(routeDisconnect)
+	if len(sent) != 2 || sent[0].signature == sent[1].signature || sent[0].body["time"] == sent[1].body["time"] {
+		t.Errorf("sent %v", sent)
+	}
+	if len(w.slept) != 1 || w.slept[0] != time.Second {
+		t.Errorf("slept %v", w.slept)
+	}
+	for v, want := range map[string]time.Duration{"7": 7 * time.Second, "0": time.Second, "": time.Second, "99999": time.Hour, "x": time.Second} {
+		if got := retryAfter(v, now); got != want {
+			t.Errorf("Retry-After %q: %v, want %v", v, got, want)
+		}
+	}
+}
+
+// TestAPermanentRefusalOfADeliveryIsNotTriedAgain has Qory Apiary refuse an issue's
+// item for good, and checks the delivery is done after one request, logged.
+func TestAPermanentRefusalOfADeliveryIsNotTriedAgain(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	linkCollection(w.st, refOf("acme/widgets"))
+	w.apiary.refuse = func(string, int) (int, string) { return 409, `{"error":"collection_not_linked"}` }
+	w.deliver(t, "issues", guid1, issueEvent(42, "acme/widgets", "opened"))
+	if n := len(w.apiary.sent(routeItems)); n != 1 || state(w.st, guid1) != store.Done || !strings.Contains(w.log.String(), "collection_not_linked") {
+		t.Errorf("%d requests, %s, log %s", n, state(w.st, guid1), w.log.String())
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
+		t.Error("the collection is still linked")
+	}
+}
+
+// signedFixture is a signed request or answer of the contract's fixtures.
+type signedFixture struct {
+	Status  int               `json:"status"`
+	Method  string            `json:"method"`
+	Target  string            `json:"target"`
+	Headers map[string]string `json:"headers"`
+	Body    *string           `json:"body"`
+}
+
+func readFixture(t *testing.T, name string, out any) {
+	t.Helper()
+	b, err := fs.ReadFile(contracts.FS, "fixtures/adapter/signed/"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTheWireMatchesTheContractsSignedFixtures sends the contract's signed fixtures,
+// under its fixture keys, and checks the requests are the fixtures' byte for byte,
+// their signatures among them, and the fixture's signed answer verifies.
+func TestTheWireMatchesTheContractsSignedFixtures(t *testing.T) {
+	var keys struct {
+		AccessKey struct {
+			Secret      string `json:"secret"`
+			AccessKeyID string `json:"access_key_id"`
+			InstanceID  string `json:"instance_id"`
+		} `json:"access_key"`
+		ServerKey struct {
+			Seed string `json:"seed"`
+		} `json:"server_key"`
+	}
+	readFixture(t, "keys.json", &keys)
+	var post, get, answer signedFixture
+	readFixture(t, "post-source-items.json", &post)
+	readFixture(t, "get-changes.json", &get)
+	readFixture(t, "answer-changes.json", &answer)
+	access, err := accesskey.ParseSecret(keys.AccessKey.Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, _ := base64.RawURLEncoding.DecodeString(keys.ServerKey.Seed)
+	server, err := accesskey.NewKey(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var got []signedFixture
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body := string(b)
+		mu.Lock()
+		got = append(got, signedFixture{Method: r.Method, Target: r.URL.RequestURI(), Body: &body, Headers: map[string]string{
+			"X-Qory-Access-Key-Id": r.Header.Get("X-Qory-Access-Key-Id"), "X-Qory-Instance-Id": r.Header.Get("X-Qory-Instance-Id"),
+			"X-Qory-Contract-Version": r.Header.Get("X-Qory-Contract-Version"), "X-Qory-Timestamp": r.Header.Get("X-Qory-Timestamp"),
+			"X-Qory-Signature-Ed25519": r.Header.Get("X-Qory-Signature-Ed25519"), "Content-Type": r.Header.Get("Content-Type"),
+		}})
+		mu.Unlock()
+		if r.Method == http.MethodGet {
+			w.Header().Set(accesskey.HeaderSignature, answer.Headers[accesskey.HeaderSignature])
+			w.WriteHeader(answer.Status)
+			io.WriteString(w, *answer.Body)
+			return
+		}
+		w.Header().Set(accesskey.HeaderSignature, server.SignAnswer(accesskey.Answer{Status: 200, RequestSignature: r.Header.Get(accesskey.HeaderSignature), Body: []byte("{}")}))
+		io.WriteString(w, "{}")
+	}))
+	defer srv.Close()
+	at := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	a := &Apiary{URL: srv.URL, KeyID: keys.AccessKey.AccessKeyID, Key: access, InstanceID: keys.AccessKey.InstanceID, Pin: pinOf(server), Now: func() time.Time { return at }}
+	var items contracts.SourceItems
+	if err := json.Unmarshal([]byte(*post.Body), &items); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Items(context.Background(), items); err != nil {
+		t.Fatal(err)
+	}
+	page, err := a.Changes(context.Background(), "c_00000040")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Cursor != "c_00000046" || len(page.Changes) != 6 {
+		t.Errorf("the page %+v", page)
+	}
+	if len(got) != 2 {
+		t.Fatalf("%d requests", len(got))
+	}
+	for i, want := range []signedFixture{post, get} {
+		g := got[i]
+		if g.Method != want.Method || g.Target != want.Target {
+			t.Errorf("%s %s, want %s %s", g.Method, g.Target, want.Method, want.Target)
+		}
+		if want.Body != nil && *g.Body != *want.Body {
+			t.Errorf("%s: the body\n%s\nwant\n%s", want.Target, *g.Body, *want.Body)
+		}
+		for k, v := range want.Headers {
+			if g.Headers[k] != v {
+				t.Errorf("%s: %s %q, want %q", want.Target, k, g.Headers[k], v)
+			}
+		}
+	}
+}
+
+// TestA403ConnectionUnknownForADayEndsALiveConnection notes Qory Apiary's answers about
+// a connection: one 403 connection_unknown ends nothing, and its time survives in the
+// store; 403s that run for a day end it; a 2xx between them starts the day again; a 403
+// with another code never counts; and a pending connection is never ended by them.
+func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	st := openStore(t, dir)
+	grantedLink(st, 42, testConnection, linkLive)
+	at := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	note := func(status int, code string, d time.Duration) bool {
+		t.Helper()
+		end, err := noteAnswer(st, testConnection, status, code, at.Add(d))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return end
+	}
+	if note(403, codeConnectionUnknown, 0) || note(403, codeConnectionUnknown, forbiddenFor-time.Second) {
+		t.Error("a 403 within a day ends the connection")
+	}
+	if b, err := st.Get(nsForbidden, testConnection); err != nil || string(b) != strconv.FormatInt(at.Unix(), 10) {
+		t.Errorf("the first 403 is kept as %q, %v", b, err)
+	}
+	if !note(403, codeConnectionUnknown, forbiddenFor) {
+		t.Error("403s for a day do not end the connection")
+	}
+	// A 2xx starts the day again.
+	if note(204, "", forbiddenFor) || note(403, codeConnectionUnknown, forbiddenFor+time.Hour) || note(403, codeConnectionUnknown, 2*forbiddenFor) {
+		t.Error("a 2xx did not start the day again")
+	}
+	if !note(403, codeConnectionUnknown, 2*forbiddenFor+time.Hour) {
+		t.Error("403s for a day after the 2xx do not end the connection")
+	}
+	// A 409 connection_suspended starts the day again too: Qory Apiary holds the
+	// connection.
+	st4 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(st4, 42, testConnection, linkLive)
+	for i, a := range []struct {
+		status int
+		code   string
+		d      time.Duration
+		end    bool
+	}{{403, codeConnectionUnknown, 0, false}, {409, codeConnectionSuspended, forbiddenFor - time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor + time.Hour, false}, {403, codeConnectionUnknown, 2*forbiddenFor + time.Hour, true}} {
+		if end, err := noteAnswer(st4, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
+			t.Errorf("after a 409 connection_suspended, answer %d: %v, %v", i, end, err)
+		}
+	}
+	// A 403 forbidden, or a 409 with another code, here collection_not_linked, neither
+	// counts nor starts the day again.
+	st5 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(st5, 42, testConnection, linkLive)
+	for i, a := range []struct {
+		status int
+		code   string
+		d      time.Duration
+		end    bool
+	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
+		if end, err := noteAnswer(st5, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
+			t.Errorf("after a 403 forbidden and a 409 collection_not_linked, answer %d: %v, %v", i, end, err)
+		}
+	}
+	// Another code never counts.
+	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(st2, 42, testConnection, linkLive)
+	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+		if end, err := noteAnswer(st2, testConnection, 403, "forbidden", at.Add(d)); end || err != nil {
+			t.Errorf("a 403 forbidden counts: %v, %v", end, err)
+		}
+	}
+	if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
+		t.Error("a 403 forbidden is kept")
+	}
+	// A pending connection is never ended.
+	st3 := openStore(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(st3, 42, testConnection, linkPending)
+	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+		if end, err := noteAnswer(st3, testConnection, 403, codeConnectionUnknown, at.Add(d)); end || err != nil {
+			t.Errorf("a pending connection ends: %v, %v", end, err)
+		}
+	}
+	// The first 403's time survives a restart.
+	st.Close()
+	st = openStore(t, dir)
+	if end, err := noteAnswer(st, testConnection, 403, codeConnectionUnknown, at.Add(3*forbiddenFor+2*time.Hour)); !end || err != nil {
+		t.Errorf("after a restart: %v, %v", end, err)
+	}
+}
+
+// TestAConnectionRefusedForADayIsDropped has the connection's first 403 kept 25 hours
+// ago: the next 403 connection_unknown to a listing drops the installation's link and
+// logs it.
+func TestAConnectionRefusedForADayIsDropped(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.st.Put(nsForbidden, testConnection, []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10)), 0)
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	if err := w.adapter.listRepositories(context.Background(), 42); !refusedAs(err, 403, codeConnectionUnknown) {
+		t.Errorf("err %v", err)
+	}
+	if ok, _ := Linked(w.st, 42); ok {
+		t.Error("still linked")
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("the first 403 is kept")
+	}
+	if !strings.Contains(w.log.String(), `"msg":"Qory Apiary answered connection_unknown for a day, so the connection is dropped","connection":"`+testConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestOnlyARequestThatNamesTheConnectionIsNoted has the connection's first 403 kept 25
+// hours ago, and checks the answers to the items and the comments of its collection,
+// which Qory Apiary never answers 403 connection_unknown, are not noted: a 403
+// connection_unknown to them ends nothing, and a 204 keeps the first 403. A listing's
+// 204 forgets it.
+func TestOnlyARequestThatNamesTheConnectionIsNoted(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	first := []byte(strconv.FormatInt(time.Now().Add(-25*time.Hour).Unix(), 10))
+	w.st.Put(nsForbidden, testConnection, first, 0)
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, status := range []int{403, 0} {
+		w.apiary.refuse = func(string, int) (int, string) { return status, `{"error":"connection_unknown"}` }
+		w.client.Items(context.Background(), widgetsItem())
+		w.client.Comments(context.Background(), comments)
+		if ok, _ := Linked(w.st, 42); !ok {
+			t.Fatalf("%d: the connection is dropped", status)
+		}
+		if b, _ := w.st.Get(nsForbidden, testConnection); string(b) != string(first) {
+			t.Errorf("%d: the first 403 is %q", status, b)
+		}
+	}
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("a listing's 204 kept the first 403")
+	}
+}
+
+// TestAPendingLinksLastListingDecidesIt lists a pending link past its connect return's
+// expiry and returnSkew more: a signed 204 makes it live; a 403 connection_unknown drops
+// it and logs it; a 409 connection_ended drops it; a 409 connection_suspended, which
+// says the connection was made, a 500, an answer not signed under the pin, or a 403
+// forbidden keeps it. Before that moment, a 403
+// connection_unknown keeps it.
+func TestAPendingLinksLastListingDecidesIt(t *testing.T) {
+	past := time.Now().Add(-returnSkew - time.Minute).Unix()
+	for name, tc := range map[string]struct {
+		status   int
+		body     string
+		unsigned bool
+		ret      int64
+		want     string
+	}{
+		"204":                      {0, "", false, past, linkLive},
+		"403 connection_unknown":   {403, `{"error":"connection_unknown"}`, false, past, ""},
+		"409 connection_ended":     {409, `{"error":"connection_ended"}`, false, past, ""},
+		"500":                      {500, `{"error":"internal"}`, false, past, linkPending},
+		"409 connection_suspended": {409, `{"error":"connection_suspended"}`, false, past, linkPending},
+		"not signed":               {0, "", true, past, linkPending},
+		"403 forbidden":            {403, `{"error":"forbidden"}`, false, past, linkPending},
+		"before the moment":        {403, `{"error":"connection_unknown"}`, false, time.Now().Add(returnFor).Unix(), linkPending},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: tc.ret})
+		if tc.status != 0 {
+			w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
+		}
+		if tc.unsigned {
+			w.apiary.signer = newKey(t)
+		}
+		err := w.adapter.listFor(context.Background(), 42, testConnection)
+		l, ok, _ := linkOf(w.st, 42)
+		if got := map[bool]string{true: l.State}[ok]; got != tc.want {
+			t.Errorf("%s: the link %q, err %v", name, got, err)
+		}
+		dropped := strings.Contains(w.log.String(), `"msg":"the connection was not made in time, so its pending link is dropped","connection":"`+testConnection+`","installation":42`)
+		if dropped != (name == "403 connection_unknown") {
+			t.Errorf("%s: the log %s", name, w.log.String())
+		}
+		if (err == nil) != (name == "204" || name == "403 connection_unknown") && name != "409 connection_ended" {
+			t.Errorf("%s: err %v", name, err)
+		}
+	}
+}
+
+// TestAReplacedConnectionAnsweredSuspendedIsEnded lists a connection a connect replaced
+// on the installation 42 while Qory Apiary answers its listing 409
+// connection_suspended, which it answers only for a connection made: the connection is
+// ended, POST /v1/connections/disconnect, and forgotten, and 42 stays linked to the
+// connection that replaced it.
+func TestAReplacedConnectionAnsweredSuspendedIsEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeCollections {
+			return 409, `{"error":"connection_suspended"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listFor(context.Background(), 42, otherConnection); err != nil {
+		t.Errorf("err %v", err)
+	}
+	if sent := w.apiary.sent(routeConnectionsDisconnect); len(sent) != 1 || sent[0].body["connection_id"] != otherConnection {
+		t.Errorf("disconnects %v", sent)
+	}
+	if _, ok, _ := replacedOf(w.st, otherConnection); ok {
+		t.Error("the replaced connection is kept")
+	}
+	if l, _, _ := linkOf(w.st, 42); l.Connection != testConnection || l.State != linkPending {
+		t.Errorf("the link %+v", l)
+	}
+	if !strings.Contains(w.log.String(), `"msg":"the replaced connection was made meanwhile, so it is disconnected","connection":"`+otherConnection+`"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestTheContractsRefusalFixturesAreRead has Qory Apiary answer an items request with
+// each of the contract's refusal fixtures that serve reads, signed, and checks serve
+// reads its status and code. A fixture the contract's revision does not hold is
+// skipped: connection-unknown.json came after 6f182ad.
+func TestTheContractsRefusalFixturesAreRead(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status int
+		code   string
+	}{
+		"connection-unknown.json":    {403, codeConnectionUnknown},
+		"connection-ended.json":      {409, codeConnectionEnded},
+		"connection-suspended.json":  {409, codeConnectionSuspended},
+		"collection-not-linked.json": {409, codeCollectionNotLinked},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, err := fs.ReadFile(contracts.FS, "fixtures/adapter/refusal/"+name)
+			if errors.Is(err, fs.ErrNotExist) {
+				t.Skipf("the contract's revision has no %s", name)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			w.apiary.refuse = func(string, int) (int, string) { return tc.status, string(b) }
+			if err := w.client.Items(context.Background(), widgetsItem()); !refusedAs(err, tc.status, tc.code) {
+				t.Errorf("err %v", err)
+			}
+		})
+	}
+}
+
+// TestAnUnsigned403KeepsNothing has Qory Apiary answer a request for a live connection
+// 403 connection_unknown under a key the pin does not list: serve acts on no unsigned
+// answer, so no first 403 is kept.
+func TestAnUnsigned403KeepsNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.apiary.signer = newKey(t)
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	if err := w.adapter.listRepositories(context.Background(), 42); err == nil {
+		t.Error("an unsigned 403 passed")
+	}
+	if ok, _ := present(w.st.Get(nsForbidden, testConnection)); ok {
+		t.Error("an unsigned 403 is kept as the first")
+	}
+}
+
+// TestTheRoundSettlesAReplacedConnection runs a round, as after a restart, with a
+// connection a connect replaced on the installation 42 whose last listing is due: the
+// round sends that listing, empty, and its 403 connection_unknown forgets the
+// connection.
+func TestTheRoundSettlesAReplacedConnection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	clock := &pullClock{t: time.Now()}
+	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log, now: clock.now, sleep: clock.sleep, jitter: func(time.Duration) time.Duration { return 0 }}
+	p.round(context.Background(), clock.now(), time.Hour)
+	p.rounds.Wait()
+	n := 0
+	for _, s := range w.apiary.sent(routeCollections) {
+		if s.body["connection_id"] == otherConnection {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d listings of the replaced connection", n)
+	}
+	if _, ok, _ := replacedOf(w.st, otherConnection); ok {
+		t.Error("the replaced connection is kept")
+	}
+}
+
+// TestOneListingOfAReplacedConnectionAtATime has two rounds find the same replaced
+// connection due while the first round's listing of it waits for the installation's
+// lock: the second round leaves it, and one listing is sent.
+func TestOneListingOfAReplacedConnectionAtATime(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(w.st, 42, link{Connection: otherConnection, Return: time.Now().Add(-returnFor - returnSkew).Unix()})
+	w.apiary.refuse = func(string, int) (int, string) { return 403, `{"error":"connection_unknown"}` }
+	unlock, err := w.adapter.lockInstallation(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waits atomic.Int32
+	w.adapter.lockWaits = func(int64) { waits.Add(1) }
+	p := &puller{adapter: w.adapter, store: w.st, log: w.adapter.Log}
+	p.listReplaced(context.Background())
+	eventually(t, "the first listing waits", func() bool { return waits.Load() == 1 })
+	p.listReplaced(context.Background())
+	unlock()
+	p.rounds.Wait()
+	n := 0
+	for _, s := range w.apiary.sent(routeCollections) {
+		if s.body["connection_id"] == otherConnection {
+			n++
+		}
+	}
+	if n != 1 || waits.Load() != 1 {
+		t.Errorf("%d listings, %d waits", n, waits.Load())
+	}
+}
+
+// repositoryEvent is a repository event of the installation on the repository repo,
+// owner/name, with action. transferred names, as GitHub does, the account the repository
+// was transferred from in changes.owner.from, and the repository as it is now.
+func repositoryEvent(installation int64, repo, action string) map[string]any {
+	ev := map[string]any{
+		"action": action, "installation": map[string]any{"id": installation},
+		"repository": map[string]any{"id": repoID(repo), "full_name": repo, "html_url": "https://github.com/" + repo},
+		"sender":     map[string]any{"login": "alice", "id": alice.ID, "type": "User"},
+	}
+	switch action {
+	case "transferred":
+		ev["changes"] = map[string]any{"owner": map[string]any{"from": map[string]any{"organization": map[string]any{"login": "acme", "id": acme.ID}}}}
+	case "renamed":
+		ev["changes"] = map[string]any{"repository": map[string]any{"name": map[string]any{"from": "widgets"}}}
+	}
+	return ev
+}
+
+// keepFirsts makes the adapter keep a first listing for each installation and
+// connection given in turn.
+func (a *Adapter) keepFirsts(keys ...firstKey) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.firsts == nil {
+		a.firsts = map[firstKey]*firstListing{}
+	}
+	for _, k := range keys {
+		a.firsts[k] = &firstListing{}
+	}
+}
+
+// keepFirstNaming makes the adapter keep a first listing for the installation and
+// connection of key whose one part names the repositories names.
+func (a *Adapter) keepFirstNaming(key firstKey, names ...string) {
+	cs := []contracts.Collection{}
+	for _, name := range names {
+		cs = append(cs, contracts.Collection{Ref: refOf(name), Title: name, URL: "https://github.com/" + name})
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.firsts == nil {
+		a.firsts = map[firstKey]*firstListing{}
+	}
+	a.firsts[key] = &firstListing{parts: []contracts.SourceCollections{{Version: contracts.Version, ConnectionID: key.connection, Collections: cs, Listing: contracts.Listing{ID: "kept", Part: 1, StartedAt: contracts.FormatTime(listingAt(0))}}}}
+}
+
+// TestARepositoryDeletedIsDisconnectedAndForgotten delivers repository deleted for a
+// repository serve listed for the installation: its collection is disconnected, which
+// installation reaches it and its pulls are forgotten, and so are the installation's
+// first listings kept, while another installation's and another repository's stay.
+// Nothing is listed.
+func TestARepositoryDeletedIsDisconnectedAndForgotten(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	setReach(w.st, gadgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	keepPulled(w.st, gadgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	w.adapter.keepFirsts(firstKey{42, testConnection}, firstKey{43, otherConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "deleted"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the deleted repository's installation is kept")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+		t.Errorf("the deleted repository's pulls are kept: %+v", m)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if !w.adapter.keptFirst(43, otherConnection) {
+		t.Error("another installation's first listing is dropped")
+	}
+	if inst, ok, _ := reachOf(w.st, gadgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/gadgets: %d %v", inst, ok)
+	}
+	if m, _ := pulledOf(w.st, gadgetsRef); m.Since.IsZero() {
+		t.Error("another repository's pulls are dropped")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+	if !strings.Contains(w.log.String(), "GitHub deleted the repository, so its collection is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestARepositoryDeletedThatServeDidNotListForTheInstallationChangesNothing delivers
+// repository deleted for a repository the store holds as another installation's, and
+// for one serve never listed: neither is disconnected and the records stay.
+func TestARepositoryDeletedThatServeDidNotListForTheInstallationChangesNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("octo-org/tools"), 43)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "octo-org/tools", "deleted"))
+	w.deliver(t, "repository", guid2, repositoryEvent(42, "acme/never", "deleted"))
+	for _, g := range []string{guid1, guid2} {
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%s: the delivery is %v", g, s)
+		}
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("octo-org/tools")); inst != 43 || !ok {
+		t.Errorf("octo-org/tools: %d %v", inst, ok)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+	if n := strings.Count(w.log.String(), "the repository is not one serve listed for the installation, so nothing is disconnected"); n != 2 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// TestARepositoryDeletedWhoseDisconnectFails has Qory Apiary refuse the disconnect of a
+// deleted repository: for good, 400 invalid_request, which is logged, and the records
+// are dropped all the same, with no line that says the collection is disconnected; 409
+// connection_suspended, which changes no state, so the records are kept and the
+// delivery fails; or with a 502, which keeps the records and the delivery, to be tried
+// again.
+func TestARepositoryDeletedWhoseDisconnectFails(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		body    string
+		dropped bool
+	}{
+		{400, `{"error":"invalid_request"}`, true},
+		{409, `{"error":"connection_suspended"}`, false},
+		{502, `{"error":"bad_gateway"}`, false},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		w.apiary.refuse = func(string, int) (int, string) { return tc.status, tc.body }
+		if tc.dropped {
+			w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "deleted"))
+		} else {
+			b, _ := json.Marshal(repositoryEvent(42, "acme/widgets", "deleted"))
+			if rec := post(w.mux, "repository", guid1, string(b), sign(string(b))); rec.Code != http.StatusAccepted {
+				t.Fatalf("status %d", rec.Code)
+			}
+			eventually(t, "a disconnect sent", func() bool { return len(w.apiary.sent(routeDisconnect)) > 0 })
+			if s := state(w.st, guid1); s == store.Done {
+				t.Errorf("%d: the delivery is done", tc.status)
+			}
+		}
+		if _, ok, _ := reachOf(w.st, widgetsRef); ok == tc.dropped {
+			t.Errorf("%d: the repository's installation kept %v", tc.status, ok)
+		}
+		if strings.Contains(w.log.String(), "its collection is disconnected") {
+			t.Errorf("%d: the log says the collection is disconnected: %s", tc.status, w.log.String())
+		}
+		if tc.dropped && !strings.Contains(w.log.String(), "the disconnect is refused") {
+			t.Errorf("%d: the log: %s", tc.status, w.log.String())
+		}
+	}
+}
+
+// TestARepositoryCreatedListsWithANewToken lists the installation, which keeps its
+// listing token, keeps a first listing for it, and delivers repository created: the
+// installation's tokens and first listing are dropped, and it is listed again with a
+// token minted after the change, the new repository in the listing, kept as reached by
+// the installation. Nothing is disconnected.
+func TestARepositoryCreatedListsWithANewToken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.gh.installed("acme/widgets", "acme/gadgets", "acme/tools")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/tools", "created"))
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	if mints != 2 {
+		t.Errorf("%d listing tokens minted, want 2", mints)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets", "acme/tools")) {
+		t.Errorf("listed %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("acme/tools")); inst != 42 || !ok {
+		t.Errorf("acme/tools: %d %v", inst, ok)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+}
+
+// TestARepositoryRenamedIsListedAgainAndNotDisconnected renames acme/widgets to
+// acme/sprockets, which keeps its id: the installation is listed again, which names the
+// collection by the same ref with the new title, URL and target, the repository stays
+// the installation's, and nothing is disconnected.
+func TestARepositoryRenamedIsListedAgainAndNotDisconnected(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.gh.installed("acme/sprockets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/sprockets", "renamed"))
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 1 {
+		t.Fatalf("%d listings", len(sent))
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[0].raw, &req)
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
+	if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+		t.Errorf("sent %s", sent[0].raw)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("the renamed repository: %d %v", inst, ok)
+	}
+}
+
+// TestRepositoryActionsThatChangeNothing delivers repository archived, unarchived,
+// privatized, publicized and edited: each is done, and none reaches GitHub or Qory
+// Apiary or changes a record.
+func TestRepositoryActionsThatChangeNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	for i, action := range []string{"archived", "unarchived", "privatized", "publicized", "edited"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, repositoryEvent(42, "acme/widgets", action))
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%s: the delivery is %v", action, s)
+		}
+	}
+	w.gh.mu.Lock()
+	requests := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if len(requests) != 0 || w.apiary.count() != 0 {
+		t.Errorf("GitHub was asked %v, Qory Apiary %d times", requests, w.apiary.count())
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/widgets: %d %v", inst, ok)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+}
+
+// TestRepositoryDeliveriesOfAnInstallationNotLinked sends repository deliveries of an
+// installation that is not linked: each is answered 202 and not kept, but transferred,
+// which is kept and handled.
+func TestRepositoryDeliveriesOfAnInstallationNotLinked(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	for i, action := range []string{"deleted", "created", "renamed", "archived", "unarchived", "privatized", "publicized", "edited"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		b, _ := json.Marshal(repositoryEvent(43, "acme/widgets", action))
+		if rec := post(w.mux, "repository", g, string(b), sign(string(b))); rec.Code != http.StatusAccepted || state(w.st, g) != "" {
+			t.Errorf("%s: %d %q", action, rec.Code, state(w.st, g))
+		}
+	}
+	if n := strings.Count(w.log.String(), `"outcome":"not_linked"`); n != 8 || w.apiary.count() != 0 {
+		t.Errorf("%d lines not_linked, %d requests", n, w.apiary.count())
+	}
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("transferred: the delivery is %v", s)
+	}
+}
+
+// TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection transfers
+// octo-org/widgets, which serve listed for the installation 9, to acme, whose
+// installation 42 is linked to another connection: GitHub sends transferred to 42 alone,
+// with the repository as acme/widgets, by the same id. The installation 42 is listed
+// again, with a token minted after the change, naming the repository by the same ref
+// under 42's connection, the repository becomes 42's, 42's first listing kept and 9's,
+// which names the repository, are dropped, while that of another installation, which
+// does not name it, stays, and serve sends no disconnect: Qory Apiary ends the
+// collection under the previous connection itself when the listing names the ref.
+func TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	setReach(w.st, widgetsRef, 9)
+	setReach(w.st, refOf("octo-org/tools"), 9)
+	w.adapter.keepFirsts(firstKey{42, testConnection}, firstKey{43, "ac_00000000000000aa"})
+	w.adapter.keepFirstNaming(firstKey{9, otherConnection}, "octo-org/widgets", "octo-org/tools")
+	w.adapter.mu.Lock()
+	w.adapter.tokens = map[string]github.InstallationToken{"42 0 ": {Token: "minted-before", ExpiresAt: time.Now().Add(time.Hour)}}
+	w.adapter.mu.Unlock()
+	w.gh.installed("acme/widgets", "acme/gadgets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection {
+		t.Fatalf("sent %v", sent)
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets", "acme/gadgets")) {
+		t.Errorf("listed %v", got)
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("the transferred repository: %d %v", inst, ok)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("octo-org/tools")); inst != 9 || !ok {
+		t.Errorf("octo-org/tools: %d %v", inst, ok)
+	}
+	if w.adapter.keptFirst(42, testConnection) || w.adapter.keptFirst(9, otherConnection) {
+		t.Error("a first listing of either installation is kept")
+	}
+	if !w.adapter.keptFirst(43, "ac_00000000000000aa") {
+		t.Error("another installation's first listing is dropped")
+	}
+	w.gh.mu.Lock()
+	mints := len(w.gh.mints)
+	w.gh.mu.Unlock()
+	if mints != 1 {
+		t.Errorf("%d listing tokens minted, want 1", mints)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+}
+
+// TestATransferToAnInstallationTheCopyDoesNotContainIsADisconnect pins that the
+// transferred handler follows the rule intake follows, see [granted]: an installation
+// with a link whose connect return has expired, and which Qory Apiary's copy of the
+// grants does not contain, counts as not linked, so the repository's collection is
+// disconnected under the installation serve listed it for, and nothing is listed.
+func TestATransferToAnInstallationTheCopyDoesNotContainIsADisconnect(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	if err := Link(w.st, 43, otherConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	setReach(w.st, widgetsRef, 42)
+	w.gh.installed("octo-org/widgets")
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+}
+
+// TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected transfers
+// acme/widgets, which serve listed for the installation 42, to an account whose
+// installation 43 is not linked: the delivery is kept, the collection is disconnected
+// under 42, which installation reaches it and its pulls are forgotten, and so are 42's
+// first listings kept. Nothing is listed. A repository serve never listed, transferred
+// so, disconnects nothing.
+func TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the transferred repository's installation is kept")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+		t.Errorf("the transferred repository's pulls are kept: %+v", m)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is kept")
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+	if !strings.Contains(w.log.String(), "GitHub transferred the repository to an installation not linked to Qory Apiary, so its collection is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+	w.deliver(t, "repository", guid2, repositoryEvent(43, "octo-org/never", "transferred"))
+	if got := w.disconnected(0); len(got) != 1 {
+		t.Errorf("disconnected %v", got)
+	}
+	if !strings.Contains(w.log.String(), "the repository is not one serve listed, so nothing is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+}
+
+// TestARepositoryEventWithoutARepositoryFailsForGood delivers repository events that
+// name no repository's id: each fails for good, at once, and reaches nobody.
+func TestARepositoryEventWithoutARepositoryFailsForGood(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	for i, action := range []string{"deleted", "transferred"} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, map[string]any{"action": action, "installation": map[string]any{"id": 42}, "repository": map[string]any{"id": 0}})
+		if s := state(w.st, g); s != store.Failed {
+			t.Errorf("%s: the delivery is %v", action, s)
+		}
+	}
+	if w.apiary.count() != 0 {
+		t.Errorf("%d requests", w.apiary.count())
+	}
+}
+
+// TestARepositoryTransferredWithoutAnInstallationIDChangesNothing delivers repository
+// transferred for a repository serve listed for the installation 42, naming no
+// installation, the installation 0 and the installation -1: each is done and logged as
+// an installation not linked, as the installation event's deleted is, and none reaches
+// GitHub or Qory Apiary or changes a record.
+func TestARepositoryTransferredWithoutAnInstallationIDChangesNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	keepPulled(w.st, widgetsRef, pullMark{Since: time.Now(), Listed: time.Now()})
+	linkCollection(w.st, widgetsRef)
+	w.adapter.keepFirsts(firstKey{42, testConnection})
+	none := repositoryEvent(42, "octo-org/widgets", "transferred")
+	delete(none, "installation")
+	for i, ev := range []map[string]any{none, repositoryEvent(0, "octo-org/widgets", "transferred"), repositoryEvent(-1, "octo-org/widgets", "transferred")} {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "repository", g, ev)
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("%d: the delivery is %v", i, s)
+		}
+	}
+	w.gh.mu.Lock()
+	requests := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if len(requests) != 0 || w.apiary.count() != 0 {
+		t.Errorf("GitHub was asked %v, Qory Apiary %d times", requests, w.apiary.count())
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/widgets: %d %v", inst, ok)
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() {
+		t.Error("the repository's pulls are dropped")
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Error("the collection is unlinked")
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Error("the installation's first listing is dropped")
+	}
+	if n := strings.Count(w.log.String(), "the installation is not linked to Qory Apiary, so the delivery is not handled"); n != 3 {
+		t.Errorf("logged %d times: %s", n, w.log.String())
+	}
+}
+
+// repositoryDrops are the deliveries that drop the records of acme/widgets, which serve
+// listed for the installation 42: repository deleted, repository transferred to the
+// installation 43, which is not linked, and installation_repositories removed.
+var repositoryDrops = []struct {
+	name  string
+	event string
+	body  map[string]any
+}{
+	{"deleted", "repository", repositoryEvent(42, "acme/widgets", "deleted")},
+	{"transferred", "repository", repositoryEvent(43, "octo-org/widgets", "transferred")},
+	{"removed", "installation_repositories", repositoriesEvent("removed", "selected", nil, []string{"acme/widgets"})},
+}
+
+// TestARepositoryDroppedLeavesNoCollectionLink links the collections of acme/widgets
+// and acme/gadgets, both the installation 42's, and drops acme/widgets' records by each
+// of [repositoryDrops]: its collection is disconnected and no longer linked, while
+// acme/gadgets' stays linked, and a link the change feed stores later is kept.
+func TestARepositoryDroppedLeavesNoCollectionLink(t *testing.T) {
+	for _, tc := range repositoryDrops {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		setReach(w.st, gadgetsRef, 42)
+		linkCollection(w.st, widgetsRef)
+		linkCollection(w.st, gadgetsRef)
+		w.gh.installed("acme/gadgets")
+		w.deliver(t, tc.event, guid1, tc.body)
+		if s := state(w.st, guid1); s != store.Done {
+			t.Errorf("%s: the delivery is %v", tc.name, s)
+		}
+		if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+			t.Errorf("%s: disconnected %v", tc.name, got)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); ok {
+			t.Errorf("%s: the dropped repository's collection is still linked", tc.name)
+		}
+		if ok, _ := collectionLinked(w.st, gadgetsRef); !ok {
+			t.Errorf("%s: another repository's collection is unlinked", tc.name)
+		}
+		if err := linkCollection(w.st, widgetsRef); err != nil {
+			t.Fatal(err)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+			t.Errorf("%s: a link the change feed stores after the drop is not kept", tc.name)
+		}
+	}
+}
+
+// TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked has the change feed link
+// the collection of acme/widgets while Qory Apiary is sent its disconnect, as each of
+// [repositoryDrops] drops its records: the link, stored after the drop began, stays.
+func TestACollectionLinkedWhileItsRepositoryIsDroppedStaysLinked(t *testing.T) {
+	for _, tc := range repositoryDrops {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		w.gh.installed("acme/gadgets")
+		w.apiary.refuse = func(route string, _ int) (int, string) {
+			if route == routeDisconnect {
+				linkCollection(w.st, widgetsRef)
+			}
+			return 0, ""
+		}
+		w.deliver(t, tc.event, guid1, tc.body)
+		if s := state(w.st, guid1); s != store.Done {
+			t.Errorf("%s: the delivery is %v", tc.name, s)
+		}
+		if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+			t.Errorf("%s: disconnected %v", tc.name, got)
+		}
+		if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+			t.Errorf("%s: the link stored during the drop is dropped", tc.name)
+		}
+	}
+}
+
+// TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept lists a pending
+// link's first listing of acme/widgets, which Qory Apiary answers 403
+// connection_unknown, so the listing is kept, and renames acme/widgets to
+// acme/sprockets, which keeps its id: the rename drops the listing kept, its listing,
+// which Qory Apiary takes, names the new title, URL and target, and so does the next
+// try of the first listing; no part after the rename names the old name.
+func TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.gh.installed("acme/widgets")
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeCollections && n == 1 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listFirst(context.Background(), 42, testConnection); !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
+		t.Fatalf("the first try: %v", err)
+	}
+	if !w.adapter.keptFirst(42, testConnection) {
+		t.Fatal("the first listing is not kept")
+	}
+	w.gh.installed("acme/sprockets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/sprockets", "renamed"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if w.adapter.keptFirst(42, testConnection) {
+		t.Error("the first listing read before the rename is kept")
+	}
+	if err := w.adapter.listFirst(context.Background(), 42, testConnection); err != nil {
+		t.Fatalf("the next try: %v", err)
+	}
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 3 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
+	for i, s := range sent[1:] {
+		var req contracts.SourceCollections
+		json.Unmarshal(s.raw, &req)
+		if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+			t.Errorf("part %d after the rename: %s", i+1, s.raw)
+		}
+		if strings.Contains(string(s.raw), "acme/widgets") {
+			t.Errorf("part %d after the rename names the old name: %s", i+1, s.raw)
+		}
+	}
+}
+
+// suspendedError is the end of the error of a request whose installation GitHub
+// answers as suspended.
+const suspendedError = `GitHub answers that the installation is suspended, so no installation token is minted for it"`
+
+// TestAnEntryOfASuspendedInstallationIsPassedAtOnce has GitHub answer the installation
+// 42 as suspended, and reads a page of the feed: a take in of acme/widgets#7, a link of
+// acme/widgets and a sync entry. One step passes the first two, each logged with the
+// suspension, applies the sync, and moves the cursor past all three; no token is asked
+// for and nothing is written on GitHub.
+func TestAnEntryOfASuspendedInstallationIsPassedAtOnce(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.installSuspended = true })
+	sixty := 60
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "linked"},
+		contracts.Change{Kind: contracts.ChangeSync, Interval: &sixty},
+	)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_3" {
+		t.Errorf("the cursor %s", c)
+	}
+	log := w.log.String()
+	for _, kind := range []string{contracts.ChangeWorkItem, contracts.ChangeCollection} {
+		if n := strings.Count(log, `"msg":"a change of the feed failed, and is passed","kind":"`+kind+`","error":"`); n != 1 {
+			t.Errorf("%s: %d lines", kind, n)
+		}
+	}
+	if n := strings.Count(log, suspendedError); n != 2 {
+		t.Errorf("%d lines say the suspension: %s", n, log)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+		t.Errorf("the interval %s", v)
+	}
+	w.gh.mu.Lock()
+	mints, labelled, requests := len(w.gh.mints), len(w.gh.labelled), slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if mints != 0 || labelled != 0 {
+		t.Errorf("%d mints, %d labels", mints, labelled)
+	}
+	for _, r := range requests {
+		if strings.HasSuffix(r, "/access_tokens") || strings.Contains(r, "/repositories/") {
+			t.Errorf("GitHub was asked %s", r)
+		}
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); !ok {
+		t.Error("the collection is not linked")
+	}
+	if m, _ := pulledOf(w.st, refOf("acme/widgets")); !m.Since.IsZero() {
+		t.Errorf("the collection has a pull mark %+v", m)
+	}
+}
+
+// TestAFillWhoseKeptTokenGitHubAnswers403MintsAgain keeps a token for acme/widgets that
+// GitHub answers 403 to: the fill fails, not for good, and drops the installation's
+// tokens, so the feed's next try mints anew; with GitHub answering the installation as
+// suspended by then, that try passes the entry for good.
+func TestAFillWhoseKeptTokenGitHubAnswers403MintsAgain(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/widgets"), 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	w.adapter.mu.Lock()
+	w.adapter.tokens = map[string]github.InstallationToken{
+		"42 " + widgetsRef + " read": {Token: ghToken, ExpiresAt: time.Now().Add(time.Hour)},
+		"42 0 ":                      {Token: ghToken, ExpiresAt: time.Now().Add(time.Hour)},
+	}
+	w.adapter.mu.Unlock()
+	setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = 403 })
+	err := w.adapter.fill(context.Background(), refOf("acme/widgets"))
+	if err == nil || IsPermanent(err) || !github.Forbidden(err) {
+		t.Fatalf("err %v", err)
+	}
+	if held := w.adapter.heldFor(42); slices.Contains(held, "tokens") {
+		t.Errorf("the installation's tokens are kept: %v", held)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.installSuspended = true })
+	err = w.adapter.fill(context.Background(), refOf("acme/widgets"))
+	if !IsPermanent(err) || !errors.Is(err, github.ErrSuspended) {
+		t.Errorf("err %v", err)
+	}
+}
+
+// TestATakeInOfAnArchivedRepositoryIsPassedAtOnce has GitHub answer the creation of the
+// label in acme/widgets 403, as it answers a write in an archived repository: the take
+// in is passed for good at once, the cursor moves, and the issue is neither labelled
+// nor commented.
+func TestATakeInOfAnArchivedRepositoryIsPassedAtOnce(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.labelStatus = 403 })
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %s", c)
+	}
+	if !strings.Contains(w.log.String(), `"msg":"a change of the feed failed, and is passed","kind":"work_item","error":"`) || !strings.Contains(w.log.String(), "Repository was archived so is read-only.") {
+		t.Errorf("the log %s", w.log.String())
+	}
+	if len(w.gh.labelled) != 0 || len(w.gh.postedComments()) != 0 {
+		t.Errorf("labelled %v, posted %v", w.gh.labelled, w.gh.postedComments())
+	}
+}
+
+// suspendedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref
+// 409 connection_suspended, and any other with the signed 204.
+func suspendedDisconnect(w *wired, ref string) {
+	refuse := func(route string, n int) (int, string) {
+		if route != routeDisconnect {
+			return 0, ""
+		}
+		if sent := w.apiary.sent(routeDisconnect); n <= len(sent) && sent[n-1].body["collection_ref"] == ref {
+			return 409, `{"error":"connection_suspended"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Lock()
+	defer w.apiary.mu.Unlock()
+	w.apiary.refuse = refuse
+}
+
+// TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords has Qory Apiary answer
+// the disconnect of a deleted repository 409 connection_suspended, which changes no
+// state: the repository's records, its collection's link and its pull mark stay, and
+// the delivery fails for good with the refusal, not logged as a disconnect refused.
+func TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, refOf("acme/old"), 42)
+	linkCollection(w.st, refOf("acme/old"))
+	keepPulled(w.st, refOf("acme/old"), pullMark{Since: time.Now()})
+	suspendedDisconnect(w, refOf("acme/old"))
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/old", "deleted"))
+	if s := state(w.st, guid1); s != store.Failed {
+		t.Errorf("the delivery is %s", s)
+	}
+	if n := len(w.apiary.sent(routeDisconnect)); n != 1 {
+		t.Errorf("%d disconnects", n)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("acme/old")); !ok || inst != 42 {
+		t.Error("the repository's installation is dropped")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/old")); !ok {
+		t.Error("the collection is unlinked")
+	}
+	if m, _ := pulledOf(w.st, refOf("acme/old")); m.Since.IsZero() {
+		t.Error("the pull mark is dropped")
+	}
+	if strings.Contains(w.log.String(), `"msg":"the disconnect is refused"`) || strings.Contains(w.log.String(), "GitHub deleted the repository, so its collection is disconnected") {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestARemovedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords removes two
+// repositories from the installation 42, and Qory Apiary answers the disconnect of one
+// 409 connection_suspended and the other's with the signed 204: the second's records
+// are dropped and the first's stay, the repositories are listed again, and the delivery
+// fails for good with the refusal.
+func TestARemovedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	for _, ref := range refsOf("acme/old", "acme/gone") {
+		setReach(w.st, ref, 42)
+		linkCollection(w.st, ref)
+	}
+	suspendedDisconnect(w, refOf("acme/old"))
+	w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{
+		map[string]any{"id": oldID, "full_name": "acme/old"}, map[string]any{"id": repoID("acme/gone"), "full_name": "acme/gone"},
+	}})
+	if s := state(w.st, guid1); s != store.Failed {
+		t.Errorf("the delivery is %s", s)
+	}
+	if n := len(w.apiary.sent(routeDisconnect)); n != 2 {
+		t.Errorf("%d disconnects", n)
+	}
+	if inst, ok, _ := reachOf(w.st, refOf("acme/old")); !ok || inst != 42 {
+		t.Error("the suspended repository's installation is dropped")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/old")); !ok {
+		t.Error("the suspended repository's collection is unlinked")
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/gone")); ok {
+		t.Error("the disconnected repository's installation is kept")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/gone")); ok {
+		t.Error("the disconnected repository's collection is still linked")
+	}
+	if len(w.apiary.sent(routeCollections)) != 1 {
+		t.Error("the repositories are not listed again")
+	}
+	if strings.Contains(w.log.String(), `"msg":"the disconnect is refused"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// listingAt is the moment the fake's listings of the reach tests started at: hour h of
+// a day, in whole seconds, as a listing's started_at is written.
+func listingAt(h int) time.Time { return time.Date(2026, 10, 18, h, 0, 0, 0, time.UTC) }
+
+// sendPart sends, through the reach sink of the installation linked to connection, one
+// part of a listing that started at started and names the repositories names.
+func (w *wired) sendPart(t *testing.T, installation int64, connection string, started time.Time, names ...string) {
+	t.Helper()
+	cs := []contracts.Collection{}
+	for _, n := range names {
+		cs = append(cs, contracts.Collection{Ref: refOf(n), Title: n, URL: "https://github.com/" + n, GrantRef: grantRef(installation)})
+	}
+	sink := reachSink{Sink: w.client, st: w.st, installation: installation, connection: connection}
+	req := contracts.SourceCollections{Version: contracts.Version, ConnectionID: connection, Collections: cs, Listing: contracts.Listing{ID: "listing-" + strconv.FormatInt(installation, 10) + "-" + contracts.FormatTime(started), Part: 1, StartedAt: contracts.FormatTime(started)}}
+	if err := sink.Collections(context.Background(), req); err != nil {
+		t.Fatalf("the part of %d: %v", installation, err)
+	}
+}
+
+// reachIs checks that the store's record of the repository name names installation,
+// with the moment read, in Unix seconds.
+func (w *wired) reachIs(t *testing.T, name string, installation, read int64) {
+	t.Helper()
+	r, ok, err := reachRecord(w.st, collectionKey(refOf(name)))
+	if err != nil || !ok || r.Installation != installation || r.Read != read || r.Ref != refOf(name) {
+		t.Errorf("the record of %s: %+v %v %v, want the installation %d read at %d", name, r, ok, err, installation, read)
+	}
+}
+
+// TestAStaleListingOfAnotherInstallationLeavesTheRepositorysInstallation has a listing
+// of the installation 42 that started at t1 name acme/widgets, then a part of a listing
+// of the installation 9 that started earlier, at t0, as a listing read before a
+// transfer and sent late does: the record stays 42's, at t1, and the part is sent as
+// it is, acme/widgets in it, under 9's connection.
+func TestAStaleListingOfAnotherInstallationLeavesTheRepositorysInstallation(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
+	w.sendPart(t, 9, otherConnection, listingAt(0), "acme/widgets", "acme/gadgets")
+	w.reachIs(t, "acme/widgets", 42, listingAt(1).Unix())
+	w.reachIs(t, "acme/gadgets", 9, listingAt(0).Unix())
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 2 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	var req contracts.SourceCollections
+	json.Unmarshal(sent[1].raw, &req)
+	if req.ConnectionID != otherConnection || req.Listing.StartedAt != contracts.FormatTime(listingAt(0)) || len(req.Collections) != 2 || req.Collections[0].Ref != widgetsRef || req.Collections[1].Ref != gadgetsRef {
+		t.Errorf("the late part: %s", sent[1].raw)
+	}
+}
+
+// TestAListingThatReadLaterTakesTheRepositoryFromAnotherInstallation has a listing of
+// the installation 42 that started at t1 name acme/widgets, then one of the
+// installation 9 that started later, at t2: the record becomes 9's, at t2.
+func TestAListingThatReadLaterTakesTheRepositoryFromAnotherInstallation(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
+	w.sendPart(t, 9, otherConnection, listingAt(2), "acme/widgets")
+	w.reachIs(t, "acme/widgets", 9, listingAt(2).Unix())
+}
+
+// TestAListingThatStartedInTheSameSecondTakesTheRepository has listings of the
+// installations 42 and 9 that started in the same second name acme/widgets, 42's
+// first: the record becomes 9's, since a start no earlier than the record's takes it.
+func TestAListingThatStartedInTheSameSecondTakesTheRepository(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
+	w.sendPart(t, 9, otherConnection, listingAt(1), "acme/widgets")
+	w.reachIs(t, "acme/widgets", 9, listingAt(1).Unix())
+}
+
+// TestAnInstallationsStalePartDoesNotMoveItsReadBack has listings of the installation
+// 42 that started at t5 and then at t1, a part of the older sent late, name
+// acme/widgets, and then one of the installation 9 that started at t3: 42's record
+// keeps t5, so 9's listing, older than that, leaves it 42's.
+func TestAnInstallationsStalePartDoesNotMoveItsReadBack(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	w.sendPart(t, 42, testConnection, listingAt(5), "acme/widgets")
+	w.sendPart(t, 42, testConnection, listingAt(1), "acme/widgets")
+	w.reachIs(t, "acme/widgets", 42, listingAt(5).Unix())
+	w.sendPart(t, 9, otherConnection, listingAt(3), "acme/widgets")
+	w.reachIs(t, "acme/widgets", 42, listingAt(5).Unix())
+}
+
+// TestARecordWithoutAReadMomentIsTaken has a listing of the installation 9, of any
+// start, name acme/widgets, whose record names the installation 42 with no moment, Read
+// 0: the record becomes 9's. A listing whose started_at does not parse takes no such
+// record, and writes one the store does not hold, which another such listing, of
+// another installation, does not take either.
+func TestARecordWithoutAReadMomentIsTaken(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setReach(w.st, gadgetsRef, 42)
+	if err := claimReach(w.st, widgetsRef, 9, listingAt(0)); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/widgets", 9, listingAt(0).Unix())
+	if err := claimReach(w.st, gadgetsRef, 9, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/gadgets", 42, 0)
+	if err := claimReach(w.st, refOf("acme/old"), 9, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/old", 9, 0)
+	if err := claimReach(w.st, refOf("acme/old"), 42, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/old", 9, 0)
+}
+
+// TestADropKeepsARecordAnotherInstallationClaimed drops the record of acme/widgets for
+// the installation 9 once a listing of the installation 42 claimed it: the record stays
+// 42's, whether the drop is the repository's or the whole installation 9's. A drop for
+// 42 forgets it.
+func TestADropKeepsARecordAnotherInstallationClaimed(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	if err := claimReach(w.st, widgetsRef, 42, listingAt(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dropReach(w.st, widgetsRef, 9); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/widgets", 42, listingAt(1).Unix())
+	if err := dropInstallation(w.st, 9); err != nil {
+		t.Fatal(err)
+	}
+	w.reachIs(t, "acme/widgets", 42, listingAt(1).Unix())
+	if err := dropReach(w.st, widgetsRef, 42); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := reachOf(w.st, widgetsRef); ok || err != nil {
+		t.Errorf("the record dropped for 42: %v %v", ok, err)
+	}
+}
+
+// holdListing lists the installation 42, which reaches acme/widgets and acme/old, and
+// holds the listing's part in Qory Apiary, once it has claimed both, until the drop
+// that deliver starts waits for 42's lock; GitHub no longer grants acme/old once the
+// listing has read it. It says, in turn, what Qory Apiary answered: the held part, and
+// each disconnect.
+func (w *wired) holdListing(t *testing.T, guid, event string, body map[string]any) []string {
+	t.Helper()
+	grantedLink(w.st, 42, testConnection, linkLive)
+	w.gh.installed("acme/widgets", "acme/old")
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, s)
+	}
+	posted, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		switch {
+		case route == routeCollections && n == 1:
+			w.gh.installed("acme/widgets")
+			close(posted)
+			<-release
+			note("the part")
+		case route == routeDisconnect:
+			note("a disconnect")
+		}
+		return 0, ""
+	}
+	var waits atomic.Int32
+	w.adapter.lockWaits = func(id int64) {
+		if id == 42 {
+			waits.Add(1)
+		}
+	}
+	listed := make(chan error, 1)
+	go func() { listed <- w.adapter.listRepositories(context.Background(), 42) }()
+	<-posted
+	b, _ := json.Marshal(body)
+	if rec := post(w.mux, event, guid, string(b), sign(string(b))); rec.Code != http.StatusAccepted {
+		t.Fatalf("%s: status %d", event, rec.Code)
+	}
+	eventually(t, "the drop waits for the listing", func() bool {
+		if s := state(w.st, guid); s == store.Done || s == store.Failed {
+			t.Fatalf("the delivery is %v without waiting for the listing", s)
+		}
+		return waits.Load() > 0
+	})
+	once.Do(func() { close(release) })
+	if err := <-listed; err != nil {
+		t.Fatalf("the listing: %v", err)
+	}
+	eventually(t, event+" handled", func() bool { return state(w.st, guid) == store.Done })
+	mu.Lock()
+	defer mu.Unlock()
+	return slices.Clone(order)
+}
+
+// TestARemovalWaitsForAListingInFlight delivers installation_repositories removed for
+// acme/old while a listing of the installation, which claimed acme/old, is held in
+// Qory Apiary: the removal waits for the installation's lock, so Qory Apiary answers
+// the listing's part before the disconnect, and the record of acme/old is gone at the
+// end, the listing after the removal naming acme/widgets alone.
+func TestARemovalWaitsForAListingInFlight(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	order := w.holdListing(t, guid1, "installation_repositories", repositoriesEvent("removed", "selected", nil, []string{"acme/old"}))
+	if !slices.Equal(order, []string{"the part", "a disconnect"}) {
+		t.Errorf("Qory Apiary answered %v", order)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, refsOf("acme/old")) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok {
+		t.Error("the removed repository's installation is kept")
+	}
+	if got := w.lastListed(t); !slices.Equal(got, refsOf("acme/widgets")) {
+		t.Errorf("listed %v", got)
+	}
+}
+
+// TestADeletedRepositoryWaitsForAListingInFlight delivers repository deleted for
+// acme/old while a listing of the installation, which claimed acme/old, is held in
+// Qory Apiary: the drop waits for the installation's lock, so Qory Apiary answers the
+// listing's part before the disconnect, and the record of acme/old is gone at the end.
+func TestADeletedRepositoryWaitsForAListingInFlight(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	order := w.holdListing(t, guid1, "repository", repositoryEvent(42, "acme/old", "deleted"))
+	if !slices.Equal(order, []string{"the part", "a disconnect"}) {
+		t.Errorf("Qory Apiary answered %v", order)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, refsOf("acme/old")) {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok {
+		t.Error("the deleted repository's installation is kept")
+	}
+}
+
+// TestATransferDropsTheFirstListingsKeptThatNameTheRepository transfers acme/widgets,
+// whose record names the installation 42 already, to 42, while the adapter keeps a
+// first listing of the installation 9 that names the repository and one of the
+// installation 43 that does not: 9's is dropped, whichever installation the record
+// names, and 43's stays.
+func TestATransferDropsTheFirstListingsKeptThatNameTheRepository(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	w.adapter.keepFirstNaming(firstKey{9, otherConnection}, "octo-org/widgets")
+	w.adapter.keepFirstNaming(firstKey{43, "ac_00000000000000aa"}, "acme/gadgets")
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if w.adapter.keptFirst(9, otherConnection) {
+		t.Error("the first listing that names the repository is kept")
+	}
+	if !w.adapter.keptFirst(43, "ac_00000000000000aa") {
+		t.Error("a first listing that does not name the repository is dropped")
+	}
+}
+
+// holdListingRead is a transport that holds GitHub's answer to the first request for a
+// page of an installation's repositories, once GitHub has answered it, until release is
+// closed, once it has closed read, and passes every other request on.
+type holdListingRead struct {
+	once          *sync.Once
+	read, release chan struct{}
+}
+
+func (h holdListingRead) RoundTrip(r *http.Request) (*http.Response, error) {
+	res, err := http.DefaultTransport.RoundTrip(r)
+	if r.Method == http.MethodGet && r.URL.Path == "/installation/repositories" {
+		held := false
+		h.once.Do(func() { held = true })
+		if held {
+			close(h.read)
+			<-h.release
+		}
+	}
+	return res, err
+}
+
+// TestAFirstListingReadAcrossATransferIsNotKept has a try of the first listing of the
+// installation 9, pending, which keeps nothing yet, read GitHub, and holds GitHub's
+// answer while acme/widgets is transferred to the installation 42: the listing read
+// across the transfer is sent once, under 9's connection, and not kept, so the next try
+// reads GitHub again, and the record stays 42's, whose listing started later.
+func TestAFirstListingReadAcrossATransferIsNotKept(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedPutLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.gh.checked = map[int64]string{9: octoOrg.Login}
+	w.gh.installed("acme/widgets")
+	// 9's listing started before the transfer, and 42's, on the clock, after it.
+	w.adapter.pacer(9).Now = func() time.Time { return listingAt(1) }
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		// The second part is 9's: 42's listing, under the transfer, is sent first.
+		if route == routeCollections && n == 2 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	h := holdListingRead{once: &sync.Once{}, read: make(chan struct{}), release: make(chan struct{})}
+	w.adapter.GitHub.HTTP = &http.Client{Transport: h}
+	done := make(chan error, 1)
+	go func() { done <- w.adapter.listFirst(context.Background(), 9, otherConnection) }()
+	<-h.read
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "transferred"))
+	close(h.release)
+	if err := <-done; !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
+		t.Fatalf("the try: %v", err)
+	}
+	n := 0
+	for _, s := range w.apiary.sent(routeCollections) {
+		if s.body["connection_id"] == otherConnection {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d parts sent under 9's connection", n)
+	}
+	if w.adapter.keptFirst(9, otherConnection) {
+		t.Error("the first listing read across the transfer is kept")
+	}
+	if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+		t.Errorf("acme/widgets: %d %v", inst, ok)
+	}
+}
+
+// TestAPartReadBeforeATransferAndSentLateKeepsItsStartAndTheRecord has the first
+// listing of the installation 9, pending, read acme/widgets at s0, and Qory Apiary
+// answer its first try 403 connection_unknown, so the listing is kept. The repository
+// is then transferred to the installation 42, live, with no transferred delivery, and
+// 42's listing, which started later, at s1, names it. 9's next try, which Qory Apiary
+// takes, sends the part kept: it carries the same listing id and started_at s0 under
+// 9's connection, the record stays 42's, at s1, and serve sends no disconnect.
+//
+// The fake Qory Apiary takes every part and does not model core's rule for a ref live
+// under another connection, nor its started_at guard, so this test checks only the
+// adapter's side: the late part keeps the moment it was read at, which is what core's
+// guard compares, and the adapter's record is not moved back by it.
+func TestAPartReadBeforeATransferAndSentLateKeepsItsStartAndTheRecord(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedPutLink(w.st, 9, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	w.gh.checked = map[int64]string{9: octoOrg.Login}
+	w.gh.installed("acme/widgets")
+	w.adapter.pacer(9).Now = func() time.Time { return listingAt(1) }
+	w.adapter.pacer(42).Now = func() time.Time { return listingAt(2) }
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeCollections && n == 1 {
+			return 403, `{"error":"connection_unknown"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listFirst(context.Background(), 9, otherConnection); !refusedAs(err, http.StatusForbidden, codeConnectionUnknown) {
+		t.Fatalf("9's first try: %v", err)
+	}
+	if !w.adapter.keptFirst(9, otherConnection) {
+		t.Fatal("9's first listing is not kept")
+	}
+	w.reachIs(t, "acme/widgets", 9, listingAt(1).Unix())
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatalf("42's listing: %v", err)
+	}
+	w.reachIs(t, "acme/widgets", 42, listingAt(2).Unix())
+	if err := w.adapter.listFirst(context.Background(), 9, otherConnection); err != nil {
+		t.Fatalf("9's next try: %v", err)
+	}
+	sent := w.apiary.sent(routeCollections)
+	if len(sent) != 3 {
+		t.Fatalf("%d parts sent", len(sent))
+	}
+	var first, late contracts.SourceCollections
+	json.Unmarshal(sent[0].raw, &first)
+	json.Unmarshal(sent[2].raw, &late)
+	if late.ConnectionID != otherConnection || late.Listing.ID != first.Listing.ID || late.Listing.StartedAt != contracts.FormatTime(listingAt(1)) || len(late.Collections) != 1 || late.Collections[0].Ref != widgetsRef {
+		t.Errorf("the late part: %s, the first try: %s", sent[2].raw, sent[0].raw)
+	}
+	w.reachIs(t, "acme/widgets", 42, listingAt(2).Unix())
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+}
+
+// TestADropOfARepositoryAnotherInstallationClaimedChangesNothing has dropRepository run
+// for the installation 42 on acme/widgets, whose record a listing of the installation 9
+// claimed by the time it reads the record under 42's lock: no disconnect is sent, the
+// record stays 9's, the collection stays linked and its pulls stay, and it says false.
+func TestADropOfARepositoryAnotherInstallationClaimedChangesNothing(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 9, otherConnection, linkLive)
+	if err := claimReach(w.st, widgetsRef, 9, listingAt(1)); err != nil {
+		t.Fatal(err)
+	}
+	linkCollection(w.st, widgetsRef)
+	keepPulled(w.st, widgetsRef, pullMark{Since: listingAt(1), Listed: listingAt(1)})
+	if sent, err := w.adapter.dropRepository(context.Background(), widgetsRef, 42); sent || err != nil {
+		t.Errorf("sent %v, %v", sent, err)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	w.reachIs(t, "acme/widgets", 9, listingAt(1).Unix())
+	if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+		t.Error("the collection is unlinked")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m.Since.IsZero() {
+		t.Error("the collection's pulls are dropped")
+	}
+}
+
+// TestARepositoryOfAnInstallationWithNoLinkIsDroppedWithoutADisconnect transfers
+// acme/widgets, whose record names the installation 42, which has no link by then, to
+// the installation 43, which is not linked: there is no connection to name, so no
+// disconnect is sent, the repository's records are dropped all the same, and no line
+// says its collection is disconnected. dropRepository says false for such a repository.
+func TestARepositoryOfAnInstallationWithNoLinkIsDroppedWithoutADisconnect(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	keepPulled(w.st, widgetsRef, pullMark{Since: listingAt(1), Listed: listingAt(1)})
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); len(got) != 0 {
+		t.Errorf("disconnected %v", got)
+	}
+	if _, ok, _ := reachOf(w.st, widgetsRef); ok {
+		t.Error("the repository's installation is kept")
+	}
+	if ok, _ := collectionLinked(w.st, widgetsRef); ok {
+		t.Error("the collection stays linked")
+	}
+	if m, _ := pulledOf(w.st, widgetsRef); m != (pullMark{}) {
+		t.Errorf("the repository's pulls are kept: %+v", m)
+	}
+	if strings.Contains(w.log.String(), "so its collection is disconnected") {
+		t.Errorf("the log: %s", w.log.String())
+	}
+	setReach(w.st, gadgetsRef, 42)
+	if sent, err := w.adapter.dropRepository(context.Background(), gadgetsRef, 42); sent || err != nil {
+		t.Errorf("sent %v, %v", sent, err)
+	}
+	if _, ok, _ := reachOf(w.st, gadgetsRef); ok || len(w.disconnected(0)) != 0 {
+		t.Errorf("acme/gadgets: the record kept %v, disconnected %v", ok, w.disconnected(0))
+	}
+}
+
+// TestADisconnectsAnswerKeepsTheFirst403OfItsConnection keeps the first 403
+// connection_unknown Qory Apiary answered a listing of a live connection, then has a
+// collection's disconnect, which names that connection, answered the signed 204, as
+// Qory Apiary answers it for a connection it does not hold: the first 403 stays, so a
+// 403 that lasts is still timed from it.
+func TestADisconnectsAnswerKeepsTheFirst403OfItsConnection(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	first := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if end, err := noteAnswer(w.st, testConnection, http.StatusForbidden, codeConnectionUnknown, first); end || err != nil {
+		t.Fatalf("the first 403: %v %v", end, err)
+	}
+	if err := w.client.Disconnect(context.Background(), contracts.SourcesDisconnect{Version: 1, ConnectionID: testConnection, CollectionRef: widgetsRef}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := w.st.Get(nsForbidden, testConnection); err != nil || string(b) != strconv.FormatInt(first.Unix(), 10) {
+		t.Errorf("the first 403 kept: %q %v", b, err)
+	}
+}
+
+// The Git object ids of the environment definitions the tests give acme/widgets.
+const (
+	envBefore = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	envAfter  = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+)
+
+// sentEnvironments are the environment_refs the listings' parts Qory Apiary was sent
+// carried, by the collection's ref, the last part's naming it winning; a collection
+// sent without one is "".
+func (w *wired) sentEnvironments() map[string]string {
+	got := map[string]string{}
+	for _, r := range w.apiary.sent(routeCollections) {
+		for _, c := range r.body["collections"].([]any) {
+			c := c.(map[string]any)
+			env, _ := c["environment_ref"].(string)
+			got[c["ref"].(string)] = env
+		}
+	}
+	return got
+}
+
+// TestAListingKeepsTheEnvironmentRefsQoryApiaryTook lists the installation's
+// repositories, acme/widgets with a .devcontainer folder and acme/gadgets with none:
+// the part carries the folder's tree id for acme/widgets and none for acme/gadgets, and
+// once Qory Apiary took it the store keeps that id and drops what it kept for
+// acme/gadgets. A listing whose part Qory Apiary refuses keeps no new id.
+func TestAListingKeepsTheEnvironmentRefsQoryApiaryTook(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	keepEnvironment(w.st, gadgetsRef, envBefore)
+	w.gh.envs = map[int64]string{widgetsID: envBefore}
+	if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := w.sentEnvironments(), map[string]string{widgetsRef: envBefore, gadgetsRef: ""}; !reflect.DeepEqual(got, want) {
+		t.Errorf("sent %v", got)
+	}
+	if sent := w.apiary.sent(routeCollections); len(sent) != 1 || strings.Count(string(sent[0].raw), `"environment_ref"`) != 1 || sent[0].body["listing"].(map[string]any)["complete"] != true {
+		t.Errorf("sent %v", sent)
+	}
+	if env, err := sentEnvironment(w.st, widgetsRef); env != envBefore || err != nil {
+		t.Errorf("acme/widgets keeps %q %v", env, err)
+	}
+	if _, err := w.st.Get(nsEnvironments, gadgetsRef); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("acme/gadgets keeps an environment_ref: %v", err)
+	}
+	if len(w.gh.envAsked) != 1 || !slices.Equal(w.gh.envAsked[0], []string{nodeID("acme/widgets"), nodeID("acme/gadgets")}) {
+		t.Errorf("GraphQL was asked %v", w.gh.envAsked)
+	}
+
+	w.gh.envs[widgetsID] = envAfter
+	w.apiary.grant("42", testConnection)
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeCollections {
+			return 400, `{"error":"invalid_request"}`
+		}
+		return 0, ""
+	}
+	if err := w.adapter.listRepositories(context.Background(), 42); err == nil {
+		t.Error("a listing Qory Apiary refused passed")
+	}
+	if env, _ := sentEnvironment(w.st, widgetsRef); env != envBefore {
+		t.Errorf("acme/widgets keeps %q after a part Qory Apiary refused", env)
+	}
+}
+
+// TestAListingThatCannotReadTheEnvironmentsLeavesTheCollectionsOut lists the
+// installation's repositories while GraphQL answers an error for each node, and then an
+// error that names none: both collections are left out, the one part says the listing
+// is not complete, one line says how many were left out and for which installation and
+// never a title, and the store keeps what it kept of each: the installation that reaches
+// it and the environment_ref sent before.
+func TestAListingThatCannotReadTheEnvironmentsLeavesTheCollectionsOut(t *testing.T) {
+	for _, fail := range []string{"node", "errors"} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedLink(w.st, 42, testConnection, linkLive)
+		setReach(w.st, widgetsRef, 42)
+		keepEnvironment(w.st, widgetsRef, envBefore)
+		w.gh.envFail = fail
+		if err := w.adapter.listRepositories(context.Background(), 42); err != nil {
+			t.Fatalf("%s: %v", fail, err)
+		}
+		sent := w.apiary.sent(routeCollections)
+		if len(sent) != 1 || len(sent[0].body["collections"].([]any)) != 0 || sent[0].body["listing"].(map[string]any)["complete"] != false {
+			t.Errorf("%s: sent %v", fail, sent)
+		}
+		logged := w.log.String()
+		line := `"level":"WARN","msg":"left out collections whose environment definition (.devcontainer or .devcontainer.json) could not be read; the listing is not complete, and the next listing reads them again","installation":42,"left_out":2}`
+		if strings.Count(logged, line) != 1 || strings.Contains(logged, "acme/") {
+			t.Errorf("%s: the log %s", fail, logged)
+		}
+		if env, _ := sentEnvironment(w.st, widgetsRef); env != envBefore {
+			t.Errorf("%s: acme/widgets keeps %q", fail, env)
+		}
+		if inst, ok, _ := reachOf(w.st, widgetsRef); inst != 42 || !ok {
+			t.Errorf("%s: acme/widgets is reached by %d %v", fail, inst, ok)
+		}
+		if _, ok, _ := reachOf(w.st, gadgetsRef); ok {
+			t.Errorf("%s: acme/gadgets, left out, is kept as reached", fail)
+		}
+	}
+}
+
+// pushEvent is a push event of the installation to ref of repo, whose default branch is
+// main.
+func pushEvent(installation int64, repo, ref string, deleted bool) map[string]any {
+	return map[string]any{
+		"ref": ref, "before": "0000000000000000000000000000000000000000", "after": envAfter, "deleted": deleted,
+		"installation": map[string]any{"id": installation},
+		"repository": map[string]any{
+			"id": repoID(repo), "node_id": nodeID(repo), "full_name": repo, "html_url": "https://github.com/" + repo, "default_branch": "main",
+		},
+	}
+}
+
+// pushWired is a wired adapter whose installation 42 is linked, with acme/widgets's
+// collection linked and its environment_ref last sent envBefore.
+func pushWired(t *testing.T) *wired {
+	t.Helper()
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	setReach(w.st, widgetsRef, 42)
+	setReach(w.st, gadgetsRef, 42)
+	linkCollection(w.st, widgetsRef)
+	keepEnvironment(w.st, widgetsRef, envBefore)
+	return w
+}
+
+// TestAPushThatChangesTheEnvironmentListsTheRepositoriesAgain pushes to acme/widgets's
+// default branch: GraphQL reads its environment_ref by its node id, and since it is not
+// the one sent last the installation's repositories are listed again, which sends it,
+// and the store keeps it.
+func TestAPushThatChangesTheEnvironmentListsTheRepositoriesAgain(t *testing.T) {
+	w := pushWired(t)
+	w.gh.envs = map[int64]string{widgetsID: envAfter}
+	w.deliver(t, "push", guid1, pushEvent(42, "acme/widgets", "refs/heads/main", false))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Fatalf("the push is %s", s)
+	}
+	if n := w.gh.listings(); n != 1 {
+		t.Errorf("%d listings", n)
+	}
+	if got := w.sentEnvironments(); got[widgetsRef] != envAfter {
+		t.Errorf("sent %v", got)
+	}
+	if env, _ := sentEnvironment(w.st, widgetsRef); env != envAfter {
+		t.Errorf("acme/widgets keeps %q", env)
+	}
+	if len(w.gh.envAsked) != 2 || !slices.Equal(w.gh.envAsked[0], []string{nodeID("acme/widgets")}) {
+		t.Errorf("GraphQL was asked %v", w.gh.envAsked)
+	}
+}
+
+// TestAPushThatLeavesTheEnvironmentListsNothing pushes to acme/widgets's default branch
+// with its environment_ref the one sent last, and with none when none was sent: GraphQL
+// is asked, and nothing is listed or sent.
+func TestAPushThatLeavesTheEnvironmentListsNothing(t *testing.T) {
+	w := pushWired(t)
+	w.gh.envs = map[int64]string{widgetsID: envBefore}
+	w.deliver(t, "push", guid1, pushEvent(42, "acme/widgets", "refs/heads/main", false))
+	keepEnvironment(w.st, widgetsRef, "")
+	delete(w.gh.envs, widgetsID)
+	w.deliver(t, "push", guid2, pushEvent(42, "acme/widgets", "refs/heads/main", false))
+	for _, g := range []string{guid1, guid2} {
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("the push is %s", s)
+		}
+	}
+	if n := w.gh.listings(); n != 0 || w.apiary.count() != 0 || len(w.gh.envAsked) != 2 {
+		t.Errorf("%d listings, %d requests to Qory Apiary, GraphQL asked %v", n, w.apiary.count(), w.gh.envAsked)
+	}
+}
+
+// TestAPushElsewhereChangesNothing pushes to another branch, a tag, a deletion of the
+// default branch, to acme/gadgets, whose collection is not linked, to a repository serve
+// never listed, and from another installation: none asks GitHub anything or lists, and
+// each is done.
+func TestAPushElsewhereChangesNothing(t *testing.T) {
+	w := pushWired(t)
+	w.gh.envs = map[int64]string{widgetsID: envAfter, gadgetsID: envAfter}
+	grantedLink(w.st, 43, otherConnection, linkLive)
+	other := pushEvent(43, "acme/widgets", "refs/heads/main", false)
+	never := pushEvent(42, "acme/sprockets-two", "refs/heads/main", false)
+	linkCollection(w.st, refOf("acme/sprockets-two"))
+	pushes := []map[string]any{
+		pushEvent(42, "acme/widgets", "refs/heads/feature", false),
+		pushEvent(42, "acme/widgets", "refs/tags/main", false),
+		pushEvent(42, "acme/widgets", "refs/heads/main", true),
+		pushEvent(42, "acme/gadgets", "refs/heads/main", false),
+		never,
+		other,
+	}
+	for i, ev := range pushes {
+		g := fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+		w.deliver(t, "push", g, ev)
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("push %d is %s", i, s)
+		}
+	}
+	if asked := reachedGitHub(w.gh); len(asked) != 0 || w.apiary.count() != 0 {
+		t.Errorf("GitHub was asked %v, Qory Apiary %d times", asked, w.apiary.count())
+	}
+	if env, _ := sentEnvironment(w.st, widgetsRef); env != envBefore {
+		t.Errorf("acme/widgets keeps %q", env)
+	}
+}
+
+// TestAPushWhoseEnvironmentCannotBeReadChangesNothing pushes to acme/widgets's default
+// branch while GraphQL answers an error for the node, and then one that names none: each
+// push is done, nothing is listed, and the failure is logged, throttled, the second line
+// held back.
+func TestAPushWhoseEnvironmentCannotBeReadChangesNothing(t *testing.T) {
+	w := pushWired(t)
+	w.gh.envFail = "node"
+	w.deliver(t, "push", guid1, pushEvent(42, "acme/widgets", "refs/heads/main", false))
+	w.gh.mu.Lock()
+	w.gh.envFail = "errors"
+	w.gh.mu.Unlock()
+	w.deliver(t, "push", guid2, pushEvent(42, "acme/widgets", "refs/heads/main", false))
+	for _, g := range []string{guid1, guid2} {
+		if s := state(w.st, g); s != store.Done {
+			t.Errorf("the push is %s", s)
+		}
+	}
+	if n := w.gh.listings(); n != 0 || w.apiary.count() != 0 || len(w.gh.envAsked) != 2 {
+		t.Errorf("%d listings, %d requests to Qory Apiary, GraphQL asked %v", n, w.apiary.count(), w.gh.envAsked)
+	}
+	line := `"level":"WARN","msg":"reading the environment definition (.devcontainer or .devcontainer.json) after a push failed; the next listing reads it again","collection":"` + widgetsRef + `","installation":42,"error":"reading the environment definition (.devcontainer or .devcontainer.json) of the repository ` + widgetsRef + `: GitHub returned an error, FORBIDDEN: Resource not accessible by integration"}`
+	if logged := w.log.String(); strings.Count(logged, line) != 1 || strings.Count(logged, "after a push failed") != 1 {
+		t.Errorf("the log %s", logged)
+	}
+	w.adapter.stopLog()
+	if logged := w.log.String(); !strings.Contains(logged, `"msg":"log lines of failed environment definition reads not printed","reads_dropped":1}`) {
+		t.Errorf("the log %s", logged)
+	}
+	if env, _ := sentEnvironment(w.st, widgetsRef); env != envBefore {
+		t.Errorf("acme/widgets keeps %q", env)
+	}
+}
+
+// TestTheEnvironmentRefSentIsDroppedWithTheRepository keeps the environment_ref sent for
+// acme/widgets, acme/gadgets and acme/third, and drops each repository's records: GitHub
+// deletes acme/widgets, the installation_repositories event removes acme/gadgets, and
+// GitHub deletes the installation, which drops the rest, another installation's kept.
+func TestTheEnvironmentRefSentIsDroppedWithTheRepository(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	grantedLink(w.st, 43, otherConnection, linkLive)
+	third := refOf("acme/third")
+	elsewhere := refOf("other/thing")
+	for ref, installation := range map[string]int64{widgetsRef: 42, gadgetsRef: 42, third: 42, elsewhere: 43} {
+		setReach(w.st, ref, installation)
+		keepEnvironment(w.st, ref, envBefore)
+	}
+	// The listing the removal sends names acme/third alone, with the same id, so a
+	// collection's record goes by the drop alone.
+	w.gh.repos = []string{"acme/third"}
+	w.gh.envs = map[int64]string{repoID("acme/third"): envBefore}
+	kept := func(ref string) bool {
+		_, err := w.st.Get(nsEnvironments, ref)
+		return err == nil
+	}
+	w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/widgets", "deleted"))
+	if kept(widgetsRef) || !kept(gadgetsRef) {
+		t.Errorf("after the repository's deletion: acme/widgets %v, acme/gadgets %v", kept(widgetsRef), kept(gadgetsRef))
+	}
+	w.deliver(t, "installation_repositories", guid2, repositoriesEvent("removed", "selected", nil, []string{"acme/gadgets"}))
+	if kept(gadgetsRef) || !kept(third) {
+		t.Errorf("after the removal: acme/gadgets %v, acme/third %v", kept(gadgetsRef), kept(third))
+	}
+	w.deliver(t, "installation", guid3, map[string]any{"action": "deleted", "installation": map[string]any{"id": 42}})
+	if kept(third) || !kept(elsewhere) {
+		t.Errorf("after the installation's deletion: acme/third %v, other/thing %v", kept(third), kept(elsewhere))
+	}
+}
