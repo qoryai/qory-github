@@ -42,9 +42,9 @@ change what the program does, and notes it under Upgrading.
   each start and at each page of the change feed that has a grant entry. serve handles
   the deliveries of an installation while that copy contains its grant, or until the
   connect return of its link expires, and drops the link of an installation the copy
-  does not contain. Qory Apiary's calls to the adapter work only for installations
-  under a grant that Qory Apiary holds; a call for any other installation gets 409
-  `grant_unknown`.
+  does not contain. A call from Qory Apiary that has a `grant_ref` works only for an
+  installation whose deliveries serve handles; a call for any other installation gets
+  409 `grant_unknown`.
 - With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
   Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
   to `public_url` followed by `/v1/calls/`, such as
@@ -55,6 +55,13 @@ change what the program does, and notes it under Upgrading.
   key. A run's credential covers only the repositories the call lists. For work, it
   reads contents and pull requests with access `read`, and writes both with access
   `write`. For a harness, it reads contents, and only on `github.com`.
+- A call for a run's work credential has no `grant_ref`. It has the connection of the
+  run's target and the id of the target's repository. serve mints the credential only
+  when the installation that reaches the repository is linked, live, to that connection,
+  and Qory Apiary's copy of the grants contains that installation's grant under that
+  connection; otherwise the call gets 403 `resource_not_covered`. A grant whose report
+  serve is still sending does not count. When GitHub returns 422 to the mint, or the
+  installation is suspended, the call gets 403 `access_not_granted`.
 - The source role of the description has `credential_scope` `resource`: one credential
   covers only the repositories a call lists.
 - The source role of the description has `apply`: a run's work credential reaches at

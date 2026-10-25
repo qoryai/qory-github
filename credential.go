@@ -94,8 +94,8 @@ type Answer struct {
 }
 
 // Apply is one entry of an [Answer]: hosts, how the token is set on them, and the
-// paths of theirs the run may request. In [SourceRole.Apply], each path is a template
-// with {target.path} in place of owner/name.
+// paths of theirs the run may request. In [SourceRole.Apply], each path that contains
+// owner/name has {target.path} in its place.
 type Apply struct {
 	Hosts    []string `json:"hosts"`
 	Scheme   string   `json:"scheme"`

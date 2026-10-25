@@ -362,25 +362,36 @@ func TestTheFeedReadsTheCopyAtStart(t *testing.T) {
 	}
 }
 
-// TestACallServesOnlyAnInstallationTheCopyHolds pins the rule a call follows, the one
-// intake follows, see [granted]: an installation whose link's connect return has
-// expired and that Qory Apiary's copy of the grants does not hold is refused 409
-// grant_unknown, and nothing is minted for it; while its connect return has not
-// expired, or once the copy holds it, a run credential is minted.
+// TestACallServesOnlyAnInstallationTheCopyHolds pins the rule a call for a harness
+// follows, the one intake follows, see [granted]: an installation whose link's connect
+// return has expired and that Qory Apiary's copy of the grants does not hold is refused
+// 409 grant_unknown, and nothing is minted for it; while its connect return has not
+// expired, or once the copy holds it, a run credential is minted. A call for work
+// counts only the copy: while the connect return has not expired and the copy does not
+// hold the grant, as while the grant's report is still being sent, it gets 403
+// resource_not_covered and nothing is minted.
 func TestACallServesOnlyAnInstallationTheCopyHolds(t *testing.T) {
 	rig := newCallsRig(t)
 	send := func() callAnswer {
-		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef}, "read", "work")))
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall("42", []string{widgetsRef}, "read")))
+	}
+	sendWork := func() callAnswer {
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCall(testConnection, widgetsRef, "read")))
 	}
 	if err := replaceGrants(rig.st, nil); err != nil {
 		t.Fatal(err)
 	}
 	checkAnswer(t, send(), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
+	checkAnswer(t, sendWork(), http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
 	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
 		t.Fatalf("minted %q for an installation the copy does not hold", mints)
 	}
 	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkLive, Return: time.Now().Add(time.Hour).Unix()}); err != nil {
 		t.Fatal(err)
+	}
+	checkAnswer(t, sendWork(), http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Fatalf("minted %q for work under a grant whose report is still being sent", mints)
 	}
 	checkAnswer(t, send(), http.StatusOK, "run-credential-answer.schema.json", "")
 	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
@@ -391,7 +402,8 @@ func TestACallServesOnlyAnInstallationTheCopyHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkAnswer(t, send(), http.StatusOK, "run-credential-answer.schema.json", "")
-	if mints := rig.gh.mintsSoFar(); len(mints) != 2 {
-		t.Errorf("minted %d credentials, want 2", len(mints))
+	checkAnswer(t, sendWork(), http.StatusOK, "run-credential-answer.schema.json", "")
+	if mints := rig.gh.mintsSoFar(); len(mints) != 3 {
+		t.Errorf("minted %d credentials, want 3", len(mints))
 	}
 }

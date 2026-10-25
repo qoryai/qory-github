@@ -78,13 +78,23 @@ type grants interface {
 	// reaches is whether the installation reaches the repository whose id is
 	// repository.
 	reaches(installation, repository int64) (bool, error)
+	// liveUnder is the installation that reaches the repository whose id is
+	// repository, when that installation is linked to connection and the link is
+	// live: the repository is then a live collection under connection. Otherwise it is
+	// false.
+	liveUnder(connection string, repository int64) (int64, bool, error)
+	// copied is whether Qory Apiary's copy of the grants contains the installation's
+	// grant under connection. A link whose grant's report is still being sent does
+	// not count.
+	copied(installation int64, connection string) (bool, error)
 }
 
 // storeGrants are the grants the store keeps: the installations' links, see [Link], and
-// the repositories each installation's listings named, see [claimReach]. An
+// the repositories each installation's listings named, see [claimReach]. For linked, an
 // installation counts as linked under the rule intake follows, see [granted]: Qory
 // Apiary's copy of the grants contains it, or the connect return of its link has not
-// expired. now is the clock; nil is time.Now.
+// expired. For copied, only the copy counts, see [grantOf]. now is the clock; nil is
+// time.Now.
 type storeGrants struct {
 	st  *store.Store
 	now func() time.Time
@@ -101,6 +111,23 @@ func (g storeGrants) linked(installation int64) (bool, error) {
 func (g storeGrants) reaches(installation, repository int64) (bool, error) {
 	id, ok, err := reachOf(g.st, github.CollectionRef(repository))
 	return err == nil && ok && id == installation, err
+}
+
+func (g storeGrants) liveUnder(connection string, repository int64) (int64, bool, error) {
+	installation, ok, err := reachOf(g.st, github.CollectionRef(repository))
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	l, ok, err := linkOf(g.st, installation)
+	if err != nil || !ok || l.Connection != connection || l.State != linkLive {
+		return 0, false, err
+	}
+	return installation, true, nil
+}
+
+func (g storeGrants) copied(installation int64, connection string) (bool, error) {
+	held, err := grantOf(g.st, installation)
+	return err == nil && held == connection, err
 }
 
 // Calls serves Qory Apiary's calls at [callsPath]: run-credential, resolve and read,
@@ -476,17 +503,18 @@ func runPermissions(purpose, access string) map[string]string {
 }
 
 // runCredential serves the call run-credential, run-credential.schema.json, made at at:
-// a token GitHub mints for the installation of grant_ref, limited to the repositories
-// of the resources and to [runPermissions]. It returns, in this order: 409
-// grant_unknown for a grant_ref that is not an installation linked to Qory Apiary, or
-// one GitHub has no more; 403 resource_not_covered for a resource that is not a
-// repository the installation reaches, with a line that contains the resource; 403
-// access_not_granted when GitHub returns 422 for the permissions on those
+// a token GitHub mints for one installation, limited to the repositories of the
+// resources and to [runPermissions]. A call for a harness has the installation's id in
+// grant_ref, see [Calls.harnessGrant]; a call for work has the connection of its one
+// repository in connection_id, see [Calls.workGrant]. Past those checks, it returns
+// 403 access_not_granted when GitHub returns 422 for the permissions on those
 // repositories, as for an installation that does not grant them, or the installation
-// is suspended; and 503 source_unavailable when GitHub fails otherwise. The answer's
-// apply has, for work, github.com with basic and the username x-access-token on the
-// repositories' git paths and api.github.com with bearer on their API paths, as
-// [github.Uses] returns them; for a harness, the github.com item alone.
+// is suspended; when the mint fails for good, as for an installation GitHub has no
+// more, 409 grant_unknown for a harness and 403 resource_not_covered for work; and 503
+// source_unavailable when GitHub fails otherwise. The answer's apply has, for work,
+// github.com with basic and the username x-access-token on the repository's git paths
+// and api.github.com with bearer on its API paths, as [github.Uses] returns them; for a
+// harness, the github.com item alone.
 func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (int, any) {
 	var req contracts.RunCredential
 	if !decodeCall("run-credential.schema.json", body, &req) {
@@ -497,22 +525,28 @@ func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (i
 
 // runCredentialFor is [Calls.runCredential] for the decoded call req. At GitHub, a
 // mint that lists no repository covers every repository of the installation, so a call
-// with no resources gets 400 invalid_request here, beside the schema's minItems.
+// with no resources gets 400 invalid_request here, beside the schema's minItems. A call
+// for work with a grant_ref, with no connection_id or with other than one resource gets
+// 400 invalid_request here too, beside the schema.
 func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredential, at time.Time) (int, any) {
 	if len(req.Resources) == 0 {
 		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
 	}
-	installation, ok := installationOf(req.GrantRef)
-	if status, refusal := c.held(ok, installation); status != 0 {
-		return status, refusal
+	work := req.Purpose == "work"
+	if work && (req.GrantRef != "" || len(req.Resources) != 1 || !connectionShape.MatchString(req.ConnectionID)) {
+		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
 	}
-	ids := make([]int64, 0, len(req.Resources))
-	for _, ref := range req.Resources {
-		if status, refusal := c.covered(installation, ref); status != 0 {
-			return status, refusal
-		}
-		id, _ := repositoryOf(ref)
-		ids = append(ids, id)
+	var installation int64
+	var ids []int64
+	var status int
+	var refusal any
+	if work {
+		installation, ids, status, refusal = c.workGrant(req.ConnectionID, req.Resources[0])
+	} else {
+		installation, ids, status, refusal = c.harnessGrant(req.GrantRef, req.Resources)
+	}
+	if status != 0 {
+		return status, refusal
 	}
 	t, err := c.GitHub.MintInstallationToken(ctx, github.Request{AppID: c.AppID, Key: c.Key, InstallationID: installation, RepositoryIDs: ids, Permissions: runPermissions(req.Purpose, req.Access)})
 	switch {
@@ -522,6 +556,9 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 	case errors.Is(err, github.ErrSuspended):
 		c.log().Info("minting the run credential's token failed: the installation is suspended", slog.Int64("installation", installation))
 		return http.StatusForbidden, contracts.Refusal{Error: codeAccessNotGranted}
+	case errors.Is(err, github.ErrMintRefused) && work:
+		c.log().Info("minting the work credential's token failed for good, so no grant covers the collection", slog.Int64("installation", installation), slog.String("error", err.Error()))
+		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	case errors.Is(err, github.ErrMintRefused):
 		c.log().Info("minting the run credential's token failed for good, so the grant counts as unknown", slog.Int64("installation", installation), slog.String("error", err.Error()))
 		return http.StatusConflict, contracts.Refusal{Error: codeGrantUnknown}
@@ -554,6 +591,65 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		return http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 	}
 	return http.StatusOK, answer
+}
+
+// harnessGrant is the installation of grant and the repositories of resources for a
+// call for a harness, or the status and refusal: 409 grant_unknown for a grant that is
+// not an installation linked to Qory Apiary, see [Calls.held], then 403
+// resource_not_covered for a resource that is not a repository the installation
+// reaches, with a line that contains the resource, see [Calls.covered].
+func (c *Calls) harnessGrant(grant string, resources []string) (int64, []int64, int, any) {
+	installation, ok := installationOf(grant)
+	if status, refusal := c.held(ok, installation); status != 0 {
+		return 0, nil, status, refusal
+	}
+	ids := make([]int64, 0, len(resources))
+	for _, ref := range resources {
+		if status, refusal := c.covered(installation, ref); status != 0 {
+			return 0, nil, status, refusal
+		}
+		id, _ := repositoryOf(ref)
+		ids = append(ids, id)
+	}
+	return installation, ids, 0, nil
+}
+
+// workGrant is the installation and the repository for a call for work under
+// connection whose one resource is ref, or the status and refusal. The repository of
+// ref must be a live collection under connection, see [grants.liveUnder], and Qory
+// Apiary's copy of the grants must contain the grant of the installation that reaches
+// it under connection, see [grants.copied]; else the call gets 403
+// resource_not_covered, with a line that contains ref and connection. The check
+// compares the connection of ref's installation with connection and never takes the
+// connection from ref. When the store fails, the call gets 503 source_unavailable.
+func (c *Calls) workGrant(connection, ref string) (int64, []int64, int, any) {
+	notCovered := func(why string) (int64, []int64, int, any) {
+		c.log().Info(why, slog.String("connection", connection), slog.String("resource", ref))
+		return 0, nil, http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
+	}
+	failed := func(err error) (int64, []int64, int, any) {
+		c.log().Error("reading the collection and the grant of a work call", slog.String("connection", connection), slog.String("resource", ref), slog.String("error", err.Error()))
+		return 0, nil, http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
+	}
+	id, ok := repositoryOf(ref)
+	if !ok {
+		return notCovered("the resource of the work call is not a repository's id")
+	}
+	installation, live, err := c.Grants.liveUnder(connection, id)
+	if err != nil {
+		return failed(err)
+	}
+	if !live {
+		return notCovered("the resource of the work call is not a live collection under the call's connection")
+	}
+	copied, err := c.Grants.copied(installation, connection)
+	if err != nil {
+		return failed(err)
+	}
+	if !copied {
+		return notCovered("Qory Apiary's copy of the grants does not contain a grant under the call's connection that covers the work call's resource")
+	}
+	return installation, []int64{id}, 0, nil
 }
 
 // held is 0 when ok and the installation is linked to Qory Apiary; else 409
@@ -670,7 +766,7 @@ func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolv
 // read serves the call read, read.schema.json: the file at path in the repository of
 // resource_ref, at the commit of at, read with a token that reads that repository's
 // contents alone, see [Calls.readToken]. It returns, in this order: 409
-// grant_unknown and 403 resource_not_covered as [Calls.runCredential] does; 404
+// grant_unknown and 403 resource_not_covered as [Calls.harnessGrant] does; 404
 // version_not_found when GitHub has no commit, branch or tag by at; 409
 // document_not_text for a path that is not a UTF-8 text file of at most
 // [contracts.ReadContentMaxBytes] bytes without a NUL; and 503 source_unavailable when

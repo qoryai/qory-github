@@ -426,17 +426,24 @@ func TestCallsBeyondTheBoundAreAnswered503(t *testing.T) {
 	checkAnswer(t, rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(widgetsAddress)), 200, "resolve-answer.schema.json", "")
 }
 
-// runCredential is a run-credential call's members.
-func runCredential(grant string, resources []string, access, purpose string) string {
+// harnessCall is a run-credential call's members for a harness under the grant.
+func harnessCall(grant string, resources []string, access string) string {
 	rs, _ := json.Marshal(resources)
-	return `"grant_ref":"` + grant + `","resources":` + string(rs) + `,"access":"` + access + `","purpose":"` + purpose + `"`
+	return `"grant_ref":"` + grant + `","resources":` + string(rs) + `,"access":"` + access + `","purpose":"harness"`
+}
+
+// workCall is a run-credential call's members for work under the connection, with the
+// one resource ref.
+func workCall(connection, ref, access string) string {
+	return `"connection_id":"` + connection + `","resources":["` + ref + `"],"access":"` + access + `","purpose":"work"`
 }
 
 // TestARunCredentialForWorkMapsTheAccess pins a run credential for work: access read
 // mints contents, metadata and pull_requests read, access write contents and
-// pull_requests write, never workflows, for the repositories alone, by id; the answer
-// sets the token on github.com with basic and x-access-token on the repositories' git
-// paths, and on api.github.com with bearer on their API paths, with GitHub's expiry.
+// pull_requests write, never workflows, for the one repository alone, by id; the answer
+// is [github.Uses] for that repository: the token on github.com with basic and
+// x-access-token on its git paths, and on api.github.com with bearer on its API paths,
+// with GitHub's expiry.
 func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 	for access, perms := range map[string]string{
 		"read":  `{"contents":"read","metadata":"read","pull_requests":"read"}`,
@@ -444,78 +451,114 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 	} {
 		t.Run(access, func(t *testing.T) {
 			rig := newCallsRig(t)
-			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef, gadgetsRef}, access, "work")))
+			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCall(testConnection, widgetsRef, access)))
 			checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
 			mints := rig.gh.mintsSoFar()
-			if want := `{"permissions":` + perms + `,"repository_ids":[` + widgetsRef + `,` + gadgetsRef + `]}`; len(mints) != 1 || mints[0] != want {
+			if want := `{"permissions":` + perms + `,"repository_ids":[` + widgetsRef + `]}`; len(mints) != 1 || mints[0] != want {
 				t.Errorf("minted %q, want %s", mints, want)
 			}
 			var ans contracts.RunCredentialAnswer
 			json.Unmarshal(got.body, &ans)
 			want := contracts.RunCredentialAnswer{Version: 1, Revision: contracts.Revision, Credential: contracts.Credential{
 				Version: 1, Token: ghToken, ExpiresAt: "2099-01-01T00:00:00Z", Apply: []contracts.CredentialApply{
-					{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*", "/acme/gadgets.git/*", "/acme/gadgets/*"}},
-					{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets", "/repos/acme/widgets/*", "/repos/acme/gadgets", "/repos/acme/gadgets/*", "/graphql"}},
+					{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*"}},
+					{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets", "/repos/acme/widgets/*", "/graphql"}},
 				},
 			}}
 			if fmt.Sprint(ans) != fmt.Sprint(want) {
 				t.Errorf("answered %s", shown(got.body))
+			}
+			uses := github.Uses([]github.Repository{{Owner: "acme", Name: "widgets"}})
+			if len(uses) != len(ans.Credential.Apply) {
+				t.Fatalf("answered %d apply items, want %d", len(ans.Credential.Apply), len(uses))
+			}
+			for i, u := range uses {
+				if fmt.Sprint(ans.Credential.Apply[i]) != fmt.Sprint(contracts.CredentialApply{Hosts: u.Hosts, Scheme: u.Scheme, Username: u.Username, Paths: u.Paths}) {
+					t.Errorf("apply item %d is %v, want %v", i, ans.Credential.Apply[i], u)
+				}
 			}
 		})
 	}
 }
 
 // TestARunCredentialForAHarnessReadsContentsOnGitHubAlone pins a run credential for a
-// harness: contents read whatever the access, and one apply item, github.com on the
-// repositories' git paths, with nothing for api.github.com.
+// harness: contents read, and one apply item, github.com on the repositories' git
+// paths, with nothing for api.github.com. A call for a harness with access write gets
+// 400 invalid_request, as run-credential.schema.json requires, and nothing is minted.
 func TestARunCredentialForAHarnessReadsContentsOnGitHubAlone(t *testing.T) {
-	for _, access := range []string{"read", "write"} {
-		rig := newCallsRig(t)
-		got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{widgetsRef}, access, "harness")))
-		checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
-		if mints := rig.gh.mintsSoFar(); len(mints) != 1 || mints[0] != `{"permissions":{"contents":"read"},"repository_ids":[`+widgetsRef+`]}` {
-			t.Errorf("%s: minted %q", access, mints)
-		}
-		var ans contracts.RunCredentialAnswer
-		json.Unmarshal(got.body, &ans)
-		if len(ans.Credential.Apply) != 1 || fmt.Sprint(ans.Credential.Apply[0]) != fmt.Sprint(contracts.CredentialApply{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*"}}) {
-			t.Errorf("%s: answered %s", access, shown(got.body))
-		}
-		if strings.Contains(string(got.body), "api.github.com") || strings.Contains(string(got.body), "graphql") {
-			t.Errorf("%s: a harness's credential reaches the API: %s", access, shown(got.body))
-		}
+	rig := newCallsRig(t)
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall("42", []string{widgetsRef}, "write")))
+	checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Fatalf("minted %q for a harness call with access write", mints)
+	}
+	got = rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall("42", []string{widgetsRef}, "read")))
+	checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
+	if mints := rig.gh.mintsSoFar(); len(mints) != 1 || mints[0] != `{"permissions":{"contents":"read"},"repository_ids":[`+widgetsRef+`]}` {
+		t.Errorf("minted %q", mints)
+	}
+	var ans contracts.RunCredentialAnswer
+	json.Unmarshal(got.body, &ans)
+	if len(ans.Credential.Apply) != 1 || fmt.Sprint(ans.Credential.Apply[0]) != fmt.Sprint(contracts.CredentialApply{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*"}}) {
+		t.Errorf("answered %s", shown(got.body))
+	}
+	if strings.Contains(string(got.body), "api.github.com") || strings.Contains(string(got.body), "graphql") {
+		t.Errorf("a harness's credential reaches the API: %s", shown(got.body))
+	}
+	rig = newCallsRig(t)
+	got = rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall("42", []string{widgetsRef, gadgetsRef}, "read")))
+	checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
+	if mints := rig.gh.mintsSoFar(); len(mints) != 1 || mints[0] != `{"permissions":{"contents":"read"},"repository_ids":[`+widgetsRef+`,`+gadgetsRef+`]}` {
+		t.Errorf("two resources: minted %q", mints)
 	}
 }
 
 // TestARunCredentialWithNoResourcesMintsNothing pins that a run-credential call with an
 // empty resources list gets 400 invalid_request and mints nothing: through the route,
 // where the schema refuses it, and past the schema, where the code refuses it, since a
-// mint that lists no repository covers every repository of the installation.
+// mint that lists no repository covers every repository of the installation. Past the
+// schema, a call for work with a grant_ref, with no connection_id or with two resources
+// gets 400 invalid_request too.
 func TestARunCredentialWithNoResourcesMintsNothing(t *testing.T) {
 	rig := newCallsRig(t)
-	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential("42", []string{}, "read", "work")))
-	checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
-	for _, resources := range [][]string{nil, {}} {
-		status, answer := rig.calls.runCredentialFor(context.Background(), contracts.RunCredential{Version: 1, GrantRef: "42", Resources: resources, Access: "read", Purpose: "work"}, time.Now())
+	for _, members := range []string{
+		`"connection_id":"` + testConnection + `","resources":[],"access":"read","purpose":"work"`,
+		harnessCall("42", []string{}, "read"),
+	} {
+		got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(members))
+		checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
+	}
+	for name, req := range map[string]contracts.RunCredential{
+		"work, nil resources":        {ConnectionID: testConnection, Access: "read", Purpose: "work"},
+		"work, no resources":         {ConnectionID: testConnection, Resources: []string{}, Access: "read", Purpose: "work"},
+		"harness, nil resources":     {GrantRef: "42", Access: "read", Purpose: "harness"},
+		"harness, no resources":      {GrantRef: "42", Resources: []string{}, Access: "read", Purpose: "harness"},
+		"work with a grant_ref":      {GrantRef: "42", ConnectionID: testConnection, Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
+		"work with no connection":    {Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
+		"work with two resources":    {ConnectionID: testConnection, Resources: []string{widgetsRef, gadgetsRef}, Access: "read", Purpose: "work"},
+		"work with a bad connection": {ConnectionID: "ac_", Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
+	} {
+		req.Version = 1
+		status, answer := rig.calls.runCredentialFor(context.Background(), req, time.Now())
 		if refusal, _ := answer.(contracts.Refusal); status != http.StatusBadRequest || refusal.Error != codeInvalidRequest {
-			t.Errorf("resources %#v: answered %d %v", resources, status, answer)
+			t.Errorf("%s: answered %d %v", name, status, answer)
 		}
 	}
 	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
-		t.Errorf("minted %q for a call with no resources", mints)
+		t.Errorf("minted %q for a refused call", mints)
 	}
 }
 
-// TestARunCredentialIsRefusedInTheContractsOrder pins the refusals of a run credential:
-// 409 grant_unknown for a grant_ref that is not a linked installation, or that GitHub
-// answers it has no more; 403 resource_not_covered for a repository the installation
-// does not reach, with a line that names it, before anything is minted; 403
-// access_not_granted when GitHub answers the mint 422 or the installation is suspended;
-// and 503 source_unavailable when GitHub fails.
+// TestARunCredentialIsRefusedInTheContractsOrder pins the refusals of a run credential
+// for a harness: 409 grant_unknown for a grant_ref that is not a linked installation,
+// or that GitHub has no more; 403 resource_not_covered for a repository the
+// installation does not reach, with a line that names it, before anything is minted;
+// 403 access_not_granted when GitHub returns 422 to the mint or the installation is
+// suspended; and 503 source_unavailable when GitHub fails.
 func TestARunCredentialIsRefusedInTheContractsOrder(t *testing.T) {
 	rig := newCallsRig(t)
 	send := func(grant string, resources ...string) callAnswer {
-		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(runCredential(grant, resources, "write", "work")))
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall(grant, resources, "read")))
 	}
 	for _, grant := range []string{"7", "042", "+42", "0", "-42", "acme", "9223372036854775808"} {
 		checkAnswer(t, send(grant, widgetsRef), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
@@ -527,7 +570,7 @@ func TestARunCredentialIsRefusedInTheContractsOrder(t *testing.T) {
 		}
 	}
 	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
-		t.Errorf("minted %q for a call refused", mints)
+		t.Errorf("minted %q for a refused call", mints)
 	}
 	rig.gh.mu.Lock()
 	rig.gh.refused = []int64{gadgetsID}
@@ -548,6 +591,82 @@ func TestARunCredentialIsRefusedInTheContractsOrder(t *testing.T) {
 	rig.gh.gh.installSuspended, rig.gh.gh.installGone = false, true
 	rig.gh.gh.mu.Unlock()
 	checkAnswer(t, send("42", widgetsRef), http.StatusConflict, "refusal.schema.json", codeGrantUnknown)
+}
+
+// TestAWorkCredentialGetsTheContractsRefusalsInOrder pins the refusals of a run
+// credential for work, which has a connection_id and no grant_ref: 403
+// resource_not_covered, with a line that contains the resource and the connection, and
+// before anything is minted, for a resource that is not a repository's id, for a
+// repository no installation reaches, for one whose installation is linked to another
+// connection or whose link is pending, and for one whose installation's grant Qory
+// Apiary's copy of the grants does not contain under the call's connection; then 403
+// access_not_granted when GitHub returns 422 to the mint or the installation is
+// suspended; 403 resource_not_covered, never 409 grant_unknown, when GitHub has the
+// installation no more; and 503 source_unavailable when GitHub fails.
+func TestAWorkCredentialGetsTheContractsRefusalsInOrder(t *testing.T) {
+	rig := newCallsRig(t)
+	send := func(connection, ref string) callAnswer {
+		return rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCall(connection, ref, "write")))
+	}
+	notCovered := func(what, connection, ref string) {
+		t.Helper()
+		checkAnswer(t, send(connection, ref), http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+		if !strings.Contains(rig.log.String(), `"connection":"`+connection+`","resource":"`+ref+`"`) {
+			t.Errorf("%s: no line contains the connection and the resource: %s", what, rig.log.String())
+		}
+	}
+	for _, ref := range []string{refOf("acme/other"), "0" + widgetsRef, "acme/widgets", strconv.Itoa(oldID), "42"} {
+		notCovered("ref "+ref, testConnection, ref)
+	}
+	notCovered("another connection", otherConnection, widgetsRef)
+
+	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkPending}); err != nil {
+		t.Fatal(err)
+	}
+	notCovered("a pending link", testConnection, widgetsRef)
+
+	if err := putLink(rig.st, 42, link{Connection: testConnection, State: linkLive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := putGrant(rig.st, 42, otherConnection); err != nil {
+		t.Fatal(err)
+	}
+	notCovered("a grant the copy has under another connection", testConnection, widgetsRef)
+
+	if err := grantedLink(rig.st, 42, otherConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	notCovered("a collection moved to another connection", testConnection, widgetsRef)
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Fatalf("minted %q for a refused call", mints)
+	}
+
+	if err := grantedLink(rig.st, 42, testConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	rig.gh.mu.Lock()
+	rig.gh.refused = []int64{widgetsID}
+	rig.gh.mu.Unlock()
+	checkAnswer(t, send(testConnection, widgetsRef), http.StatusForbidden, "refusal.schema.json", codeAccessNotGranted)
+	rig.gh.mu.Lock()
+	rig.gh.refused, rig.gh.mintStatus = nil, http.StatusBadGateway
+	rig.gh.mu.Unlock()
+	checkAnswer(t, send(testConnection, widgetsRef), http.StatusServiceUnavailable, "refusal.schema.json", codeSourceUnavailable)
+	rig.gh.mu.Lock()
+	rig.gh.mintStatus = 0
+	rig.gh.mu.Unlock()
+	rig.gh.gh.mu.Lock()
+	rig.gh.gh.installSuspended = true
+	rig.gh.gh.mu.Unlock()
+	checkAnswer(t, send(testConnection, widgetsRef), http.StatusForbidden, "refusal.schema.json", codeAccessNotGranted)
+	rig.gh.gh.mu.Lock()
+	rig.gh.gh.installSuspended, rig.gh.gh.installGone = false, true
+	rig.gh.gh.mu.Unlock()
+	checkAnswer(t, send(testConnection, widgetsRef), http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+	rig.gh.gh.mu.Lock()
+	rig.gh.gh.installGone = false
+	rig.gh.gh.mu.Unlock()
+	checkAnswer(t, send(testConnection, widgetsRef), http.StatusOK, "run-credential-answer.schema.json", "")
 }
 
 // TestResolveMapsGitHubAddressesToTheInstallation pins resolve: an https address of a
