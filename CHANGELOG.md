@@ -7,72 +7,17 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
-### Added
-
-- `qory-github-server`, the program that connects a GitHub App to Qory Apiary, and its
-  container image, which the `Dockerfile` builds and
-  `.github/workflows/prerelease.yml` publishes when a person runs that workflow. The
-  program runs only where `QORY_FEATURES` names `factory`: without it, the program
-  prints its usage line and knows no command.
-- `qory-github-server serve` answers at the root of the adapter's host name: set
-  `public_url` to that origin alone, such as `https://github.example.com`. GitHub sends
-  the App's webhook deliveries to `<public_url>/v1/events`, and serve answers `/setup`,
-  `/v1/connect` and `/health` at the same origin. A `public_url` with a path, a query, a
-  fragment or a user stops serve with an error.
-- Where `QORY_FEATURES` names `factory`, `qory-github describe` prints the source
-  role, `qory-github-server`, too.
-- The setup page of `qory-github-server serve` has a choice of who can install the
-  GitHub App: only the account it is for (private), selected first, or any GitHub
-  account (public). GitHub lets only the account that owns a private App install it.
-- `qory-github-server serve` stores the GitHub App that its setup creates in Qory
-  Apiary: the App's id, slug, client id, private key, webhook secret and client secret,
-  sealed to Qory Apiary's server key. At each start, serve reads the App back, sealed
-  to its access key, and keeps it in memory. serve writes none of it to disk, and no
-  setting contains it.
-- GitHub issues the App's private key once. When storing the App in Qory Apiary
-  fails, the setup tries again for `upload_retry_seconds`, 600 by default, and its page
-  reloads until the App is stored. When every try fails, the page shows which App to
-  delete on GitHub.
-- The description's source role lists the secrets `qory-github-server` stores in Qory
-  Apiary: `app`, `private-key`, `webhook-secret` and `client-secret`.
-- A connect reports the installation's grant to Qory Apiary, with the installation's
-  id as its `grant_ref`. While Qory Apiary returns `pass_unknown` or
-  `connection_unknown`, the report is sent again until the connect return expires; then
-  serve drops the installation's link. serve reads Qory Apiary's copy of the grants at
-  each start and at each page of the change feed that has a grant entry. serve handles
-  the deliveries of an installation while that copy contains its grant, or until the
-  connect return of its link expires, and drops the link of an installation the copy
-  does not contain. A call from Qory Apiary that has a `grant_ref` works only for an
-  installation whose deliveries serve handles; a call for any other installation gets
-  409 `grant_unknown`.
-- With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
-  Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
-  to `public_url` followed by `/v1/calls/`, such as
-  `https://github.example.com/v1/calls/`. The calls are a credential for a run, the
-  repository at an address `https://github.com/<owner>/<name>`, and a file of a
-  repository at a branch, a tag or a commit. serve checks each call's signature against
-  the Qory Apiary keys it pinned at enrolment, and signs each answer with its access
-  key. A run's credential covers only the repositories the call lists. For work, it
-  reads contents and pull requests with access `read`, and writes both with access
-  `write`. For a harness, it reads contents, and only on `github.com`.
-- A call for a run's work credential has no `grant_ref`. It has the connection of the
-  run's target and the id of the target's repository. serve mints the credential only
-  when the installation that reaches the repository is linked, live, to that connection,
-  and Qory Apiary's copy of the grants contains that installation's grant under that
-  connection; otherwise the call gets 403 `resource_not_covered`. A grant whose report
-  serve is still sending does not count. When GitHub returns 422 to the mint, or the
-  installation is suspended, the call gets 403 `access_not_granted`.
-- The source role of the description has `credential_scope` `resource`: one credential
-  covers only the repositories a call lists.
-- The source role of the description has `apply`: a run's work credential reaches at
-  most the git paths of the run's repository on `github.com` and its API paths and
-  `/graphql` on `api.github.com`.
-
 ### Changed
 
 - The description lists `egress_hosts`, the hosts a run of the integration reaches:
-  `github.com` and `api.github.com`, the hosts of the credential role. The policy that
-  `setup` prints allows the same two hosts, as before.
+  `github.com` and `api.github.com`, the hosts of the credential role.
+  `qory-github describe` prints them, and `description.json` lists them. The policy that
+  `setup` prints takes its hosts from them and allows the same two hosts as before.
+- `setup` gives the exchange of GitHub's code for the App 30 seconds from the moment you
+  approve the App. Before, the exchange had only what was left of the ten-minute wait,
+  so an approval near the end of the wait could fail the exchange.
+- `setup` escapes the code it exchanges for the App in the request's path. When an error
+  from GitHub's API quotes the code, the error shows `[the code]` in its place.
 - Building `qory-github` from source needs Go 1.27.3, up from 1.27.1: the integrations
   and Forager modules it builds against require it.
 
