@@ -57,6 +57,9 @@ change what the program does, and notes it under Upgrading.
   `write`. For a harness, it reads contents, and only on `github.com`.
 - The source role of the description has `credential_scope` `resource`: one credential
   covers only the repositories a call lists.
+- The source role of the description has `apply`: a run's work credential reaches at
+  most the git paths of the run's repository on `github.com` and its API paths and
+  `/graphql` on `api.github.com`.
 
 ### Changed
 

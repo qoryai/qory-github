@@ -456,8 +456,8 @@ func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
 // TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
 // names factory, names the source role, qory-github-server, with every member the
 // integration contract requires, item_noun, issue and issues, collection_noun,
-// repository and repositories, and secrets, the four the adapter stores in Qory
-// Apiary, and that the contract's schema, as conformance compiles
+// repository and repositories, secrets, the four the adapter stores in Qory Apiary,
+// credential_scope and apply, and that the contract's schema, as conformance compiles
 // it, checks that role: the description without any one member the contract requires,
 // or with a member the schema refuses, does not conform.
 func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
@@ -484,8 +484,8 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+4 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+4, source)
+	if len(source) != len(members)+5 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+5, source)
 	}
 	if got := fmt.Sprint(source["secrets"]); got != "[app private-key webhook-secret client-secret]" {
 		t.Errorf("the source role's secrets are %s, want app, private-key, webhook-secret and client-secret", got)
@@ -548,6 +548,12 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 		"a secret name in capitals": func(s map[string]any) { s["secrets"] = []any{"App"} },
 		"a secret named twice":      func(s map[string]any) { s["secrets"] = []any{"app", "app"} },
 		"no secret in the list":     func(s map[string]any) { s["secrets"] = []any{} },
+		"an apply host outside egress_hosts": func(s map[string]any) {
+			s["apply"].([]any)[0].(map[string]any)["hosts"] = []any{"gist.github.com"}
+		},
+		"an apply path with a * after the target": func(s map[string]any) {
+			s["apply"].([]any)[0].(map[string]any)["paths"] = []any{"/{target.path}*"}
+		},
 	}
 	for _, m := range members {
 		refused["no "+m] = func(s map[string]any) { delete(s, m) }

@@ -129,7 +129,31 @@
         "webhook-secret",
         "client-secret"
       ],
-      "credential_scope": "resource"
+      "credential_scope": "resource",
+      "apply": [
+        {
+          "hosts": [
+            "github.com"
+          ],
+          "scheme": "basic",
+          "username": "x-access-token",
+          "paths": [
+            "/{target.path}.git/*",
+            "/{target.path}/*"
+          ]
+        },
+        {
+          "hosts": [
+            "api.github.com"
+          ],
+          "scheme": "bearer",
+          "paths": [
+            "/repos/{target.path}",
+            "/repos/{target.path}/*",
+            "/graphql"
+          ]
+        }
+      ]
     }
   },
   "egress_hosts": [

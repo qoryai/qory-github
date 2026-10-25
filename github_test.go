@@ -515,6 +515,30 @@ func TestTheAnswerIsTheGatewaysCredentialDocument(t *testing.T) {
 	}
 }
 
+// TestTheSourceApplyIsUsesForTheTarget pins the source role's apply to [Uses]: filled
+// with a run's target, owner/name, it is what Uses returns for that one repository, so
+// the credential of a run-credential call for work on the target fits inside it.
+func TestTheSourceApplyIsUsesForTheTarget(t *testing.T) {
+	repos, err := ParseRepositories("acme/widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filled []Apply
+	for _, a := range Describe("").Roles.Source.Apply {
+		var paths []string
+		for _, p := range a.Paths {
+			paths = append(paths, strings.Replace(p, "{target.path}", "acme/widgets", 1))
+		}
+		a.Paths = paths
+		filled = append(filled, a)
+	}
+	got, _ := json.Marshal(filled)
+	want, _ := json.Marshal(Uses(repos))
+	if string(got) != string(want) {
+		t.Errorf("the source role's apply, filled with acme/widgets, is\n%s\nwant Uses for acme/widgets\n%s", got, want)
+	}
+}
+
 func TestOneRunsRepositoriesShareAnOwner(t *testing.T) {
 	for _, arg := range []string{"acme/shop,other/lib", "acme/shop,acme/shop", "acme", "acme/", "/shop", "acme/..", "acme/shop.git", "ac me/shop", "-acme/shop", "acme/shop/x"} {
 		if _, err := ParseRepositories(arg); err == nil {
