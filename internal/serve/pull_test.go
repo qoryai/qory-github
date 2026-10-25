@@ -1235,11 +1235,11 @@ func (f *fakeGitHub) repositoryReads() []string {
 
 // endedLine is the line of a round that ended the installation 42, linked to
 // testConnection.
-const endedLine = `"msg":"GitHub answers 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve handles it as deleted","installation":42,"connection":"` + testConnection + `"`
+const endedLine = `"msg":"GitHub returns 404 for the installation under the App's token in two rounds in a row, as for an installation deleted, so serve handles it as deleted","installation":42,"connection":"` + testConnection + `"`
 
 // goneOnceLine is the line of a round that met GitHub's first 404 in a row to the
 // installation 42's check.
-const goneOnceLine = `"level":"WARN","msg":"GitHub answers 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round handles it as deleted unless GitHub shows the installation in between","installation":42,"error":"`
+const goneOnceLine = `"level":"WARN","msg":"GitHub returns 404 for the installation under the App's token, as for an installation deleted, so nothing more of it is pulled this round, and a 404 in the next round handles it as deleted unless GitHub shows the installation in between","installation":42,"error":"`
 
 // goneOnceError is goneOnceLine with the error of a listing whose check GitHub
 // answered 404.
@@ -1263,8 +1263,8 @@ func keptLinked(t *testing.T, w *wired) {
 	}
 }
 
-// TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsGrant has GitHub answer the
-// check of the installation 42 404 under the App's token, and runs rounds. The first
+// TestTwoRoundsGitHubAnswers404ForTheInstallationEndItsGrant has the check of the
+// installation 42 return 404 under the App's token, and runs rounds. The first
 // changes nothing, pulls nothing of 42 and logs that it met a first 404. The second:
 // one POST /v1/grants/end names 42's connection and grant, the link, the repository's
 // records, the collection's link and its pull mark are dropped, GitHub's deletion is
@@ -1600,10 +1600,10 @@ func TestAnInstallationDeletedByTheWebhookAndTheRoundIsEndedOnce(t *testing.T) {
 	})
 }
 
-// TestAGrantEndAfterA503IsSentAgainUntilConnectionEnded has Qory Apiary answer the
-// POST /v1/grants/end of the round that met GitHub's second 404 503: the link stays and
-// a line says the grant end is sent again; the next try, 2 seconds later, is answered
-// 409 connection_ended, as for a connection that ended meanwhile, which is taken as the
+// TestAGrantEndAfterA503IsSentAgainUntilConnectionEnded has the POST /v1/grants/end of
+// the round that met GitHub's second 404 return 503: the link stays and a line says
+// the grant end is sent again; the next try, 2 seconds later, returns 409
+// connection_ended, as for a connection that ended meanwhile, which is taken as the
 // 204 is: the link is dropped with no error line, and the next round sends nothing.
 func TestAGrantEndAfterA503IsSentAgainUntilConnectionEnded(t *testing.T) {
 	w, _, p, clock := pulling(t)
@@ -1689,8 +1689,8 @@ func TestASignDuringTheListingBeforeIts404StartsTheCountOver(t *testing.T) {
 
 // TestAPendingLinkOfAnInstallationGitHubAnswers404ForIsEnded has GitHub answer the check
 // of the installation 42 404 while its link is pending and Qory Apiary's copy has its
-// grant: the second round sends the grant end, which Qory Apiary answers with the
-// signed 204, and drops the link.
+// grant: the second round sends the grant end, which returns the signed 204, and drops
+// the link.
 func TestAPendingLinkOfAnInstallationGitHubAnswers404ForIsEnded(t *testing.T) {
 	w, _, p, clock := pulling(t)
 	grantedLink(w.st, 42, testConnection, linkPending)
@@ -2919,9 +2919,9 @@ func TestARefusedRepositoryWithNoMarkIsConfirmedAtEachRead(t *testing.T) {
 	}
 }
 
-// TestAnEndThatFailsStopsTheRound has GitHub answer 404 to the installation 42's check
-// in two rounds, and Qory Apiary answer the second's POST /v1/grants/end 503: a line
-// says the grant end is sent again, the link stays, and none of 42's collections is
+// TestAnEndThatFailsStopsTheRound has the installation 42's check return 404 in two
+// rounds, and the second's POST /v1/grants/end return 503: a line says the grant end
+// is sent again, the link stays, and none of 42's collections is
 // pulled in either round.
 func TestAnEndThatFailsStopsTheRound(t *testing.T) {
 	w, _, p, clock := pulling(t)
@@ -2956,9 +2956,9 @@ func TestAnEndThatFailsStopsTheRound(t *testing.T) {
 	}
 }
 
-// TestAGrantEndRefusedForGoodIsNotSentByLaterRounds has GitHub answer 404 to the
-// installation 42's check in four rounds, and Qory Apiary answer the grant end 403
-// forbidden: the second round sends it once, with a line, and the link stays; the
+// TestAGrantEndRefusedForGoodIsNotSentByLaterRounds has the installation 42's check
+// return 404 in four rounds, and the grant end return 403 forbidden: the second round
+// sends it once, with a line, and the link stays; the
 // third and fourth rounds send no grant end and log no other line that the
 // installation is handled as deleted.
 func TestAGrantEndRefusedForGoodIsNotSentByLaterRounds(t *testing.T) {
@@ -2980,7 +2980,7 @@ func TestAGrantEndRefusedForGoodIsNotSentByLaterRounds(t *testing.T) {
 	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
 		t.Errorf("%d grant ends after four rounds", n)
 	}
-	if log := w.log.String(); strings.Count(log, endedLine) != 1 || strings.Count(log, `"msg":"Qory Apiary refused the end of the installation's grant`) != 1 {
+	if log := w.log.String(); strings.Count(log, endedLine) != 1 || strings.Count(log, `"msg":"Qory Apiary returned an error that a retry does not change to the end of the installation's grant`) != 1 {
 		t.Errorf("the log %s", log)
 	}
 	if _, ok, _ := linkOf(w.st, 42); !ok {

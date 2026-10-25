@@ -444,7 +444,7 @@ func TestAnAccountIsItsIDAndLogin(t *testing.T) {
 func TestACollectionWaitsForItsGrantsReport(t *testing.T) {
 	rig, _ := reportRig(t)
 	rig.apiary.refuse = func(route string, _ int) (int, string) {
-		// The report is refused until a listing has reached Qory Apiary.
+		// The report returns 409 pass_unknown until a listing has reached Qory Apiary.
 		if route == routeGrants && len(rig.apiary.sent(routeCollections)) == 0 {
 			return http.StatusConflict, `{"error":"pass_unknown"}`
 		}
@@ -473,11 +473,11 @@ func TestACollectionWaitsForItsGrantsReport(t *testing.T) {
 	}
 }
 
-// TestAPartRefused400IsSentAgainAfterTheGrantsAreRead pins that a part Qory Apiary
-// refuses 400 invalid_request, as for a grant_ref its copy does not have, reads the
-// copy again, GET /v1/grants. When the copy does not have the grant, the part is sent
-// again, built anew, without its collections and not complete. When the copy has it,
-// the refusal has another cause: the part is not sent again, and the refusal is the
+// TestAPartRefused400IsSentAgainAfterTheGrantsAreRead pins that a part that returns 400
+// invalid_request, as for a grant_ref Qory Apiary's copy does not have, has serve read
+// the copy again, GET /v1/grants. When the copy does not have the grant, the part is
+// sent again, built anew, without its collections and not complete. When the copy has
+// it, the refusal has another cause: the part is not sent again, and the refusal is the
 // listing's error.
 func TestAPartRefused400IsSentAgainAfterTheGrantsAreRead(t *testing.T) {
 	for _, inCopy := range []bool{false, true} {
@@ -520,9 +520,9 @@ func TestAPartRefused400IsSentAgainAfterTheGrantsAreRead(t *testing.T) {
 	}
 }
 
-// TestAConnectForTheAccountStopsItsGrantEnd pins that a grant end Qory Apiary answers
-// 503, sent again later, stops once a connect mints a linked connect return for the
-// GitHub account of its installation, acme: no try follows, and the deleted
+// TestAConnectForTheAccountStopsItsGrantEnd pins that a grant end that returns 503,
+// sent again later, stops once a connect mints a linked connect return for the GitHub
+// account of its installation, acme: no try follows, and the deleted
 // installation's link stays, while the grant end of an installation on another account
 // is sent again and taken.
 func TestAConnectForTheAccountStopsItsGrantEnd(t *testing.T) {

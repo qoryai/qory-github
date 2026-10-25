@@ -682,7 +682,7 @@ func TestAnInstallationDeletedLeavesNothingOfItInMemory(t *testing.T) {
 }
 
 // TestAnInstallationDeletedWhoseConnectionEndedLeavesNothingOfItInMemory deletes a
-// linked installation whose grant end Qory Apiary answers 409 connection_ended, which
+// linked installation whose grant end returns 409 connection_ended, which
 // forgets the connection's first listings, those of the installation still linked
 // among them, after the installation's are forgotten: the adapter's maps hold nothing
 // of it.
@@ -888,12 +888,12 @@ func TestAnInstallationSuspendedThenDeletedEndsItsGrant(t *testing.T) {
 }
 
 // TestEachAnswerToAGrantEndIsActedOn deletes the linked installation 42, whose grant
-// Qory Apiary's copy has, and has Qory Apiary answer its grant end in turn. The signed
-// 204, 409 grant_unknown and 409 connection_ended drop the grant, the link and the
-// collections' records at once. 403 connection_unknown, a 503 and an answer not signed
-// have the grant end sent again, built anew, after waits that double from 2 seconds to
-// a minute, until one of those. 403 forbidden and 400 invalid_request stop it with a
-// line, and the state stays.
+// Qory Apiary's copy has, and has the fake return each answer to its grant end in turn.
+// The signed 204, 409 grant_unknown and 409 connection_ended drop the grant, the link
+// and the collections' records at once. 403 connection_unknown, a 503 and an answer not
+// signed have the grant end sent again, built anew, after waits that double from 2
+// seconds to a minute, until one of those. 403 forbidden and 400 invalid_request stop
+// it with a line, and the state stays.
 func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 	unknown := func(int) (int, string) { return 403, `{"error":"connection_unknown"}` }
 	for _, tc := range []struct {
@@ -970,7 +970,7 @@ func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 			t.Errorf("%s: linked %v, grant %q, reached %v, collection linked %v", tc.name, linked, held, reached, collection)
 		}
 		log := w.log.String()
-		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary refused the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
+		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary returned an error that a retry does not change to the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
 			t.Errorf("%s: the log %s", tc.name, log)
 		}
 		if tc.dropped != strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link","installation":42`) {
@@ -982,10 +982,10 @@ func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 	}
 }
 
-// TestARefusedGrantEndWaitsForAConnectOfItsAccount has Qory Apiary answer the end of
-// the grant of 42, on acme's account, 400 invalid_request, and of 43, on alice's, 403
-// forbidden: a second end of either sends nothing and keeps the link; a connect for
-// acme, [Adapter.stopEnd], lets the next end of 42 be sent, and 43's stays held.
+// TestARefusedGrantEndWaitsForAConnectOfItsAccount has the end of the grant of 42, on
+// acme's account, return 400 invalid_request, and of 43, on alice's, 403 forbidden: a
+// second end of either sends nothing and keeps the link; a connect for acme,
+// [Adapter.stopEnd], lets the next end of 42 be sent, and 43's stays held.
 func TestARefusedGrantEndWaitsForAConnectOfItsAccount(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkLive, Account: acme.ID})
@@ -1038,9 +1038,9 @@ func TestARefusedGrantEndWaitsForAConnectOfItsAccount(t *testing.T) {
 	}
 }
 
-// TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown has Qory Apiary answer
-// each end of the grant of 42, whose link is pending, as when its first listing was
-// never taken, 403 connection_unknown, an hour apart on the adapter's clock: the 403s
+// TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown has each end of the
+// grant of 42, whose link is pending, as when its first listing was never taken,
+// return 403 connection_unknown, an hour apart on the adapter's clock: the 403s
 // of a pending link count toward nothing in [noteAnswer], and once they have lasted a
 // day since the first, see [forbiddenFor], serve drops the grant, the link and the
 // collection's records, and sends no more grant end.
@@ -1066,7 +1066,7 @@ func TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown(t *testing.T) 
 		t.Fatal(err)
 	}
 	w.endsDone(t, 42)
-	// The first 403 comes at 13:00; the try answered at 13:00 the next day is the last.
+	// The first 403 comes at 13:00; the try that returns at 13:00 the next day is last.
 	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
 		t.Errorf("%d grant ends", n)
 	}
@@ -1082,15 +1082,15 @@ func TestAGrantEndOfAPendingLinkStopsAfterADayOfConnectionUnknown(t *testing.T) 
 	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); ok {
 		t.Error("the collection is still linked")
 	}
-	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary answered connection_unknown to the end of the installation's grant for a day, so serve takes the connection as ended and drops the grant and the installation's link","installation":42,"connection":"`+testConnection+`"`) {
+	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary returned 403 connection_unknown to the end of the installation's grant for 24 hours, so serve takes the connection as ended and drops the grant and the installation's link","installation":42,"connection":"`+testConnection+`"`) {
 		t.Errorf("the log %s", log)
 	}
 }
 
-// TestALastingConnectionUnknownStopsTheGrantEnd has Qory Apiary answer each end of the
-// grant of 42, linked live, 403 connection_unknown, an hour apart on the adapter's
-// clock: once the 403 has lasted a day, see [forbiddenFor], serve drops the connection
-// and the grant, and sends no more grant end.
+// TestALastingConnectionUnknownStopsTheGrantEnd has each end of the grant of 42, linked
+// live, return 403 connection_unknown, an hour apart on the adapter's clock: once the
+// 403 has lasted a day, see [forbiddenFor], serve drops the connection and the grant,
+// and sends no more grant end.
 func TestALastingConnectionUnknownStopsTheGrantEnd(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	w.retryEnds()

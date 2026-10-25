@@ -1574,9 +1574,9 @@ func TestAReplacedConnectionIsListedEmptyUntilItsLastListing(t *testing.T) {
 		if r, ok, _ := replacedOf(rig.st, otherConnection); !ok || r.Installation != 42 {
 			t.Fatalf("the replaced connection %+v %v", r, ok)
 		}
-		// The connect's first listing for testConnection, refused 403 at each try, may
-		// have spent the waits' budget before the stop; the tries that follow start a
-		// new budget.
+		// The connect's first listing for testConnection, which returns 403 at each
+		// try, may have spent the waits' budget before the stop; the tries that follow
+		// start a new budget.
 		rig.mu.Lock()
 		rig.waits = nil
 		rig.mu.Unlock()

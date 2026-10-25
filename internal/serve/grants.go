@@ -59,7 +59,7 @@ const maxAccountTitle = 1024
 // accountOf is the account of an installation's grant, as the grant's report sends it:
 // ref, the GitHub account's id in decimal, and title, its login. A login that is not
 // one line of 1 to [maxAccountTitle] characters with none of the characters the
-// contract refuses in a line, see [lineRune], is sent as the ref instead, so the
+// contract does not allow in a line, see [lineRune], is sent as the ref instead, so the
 // report never breaks the contract.
 func accountOf(a github.Account) contracts.Account {
 	ref := strconv.FormatInt(a.ID, 10)
@@ -440,16 +440,16 @@ type grantEnding struct {
 
 // endGrant reports to Qory Apiary that GitHub no longer covers the grant of the
 // installation, whose link is l, for a caller that holds the installation's lock, see
-// [Apiary.EndGrant], and acts on the answer, see [Adapter.grantEnded]. An answer that
-// asks for another try starts the tries of [Adapter.endSoon], and so nothing is sent
-// while those tries run. Nothing is sent either for a grant end Qory Apiary refused for
-// good, see [Adapter.endRefusedFor]. A request stopped by ctx is the error, with the
-// state kept.
-// While Qory Apiary's copy of the grants does not have the installation's grant for l's
-// connection, as while the grant's report is being sent again, see
-// [Connect.reportSoon], it sends no grant end: it drops the installation's link and the
-// records of the collections it reaches, see [dropInstallation], and the report stops
-// at its next try, since GitHub deleted the installation, see [keepDeleted].
+// [Apiary.EndGrant], and acts on the answer, see [Adapter.grantEnded]. When grantEnded
+// returns true, the tries of [Adapter.endSoon] start, and so nothing is sent while
+// those tries run. Nothing is sent either for a grant end to which Qory Apiary returned
+// an error that a retry does not change, see [Adapter.endRefusedFor]. A request stopped
+// by ctx is the error, with the state kept. While Qory Apiary's copy of the grants does
+// not have the installation's grant for l's connection, as while the grant's report is
+// being sent again, see [Connect.reportSoon], it sends no grant end: it drops the
+// installation's link and the records of the collections it reaches, see
+// [dropInstallation], and the report stops at its next try, since GitHub deleted the
+// installation, see [keepDeleted].
 func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) error {
 	if a.ending(installation) || a.endRefusedFor(installation, l.Connection) {
 		return nil
@@ -487,24 +487,24 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 
 // grantEnded acts on Qory Apiary's answer err to the end of the installation's grant,
 // which connection has, for the GitHub account whose id is account, and says whether to
-// send the grant end again. since is when Qory Apiary first answered this grant end's
-// tries 403 connection_unknown, on the adapter's clock, zero before the first:
+// send the grant end again. since is when a try of this grant end first returned 403
+// connection_unknown, on the adapter's clock, zero before the first:
 //
-//   - the signed 204, or 409 grant_unknown, which says the copy has no such grant:
+//   - the signed 204, or 409 grant_unknown, which means the copy has no such grant:
 //     serve drops the grant from the copy, and the installation's link with the records
 //     of the collections it reaches, see [dropInstallation];
 //   - 409 connection_ended: [Apiary.Ended] has dropped the connection's links and their
 //     collections' records, and serve drops the grant from the copy;
-//   - 403 connection_unknown: it says to send the grant end again, until the 403 has
-//     lasted [forbiddenFor] since since, whatever the link's state, as a pending link's
-//     is when its first listing was never taken: serve then takes the connection as
-//     ended for the installation, and drops the grant from the copy, and the
-//     installation's link with the records of its collections. A live link may be
+//   - 403 connection_unknown: it returns true, so the grant end is sent again, until
+//     the 403 has lasted [forbiddenFor] since since, whatever the link's state, as a
+//     pending link's is when its first listing was never taken: serve then takes the
+//     connection as ended for the installation, and drops the grant from the copy, and
+//     the installation's link with the records of its collections. A live link may be
 //     dropped first, by the 403s that [noteAnswer] counts for the connection, see
 //     [answeredIn]; once the installation's link no longer names connection, serve
 //     drops the grant from the copy and stops;
-//   - a failure that may pass, no answer, a 5xx or an answer not signed: it says to
-//     send the grant end again;
+//   - a failure that may pass, no answer, a 5xx or an answer not signed: it returns
+//     true, so the grant end is sent again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it, keeps its
 //     state, since neither ends a connection or a grant, and sends no more grant end for
 //     the grant, see [Adapter.endRefusedFor].
@@ -558,7 +558,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 				a.log().LogAttrs(context.Background(), slog.LevelError, "dropping the link of an installation whose connection is taken as ended", append(attrs, slog.String("error", derr.Error()))...)
 				return false
 			}
-			a.log().LogAttrs(context.Background(), slog.LevelInfo, "Qory Apiary answered connection_unknown to the end of the installation's grant for a day, so serve takes the connection as ended and drops the grant and the installation's link", attrs...)
+			a.log().LogAttrs(context.Background(), slog.LevelInfo, "Qory Apiary returned 403 connection_unknown to the end of the installation's grant for 24 hours, so serve takes the connection as ended and drops the grant and the installation's link", attrs...)
 			return false
 		}
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
@@ -568,20 +568,19 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		return true
 	}
 	a.refuseEnd(installation, connection, account)
-	a.log().LogAttrs(context.Background(), slog.LevelError, "Qory Apiary refused the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart", append(attrs, slog.String("error", err.Error()))...)
+	a.log().LogAttrs(context.Background(), slog.LevelError, "Qory Apiary returned an error that a retry does not change to the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart", append(attrs, slog.String("error", err.Error()))...)
 	return false
 }
 
-// endSoon sends the end of the installation's grant, which connection has, again,
-// after Qory Apiary's answer to the first asked for another try, see
-// [Adapter.grantEnded]: after a wait that doubles from [grantFirstWait] to
-// [grantMaxWait], as for a grant's report, each try holding the installation's lock,
-// until an answer that asks for no other try. It stops once the installation's link
-// names another connection, or none, as after [Apiary.Ended] dropped it; once a linked
-// connect return is minted for account, the GitHub account of the grant, see
+// endSoon sends the end of the installation's grant, which connection has, again, after
+// [Adapter.grantEnded] returned true for the first try: after a wait that doubles from
+// [grantFirstWait] to [grantMaxWait], as for a grant's report, each try holding the
+// installation's lock, until grantEnded returns false. It stops once the installation's
+// link names another connection, or none, as after [Apiary.Ended] dropped it; once a
+// linked connect return is minted for account, the GitHub account of the grant, see
 // [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
-// installation has one grant end sent again at a time. since is when Qory Apiary first
-// answered the grant end 403 connection_unknown, zero when it has not, see
+// installation has one grant end sent again at a time. since is when a try of the grant
+// end first returned 403 connection_unknown, zero when none has, see
 // [Adapter.grantEnded].
 func (a *Adapter) endSoon(installation int64, connection string, account int64, since time.Time) {
 	a.endMu.Lock()
@@ -660,10 +659,11 @@ func (a *Adapter) forgetEnding(installation int64, e *grantEnding) {
 }
 
 // stopEnd stops each grant end being sent again, see [Adapter.endSoon], for the GitHub
-// account whose id is account, as a linked connect return minted for that account
-// does, and forgets the grant ends Qory Apiary refused for good for that account, see
-// [Adapter.endRefusedFor], so a later end of the installation's grant is sent; an
-// account of 0 or below stops none. The installation's link and state stay.
+// account whose id is account, as a linked connect return minted for that account does,
+// and forgets the grant ends of that account to which Qory Apiary returned an error
+// that a retry does not change, see [Adapter.endRefusedFor], so a later end of the
+// installation's grant is sent; an account of 0 or below stops none. The installation's
+// link and state stay.
 func (a *Adapter) stopEnd(account int64) {
 	if account <= 0 {
 		return
@@ -684,16 +684,17 @@ func (a *Adapter) stopEnd(account int64) {
 	}
 }
 
-// refusedEnd is a grant end Qory Apiary refused for good: the connection it named, and
-// the GitHub account of the installation's grant, by its id, 0 when the link does not
-// have it.
+// refusedEnd is a grant end to which Qory Apiary returned an error that a retry does
+// not change: the connection it named, and the GitHub account of the installation's
+// grant, by its id, 0 when the link does not have it.
 type refusedEnd struct {
 	connection string
 	account    int64
 }
 
-// refuseEnd keeps that Qory Apiary refused the end of the installation's grant, which
-// connection has, for good, see [Adapter.endRefusedFor].
+// refuseEnd keeps that Qory Apiary returned an error that a retry does not change to
+// the end of the installation's grant, which connection has, see
+// [Adapter.endRefusedFor].
 func (a *Adapter) refuseEnd(installation int64, connection string, account int64) {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()
@@ -703,8 +704,9 @@ func (a *Adapter) refuseEnd(installation int64, connection string, account int64
 	a.endRefused[installation] = refusedEnd{connection: connection, account: account}
 }
 
-// endRefusedFor is whether Qory Apiary refused the end of the installation's grant,
-// which connection has, for good, 403 forbidden or 400, see [Adapter.grantEnded]. Serve
+// endRefusedFor is whether Qory Apiary returned an error that a retry does not change,
+// such as 403 forbidden or 400, to the end of the installation's grant, which
+// connection has, see [Adapter.grantEnded]. Serve
 // keeps it in memory alone, so it holds until a connect for the grant's account, see
 // [Adapter.stopEnd], or until serve starts again.
 func (a *Adapter) endRefusedFor(installation int64, connection string) bool {
@@ -715,8 +717,8 @@ func (a *Adapter) endRefusedFor(installation int64, connection string) bool {
 }
 
 // endHeld is whether serve sends no grant end for the installation now: its grant end
-// is being sent again, see [Adapter.endSoon], or Qory Apiary refused one for good, see
-// [Adapter.endRefusedFor].
+// is being sent again, see [Adapter.endSoon], or Qory Apiary returned an error that a
+// retry does not change to one, see [Adapter.endRefusedFor].
 func (a *Adapter) endHeld(installation int64) bool {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()

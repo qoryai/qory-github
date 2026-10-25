@@ -139,7 +139,7 @@ type fakeApiary struct {
 	// testAdapterID before any.
 	node string
 	// grants is the fake's copy of the adapter's grants, the connection of each by its
-	// grant_ref, which GET /v1/grants answers, each report it takes adds to, and each
+	// grant_ref, which GET /v1/grants returns, each report it takes adds to, and each
 	// grant end it takes drops from.
 	grants map[string]string
 
