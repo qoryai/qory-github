@@ -489,13 +489,14 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 //     serve drops the grant from the copy, and the installation's link with the records
 //     of the collections it reaches, see [dropInstallation];
 //   - 409 connection_ended: [Apiary.Ended] has dropped the connection's links and their
-//     collections' records, and serve drops the grant and the installation's link too;
+//     collections' records, and serve drops the grant from the copy;
 //   - 403 connection_unknown, or a failure that may pass, no answer, a 5xx or an answer
 //     not signed: it says to send the grant end again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it and keeps its
 //     state, since neither ends a connection or a grant.
 //
-// It drops nothing while the installation's link names another connection, or none.
+// It drops the grant from the copy whatever the link is, and drops the installation's
+// link only while the link names connection.
 func (a *Adapter) grantEnded(installation int64, connection string, err error) bool {
 	attrs := []slog.Attr{slog.Int64("installation", installation), slog.String("connection", connection)}
 	switch {

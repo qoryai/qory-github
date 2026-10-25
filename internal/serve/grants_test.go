@@ -524,16 +524,26 @@ func TestAPartRefused400IsSentAgainAfterTheGrantsAreRead(t *testing.T) {
 // 503, sent again later, stops once a connect mints a linked connect return for the
 // GitHub account of its installation, acme: no try follows, and the deleted
 // installation's link stays, while the grant end of an installation on another account
-// is still sent again.
+// is sent again and taken.
 func TestAConnectForTheAccountStopsItsGrantEnd(t *testing.T) {
 	rig, _ := reportRig(t)
 	grantedPutLink(rig.st, 99, link{Connection: otherConnection, State: linkLive, Account: acme.ID})
 	grantedPutLink(rig.st, 98, link{Connection: "ac_0000000000000002", State: linkLive, Account: alice.ID})
-	rig.apiary.refuse = func(route string, _ int) (int, string) {
-		if route == routeGrantsEnd {
+	rig.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeGrantsEnd && n <= 2 {
 			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
 		}
 		return 0, ""
+	}
+	// Each wait before a try lasts until the connect is done, or until its grant end is
+	// stopped.
+	connected := make(chan struct{})
+	rig.adapter.endSleep = func(ctx context.Context, _ time.Duration) error {
+		select {
+		case <-connected:
+		case <-ctx.Done():
+		}
+		return ctx.Err()
 	}
 	for _, id := range []int64{99, 98} {
 		if _, err := rig.adapter.endInstallation(context.Background(), id); err != nil {
@@ -550,11 +560,21 @@ func TestAConnectForTheAccountStopsItsGrantEnd(t *testing.T) {
 	if !rig.adapter.ending(98) {
 		t.Error("the grant end of another account's installation stopped")
 	}
+	close(connected)
+	rig.endsDone(t, 98)
+	rig.adapter.stopEnds()
+	tries := map[any]int{}
+	for _, s := range rig.apiary.sent(routeGrantsEnd) {
+		tries[s.body["grant_ref"]]++
+	}
+	if tries["99"] != 1 || tries["98"] != 2 {
+		t.Errorf("grant ends by grant_ref %v", tries)
+	}
 	if l, ok, _ := linkOf(rig.st, 99); !ok || l.Connection != otherConnection {
 		t.Errorf("the deleted installation's link %+v %v", l, ok)
 	}
-	if n := len(rig.apiary.sent(routeGrantsEnd)); n != 2 {
-		t.Errorf("%d grant ends", n)
+	if _, ok, _ := linkOf(rig.st, 98); ok {
+		t.Error("the link of the installation on another account is kept")
 	}
 	if !strings.Contains(rig.log.String(), `"msg":"a connect for the account stops the end of its earlier installation's grant","installation":99`) {
 		t.Errorf("the log %s", rig.log.String())

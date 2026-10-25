@@ -749,8 +749,8 @@ type firstKey struct {
 // firstListing is a link's first listing as [Adapter.sendFirst] keeps it: its parts,
 // read from GitHub once; next, the index of the first part the next try sends, the
 // first Qory Apiary has not taken, or 0 after a 403 connection_unknown; and held,
-// whether a part Qory Apiary took was sent without its collections, see [reachSink],
-// false again after a 403 connection_unknown. Only a holder of the installation's lock
+// whether a part was sent without its collections, see [reachSink], false again after
+// a 403 connection_unknown. Only a holder of the installation's lock
 // reads or moves next and held.
 type firstListing struct {
 	parts []contracts.SourceCollections
