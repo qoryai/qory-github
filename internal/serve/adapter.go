@@ -91,8 +91,8 @@ type Adapter struct {
 	endStop     context.CancelFunc
 	endWG       sync.WaitGroup
 	endSleep    func(ctx context.Context, d time.Duration) error
-	// endRefused are the grant ends to which Qory Apiary returned an error that a retry
-	// does not change, by installation, under endMu, see [Adapter.endRefusedFor].
+	// endRefused are the grant ends for which Qory Apiary returned an error that a
+	// retry does not change, by installation, under endMu, see [Adapter.endRefusedFor].
 	endRefused map[int64]refusedEnd
 
 	// cutsOnce makes cuts, which logs the texts cut to the contract's limit as the
@@ -426,11 +426,11 @@ type reachSink struct {
 // no part of it says it is complete, so the listing disconnects none of the collections
 // it left out. It claims each collection the part sends for the installation, with the
 // listing's started_at, or the zero time when it does not parse, sends the part, and
-// once Qory Apiary took it keeps each collection's environment_ref. When a part that
-// has collections returns 400 invalid_request, as for a grant_ref Qory Apiary's copy
-// of the grants does not have, it reads that copy again, see [Adapter.readGrants], and
-// when the copy does not have the installation's grant for the connection, it sends the
-// part again, built anew, without its collections. When the copy has the grant, the
+// once Qory Apiary took it keeps each collection's environment_ref. When Qory Apiary
+// returns 400 invalid_request for a part that has collections, as for a grant_ref its
+// copy of the grants does not have, it reads that copy again, see [Adapter.readGrants],
+// and when the copy does not have the installation's grant for the connection, it sends
+// the part again, built anew, without its collections. When the copy has the grant, the
 // refusal has another cause, and the part is not sent again.
 func (s reachSink) Collections(ctx context.Context, req contracts.SourceCollections) error {
 	read, err := time.Parse(contracts.TimeLayout, req.Listing.StartedAt)

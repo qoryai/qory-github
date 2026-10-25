@@ -473,12 +473,12 @@ func TestACollectionWaitsForItsGrantsReport(t *testing.T) {
 	}
 }
 
-// TestAPartRefused400IsSentAgainAfterTheGrantsAreRead pins that a part that returns 400
-// invalid_request, as for a grant_ref Qory Apiary's copy does not have, has serve read
-// the copy again, GET /v1/grants. When the copy does not have the grant, the part is
-// sent again, built anew, without its collections and not complete. When the copy has
-// it, the refusal has another cause: the part is not sent again, and the refusal is the
-// listing's error.
+// TestAPartRefused400IsSentAgainAfterTheGrantsAreRead pins that when Qory Apiary
+// returns 400 invalid_request for a part, as for a grant_ref its copy does not have,
+// serve reads the copy again, GET /v1/grants. When the copy does not have the grant,
+// the part is sent again, built anew, without its collections and not complete. When
+// the copy has it, the refusal has another cause: the part is not sent again, and the
+// refusal is the listing's error.
 func TestAPartRefused400IsSentAgainAfterTheGrantsAreRead(t *testing.T) {
 	for _, inCopy := range []bool{false, true} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))

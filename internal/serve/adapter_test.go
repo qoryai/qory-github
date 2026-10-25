@@ -970,7 +970,7 @@ func TestEachAnswerToAGrantEndIsActedOn(t *testing.T) {
 			t.Errorf("%s: linked %v, grant %q, reached %v, collection linked %v", tc.name, linked, held, reached, collection)
 		}
 		log := w.log.String()
-		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary returned an error that a retry does not change to the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
+		if tc.line != "" && !strings.Contains(log, `"level":"ERROR","msg":"Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart","installation":42,"connection":"`+testConnection+`","error":"reporting the end of the installation's grant to Qory Apiary: Qory Apiary answered `+tc.line+`"`) {
 			t.Errorf("%s: the log %s", tc.name, log)
 		}
 		if tc.dropped != strings.Contains(log, `"msg":"the installation's grant ended in Qory Apiary, so serve drops its link","installation":42`) {

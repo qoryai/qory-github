@@ -2980,7 +2980,7 @@ func TestAGrantEndRefusedForGoodIsNotSentByLaterRounds(t *testing.T) {
 	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
 		t.Errorf("%d grant ends after four rounds", n)
 	}
-	if log := w.log.String(); strings.Count(log, endedLine) != 1 || strings.Count(log, `"msg":"Qory Apiary returned an error that a retry does not change to the end of the installation's grant`) != 1 {
+	if log := w.log.String(); strings.Count(log, endedLine) != 1 || strings.Count(log, `"msg":"Qory Apiary returned an error for the end of the installation's grant that a retry does not change`) != 1 {
 		t.Errorf("the log %s", log)
 	}
 	if _, ok, _ := linkOf(w.st, 42); !ok {

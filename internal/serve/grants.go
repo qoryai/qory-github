@@ -517,12 +517,12 @@ type grantEnding struct {
 // installation, whose link is l, for a caller that holds the installation's lock, see
 // [Apiary.EndGrant], and acts on the answer, see [Adapter.grantEnded]. When grantEnded
 // returns true, the tries of [Adapter.endSoon] start, and so nothing is sent while
-// those tries run. Nothing is sent either for a grant end to which Qory Apiary returned
-// an error that a retry does not change, see [Adapter.endRefusedFor]. A request stopped
-// by ctx is the error, with the state kept. While Qory Apiary's copy of the grants does
-// not have the installation's grant for l's connection, as while the grant's report is
-// being sent again, see [Connect.reportSoon], it sends no grant end: it drops the
-// installation's link and the records of the collections it reaches, see
+// those tries run. Nothing is sent either for a grant end for which Qory Apiary
+// returned an error that a retry does not change, see [Adapter.endRefusedFor]. A
+// request stopped by ctx is the error, with the state kept. While Qory Apiary's copy of
+// the grants does not have the installation's grant for l's connection, as while the
+// grant's report is being sent again, see [Connect.reportSoon], it sends no grant end:
+// it drops the installation's link and the records of the collections it reaches, see
 // [dropInstallation], and the report stops at its next try, since GitHub deleted the
 // installation, see [keepDeleted]. A grant that reaches the copy after that drop is
 // ended when serve next reads the copy, see [Adapter.syncGrants].
@@ -658,7 +658,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		return true
 	}
 	a.refuseEnd(installation, connection, account)
-	a.log().LogAttrs(context.Background(), slog.LevelError, "Qory Apiary returned an error that a retry does not change to the end of the installation's grant, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart", append(attrs, slog.String("error", err.Error()))...)
+	a.log().LogAttrs(context.Background(), slog.LevelError, "Qory Apiary returned an error for the end of the installation's grant that a retry does not change, so serve keeps its link and sends no more grant end for it until a connect for its account or a restart", append(attrs, slog.String("error", err.Error()))...)
 	return false
 }
 
@@ -775,7 +775,7 @@ func (a *Adapter) forgetEnding(installation int64, e *grantEnding) {
 
 // stopEnd stops each grant end being sent again, see [Adapter.endSoon], for the GitHub
 // account whose id is account, as a linked connect return minted for that account does,
-// and forgets the grant ends of that account to which Qory Apiary returned an error
+// and forgets the grant ends of that account for which Qory Apiary returned an error
 // that a retry does not change, see [Adapter.endRefusedFor], so a later end of the
 // installation's grant is sent; an account of 0 or below stops none. The installation's
 // link and state stay.
@@ -807,8 +807,8 @@ type refusedEnd struct {
 	account    int64
 }
 
-// refuseEnd keeps that Qory Apiary returned an error that a retry does not change to
-// the end of the installation's grant, which connection has, see
+// refuseEnd keeps that the end of the installation's grant, which connection has,
+// failed with an error from Qory Apiary that a retry does not change, see
 // [Adapter.endRefusedFor].
 func (a *Adapter) refuseEnd(installation int64, connection string, account int64) {
 	a.endMu.Lock()
@@ -819,9 +819,9 @@ func (a *Adapter) refuseEnd(installation int64, connection string, account int64
 	a.endRefused[installation] = refusedEnd{connection: connection, account: account}
 }
 
-// endRefusedFor is whether Qory Apiary returned an error that a retry does not change,
-// such as 403 forbidden or 400, to the end of the installation's grant, which
-// connection has, see [Adapter.grantEnded]. Serve
+// endRefusedFor is whether the end of the installation's grant, which connection has,
+// failed with an error from Qory Apiary that a retry does not change, such as 403
+// forbidden or 400, see [Adapter.grantEnded]. Serve
 // keeps it in memory alone, so it holds until a connect for the grant's account, see
 // [Adapter.stopEnd], or until serve starts again.
 func (a *Adapter) endRefusedFor(installation int64, connection string) bool {
@@ -832,8 +832,8 @@ func (a *Adapter) endRefusedFor(installation int64, connection string) bool {
 }
 
 // endHeld is whether serve sends no grant end for the installation now: its grant end
-// is being sent again, see [Adapter.endSoon], or Qory Apiary returned an error that a
-// retry does not change to one, see [Adapter.endRefusedFor].
+// is being sent again, see [Adapter.endSoon], or one failed with an error from Qory
+// Apiary that a retry does not change, see [Adapter.endRefusedFor].
 func (a *Adapter) endHeld(installation int64) bool {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()

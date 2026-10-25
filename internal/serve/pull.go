@@ -669,16 +669,16 @@ func (p *puller) installationGone(ctx context.Context, attr slog.Attr, installat
 	p.ended(ctx, attr, installation)
 }
 
-// ended handles the installation, whose check returned 404 under the App's token,
-// [github.ErrInstallationGone], in two rounds in a row, see [puller.installationGone],
-// as deleted, the way the webhook's deleted does, see
+// ended handles as deleted the installation, whose check returned 404 under the App's
+// token, [github.ErrInstallationGone], in two rounds in a row, see
+// [puller.installationGone], the way the webhook's deleted does, see
 // [Adapter.endInstallation], with a line, and pulls none of its collections. Only
 // GitHub's 404 to the installation's check brings it: a 401, as for an App key GitHub
 // does not take, or a suspension never does. An installation that is no longer linked,
 // as once the webhook or an earlier round ended it, is passed with no line, and so is
-// one whose grant end serve sends again, or to whose grant end Qory Apiary returned an
-// error that a retry does not change, see [Adapter.endHeld], since the round changes
-// nothing of it. A failure is reported, see [puller.report], and the 404s stay
+// one whose grant end serve sends again, or whose grant end failed with an error from
+// Qory Apiary that a retry does not change, see [Adapter.endHeld], since the round
+// changes nothing of it. A failure is reported, see [puller.report], and the 404s stay
 // counted, so the next round's 404 tries again.
 func (p *puller) ended(ctx context.Context, attr slog.Attr, installation int64) {
 	held := p.adapter.endHeld(installation)
