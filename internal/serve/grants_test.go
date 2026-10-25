@@ -621,6 +621,7 @@ func TestAGrantTheFeedAddsAfterItsInstallationWasDeletedIsEnded(t *testing.T) {
 	if err := w.feed.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	w.endsDone(t, 42)
 	sent := w.apiary.sent(routeGrantsEnd)
 	if len(sent) != 1 || sent[0].body["connection_id"] != testConnection || sent[0].body["grant_ref"] != "42" {
 		t.Fatalf("the grant ends %v", sent)
@@ -654,6 +655,7 @@ func TestAGrantOfADeletedInstallationIsEndedOnceAtATime(t *testing.T) {
 	if err := w.feed.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	eventually(t, "the first grant end", func() bool { return len(w.apiary.sent(routeGrantsEnd)) == 1 })
 	if !w.adapter.ending(42) {
 		t.Fatal("the grant end is not sent again")
 	}
@@ -787,5 +789,96 @@ func TestAnUnlinkedGrantEndStopsAfterADayOfConnectionUnknown(t *testing.T) {
 	}
 	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary returned 403 connection_unknown for 24 hours to the end of the grant of an installation that has no link, so serve drops the grant and sends no more grant end","installation":42,"connection":"`+testConnection+`"`) {
 		t.Errorf("the log %s", log)
+	}
+}
+
+// TestAnUnlinkedGrantEndLeavesTheFeedAtOnce deletes 42 before serve has its grant, see
+// [deletedBeforeTheReport], and holds Qory Apiary's answer to the grant end: the
+// change feed's step that starts the grant end returns while the grant end waits.
+func TestAnUnlinkedGrantEndLeavesTheFeedAtOnce(t *testing.T) {
+	w := deletedBeforeTheReport(t)
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			<-release
+		}
+		return 0, ""
+	}
+	stepped := make(chan error, 1)
+	go func() { stepped <- w.feed.step(context.Background()) }()
+	select {
+	case err := <-stepped:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the feed's step waits for the grant end")
+	}
+	eventually(t, "the grant end", func() bool { return len(w.apiary.sent(routeGrantsEnd)) == 1 || w.adapter.ending(42) })
+	close(release)
+	w.endsDone(t, 42)
+	if n := len(w.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
+	}
+	if held, _ := grantOf(w.st, 42); held != "" {
+		t.Errorf("the grant is kept for %s", held)
+	}
+}
+
+// TestAConnectForTheAccountStopsAnUnlinkedGrantEnd deletes 99, on acme's account,
+// before serve has its grant, and has the grant end that the change feed's grant entry
+// starts return 503, so it is sent again later: a connect for acme, which links 42,
+// stops it, and no try follows.
+func TestAConnectForTheAccountStopsAnUnlinkedGrantEnd(t *testing.T) {
+	rig, _ := reportRig(t)
+	if err := putLink(rig.st, 99, link{Connection: otherConnection, State: linkLive, Account: acme.ID}); err != nil {
+		t.Fatal(err)
+	}
+	rig.apiary.grant("99", otherConnection)
+	if _, err := rig.adapter.endInstallation(context.Background(), 99); err != nil {
+		t.Fatal(err)
+	}
+	// Each wait before a try lasts until the connect is done, or until the grant end is
+	// stopped.
+	connected := make(chan struct{})
+	rig.adapter.endSleep = func(ctx context.Context, _ time.Duration) error {
+		select {
+		case <-connected:
+		case <-ctx.Done():
+		}
+		return ctx.Err()
+	}
+	rig.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeGrantsEnd {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	rig.apiary.changes = []contracts.Change{{Kind: contracts.ChangeGrant, ConnectionID: otherConnection, GrantRef: "99", Status: "linked"}}
+	if err := rig.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the first grant end", func() bool { return len(rig.apiary.sent(routeGrantsEnd)) == 1 })
+	if !rig.adapter.ending(99) {
+		t.Fatal("the grant end is not sent again")
+	}
+	connectWith(t, rig, newNonce())
+	if rig.adapter.ending(99) {
+		t.Error("the grant end is still sent again after the connect")
+	}
+	close(connected)
+	rig.adapter.stopEnds()
+	if n := len(rig.apiary.sent(routeGrantsEnd)); n != 1 {
+		t.Errorf("%d grant ends", n)
+	}
+	if held, _ := grantOf(rig.st, 99); held != otherConnection {
+		t.Errorf("the grant is %q", held)
 	}
 }

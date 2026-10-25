@@ -39,8 +39,8 @@ import (
 //     connection's id, see [noteAnswer].
 //   - connections_replaced: a pending link a connect for another connection replaced,
 //     by the replaced connection's id, until its last listing, see [keepReplaced].
-//   - installations_deleted: an installation GitHub deleted, by its id, for
-//     [deletedFor], see [keepDeleted].
+//   - installations_deleted: an installation GitHub deleted, by its id, with the GitHub
+//     account of its link, for [deletedFor], see [keepDeleted].
 //   - connections_passes: the expiry of the newest pass a linked connect return was
 //     minted under, by the connection's id, see [keepPass].
 //   - pulls: when the last pull of a collection that finished without error began, and
@@ -402,11 +402,40 @@ func newestPass(st *store.Store, connection string) (int64, error) {
 // [keepDeleted]: a day, far past any connect under way when it was deleted.
 const deletedFor = 24 * time.Hour
 
+// deletedRecord is what the store keeps of an installation GitHub deleted: the GitHub
+// account of its link, by its id, 0 when serve did not know it.
+type deletedRecord struct {
+	Account int64 `json:"account_id,omitempty"`
+}
+
 // keepDeleted keeps, for [deletedFor], that GitHub deleted the installation, so a
 // connect that confirmed it before the deletion links nothing after it, see
-// [Connect.link].
-func keepDeleted(st *store.Store, installation int64) error {
-	return st.Put(nsDeleted, strconv.FormatInt(installation, 10), []byte("1"), deletedFor)
+// [Connect.link], with account, the GitHub account of its link, so a connect for that
+// account stops the end of its grant, see [Adapter.endUnlinked]. An account of 0 keeps
+// the account the record has.
+func keepDeleted(st *store.Store, installation, account int64) error {
+	if account <= 0 {
+		account = deletedAccount(st, installation)
+	}
+	b, err := json.Marshal(deletedRecord{Account: account})
+	if err != nil {
+		return err
+	}
+	return st.Put(nsDeleted, strconv.FormatInt(installation, 10), b, deletedFor)
+}
+
+// deletedAccount is the GitHub account that the record of [keepDeleted] has for the
+// installation, by its id, or 0.
+func deletedAccount(st *store.Store, installation int64) int64 {
+	b, err := st.Get(nsDeleted, strconv.FormatInt(installation, 10))
+	if err != nil {
+		return 0
+	}
+	var r deletedRecord
+	if json.Unmarshal(b, &r) != nil || r.Account < 0 {
+		return 0
+	}
+	return r.Account
 }
 
 // wasDeleted is whether GitHub deleted the installation, see [keepDeleted].

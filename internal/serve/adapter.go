@@ -961,16 +961,19 @@ func (a *Adapter) endInstallation(ctx context.Context, installation int64) (stri
 		return "", err
 	}
 	defer unlock()
-	if err := keepDeleted(a.Store, installation); err != nil {
+	l, ok, err := linkOf(a.Store, installation)
+	if err != nil {
+		return "", err
+	}
+	if err := keepDeleted(a.Store, installation, l.Account); err != nil {
 		return "", err
 	}
 	a.forgetInstallation(installation)
 	if err := dropUnlinked(a.Store, installation); err != nil {
 		return "", err
 	}
-	l, ok, err := linkOf(a.Store, installation)
-	if err != nil || !ok {
-		return "", err
+	if !ok {
+		return "", nil
 	}
 	if err := a.endGrant(ctx, installation, l); err != nil {
 		return "", err

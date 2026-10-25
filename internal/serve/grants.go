@@ -272,9 +272,7 @@ func (a *Adapter) syncGrants(ctx context.Context) error {
 		return err
 	}
 	for _, id := range ends {
-		if err := a.endUnlinked(ctx, id, g[id]); err != nil {
-			return err
-		}
+		a.endUnlinked(id, g[id])
 	}
 	return nil
 }
@@ -345,40 +343,25 @@ func (a *Adapter) keepGrants(g map[int64]string) ([]int64, error) {
 	return ends, nil
 }
 
-// endUnlinked ends the grant of the installation, which connection has in Qory
-// Apiary's copy, after GitHub deleted the installation and serve dropped its link, see
-// [Adapter.syncGrants]: it sends the grant end and acts on the answer as
-// [Adapter.endGrant] does, holding the installation's lock. It sends nothing while the
-// grant end is being sent again, or after Qory Apiary returned an error that a retry
-// does not change to it, see [Adapter.endRefusedFor], or once the installation has a
-// link, or the copy no longer has the grant for connection. A request stopped by ctx
-// is the error.
-func (a *Adapter) endUnlinked(ctx context.Context, installation int64, connection string) error {
-	unlock, err := a.lockInstallation(ctx, installation)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+// endUnlinked starts the end of the grant of the installation, which connection has in
+// Qory Apiary's copy, after GitHub deleted the installation and serve dropped its link,
+// see [Adapter.syncGrants]: the tries of [Adapter.endSoon], the first at once, for the
+// GitHub account of the deletion record, see [keepDeleted], so a connect for that
+// account stops them, see [Adapter.stopEnd]. It returns before the first try, so a
+// caller such as the change feed does not wait for Qory Apiary. It starts nothing while
+// the grant end is being sent again, or after Qory Apiary returned an error for it that
+// a retry does not change, see [Adapter.endRefusedFor], or once the installation has a
+// link, or the copy no longer has the grant for connection.
+func (a *Adapter) endUnlinked(installation int64, connection string) {
 	if a.ending(installation) || a.endRefusedFor(installation, connection) {
-		return nil
+		return
 	}
 	if send, err := unlinkedGrant(a.Store, installation, connection); err != nil || !send {
-		return err
+		return
 	}
-	es, ok := a.Sink.(grantEndSink)
-	if !ok {
-		return Permanent(errors.New("the sink cannot end a grant"))
+	if a.endSoon(installation, connection, deletedAccount(a.Store, installation), false, time.Time{}, true) {
+		a.log().Info("Qory Apiary's copy of the grants has the grant of an installation GitHub deleted, so serve reports the end of the grant", slog.Int64("installation", installation), slog.String("connection", connection))
 	}
-	a.log().Info("Qory Apiary's copy of the grants has the grant of an installation GitHub deleted, so serve reports the end of the grant", slog.Int64("installation", installation), slog.String("connection", connection))
-	err = es.EndGrant(ctx, connection, installation)
-	if ctx.Err() != nil {
-		return err
-	}
-	var since time.Time
-	if a.grantEnded(installation, connection, 0, false, &since, err) {
-		a.endSoon(installation, connection, 0, false, since)
-	}
-	return nil
 }
 
 // unlinkedGrant is whether the installation has no link and the copy has its grant for
@@ -559,7 +542,7 @@ func (a *Adapter) endGrant(ctx context.Context, installation int64, l link) erro
 		return err
 	}
 	if a.grantEnded(installation, l.Connection, l.Account, true, nil, err) {
-		a.endSoon(installation, l.Connection, l.Account, true, time.Time{})
+		a.endSoon(installation, l.Connection, l.Account, true, time.Time{}, false)
 	}
 	return nil
 }
@@ -687,13 +670,14 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 // linked connect return is minted for account, the GitHub account of the grant, see
 // [Adapter.stopEnd]; and once [Adapter.stopEnds] has run. A stop changes no state. One
 // installation has one grant end sent again at a time. linked and since are as for
-// [Adapter.grantEnded].
-func (a *Adapter) endSoon(installation int64, connection string, account int64, linked bool, since time.Time) {
+// [Adapter.grantEnded]. With now set, the first try goes at once, with no wait before
+// it, as for [Adapter.endUnlinked]. It returns whether it started the tries.
+func (a *Adapter) endSoon(installation int64, connection string, account int64, linked bool, since time.Time, now bool) bool {
 	a.endMu.Lock()
 	defer a.endMu.Unlock()
 	a.initEnds()
 	if a.endsStopped || a.ends[installation] != nil {
-		return
+		return false
 	}
 	ctx, cancel := context.WithCancel(a.endCtx)
 	e := &grantEnding{account: account, cancel: cancel}
@@ -703,16 +687,19 @@ func (a *Adapter) endSoon(installation int64, connection string, account int64, 
 		defer a.endWG.Done()
 		defer a.forgetEnding(installation, e)
 		wait := grantFirstWait
-		for {
-			if a.endWait(ctx, wait) != nil {
-				return
+		for first := now; ; first = false {
+			if !first {
+				if a.endWait(ctx, wait) != nil {
+					return
+				}
+				wait = min(2*wait, grantMaxWait)
 			}
-			wait = min(2*wait, grantMaxWait)
 			if !a.endAgain(ctx, installation, connection, account, linked, &since) {
 				return
 			}
 		}
 	}()
+	return true
 }
 
 // endAgain is one try of [Adapter.endSoon], holding the installation's lock, and says
