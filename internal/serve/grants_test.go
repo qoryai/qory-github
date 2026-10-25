@@ -781,29 +781,46 @@ func TestAnUnlinkedGrantEndStopsOnceItsConnectionEnds(t *testing.T) {
 	}
 }
 
-// TestAnUnlinkedGrantEndStopsAfterADayOfConnectionUnknown deletes 42 before serve has
-// its grant, see [deletedBeforeTheReport], with no other link to the connection, and
-// has each grant end return 403 connection_unknown an hour apart: no live link counts
-// the 403s, so once they have lasted a day, see [forbiddenFor], serve drops the grant
-// from the copy, with a line, and sends no more grant end.
-func TestAnUnlinkedGrantEndStopsAfterADayOfConnectionUnknown(t *testing.T) {
+// TestAnUnlinkedGrantEndIsNeverStoppedBy403s deletes 42 before serve has its grant,
+// see [deletedBeforeTheReport], with no other link to the connection, and has each
+// grant end return 403 connection_unknown an hour apart: no live link counts the 403s,
+// so past a day, see [forbiddenFor], the grant end is still sent again, at most a
+// minute apart, and the grant stays in the copy.
+func TestAnUnlinkedGrantEndIsNeverStoppedBy403s(t *testing.T) {
 	w := deletedBeforeTheReport(t)
 	w.retryEnds()
 	everyHour(w)
+	hourly := w.apiary.refuse
+	const tries = 30
+	past := make(chan struct{})
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeGrantsEnd && n == tries {
+			close(past)
+		}
+		return hourly(route, n)
+	}
 	if err := w.feed.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	w.endsDone(t, 42)
-	// The first 403 comes at 13:00; the try that returns at 13:00 the next day is last.
-	if n := len(w.apiary.sent(routeGrantsEnd)); n != 25 {
-		t.Errorf("%d grant ends", n)
+	select {
+	case <-past:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%d grant ends", len(w.apiary.sent(routeGrantsEnd)))
 	}
-	if held, _ := grantOf(w.st, 42); held != "" {
-		t.Errorf("the grant is kept for %s", held)
+	if !w.adapter.ending(42) {
+		t.Error("the grant end is no longer sent again")
 	}
-	if log := w.log.String(); !strings.Contains(log, `"msg":"Qory Apiary returned 403 connection_unknown for 24 hours to the end of the grant of an installation that has no link, so serve drops the grant and sends no more grant end","installation":42,"connection":"`+testConnection+`"`) {
-		t.Errorf("the log %s", log)
+	w.adapter.stopEnds()
+	if held, _ := grantOf(w.st, 42); held != testConnection {
+		t.Errorf("the grant is %q", held)
 	}
+	w.mu.Lock()
+	for _, d := range w.endWaits {
+		if d > time.Minute {
+			t.Errorf("waited %v", d)
+		}
+	}
+	w.mu.Unlock()
 }
 
 // TestAnUnlinkedGrantEndLeavesTheFeedAtOnce deletes 42 before serve has its grant, see
