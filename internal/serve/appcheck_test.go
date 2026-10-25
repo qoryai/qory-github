@@ -141,7 +141,7 @@ func TestAnAnswerWithNoSlugIsRefused(t *testing.T) {
 		gh := newAppGitHub(t, appAnswer{200, body})
 		s, apiary := checkSettings(t, gh, nil)
 		_, err := refusedStart(t, s)
-		const want = "checking the App with GitHub: GitHub's answer names no slug for the App with app_id 1"
+		const want = "checking the App with GitHub: GitHub's answer has no slug for the App with app_id 1"
 		if err == nil || err.Error() != want || len(apiary.sent(routeSecrets)) != 0 {
 			t.Errorf("%s: err %v", body, err)
 		}
@@ -155,7 +155,7 @@ func TestTheAppIsRefusedForAnotherID(t *testing.T) {
 		gh := newAppGitHub(t, appAnswer{200, body})
 		s, _ := checkSettings(t, gh, setupApp())
 		log, err := refusedStart(t, s)
-		const want = "Qory Apiary stores the App with app_id 777001, and GitHub answers for another App"
+		const want = "Qory Apiary stores the App with app_id 777001, and GitHub's answer is for another App"
 		if err == nil || err.Error() != want || strings.Contains(log, lineServing) {
 			t.Errorf("%s: err %v; the log: %s", body, err, log)
 		}
@@ -187,7 +187,7 @@ func TestTheAppKeepsItsNewSlug(t *testing.T) {
 	s, apiary := checkSettings(t, gh, a)
 	_, log, stop := runWith(t, s, Options{feedSleep: shortSleep})
 	stop()
-	const line = `"level":"INFO","msg":"GitHub names the App with app_id 777001 qory-acme-2 now, so serve uses qory-acme-2 in place of qory-acme"`
+	const line = `"level":"INFO","msg":"GitHub's answer has the slug qory-acme-2 for the App with app_id 777001 now, so serve uses qory-acme-2 in place of qory-acme"`
 	if strings.Count(log.String(), line) != 1 || !strings.Contains(log.String(), "/organizations/acme/settings/apps/qory-acme-2\"") || !strings.Contains(log.String(), lineServing) {
 		t.Errorf("the log: %s", log.String())
 	}

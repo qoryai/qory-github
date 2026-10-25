@@ -41,8 +41,8 @@ const maxDocumentAnswer = 2 << 20
 
 // RepositoryInstallation reads from GitHub, with the App's token, the installation of
 // the App that reaches the repository by owner/name, GET
-// /repos/{owner}/{repo}/installation, and returns its id and its account's login. A 404 or a redirect is [ErrNotInstalled]. The
-// redirect is never followed.
+// /repos/{owner}/{repo}/installation, and returns its id and its account's login. A
+// 404 or a redirect is [ErrNotInstalled]. The redirect is never followed.
 func (c Client) RepositoryInstallation(ctx context.Context, appID string, key *rsa.PrivateKey, repo Repository) (int64, string, error) {
 	const what = "finding the App's installation on a repository"
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
@@ -100,8 +100,8 @@ func (c Client) RepositoryID(ctx context.Context, token string, repo Repository)
 
 // CommitAt reads the commit that at is or points to in the repository whose id is
 // repository, with an installation token: at is a commit's id, a branch or a tag. It
-// reads the newest commit of the history at that name, GET /repositories/{id}/commits?sha={at}&per_page=1,
-// and returns its id. A 404, a 409 or a 422, or an empty list, is [ErrVersionNotFound].
+// reads the newest commit of the history at that name, GET
+// /repositories/{id}/commits?sha={at}&per_page=1, and returns its id. A 404, a 409 or a 422, or an empty list, is [ErrVersionNotFound].
 func (c Client) CommitAt(ctx context.Context, token string, repository int64, at string) (string, error) {
 	const what = "reading the commit of a version"
 	if repository <= 0 {

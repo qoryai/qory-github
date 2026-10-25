@@ -847,12 +847,13 @@ const keyAdapterID = "adapter_id"
 // recordState is what the store holds for one adapter record in Qory Apiary, which a
 // new record does not have: the installations' links to its connections, the linked
 // collections, their pulls and the environment_refs sent for them, what serve keeps of
-// its connections, the connect flows and their passes' nonces, and in the adapter
-// namespace the change feed's cursor and the sync interval. What belongs to the GitHub
+// its connections, the connect flows and their passes' nonces, the copy of the
+// record's grants, and in the adapter namespace the change feed's cursor and the sync
+// interval. What belongs to the GitHub
 // App stays: the deliveries, the installations' repositories, the installations GitHub
 // announced or deleted, and the instance id.
 var recordState = store.Owner{
-	Namespaces: []string{nsInstallations, nsCollections, nsPulls, nsEnvironments, nsForbidden, nsReplaced, nsPasses, nsConnectSessions, nsConnectNonces},
+	Namespaces: []string{nsInstallations, nsCollections, nsPulls, nsEnvironments, nsForbidden, nsReplaced, nsPasses, nsConnectSessions, nsConnectNonces, nsGrants},
 	Keys:       map[string][]string{nsAdapter: {keyCursor, keySyncInterval}},
 }
 
@@ -874,7 +875,7 @@ func ownState(st *store.Store, adapterID string, log *slog.Logger) error {
 	for _, ns := range append(append([]string(nil), recordState.Namespaces...), nsAdapter) {
 		counts = append(counts, slog.Int(ns, dropped[ns]))
 	}
-	log.Warn("the adapter is enrolled as another adapter in Qory Apiary, so serve dropped the data in its store for the old one: the installations' links, the linked collections, their pulls and the environment_refs sent for them, the connections' state, the connect flows, the change feed's cursor and the sync interval",
+	log.Warn("the adapter is enrolled as another adapter in Qory Apiary, so serve dropped the data in its store for the old one: the installations' links, the linked collections, their pulls and the environment_refs sent for them, the connections' state, the connect flows, the copy of the grants, the change feed's cursor and the sync interval",
 		slog.String("old_adapter_id", previous), slog.String("adapter_id", adapterID), slog.Group("dropped", counts...))
 	return nil
 }

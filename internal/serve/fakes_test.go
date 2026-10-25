@@ -125,6 +125,10 @@ type fakeApiary struct {
 	secrets []contracts.SecretEntry
 	uploads []contracts.AdapterSecretsPlaintext
 	sealing func(doc map[string]any, keyID string)
+	// described are the secret names the source role of each adapter record's latest
+	// description lists, by the record's adapter id: an upload of a secret its
+	// record's list does not contain is refused, 400 invalid_request.
+	described map[string][]string
 	// node is the adapter id of the last enrolment, which a seal of secrets binds to,
 	// testAdapterID before any.
 	node string
@@ -279,11 +283,13 @@ func newFakeApiary(t *testing.T, adapter *accesskey.Key) *fakeApiary {
 	return f
 }
 
-// noApp makes the fake store no secret, as before the App setup.
+// noApp makes the fake store no secret and no description, as before the adapter's
+// first start.
 func (f *fakeApiary) noApp() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = nil
+	f.described = nil
 }
 
 func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -369,11 +375,20 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	refuse, refuseGet := f.refuse, f.refuseGet
 	f.mu.Unlock()
+	// A start-up body's description counts once the body arrives, as Qory Apiary keeps
+	// it before it answers; a refusal puts the one before back.
+	var undescribe func()
+	if r.URL.Path == routeAdapter && r.Method == http.MethodPost {
+		undescribe = f.describe(b)
+	}
 	refused := false
 	if refuse != nil && r.Method == http.MethodPost {
 		if s, b := refuse(r.URL.Path, n); s != 0 {
 			status, body, refused = s, b, true
 		}
+	}
+	if undescribe != nil && (status < 200 || status > 299) {
+		undescribe()
 	}
 	switch {
 	case r.URL.Path == routeSecrets && r.Method == http.MethodGet:
@@ -515,6 +530,16 @@ func (f *fakeApiary) storeApp(a *app) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.secrets = p.Secrets
+	// Secrets are stored only under a description that lists them, so the record of
+	// the last enrolment has one.
+	if f.described == nil {
+		f.described = map[string][]string{}
+	}
+	names := make([]string, len(p.Secrets))
+	for i, e := range p.Secrets {
+		names[i] = e.Name
+	}
+	f.described[cmp.Or(f.node, testAdapterID)] = names
 }
 
 // storeTestApp makes the fake store [testApp].
@@ -589,12 +614,49 @@ func sealTo(t *testing.T, pub accesskey.PublicKey, pt, info, aad []byte) (string
 	return base64.RawURLEncoding.EncodeToString(enc), base64.RawURLEncoding.EncodeToString(ct)
 }
 
+// describe keeps the secret names of the description in the start-up body b as the
+// latest of the adapter record of the last enrolment, and returns what puts the names
+// before back.
+func (f *fakeApiary) describe(b []byte) func() {
+	var doc struct {
+		Description struct {
+			Roles struct {
+				Source struct {
+					Secrets []string `json:"secrets"`
+				} `json:"source"`
+			} `json:"roles"`
+		} `json:"description"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		f.t.Errorf("the start-up body is not JSON: %v", err)
+		return func() {}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.described == nil {
+		f.described = map[string][]string{}
+	}
+	node := cmp.Or(f.node, testAdapterID)
+	before, had := f.described[node]
+	f.described[node] = doc.Description.Roles.Source.Secrets
+	return func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if had {
+			f.described[node] = before
+		} else {
+			delete(f.described, node)
+		}
+	}
+}
+
 // openUpload opens the upload b, signed with the access key keyID, with the server
 // key, as Qory Apiary does: info from sealed.server_key, aad from the adapter of the
 // last enrolment and keyID. It returns the refusal's code: unknown_server_key for an
 // upload sealed to another key than the server's, invalid_request for one that does
-// not open or has no plaintext the contract takes, and "" for an accepted one, which
-// replaces the secrets the fake stores.
+// not open, has no plaintext the contract takes, or has a secret whose name the source
+// role of the record's latest description does not list, and "" for an accepted one,
+// which replaces the secrets the fake stores.
 func (f *fakeApiary) openUpload(b []byte, keyID string) string {
 	var doc contracts.AdapterSecrets
 	if err := json.Unmarshal(b, &doc); err != nil {
@@ -616,6 +678,11 @@ func (f *fakeApiary) openUpload(b []byte, keyID string) string {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, e := range p.Secrets {
+		if !slices.Contains(f.described[node], e.Name) {
+			return codeInvalidRequest
+		}
+	}
 	f.secrets = p.Secrets
 	f.uploads = append(f.uploads, p)
 	return ""

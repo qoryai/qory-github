@@ -71,8 +71,9 @@ import (
 //     the App on GitHub. While the setup tries again, every setup pass is refused.
 //
 // The session's cookie, __Secure-qory_github_setup, is for <public_url>/setup alone,
-// HttpOnly, Secure and SameSite=Lax, for 900 seconds at most; it holds a random id, and
-// the store keeps the session under the id's SHA-256. Every end of a flow drops the
+// HttpOnly, Secure and SameSite=Lax, for 900 seconds at most, or, while the setup tries
+// again to store the App, for upload_retry_seconds and 900 seconds more at most; it
+// contains a random id, and the store keeps the session under the id's SHA-256. Every end of a flow drops the
 // cookie. serve reads no cookie but the two it sets, by name, and logs no header: a cookie it
 // did not set is never logged, kept or sent on. Every redirect's target is built from
 // the settings and the session, and a page says nothing the request carries.

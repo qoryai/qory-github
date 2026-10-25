@@ -145,9 +145,10 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 //     answered 503 until it is enrolled.
 //   - Reading the App: serve reads the App's values from Qory Apiary, sealed to its
 //     access key, see [runner.loadApp], and keeps them in memory alone. Every request
-//     but /health is answered 503 until Qory Apiary answers.
-//   - App check, when Qory Apiary delivers an App: serve asks GitHub which App it is,
-//     see [runner.checkApp]. Every request but /health is answered 503 until serve
+//     but /health gets 503 until serve has read the App, or that Qory Apiary stores
+//     none.
+//   - App check, when Qory Apiary delivers an App: serve checks with GitHub which App
+//     it is, see [runner.checkApp]. Every request but /health gets 503 until serve
 //     serves with the App or stops.
 //   - No App, when Qory Apiary stores no App: it declares the adapter with setup_url,
 //     <public_url>/setup, where an instance admin sets the App up, see [appSetup],
@@ -162,15 +163,15 @@ func answeredIn(st *store.Store, log *slog.Logger) func(connection string, statu
 //     setup_url, until it stops, and pulls from GitHub what the webhooks missed, see
 //     [puller]. The App setup refuses every setup pass.
 //
-// serve writes none of the App's values to disk: the state directory holds the access
-// key, the enrolment and the store alone. Before serve serves with the App Qory Apiary
-// delivered, it asks GitHub once which App it is, see [runner.checkApp], and refuses
-// to start when GitHub does not take the App's token, or when GitHub's answer names no
-// id, answers for another App, or names a new slug that is no slug. A new slug is used
-// in place of the old one and stored in Qory Apiary. An App whose webhook secret GitHub
-// did not confirm has it set again at each start. With public_address false, serve
-// declares that it learns of changes on GitHub by pulling, and so it does for an App
-// whose webhook was created inactive.
+// serve writes none of the App's values to disk: the state directory contains the
+// access key, the enrolment and the store alone. Before serve serves with the App Qory
+// Apiary delivered, it checks once with GitHub which App it is, see [runner.checkApp],
+// and stops with an error when GitHub does not accept the App's token, or when
+// GitHub's answer has no id, is for another App, or has a new slug that is no slug.
+// A new slug is used in place of the old one and stored in Qory Apiary. An App whose
+// webhook secret GitHub did not confirm has it set again at each start. With
+// public_address false, serve declares that it learns of changes on GitHub by pulling,
+// and so it does for an App whose webhook was created inactive.
 //
 // With the enrolment kept in the state directory and enrolment_code_file set, it looks
 // at the code file again at start and after each 401 Qory Apiary answers, beside
@@ -256,6 +257,11 @@ type runner struct {
 	setUp chan *app
 	// inUse is the App serve serves with, nil before; mu guards it once serving starts.
 	inUse *app
+	// storeMu guards newRecordApp: the App to store in the adapter record of a new
+	// enrolment once the adapter is declared there, nil when none waits, see
+	// [runner.storeInNewRecord].
+	storeMu      sync.Mutex
+	newRecordApp *app
 
 	// mu guards start, stop and inUse: start starts what declares the adapter in the
 	// phase in place, the declaration with setup_url or the change feed's reader and the
@@ -378,10 +384,12 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 		// for the old record when the enrolment is in another one, puts the enrolment
 		// in use, whether the drop failed or not, and starts it again, so the adapter
 		// is declared again under the new key, and a new record's feed is read from its
-		// start. In another record, the App in use is stored there too, see
-		// [runner.storeInNewRecord]. Only the reenroller calls it, one look at a time,
-		// and it is stopped before what declares the adapter is at the stop. Before
-		// serve has read the App, nothing declares the adapter yet.
+		// start. In another record, the App in use is stored there too, once the adapter
+		// is declared there, see [runner.storeInNewRecord]: Qory Apiary returns 400 for
+		// a secret that the source role of the record's latest description does not
+		// list. Only the reenroller calls it, one look at a time, and it is stopped
+		// before what declares the adapter is at the stop. Before serve has read the
+		// App, nothing declares the adapter yet.
 		r.re.inUse = func(got enrolment) error {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -391,8 +399,10 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 			}
 			err := ownState(st, got.adapterID, log)
 			r.creds.set(got)
-			if got.adapterID != old.adapterID {
-				r.storeInNewRecord()
+			if got.adapterID != old.adapterID && r.inUse != nil {
+				r.storeMu.Lock()
+				r.newRecordApp = r.inUse
+				r.storeMu.Unlock()
 			}
 			if r.start != nil {
 				r.stop = r.start()
@@ -567,19 +577,55 @@ func (r *runner) upload(ctx context.Context, a *app) error {
 	return r.apiary.UploadSecrets(ctx, p)
 }
 
-// storeInNewRecord stores the App in use, if any, in the adapter record of the
-// enrolment in use, after a new enrolment made the adapter another record in Qory
-// Apiary, which stores no App. When the upload fails, a line says so: the next start
-// of serve finds no App, and serves the App setup. r.mu is held.
-func (r *runner) storeInNewRecord() {
-	a := r.inUse
-	if a == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.ctx, connectBound)
-	defer cancel()
-	if err := r.upload(ctx, a); err != nil {
-		r.log.Error("storing the GitHub App in the new adapter in Qory Apiary failed; at its next start serve finds no App there", slog.String("slug", a.slug), slog.String("error", err.Error()))
+// storeInNewRecord stores the App that waits in newRecordApp, if any, in the adapter
+// record of the enrolment in use, after a new enrolment made the adapter another
+// record in Qory Apiary, which stores no App. It runs once the change feed's reader
+// has declared the adapter in that record, since Qory Apiary returns 400 for a secret
+// the source role of the record's latest description does not list. A failed upload
+// is tried again, after a wait that doubles from [feedFirstBackoff] to
+// [feedMaxBackoff], until ctx is done; a permanent error, such as a 400, ends it.
+// When the App is not stored, a line says so: the next start of serve finds no App,
+// and serves the App setup.
+func (r *runner) storeInNewRecord(ctx context.Context) {
+	waits := &feed{sleep: r.opts.feedSleep}
+	backoff := feedFirstBackoff
+	for {
+		r.storeMu.Lock()
+		a := r.newRecordApp
+		r.storeMu.Unlock()
+		if a == nil {
+			return
+		}
+		upCtx, cancel := context.WithTimeout(ctx, connectBound)
+		err := r.upload(upCtx, a)
+		cancel()
+		if err == nil || IsPermanent(err) {
+			r.storeMu.Lock()
+			if r.newRecordApp == a {
+				r.newRecordApp = nil
+			}
+			r.storeMu.Unlock()
+		}
+		switch {
+		case err == nil:
+			return
+		case IsPermanent(err):
+			r.log.Error("storing the GitHub App in the new adapter in Qory Apiary failed; at its next start serve finds no App there", slog.String("slug", a.slug), slog.String("error", err.Error()))
+			return
+		case r.ctx.Err() != nil:
+			r.log.Error("serve stopped before it stored the GitHub App in the new adapter in Qory Apiary; at its next start serve finds no App there", slog.String("slug", a.slug))
+			return
+		case ctx.Err() != nil:
+			return
+		}
+		r.log.Warn("storing the GitHub App in the new adapter in Qory Apiary failed, and is tried again", slog.String("slug", a.slug), slog.String("error", err.Error()))
+		if waits.wait(ctx, backoff) != nil {
+			if r.ctx.Err() != nil {
+				r.log.Error("serve stopped before it stored the GitHub App in the new adapter in Qory Apiary; at its next start serve finds no App there", slog.String("slug", a.slug))
+			}
+			return
+		}
+		backoff = min(2*backoff, feedMaxBackoff)
 	}
 }
 
@@ -692,10 +738,20 @@ func (r *runner) serveApp(a *app, atStart bool) {
 			case <-feedCtx.Done():
 			}
 		}()
+		stored := make(chan struct{})
+		go func() {
+			defer close(stored)
+			select {
+			case <-declared:
+				r.storeInNewRecord(feedCtx)
+			case <-feedCtx.Done():
+			}
+		}()
 		return func() {
 			stopFeed()
 			<-fed
 			<-pulled
+			<-stored
 		}
 	}
 	if atStart && !a.confirmed {

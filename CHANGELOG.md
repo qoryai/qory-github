@@ -36,12 +36,13 @@ change what the program does, and notes it under Upgrading.
 - The description's source role lists the secrets `qory-github-server` stores in Qory
   Apiary: `app`, `private-key`, `webhook-secret` and `client-secret`.
 - A connect reports the installation's grant to Qory Apiary, with the installation's
-  id as its `grant_ref`. While Qory Apiary answers that it has not taken the connect
-  return yet, the report is sent again until the return expires; then serve drops the
-  installation's link. serve reads Qory Apiary's copy of the grants at each start and
-  at each grant entry of the change feed. serve handles the deliveries of an
-  installation while that copy holds its grant, or until the connect return of its
-  link expires, and drops the link of an installation the copy does not hold.
+  id as its `grant_ref`. While Qory Apiary returns `pass_unknown` or
+  `connection_unknown`, the report is sent again until the connect return expires; then
+  serve drops the installation's link. serve reads Qory Apiary's copy of the grants at
+  each start and at each page of the change feed that has a grant entry. serve handles
+  the deliveries of an installation while that copy contains its grant, or until the
+  connect return of its link expires, and drops the link of an installation the copy
+  does not contain.
 - With `call_url` set, or `QORY_GITHUB_CALL_URL`, `qory-github-server serve` takes Qory
   Apiary's calls at `/v1/calls/` and declares `call_url` to Qory Apiary. Set `call_url`
   to `public_url` followed by `/v1/calls/`, such as

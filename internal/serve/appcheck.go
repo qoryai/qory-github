@@ -57,13 +57,13 @@ func (r *runner) compareApp(ctx context.Context, a *app, got github.AppIdentity)
 	case got.ID <= 0:
 		return nil, fmt.Errorf("checking the App with GitHub: GitHub's answer names no id for the App with app_id %s", a.id)
 	case got.ID != a.numericID:
-		return nil, fmt.Errorf("Qory Apiary stores the App with app_id %d, and GitHub answers for another App", a.numericID)
+		return nil, fmt.Errorf("Qory Apiary stores the App with app_id %d, and GitHub's answer is for another App", a.numericID)
 	case got.Slug == a.slug:
 		return a, nil
 	case github.CheckSlug(got.Slug) != nil:
-		return nil, fmt.Errorf("checking the App with GitHub: GitHub's answer names no slug for the App with app_id %s", a.id)
+		return nil, fmt.Errorf("checking the App with GitHub: GitHub's answer has no slug for the App with app_id %s", a.id)
 	}
-	r.log.Info("GitHub names the App with app_id " + a.id + " " + got.Slug + " now, so serve uses " + got.Slug + " in place of " + a.slug)
+	r.log.Info("GitHub's answer has the slug " + got.Slug + " for the App with app_id " + a.id + " now, so serve uses " + got.Slug + " in place of " + a.slug)
 	renamed := a.with(func(c *app) { c.slug = got.Slug })
 	r.keepSlug(ctx, renamed)
 	return renamed, nil

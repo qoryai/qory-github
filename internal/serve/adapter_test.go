@@ -3076,6 +3076,31 @@ func TestARepositoryTransferredToALinkedInstallationIsListedUnderItsConnection(t
 	}
 }
 
+// TestATransferToAnInstallationTheCopyDoesNotContainIsADisconnect pins that the
+// transferred handler follows the rule intake follows, see [granted]: an installation
+// with a link whose connect return has expired, and which Qory Apiary's copy of the
+// grants does not contain, counts as not linked, so the repository's collection is
+// disconnected under the installation serve listed it for, and nothing is listed.
+func TestATransferToAnInstallationTheCopyDoesNotContainIsADisconnect(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	grantedLink(w.st, 42, testConnection, linkLive)
+	if err := Link(w.st, 43, otherConnection, linkLive); err != nil {
+		t.Fatal(err)
+	}
+	setReach(w.st, widgetsRef, 42)
+	w.gh.installed("octo-org/widgets")
+	w.deliver(t, "repository", guid1, repositoryEvent(43, "octo-org/widgets", "transferred"))
+	if s := state(w.st, guid1); s != store.Done {
+		t.Errorf("the delivery is %v", s)
+	}
+	if got := w.disconnected(0); !slices.Equal(got, []string{widgetsRef}) {
+		t.Errorf("disconnected %v", got)
+	}
+	if n := len(w.apiary.sent(routeCollections)); n != 0 {
+		t.Errorf("%d listings", n)
+	}
+}
+
 // TestARepositoryTransferredToAnInstallationNotLinkedIsDisconnected transfers
 // acme/widgets, which serve listed for the installation 42, to an account whose
 // installation 43 is not linked: the delivery is kept, the collection is disconnected

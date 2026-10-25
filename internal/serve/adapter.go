@@ -1095,7 +1095,7 @@ func (a *Adapter) transferred(ctx context.Context, d Delivery) error {
 	if err != nil {
 		return err
 	}
-	linked, err := Linked(a.Store, d.InstallationID)
+	linked, err := granted(a.Store, d.InstallationID, a.clock())
 	if err != nil {
 		return err
 	}

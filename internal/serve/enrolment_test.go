@@ -1494,7 +1494,7 @@ func recordStateLeft(t *testing.T, dir string) (left, leftInAdapter int, appKept
 // TestOwnStateDropsAnotherRecordsStateAlone pins what a new adapter record drops of
 // the store, and that the same record drops nothing and says nothing.
 func TestOwnStateDropsAnotherRecordsStateAlone(t *testing.T) {
-	want := []string{nsInstallations, nsCollections, nsPulls, nsEnvironments, nsForbidden, nsReplaced, nsPasses, nsConnectSessions, nsConnectNonces}
+	want := []string{nsInstallations, nsCollections, nsPulls, nsEnvironments, nsForbidden, nsReplaced, nsPasses, nsConnectSessions, nsConnectNonces, nsGrants}
 	if fmt.Sprint(recordState.Namespaces) != fmt.Sprint(want) || fmt.Sprint(recordState.Keys) != fmt.Sprint(map[string][]string{nsAdapter: {keyCursor, keySyncInterval}}) {
 		t.Errorf("a new record drops %v", recordState)
 	}
@@ -1523,7 +1523,7 @@ func TestOwnStateDropsAnotherRecordsStateAlone(t *testing.T) {
 	var line map[string]any
 	json.Unmarshal([]byte(log.String()), &line)
 	dropped, _ := line["dropped"].(map[string]any)
-	if line["msg"] != "the adapter is enrolled as another adapter in Qory Apiary, so serve dropped the data in its store for the old one: the installations' links, the linked collections, their pulls and the environment_refs sent for them, the connections' state, the connect flows, the change feed's cursor and the sync interval" ||
+	if line["msg"] != "the adapter is enrolled as another adapter in Qory Apiary, so serve dropped the data in its store for the old one: the installations' links, the linked collections, their pulls and the environment_refs sent for them, the connections' state, the connect flows, the copy of the grants, the change feed's cursor and the sync interval" ||
 		line["old_adapter_id"] != testAdapterID || line["adapter_id"] != otherAdapterID || dropped[nsInstallations] != 1.0 || dropped[nsAdapter] != 2.0 || len(dropped) != all+1 {
 		t.Errorf("the log: %s", log.String())
 	}
@@ -1629,18 +1629,63 @@ func TestRunDropsTheOldRecordsStateAtANewRecord(t *testing.T) {
 			}
 			eventually(t, "a read of the feed with the new key", func() bool { return withNewKey("GET "+routeChanges) > 0 })
 			stop()
-			// The feed writes its cursor as it reads, so the same record's is not checked.
+			// The feed writes its cursor as it reads, so the same record's is not checked,
+			// and it replaces the copy of the grants with Qory Apiary's at its start, so
+			// the seeded grant is gone in the same record too.
 			left, inAdapter, app, owner := recordStateLeft(t, e.settings.StateDir)
 			dropLines := e.lines("so serve dropped the data in its store for the old one")
 			if node == otherAdapterID {
 				if left != 0 || inAdapter != 0 || !app || owner != otherAdapterID || len(dropLines) != 1 || withNewKey(routeAdapter) == 0 {
 					t.Errorf("left %d and %d, the App's kept %v, the record %s, declared %d times; the log: %s", left, inAdapter, app, owner, withNewKey(routeAdapter), e.log.String())
 				}
-			} else if left != len(recordState.Namespaces) || !app || owner != testAdapterID || len(dropLines) != 0 || withNewKey(routeAdapter) == 0 {
+			} else if left != len(recordState.Namespaces)-1 || !app || owner != testAdapterID || len(dropLines) != 0 || withNewKey(routeAdapter) == 0 {
 				t.Errorf("left %d, the App's kept %v, the record %s, declared %d times; the log: %s", left, app, owner, withNewKey(routeAdapter), e.log.String())
 			}
 			noCode(t, e.log.String())
 		})
+	}
+}
+
+// TestANewRecordStoresTheAppAfterItsDeclaration pins that a re-enrolment that makes
+// the adapter a new record stores the App in use there only after the adapter is
+// declared there, signed with the new key: the fake, as Qory Apiary does, refuses a
+// secret that the source role of the record's latest description does not list, and
+// a new record has none before its first start-up body.
+func TestANewRecordStoresTheAppAfterItsDeclaration(t *testing.T) {
+	e := newEnrolEnv(t)
+	old := e.enrolled()
+	e.apiary.enrolKeyIDs = []string{"ak_fedcba9876543210"}
+	e.apiary.enrolReply = func(int) enrolAnswer { return enrolAnswer{status: http.StatusCreated, node: otherAdapterID} }
+	stop := runServe(t, e.settings, e.opts(), e.log)
+	eventually(t, "declared", func() bool { return len(e.apiary.sent(routeAdapter)) > 0 })
+	before := len(e.apiary.uploaded())
+	e.apiary.revoke(old.key.PublicKey())
+	e.writeCode(enrolCode(codeCore2, e.apiary.server))
+	eventually(t, "the App stored in the new record", func() bool { return len(e.apiary.uploaded()) > before })
+	stop()
+	e.apiary.mu.Lock()
+	declaredAt, uploadedAt := -1, -1
+	for i, r := range e.apiary.requests {
+		if r.method != http.MethodPost || r.keyID != "ak_fedcba9876543210" {
+			continue
+		}
+		if r.target == routeAdapter && declaredAt < 0 {
+			declaredAt = i
+		}
+		if r.target == routeSecrets && uploadedAt < 0 {
+			uploadedAt = i
+		}
+	}
+	listed := e.apiary.described[otherAdapterID]
+	e.apiary.mu.Unlock()
+	if declaredAt < 0 || uploadedAt < declaredAt || len(listed) != 4 {
+		t.Errorf("declared in the new record at %d, uploaded at %d, with the secrets %v listed", declaredAt, uploadedAt, listed)
+	}
+	if got, err := appOf(e.apiary.uploaded()[before]); err != nil || got.id != testApp().id || got.slug != testApp().slug {
+		t.Errorf("the new record stores the App %v: %v", got, err)
+	}
+	if lines := e.lines("storing the GitHub App in the new adapter"); len(lines) != 0 {
+		t.Errorf("the log: %v", lines)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"log/slog"
@@ -457,7 +458,12 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 		}
 		// GitHub made no webhook secret, so one was made and set on the App.
 		if p := rig.gh.patched(); len(p) != 1 || p[0] != string(kept.webhookSecret) || len(p[0]) != 64 {
-			t.Errorf("the webhook secrets set: %v", p)
+			// The secret is a generated value, so the output shows its length alone.
+			shown := make([]string, len(p))
+			for i, v := range p {
+				shown[i] = fmt.Sprintf("[secret of %d bytes, the App's: %v]", len(v), v == string(kept.webhookSecret))
+			}
+			t.Errorf("the webhook secrets set: %v", shown)
 		}
 		if c := rig.gh.converted(); len(c) != 1 || c[0] != setupCode {
 			t.Errorf("the conversions: %v", c)

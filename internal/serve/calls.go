@@ -574,8 +574,8 @@ func (c *Calls) held(ok bool, installation int64) (int, any) {
 }
 
 // covered is 0 when ref is a repository the installation reaches; else 403
-// resource_not_covered, with a line that contains ref, or 503 source_unavailable when the
-// store fails.
+// resource_not_covered, with a line that contains ref, or 503 source_unavailable when
+// the store fails.
 func (c *Calls) covered(installation int64, ref string) (int, any) {
 	id, ok := repositoryOf(ref)
 	reaches := false
