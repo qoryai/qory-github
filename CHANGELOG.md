@@ -7,6 +7,20 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+### Changed
+
+- The description lists `egress_hosts`, the hosts a run of the integration reaches:
+  `github.com` and `api.github.com`, the hosts of the credential role.
+  `qory-github describe` prints them, and `description.json` lists them. The policy that
+  `setup` prints takes its hosts from them and allows the same two hosts as before.
+- `setup` gives the exchange of GitHub's code for the App 30 seconds from the moment you
+  approve the App. Before, the exchange had only what was left of the ten-minute wait,
+  so an approval near the end of the wait could fail the exchange.
+- `setup` escapes the code it exchanges for the App in the request's path. When an error
+  from GitHub's API quotes the code, the error shows `[the code]` in its place.
+- Building `qory-github` from source needs Go 1.27.3, up from 1.27.1: the integrations
+  and Forager modules it builds against require it.
+
 ## [0.2.1] - 2026-10-24
 
 ### Added
