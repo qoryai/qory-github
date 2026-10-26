@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/qoryai/integrations/contracts"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 	"golang.org/x/text/language"
@@ -59,11 +60,11 @@ type CredentialRole struct {
 
 // SourceRole is the source adapter, qory-github-server: the lines Qory Apiary shows,
 // verbatim and as plain text, to set it up, start it, install it, change which
-// repositories it reaches and uninstall it, and the words it names the source's items
-// and collections by, as description.json holds them. [Describe]
-// always holds it; qory-github describe prints it only where QORY_FEATURES names
-// factory, and qory-github-server serve sends it in the description it declares at
-// each start.
+// repositories it reaches and uninstall it, the steps of its guide, and the words it
+// names the source's items and collections by, as description.json holds them.
+// [Describe] always holds it; qory-github describe prints it only where QORY_FEATURES
+// names factory, and qory-github-server serve sends it in the description it declares
+// at each start.
 type SourceRole struct {
 	Description string `json:"description"`
 	// ItemNoun is what Qory Apiary calls one of the source's items and many of them:
@@ -78,6 +79,10 @@ type SourceRole struct {
 	Connect        string     `json:"connect"`
 	Access         string     `json:"access"`
 	Disconnect     string     `json:"disconnect"`
+	// Guide is the short step-by-step help Qory Apiary shows for the set-up step and the
+	// connect step, after the first step that Qory Apiary writes: what a person does on
+	// the setup page and on GitHub.
+	Guide *contracts.Guide `json:"guide,omitempty"`
 	// Secrets are the names of the secrets qory-github-server stores in Qory Apiary:
 	// the App, its private key, its webhook secret and its client secret.
 	Secrets []string `json:"secrets,omitempty"`
