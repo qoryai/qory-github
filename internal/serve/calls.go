@@ -62,6 +62,7 @@ const (
 	codeSourceUnavailable          = "source_unavailable"
 	codeVersionNotFound            = "version_not_found"
 	codeDocumentNotText            = "document_not_text"
+	codeResourceNotPublic          = "resource_not_public"
 	codeMethodNotAllowed           = "method_not_allowed"
 	codePayloadTooLarge            = "payload_too_large"
 	codeBusy                       = "busy"
@@ -130,10 +131,12 @@ func (g storeGrants) copied(installation int64, connection string) (bool, error)
 	return err == nil && held == connection, err
 }
 
-// Calls serves Qory Apiary's calls at [callsPath]: run-credential, resolve and read,
-// each a POST signed with a key of the pin, see [Calls.ServeHTTP]. Each answer is signed
-// with the adapter's access key. A grant_ref is an installation's id in decimal, and a
-// resource_ref a repository's id in decimal, as a collection's ref is.
+// Calls serves Qory Apiary's calls at [callsPath]: run-credential, resolve, read and
+// read-public, each a POST signed with a key of the pin, see [Calls.ServeHTTP]. Each
+// answer is signed with the adapter's access key. A grant_ref is an installation's id in
+// decimal, and a resource_ref a repository's id in decimal, as a collection's ref is,
+// except in a resolve result with public: true and no grant_ref, whose resource_ref is
+// github.com/owner/name in lower case, see [github.PublicRef].
 type Calls struct {
 	// Store keeps the signatures of the calls accepted.
 	Store *store.Store
@@ -142,6 +145,9 @@ type Calls struct {
 	Grants grants
 	// GitHub reaches GitHub's API.
 	GitHub github.Client
+	// Public reads public repositories without a credential, for resolve and
+	// read-public. It has no token, so no installation's token reaches its hosts.
+	Public github.Public
 	// AppID and Key are the App's id and private key, which mint installation tokens.
 	AppID string
 	Key   *rsa.PrivateKey
@@ -167,6 +173,10 @@ type Calls struct {
 	// mu guards reads, the tokens a read reads with, by installation and repository.
 	mu    sync.Mutex
 	reads map[[2]int64]github.InstallationToken
+	// publicMu guards publicSeen, what the anonymous ref list returned for each
+	// repository, by [github.PublicRef], for [publicFor] at most.
+	publicMu   sync.Mutex
+	publicSeen map[string]publicEntry
 }
 
 func (c *Calls) init() {
@@ -226,7 +236,7 @@ func (c *Calls) Route(next http.Handler) http.Handler {
 // schema; 400 unsupported_contract_version for an X-Qory-Contract-Version that is
 // missing, sent twice, not a decimal integer or not [contracts.Revision]; 404 not_found
 // for a path that is not a call's; and the call's answer, see [Calls.runCredential],
-// [Calls.resolve] and [Calls.read].
+// [Calls.resolve], [Calls.read] and [Calls.readPublic].
 func (c *Calls) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.init()
 	path := strings.TrimPrefix(r.URL.EscapedPath(), callsPath)
@@ -299,6 +309,8 @@ func (c *Calls) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status, answer = c.resolve(r.Context(), body)
 	case contracts.ReadPath:
 		status, answer = c.read(r.Context(), body)
+	case contracts.ReadPublicPath:
+		status, answer = c.readPublic(r.Context(), body)
 	default:
 		status, answer = http.StatusNotFound, contracts.Refusal{Error: codeNotFound}
 	}
@@ -344,7 +356,7 @@ func callTime(body []byte) (time.Time, bool) {
 // so a sender with no key writes nothing of its choice in the log.
 func callName(path string) string {
 	switch path {
-	case contracts.RunCredentialPath, contracts.ResolvePath, contracts.ReadPath:
+	case contracts.RunCredentialPath, contracts.ResolvePath, contracts.ReadPath, contracts.ReadPublicPath:
 		return path
 	}
 	return "other"
@@ -719,12 +731,39 @@ func githubAddress(address string) (github.Repository, bool) {
 	return repos[0], true
 }
 
-// resolveOne is the result for one address: the installation of the App on the
-// repository's owner, as GitHub returns it, whose account's login is the owner's
+// resolveOne is the result for one address: the covered result, see
+// [Calls.coveredOne], with public: true added when the repository is public, see
+// [Calls.isPublic]. An address no grant covers is public: true with the resource_ref
+// [github.PublicRef] when the repository is public, and covered: false otherwise. When
+// the anonymous check fails, as for a network error, a 5xx or a rate limit, the result
+// is the covered result alone, without public, and a line says why.
+func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
+	result := c.coveredOne(ctx, address)
+	repo, ok := githubAddress(address)
+	if !ok {
+		return result
+	}
+	public, err := c.isPublic(ctx, repo)
+	if err != nil {
+		c.log().Warn("checking whether a repository to resolve is public", slog.String("resource", github.PublicRef(repo)), slog.String("error", err.Error()))
+		return result
+	}
+	switch {
+	case !public:
+		return result
+	case result.GrantRef != "":
+		result.Public = true
+		return result
+	}
+	return contracts.Resolved{Address: address, ResourceRef: github.PublicRef(repo), Public: true}
+}
+
+// coveredOne is the result for one address under a grant: the installation of the App
+// on the repository's owner, as GitHub returns it, whose account's login is the owner's
 // without regard to case, that is linked to Qory Apiary, and that reaches the
 // repository, read by its name with the installation's listing token. Any other
 // address, one GitHub returns no installation for among them, is covered: false.
-func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
+func (c *Calls) coveredOne(ctx context.Context, address string) contracts.Resolved {
 	covered := false
 	notCovered := contracts.Resolved{Address: address, Covered: &covered}
 	repo, ok := githubAddress(address)
@@ -852,4 +891,164 @@ func (c *Calls) readToken(ctx context.Context, installation, repository int64) (
 	}
 	c.reads[key] = t
 	return t.Token, nil
+}
+
+// publicFor is how long what the anonymous ref list of a repository returned is kept:
+// whether the repository is public, and the commits of the names read so far.
+const publicFor = 60 * time.Second
+
+// maxPublicSeen is how many repositories [Calls.publicSeen] keeps at most. When it is
+// full, the entries older than [publicFor] are dropped, and if none is, all are.
+const maxPublicSeen = 1024
+
+// maxPublicNames is how many names one entry of [Calls.publicSeen] keeps the commits of.
+const maxPublicNames = 64
+
+// publicEntry is what the anonymous ref list of one repository returned at read: public,
+// and the commit of each name read, "" for a name the list does not have.
+type publicEntry struct {
+	read    time.Time
+	public  bool
+	commits map[string]string
+}
+
+// isPublic is whether the repository is public, see [Calls.publicRefs].
+func (c *Calls) isPublic(ctx context.Context, repo github.Repository) (bool, error) {
+	refs, err := c.publicRefs(ctx, repo, "")
+	return refs.Public, err
+}
+
+// publicRefs is what the anonymous ref list of the repository returns, see
+// [github.Public.Refs], with the commit of name when name is set. A result is kept for
+// [publicFor]: within it, a repository that was not public is not public, and a name
+// read before has the same commit, with no request. A name not read before sends the
+// request again. An error is never kept.
+func (c *Calls) publicRefs(ctx context.Context, repo github.Repository, name string) (github.Refs, error) {
+	key := github.PublicRef(repo)
+	now := c.clock()
+	c.publicMu.Lock()
+	e, ok := c.publicSeen[key]
+	c.publicMu.Unlock()
+	if ok && now.Sub(e.read) < publicFor && now.Sub(e.read) >= 0 {
+		if !e.public {
+			return github.Refs{}, nil
+		}
+		if name == "" {
+			return github.Refs{Public: true}, nil
+		}
+		if commit, ok := e.commits[name]; ok {
+			return github.Refs{Public: true, Commit: commit, Found: commit != ""}, nil
+		}
+	}
+	refs, err := c.Public.Refs(ctx, repo, name)
+	if err != nil {
+		return github.Refs{}, err
+	}
+	c.publicMu.Lock()
+	defer c.publicMu.Unlock()
+	if c.publicSeen == nil {
+		c.publicSeen = map[string]publicEntry{}
+	}
+	old, ok := c.publicSeen[key]
+	fresh := publicEntry{read: now, public: refs.Public, commits: map[string]string{}}
+	// The names of an entry read within publicFor stay, until the first is that old.
+	if ok && old.public && refs.Public && now.Sub(old.read) < publicFor && now.Sub(old.read) >= 0 && len(old.commits) < maxPublicNames {
+		fresh = old
+	}
+	if refs.Public && name != "" {
+		fresh.commits[name] = refs.Commit
+	}
+	if _, ok := c.publicSeen[key]; !ok && len(c.publicSeen) >= maxPublicSeen {
+		for k, e := range c.publicSeen {
+			if now.Sub(e.read) >= publicFor || now.Sub(e.read) < 0 {
+				delete(c.publicSeen, k)
+			}
+		}
+		if len(c.publicSeen) >= maxPublicSeen {
+			clear(c.publicSeen)
+		}
+	}
+	c.publicSeen[key] = fresh
+	return refs, nil
+}
+
+// readPublic serves the call read-public, read-public.schema.json: the file at path in
+// the public repository of resource_ref, github.com/owner/name as [github.PublicRef]
+// writes it, at the commit of at, every request without a credential, see
+// [github.Public]. It returns, in this order:
+//
+//   - 403 resource_not_public when the repository's anonymous ref list is not public,
+//     see [Calls.publicRefs], a repository that does not exist or moved included, and
+//     for a resource_ref of another form, a repository's id among them;
+//   - 404 version_not_found for a name at that is not HEAD, a branch or a tag of the
+//     list, or a commit id at that the anonymous REST check does not find, see
+//     [github.Public.CommitExists], which runs only when the raw file host returns 404
+//     for a commit id at;
+//   - 409 document_not_text for a file larger than [contracts.ReadContentMaxBytes]
+//     bytes, not UTF-8 or with a NUL;
+//   - 503 source_unavailable when a request fails, returns a status the read does not
+//     expect, or returns GitHub's rate limit.
+//
+// A full commit id at is the commit as it is. A path the commit has no file at is
+// found: false, a directory among them, since the raw file host returns 404 for one.
+func (c *Calls) readPublic(ctx context.Context, body []byte) (int, any) {
+	var req contracts.ReadPublic
+	if !decodeCall("read-public.schema.json", body, &req) {
+		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
+	}
+	repo, ok := github.ParsePublicRef(req.ResourceRef)
+	if !ok {
+		c.log().Info("the resource of the read-public call is not github.com/owner/name", slog.String("resource", req.ResourceRef))
+		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotPublic}
+	}
+	commitID := github.CommitID(req.At)
+	name := req.At
+	if commitID {
+		name = ""
+	}
+	refs, err := c.publicRefs(ctx, repo, name)
+	if err != nil {
+		return c.publicFailed(repo, err)
+	}
+	if !refs.Public {
+		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotPublic}
+	}
+	commit := req.At
+	if !commitID {
+		if !refs.Found {
+			return http.StatusNotFound, contracts.Refusal{Error: codeVersionNotFound}
+		}
+		commit = refs.Commit
+	}
+	content, found, err := c.Public.RawFile(ctx, repo, commit, req.Path, contracts.ReadContentMaxBytes)
+	if errors.Is(err, github.ErrNotText) {
+		return http.StatusConflict, contracts.Refusal{Error: codeDocumentNotText}
+	}
+	if err != nil {
+		return c.publicFailed(repo, err)
+	}
+	if !found && commitID {
+		exists, err := c.Public.CommitExists(ctx, repo, commit)
+		if err != nil {
+			return c.publicFailed(repo, err)
+		}
+		if !exists {
+			return http.StatusNotFound, contracts.Refusal{Error: codeVersionNotFound}
+		}
+	}
+	answer := contracts.ReadAnswer{Version: contracts.Version, Revision: contracts.Revision, Content: content, ResolvedAt: commit}
+	if !found {
+		answer.Found = &found
+	}
+	if answer.Check() != nil {
+		return http.StatusConflict, contracts.Refusal{Error: codeDocumentNotText}
+	}
+	return http.StatusOK, answer
+}
+
+// publicFailed is the answer to a read-public whose request to GitHub failed with err:
+// 503 source_unavailable, with a line.
+func (c *Calls) publicFailed(repo github.Repository, err error) (int, any) {
+	c.log().Warn("reading a public file for a read-public call", slog.String("resource", github.PublicRef(repo)), slog.String("error", err.Error()))
+	return http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 }

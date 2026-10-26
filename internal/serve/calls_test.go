@@ -158,6 +158,7 @@ func (c *callsGitHub) mintsSoFar() []string {
 type callsRig struct {
 	st     *store.Store
 	gh     *callsGitHub
+	pub    *publicGitHub
 	calls  *Calls
 	server *accesskey.Key
 	access *accesskey.Key
@@ -172,7 +173,7 @@ type callsRig struct {
 func newCallsRig(t *testing.T) *callsRig {
 	t.Helper()
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rig := &callsRig{st: st, gh: newCallsGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}, base: time.Now()}
+	rig := &callsRig{st: st, gh: newCallsGitHub(t), pub: newPublicGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}, base: time.Now()}
 	if err := grantedLink(st, 42, testConnection, linkLive); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +185,7 @@ func newCallsRig(t *testing.T) *callsRig {
 	gh := github.Client{API: rig.gh.srv.URL}
 	adapter := &Adapter{Store: st, GitHub: gh, AppID: "1", Key: appKey(), Slug: testSlug}
 	rig.calls = &Calls{
-		Store: st, Grants: storeGrants{st: st}, GitHub: gh, AppID: "1", Key: appKey(), InstanceID: testInstance,
+		Store: st, Grants: storeGrants{st: st}, GitHub: gh, Public: rig.pub.client(), AppID: "1", Key: appKey(), InstanceID: testInstance,
 		Log:   slog.New(slog.NewJSONHandler(rig.log, nil)),
 		creds: &credentials{e: enrolment{keyID: testKeyID, key: rig.access, pin: pinOf(rig.server), adapterID: testAdapterID}},
 		listingToken: func(ctx context.Context, installation int64) (string, error) {
