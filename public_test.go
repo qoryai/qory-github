@@ -466,3 +466,22 @@ func TestPublicSendsToGitHubOrALoopbackHostAlone(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckPublicBaseTakesALoopbackHostAlone pins the base URLs CheckPublicBase takes:
+// http or https on a loopback host with any port; GitHub's hosts, another host, an
+// empty base, a path, a user, a query, a fragment and another scheme are errors that
+// quote nothing.
+func TestCheckPublicBaseTakesALoopbackHostAlone(t *testing.T) {
+	for _, base := range []string{"http://127.0.0.1", "http://127.0.0.1:8080", "https://127.0.0.2:1", "http://[::1]:9", "https://localhost", "http://localhost:65535/"} {
+		if err := CheckPublicBase(base); err != nil {
+			t.Errorf("%s: %v", base, err)
+		}
+	}
+	for _, base := range []string{"", PublicGitURL, PublicRawURL, PublicAPIURL, "https://github.com.example.com", "http://10.0.0.1", "http://[::2]", "http://127.0.0.1:1/path",
+		"http://secret@127.0.0.1:1", "http://127.0.0.1:1?secret", "http://127.0.0.1:1#secret", "http://127.0.0.1:1/#", "http://127.0.0.1:1?", "ftp://127.0.0.1", "127.0.0.1:1", "http:secret"} {
+		err := CheckPublicBase(base)
+		if err == nil || strings.Contains(err.Error(), "secret") || (base != "" && strings.Contains(err.Error(), base)) {
+			t.Errorf("%q: %v, want the rule's error", base, err)
+		}
+	}
+}

@@ -890,3 +890,39 @@ func TestRunServesCallsOnlyWithCallURL(t *testing.T) {
 		}
 	}
 }
+
+// TestRunReadsPublicRepositoriesFromThePublicHosts runs serve with call_url and
+// public_git_url, public_raw_url and public_api_url set to fakes of GitHub's three
+// hosts: a signed read-public call of a missing file at a commit reaches each of them,
+// and no other host.
+func TestRunReadsPublicRepositoriesFromThePublicHosts(t *testing.T) {
+	dir := t.TempDir()
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	pub := newPublicGitHub(t)
+	pub.set(func() { pub.public = map[string]bool{"acme/tools": true} })
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	s.CallURL = "https://github.example.com/v1/calls/"
+	s.PublicGitURL, s.PublicRawURL, s.PublicAPIURL = pub.git.URL, pub.raw.URL, pub.api.URL
+	addr := make(chan net.Addr, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, s, Options{ProgramVersion: testVersion, Listening: func(a net.Addr) { addr <- a }})
+	}()
+	at := <-addr
+	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
+	rig := &callsRig{srv: &httptest.Server{URL: "http://" + at.String()}, server: apiary.server, access: access}
+	got := rig.send(t, signedCall{path: contracts.ReadPublicPath, instance: apiary.sent(routeAdapter)[0].instance}, callBodyAt(time.Now(), readPublic("github.com/acme/tools", "missing.md", devCommit)))
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, got, 200, "read-answer.schema.json", "")
+	for _, request := range []string{"git /acme/tools.git/info/refs", "raw /acme/tools/" + devCommit + "/missing.md", "api /repos/acme/tools/git/commits/" + devCommit} {
+		if pub.count(request) != 1 {
+			t.Errorf("%s: sent %d times, want 1", request, pub.count(request))
+		}
+	}
+	pub.checkAnonymous(t)
+}

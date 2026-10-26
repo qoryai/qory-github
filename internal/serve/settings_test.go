@@ -545,3 +545,57 @@ func TestAPublicURLLongerThan2037CharactersIsRefused(t *testing.T) {
 		t.Errorf("a trailing slash: %v", err)
 	}
 }
+
+// TestThePublicHostsAreLoopbackOnly pins public_git_url, public_raw_url and
+// public_api_url, in the file and in the environment: each is taken as it is for http or
+// https on a loopback host with any port, and is left empty when it is left out, for
+// GitHub's host. Any other value fails the settings with an error that starts with the
+// fix, has the setting's name and quotes nothing.
+func TestThePublicHostsAreLoopbackOnly(t *testing.T) {
+	base := map[string]any{"listen": ":8080", "state_dir": "/d", "apiary_url": "https://apiary.example.com", "public_url": "https://github.example.com"}
+	parse := func(change map[string]any) (Settings, error) {
+		doc := map[string]any{}
+		for k, v := range base {
+			doc[k] = v
+		}
+		for k, v := range change {
+			doc[k] = v
+		}
+		b, _ := json.Marshal(doc)
+		return parseSettings(b)
+	}
+	if s, err := parse(nil); err != nil || s.PublicGitURL != "" || s.PublicRawURL != "" || s.PublicAPIURL != "" {
+		t.Errorf("left out: %+v %v", s, err)
+	}
+	for _, u := range []string{"http://127.0.0.1:8081", "https://127.0.0.1", "http://[::1]:9", "http://localhost:65535/", "https://localhost"} {
+		s, err := parse(map[string]any{"public_git_url": u, "public_raw_url": u, "public_api_url": u})
+		if err != nil || s.PublicGitURL != u || s.PublicRawURL != u || s.PublicAPIURL != u {
+			t.Errorf("%s: %+v %v", u, s, err)
+		}
+		env := map[string]string{"QORY_GITHUB_LISTEN": ":8080", "QORY_GITHUB_STATE_DIR": "/d", "QORY_GITHUB_APIARY_URL": "https://apiary.example.com", "QORY_GITHUB_PUBLIC_URL": "https://github.example.com",
+			"QORY_GITHUB_PUBLIC_GIT_URL": u, "QORY_GITHUB_PUBLIC_RAW_URL": u, "QORY_GITHUB_PUBLIC_API_URL": u}
+		if s, err := ReadEnvironment(lookupIn(env)); err != nil || s.PublicGitURL != u || s.PublicRawURL != u || s.PublicAPIURL != u {
+			t.Errorf("%s in the environment: %+v %v", u, s, err)
+		}
+	}
+	const rule = "is not http or https on a loopback host with no path, user, query or fragment"
+	const fix = " to a loopback URL, such as http://127.0.0.1:8080, or leave it out for GitHub: "
+	for _, field := range []string{"public_git_url", "public_raw_url", "public_api_url"} {
+		for _, u := range []string{"https://github.com", "https://raw.githubusercontent.com", "https://api.github.com", "https://github.com.secret.example.com", "http://10.0.0.1:80",
+			"http://127.0.0.1:1/secret", "http://secret@127.0.0.1:1", "http://127.0.0.1:1?secret", "http://127.0.0.1:1#secret", "http://127.0.0.1:1/#", "ftp://127.0.0.1", "file:///secret", "127.0.0.1:1"} {
+			want := "Set " + field + fix + "the settings are invalid: /" + field + ": " + rule
+			if _, err := parse(map[string]any{field: u}); err == nil || err.Error() != want {
+				t.Errorf("%s %s: err %v, want %q", field, u, err, want)
+			}
+			variable := envName(field)
+			env := map[string]string{"QORY_GITHUB_LISTEN": ":8080", "QORY_GITHUB_STATE_DIR": "/d", "QORY_GITHUB_APIARY_URL": "https://apiary.example.com", "QORY_GITHUB_PUBLIC_URL": "https://github.example.com", variable: u}
+			want = "Set " + variable + fix + "the settings in the environment are invalid: " + variable + ": " + rule
+			if _, err := ReadEnvironment(lookupIn(env)); err == nil || err.Error() != want {
+				t.Errorf("%s %s: err %v, want %q", variable, u, err, want)
+			}
+		}
+		if _, err := parse(map[string]any{field: ""}); err == nil || err.Error() != "Set "+field+fix+"the settings are invalid: /"+field+": is not a string that is not empty" {
+			t.Errorf("%s empty: err %v", field, err)
+		}
+	}
+}
