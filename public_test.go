@@ -38,12 +38,14 @@ func advertisement(lines ...string) string {
 }
 
 // refList is a repository's ref list: HEAD and main at commitA, a branch and a tag both
-// named both at different commits, an annotated tag v1.0 peeled to commitA, a
-// lightweight tag light at commitB, and a pull request's ref.
+// named both at different commits, a branch named refs/tags/v1.0 at commitB, an
+// annotated tag v1.0 peeled to commitA, a lightweight tag light at commitB, and a pull
+// request's ref.
 var refList = advertisement(
 	commitA+" HEAD",
 	commitB+" refs/heads/both",
 	commitA+" refs/heads/main",
+	commitB+" refs/heads/refs/tags/v1.0",
 	commitB+" refs/pull/1/head",
 	commitA+" refs/tags/both",
 	commitB+" refs/tags/light",
@@ -53,7 +55,8 @@ var refList = advertisement(
 
 // TestFindRefReadsTheRefList pins the names a ref list resolves: HEAD, a branch before
 // a tag of the same name, an annotated tag peeled to its commit, a lightweight tag, a
-// full ref name, and a name the list does not have, as in an empty repository.
+// full ref name as that ref alone, never as a branch whose name starts with refs/, and
+// a name the list does not have, as in an empty repository.
 func TestFindRefReadsTheRefList(t *testing.T) {
 	for name, want := range map[string]string{
 		"HEAD":             commitA,

@@ -109,8 +109,8 @@ type Refs struct {
 //
 //   - 200 with git's media type: the repository is public. With name set, Refs reads the
 //     list, at most [maxAdvertisement] bytes of strict pkt-lines, and returns the commit
-//     of name: HEAD for HEAD; else the branch name, then the tag name, peeled to its
-//     commit; or, for a name that starts with refs/, that ref alone.
+//     of name: HEAD for HEAD; for a name that starts with refs/, that ref alone; else
+//     the branch name, then the tag name. A tag is peeled to its commit.
 //   - 401, 404, 410, 451, a 403 that is not a rate limit, and a redirect: the repository
 //     is not public at this owner/name. GitHub returns 401 for a private repository and
 //     for one that does not exist.
@@ -306,18 +306,16 @@ func unsentURL(err error) error {
 }
 
 // findRef reads git's ref list for a fetch over HTTP from r, at most limit bytes of
-// strict pkt-lines, and
-// returns the commit of name: HEAD for HEAD; else the branch name, then the tag name,
-// peeled to its commit when the list has the peeled line; or, for a name that starts
-// with refs/, that ref alone, peeled the same way. The list is a service line,
+// strict pkt-lines, and returns the commit of name: HEAD for HEAD; for a name that
+// starts with refs/, that ref alone; else the branch name, then the tag name. A tag is
+// peeled to its commit when the list has the peeled line. The list is a service line,
 // "# service=git-upload-pack", a flush, the refs, the first with the capabilities after
 // a NUL, and a flush, with nothing after it; an empty repository lists the one ref
 // capabilities^{} with the zero id. Reading stops at a branch or HEAD that matches,
-// since nothing later in the list changes that commit. A list longer than limit
-// bytes, a length that is not four lower-case hexadecimal digits, a
-// pkt-line shorter than 5 or longer than [maxPktLine] bytes, an id that is not a commit
-// id, a ref name with a space or a control character, and anything after the last
-// flush are errors.
+// since nothing later in the list changes that commit. A list longer than limit bytes,
+// a length that is not four lower-case hexadecimal digits, a pkt-line shorter than 5 or
+// longer than [maxPktLine] bytes, an id that is not a commit id, a ref name with a
+// space or a control character, and anything after the last flush are errors.
 func findRef(r io.Reader, name string, limit int64) (string, bool, error) {
 	lr := &io.LimitedReader{R: r, N: limit + 1}
 	br := bufio.NewReaderSize(lr, 64<<10)
@@ -340,6 +338,9 @@ func findRef(r io.Reader, name string, limit int64) (string, bool, error) {
 		return "", false, errors.New("the ref list has no flush after its service line")
 	}
 	var branch, tag, tagPeeled, exact, exactPeeled string
+	// A name that starts with refs/ is looked up as that ref alone, as git and GitHub's
+	// API look up a full ref name.
+	full := strings.HasPrefix(name, "refs/")
 	first := true
 	for {
 		line, flush, err := next()
@@ -365,16 +366,19 @@ func findRef(r io.Reader, name string, limit int64) (string, bool, error) {
 		case name == "HEAD" && ref == "HEAD":
 			return id, true, nil
 		case name == "HEAD":
+		case full && ref == name && strings.HasPrefix(name, "refs/heads/"):
+			return id, true, nil
+		case full && ref == name:
+			exact = id
+		case full && ref == name+"^{}":
+			exactPeeled = id
+		case full:
 		case ref == "refs/heads/"+name:
 			branch = id
 		case ref == "refs/tags/"+name:
 			tag = id
 		case ref == "refs/tags/"+name+"^{}":
 			tagPeeled = id
-		case ref == name:
-			exact = id
-		case ref == name+"^{}":
-			exactPeeled = id
 		}
 		if branch != "" {
 			return branch, true, nil
@@ -391,9 +395,9 @@ func findRef(r io.Reader, name string, limit int64) (string, bool, error) {
 		return tagPeeled, true, nil
 	case tag != "":
 		return tag, true, nil
-	case exactPeeled != "" && strings.HasPrefix(name, "refs/"):
+	case exactPeeled != "":
 		return exactPeeled, true, nil
-	case exact != "" && strings.HasPrefix(name, "refs/"):
+	case exact != "":
 		return exact, true, nil
 	}
 	return "", false, nil
