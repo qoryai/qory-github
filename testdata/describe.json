@@ -131,7 +131,7 @@
             "Under Who can install the App, keep Only this account (private), or choose Any GitHub account (public) if other GitHub accounts must install the App.",
             "Press Continue. GitHub opens with the App filled in, named qory-example-org; you can change the name there.",
             "On GitHub, press Create GitHub App.",
-            "When the page shows that the GitHub App is set up, press Back to Qory Apiary."
+            "When the page shows that the GitHub App is set up, click Back to Qory Apiary."
           ]
         },
         "connect": {
