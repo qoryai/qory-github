@@ -136,7 +136,8 @@ func (g storeGrants) copied(installation int64, connection string) (bool, error)
 // answer is signed with the adapter's access key. A grant_ref is an installation's id in
 // decimal, and a resource_ref a repository's id in decimal, as a collection's ref is,
 // except in a resolve result with public: true and no grant_ref, whose resource_ref is
-// github.com/owner/name in lower case, see [github.PublicRef].
+// github.com/owner/name in lower case, see [github.PublicRef]. A result with public:
+// true has that ref in public_ref too, and read-public takes it as its resource_ref.
 type Calls struct {
 	// Store keeps the signatures of the calls accepted.
 	Store *store.Store
@@ -732,9 +733,10 @@ func githubAddress(address string) (github.Repository, bool) {
 }
 
 // resolveOne is the result for one address: the covered result, see
-// [Calls.coveredOne], with public: true added when the repository is public, see
-// [Calls.isPublic]. An address no grant covers is public: true with the resource_ref
-// [github.PublicRef] when the repository is public, and covered: false otherwise. When
+// [Calls.coveredOne], with public: true and the public_ref [github.PublicRef] added
+// when the repository is public, see [Calls.isPublic]. An address no grant covers is
+// public: true with [github.PublicRef] as both resource_ref and public_ref when the
+// repository is public, and covered: false otherwise. When
 // the anonymous check fails, as for a network error, a 5xx or a rate limit, the result
 // is the covered result alone, without public, and a line says why.
 func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
@@ -752,10 +754,11 @@ func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolv
 	case !public:
 		return result
 	case result.GrantRef != "":
-		result.Public = true
+		result.Public, result.PublicRef = true, github.PublicRef(repo)
 		return result
 	}
-	return contracts.Resolved{Address: address, ResourceRef: github.PublicRef(repo), Public: true}
+	ref := github.PublicRef(repo)
+	return contracts.Resolved{Address: address, ResourceRef: ref, Public: true, PublicRef: ref}
 }
 
 // coveredOne is the result for one address under a grant: the installation of the App
