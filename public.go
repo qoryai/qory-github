@@ -275,7 +275,9 @@ func caseRedirect(req *http.Request, via []*http.Request) error {
 // GitHub's hosts: http or https on a loopback host, 127.0.0.0/8, [::1] or localhost,
 // with any port and no path, user, query or fragment. An empty base and GitHub's hosts
 // are errors, and so is a # or a ? anywhere, an empty fragment or query among them,
-// which url.Parse leaves no trace of. The error is the rule and never contains the URL.
+// which publicBase does not check: url.Parse leaves an empty fragment no trace and
+// marks an empty query only in ForceQuery. The error is the rule and never contains
+// the URL.
 func CheckPublicBase(base string) error {
 	if _, err := publicBase(base, ""); base == "" || err != nil || strings.ContainsAny(base, "#?") {
 		return errors.New("the base URL is not http or https on a loopback host with no path, user, query or fragment")

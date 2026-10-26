@@ -893,8 +893,8 @@ func TestRunServesCallsOnlyWithCallURL(t *testing.T) {
 
 // TestRunReadsPublicRepositoriesFromThePublicHosts runs serve with call_url and
 // public_git_url, public_raw_url and public_api_url set to fakes of GitHub's three
-// hosts: a signed read-public call of a missing file at a commit reaches each of them,
-// and no other host.
+// hosts: a signed read-public call of a missing file at a commit sends one request to
+// each of them, and none of the requests has a credential.
 func TestRunReadsPublicRepositoriesFromThePublicHosts(t *testing.T) {
 	dir := t.TempDir()
 	access := newKey(t)
