@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -929,19 +930,8 @@ func (c *Calls) isPublic(ctx context.Context, repo github.Repository) (bool, err
 func (c *Calls) publicRefs(ctx context.Context, repo github.Repository, name string) (github.Refs, error) {
 	key := github.PublicRef(repo)
 	now := c.clock()
-	c.publicMu.Lock()
-	e, ok := c.publicSeen[key]
-	c.publicMu.Unlock()
-	if ok && now.Sub(e.read) < publicFor && now.Sub(e.read) >= 0 {
-		if !e.public {
-			return github.Refs{}, nil
-		}
-		if name == "" {
-			return github.Refs{Public: true}, nil
-		}
-		if commit, ok := e.commits[name]; ok {
-			return github.Refs{Public: true, Commit: commit, Found: commit != ""}, nil
-		}
+	if refs, ok := c.publicKept(key, name, now); ok {
+		return refs, nil
 	}
 	refs, err := c.Public.Refs(ctx, repo, name)
 	if err != nil {
@@ -954,9 +944,11 @@ func (c *Calls) publicRefs(ctx context.Context, repo github.Repository, name str
 	}
 	old, ok := c.publicSeen[key]
 	fresh := publicEntry{read: now, public: refs.Public, commits: map[string]string{}}
-	// The names of an entry read within publicFor stay, until the first is that old.
+	// The names of an entry read within publicFor stay, until the first is that old. The
+	// map is copied, never changed in place.
 	if ok && old.public && refs.Public && now.Sub(old.read) < publicFor && now.Sub(old.read) >= 0 && len(old.commits) < maxPublicNames {
-		fresh = old
+		fresh.read = old.read
+		maps.Copy(fresh.commits, old.commits)
 	}
 	if refs.Public && name != "" {
 		fresh.commits[name] = refs.Commit
@@ -973,6 +965,26 @@ func (c *Calls) publicRefs(ctx context.Context, repo github.Repository, name str
 	}
 	c.publicSeen[key] = fresh
 	return refs, nil
+}
+
+// publicKept is what [Calls.publicSeen] keeps for the repository key and name at now,
+// read under publicMu, or false when it keeps nothing younger than [publicFor] for them.
+func (c *Calls) publicKept(key, name string, now time.Time) (github.Refs, bool) {
+	c.publicMu.Lock()
+	defer c.publicMu.Unlock()
+	e, ok := c.publicSeen[key]
+	if !ok || now.Sub(e.read) >= publicFor || now.Sub(e.read) < 0 {
+		return github.Refs{}, false
+	}
+	switch commit, kept := e.commits[name]; {
+	case !e.public:
+		return github.Refs{}, true
+	case name == "":
+		return github.Refs{Public: true}, true
+	case kept:
+		return github.Refs{Public: true, Commit: commit, Found: commit != ""}, true
+	}
+	return github.Refs{}, false
 }
 
 // readPublic serves the call read-public, read-public.schema.json: the file at path in
@@ -1052,6 +1064,6 @@ func (c *Calls) readPublic(ctx context.Context, body []byte) (int, any) {
 // publicFailed is the answer to a read-public whose request to GitHub failed with err:
 // 503 source_unavailable, with a line.
 func (c *Calls) publicFailed(repo github.Repository, err error) (int, any) {
-	c.log().Warn("reading a public file for a read-public call", slog.String("resource", github.PublicRef(repo)), slog.String("error", err.Error()))
+	c.log().Warn("a request to GitHub for a read-public call failed", slog.String("resource", github.PublicRef(repo)), slog.String("error", err.Error()))
 	return http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 }

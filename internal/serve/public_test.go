@@ -40,8 +40,8 @@ type publicGitHub struct {
 	public   map[string]bool
 	requests []string
 	headers  []http.Header
-	// gitStatus, rawStatus and apiStatus, when set, answer every request to that host
-	// with that status and the header given.
+	// gitStatus, rawStatus and apiStatus, when set, are the status that host returns to
+	// every request, with the header given.
 	gitStatus, rawStatus, apiStatus int
 	header                          http.Header
 }
@@ -411,7 +411,7 @@ func TestReadPublicReturnsTheRefusalsInTheContractsOrder(t *testing.T) {
 			checkAnswer(t, got, http.StatusServiceUnavailable, "refusal.schema.json", codeSourceUnavailable)
 		}
 	}
-	if !strings.Contains(rig.log.String(), "reading a public file for a read-public call") {
+	if !strings.Contains(rig.log.String(), "a request to GitHub for a read-public call failed") {
 		t.Errorf("no line for a failed read: %s", rig.log.String())
 	}
 	rig.pub.checkAnonymous(t)
