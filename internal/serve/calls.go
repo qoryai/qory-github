@@ -995,10 +995,11 @@ func (c *Calls) publicKept(key, name string, now time.Time) (github.Refs, bool) 
 //   - 403 resource_not_public when the repository's anonymous ref list is not public,
 //     see [Calls.publicRefs], a repository that does not exist or moved included, and
 //     for a resource_ref of another form, a repository's id among them;
-//   - 404 version_not_found for a name at that is not HEAD, a branch or a tag of the
-//     list, or a commit id at that the anonymous REST check does not find, see
-//     [github.Public.CommitExists], which runs only when the raw file host returns 404
-//     for a commit id at;
+//   - 404 version_not_found for a name that the list does not resolve, in the order
+//     HEAD, a full ref name such as refs/pull/1/head, a branch, then a tag, see
+//     [github.Public.Refs]; or for a commit id that the anonymous REST check does not
+//     find, see [github.Public.CommitExists], which runs only when the raw file host
+//     returns 404 for a commit id;
 //   - 409 document_not_text for a file larger than [contracts.ReadContentMaxBytes]
 //     bytes, not UTF-8 or with a NUL;
 //   - 503 source_unavailable when a request fails, returns a status the read does not

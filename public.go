@@ -338,8 +338,8 @@ func findRef(r io.Reader, name string, limit int64) (string, bool, error) {
 		return "", false, errors.New("the ref list has no flush after its service line")
 	}
 	var branch, tag, tagPeeled, exact, exactPeeled string
-	// A name that starts with refs/ is looked up as that ref alone, as git and GitHub's
-	// API look up a full ref name.
+	// A name that starts with refs/ is looked up as that ref alone; git tries that ref
+	// first too.
 	full := strings.HasPrefix(name, "refs/")
 	first := true
 	for {
