@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -529,9 +528,7 @@ func (c *Connect) showPage(w http.ResponseWriter, r *http.Request, _ url.Values)
 		rf = *pages[ck.Value]
 	}
 	http.SetCookie(w, &http.Cookie{Name: pageCookie, Value: "", Path: connectPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(rf.status)
-	io.WriteString(w, rf.page+"\n")
+	c.refusalPage(w, rf)
 }
 
 // checkPass checks a connect pass, in this order, and returns its payload and when it
@@ -1344,25 +1341,32 @@ func (c *Connect) toApiary(w http.ResponseWriter, connection, ret string) {
 	redirect(w, c.ApiaryPublicURL+"/integrations/"+url.PathEscape(connection)+"?"+url.Values{"return": {ret}}.Encode())
 }
 
+// installHeading is the heading of Connect's pages.
+const installHeading = "Install the GitHub App"
+
+// refusalPage answers the page of Connect's refusal rf.
+func (c *Connect) refusalPage(w http.ResponseWriter, rf refusal) {
+	refusalPage(w, pageFrame{Heading: installHeading, Apiary: c.ApiaryPublicURL}, rf)
+}
+
 // savePageHTML is the page that tells the person to press Save on GitHub's page, which
 // links to GitHub's page to install the App.
-var savePageHTML = template.Must(template.New("save").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github</title>
-<p>{{.Line}}</p>
-<p><a href="{{.Target}}">{{.Link}}</a></p>
-`))
+var savePageHTML = pageTemplate(`{{define "main"}}<p>The App is already installed on a GitHub account you can reach. On GitHub's page, choose the account, then press Save to finish.</p>
+<div class="q-su-acts"><a class="btn btn-md btn-primary" href="{{.Target}}">Continue on GitHub</a></div>{{end}}`)
+
+// saveView is what [savePageHTML] shows: Target, GitHub's page to install the App.
+type saveView struct {
+	pageFrame
+	Target string
+}
 
 // savePage answers the page that tells the person, who reaches an installation of the
 // App already, to press Save on GitHub's page: GitHub sends the browser back to the
 // Setup URL for an installation that exists only once Save is pressed. target is
 // GitHub's page to install the App, built from the settings.
 func (c *Connect) savePage(w http.ResponseWriter, target string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	savePageHTML.Execute(w, map[string]string{
-		"Line":   "The App is already installed. On GitHub's page, choose the account, then press Save to finish.",
-		"Link":   "Continue on GitHub",
-		"Target": target,
+	writePage(w, http.StatusOK, pageCSP(""), savePageHTML, saveView{
+		pageFrame: pageFrame{Title: installHeading, Heading: installHeading, Apiary: c.ApiaryPublicURL}, Target: target,
 	})
 }
 
@@ -1468,9 +1472,7 @@ func (c *Connect) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id 
 		})
 		redirect(w, connectPath+"/refused")
 	} else {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(rf.status)
-		io.WriteString(w, rf.page+"\n")
+		c.refusalPage(w, rf)
 	}
 	ok, dropped := c.refusals.allow()
 	if !ok {

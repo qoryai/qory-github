@@ -263,12 +263,17 @@ func (b *browser) connect(pass string, installation string) *httptest.ResponseRe
 	return b.finish("installation_id=" + installation + "&setup_action=install")
 }
 
-// refused checks that rec is the refusal rf: its status and its page, plain text,
-// never to be kept.
+// refused checks that rec is the refusal rf: its status and its page, under the
+// heading Install the GitHub App with a link back to Qory Apiary, never to be kept.
 func refused(t *testing.T, rec *httptest.ResponseRecorder, rf refusal) {
 	t.Helper()
-	if rec.Code != rf.status || rec.Body.String() != rf.page+"\n" || rec.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+	body := rec.Body.String()
+	if rec.Code != rf.status || !shows(body, rf.page) || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" ||
+		!strings.Contains(body, `<h1 class="q-su-h1">Install the GitHub App</h1>`) || !strings.Contains(body, ">Back to Qory Apiary</a>") {
 		t.Errorf("answered %d %q, want %d %q", rec.Code, rec.Body, rf.status, rf.page)
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); csp != pageCSP("") {
+		t.Errorf("the Content-Security-Policy %q", csp)
 	}
 	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" {
 		t.Errorf("the headers %v", rec.Header())
@@ -716,10 +721,10 @@ func TestTheSavePageIsShownWhenTheAppIsInstalled(t *testing.T) {
 	install := rig.gh.srv.URL + "/apps/" + testSlug + "/installations/new"
 	rec := rig.browser(t).signIn(rig.pass())
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" || rec.Header().Get("Location") != "" ||
-		!strings.Contains(rec.Body.String(), "press Save to finish") || !strings.Contains(rec.Body.String(), `<a href="`+install+`?state=`) {
+		!strings.Contains(rec.Body.String(), "press Save to finish") || !strings.Contains(rec.Body.String(), `<a class="btn btn-md btn-primary" href="`+install+`?state=`) {
 		t.Errorf("%d %v %s", rec.Code, rec.Header(), rec.Body)
 	}
-	if rec.Header().Get("Referrer-Policy") != "no-referrer" || rec.Header().Get("Content-Security-Policy") != "default-src 'none'; frame-ancestors 'none'" {
+	if rec.Header().Get("Referrer-Policy") != "no-referrer" || rec.Header().Get("Content-Security-Policy") != pageCSP("") {
 		t.Errorf("the headers %v", rec.Header())
 	}
 	rig.gh.userInstallations = nil
@@ -983,7 +988,7 @@ func TestTheSetupURLsAnswerIsChecked(t *testing.T) {
 		signed := b.signIn(rig.pass())
 		target := signed.Header().Get("Location")
 		if signed.Code == http.StatusOK {
-			target = html.UnescapeString(strings.Split(strings.Split(signed.Body.String(), `href="`)[1], `"`)[0])
+			target = html.UnescapeString(strings.Split(strings.Split(signed.Body.String(), `btn-primary" href="`)[1], `"`)[0])
 		}
 		u, _ := url.Parse(target)
 		rec := b.finish(strings.ReplaceAll(query, "state=S", "state="+url.QueryEscape(u.Query().Get("state"))))
@@ -1737,8 +1742,8 @@ func TestALiveAnswerChangesOnlyTheLinkOfItsConnection(t *testing.T) {
 }
 
 // TestThePagesSayTheUsersWords pins each page's line as the user approved it, and
-// checks a page carries its quotes as they are, since a page is plain text, and the
-// Save page's line reads the same once its HTML is read.
+// checks a page shows its quotes as they are once its HTML is read, the Save page's
+// line among them.
 func TestThePagesSayTheUsersWords(t *testing.T) {
 	for rf, want := range map[*refusal]string{
 		&refuseQuery:     `This link is not one this server reads. Press "Install" in Qory Apiary again.`,
@@ -1760,12 +1765,13 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 	rig := newConnectRig(t)
 	rec := rig.browser(t).get("/v1/connect/return?installation_id=42&setup_action=install")
 	refused(t, rec, refuseNoSession)
-	if !strings.Contains(rec.Body.String(), `Press "Install" in`) {
+	if !shows(rec.Body.String(), `Press "Install" in`) {
 		t.Errorf("the page %q", rec.Body)
 	}
 	rec = rig.browser(t).signIn(rig.pass())
-	if line := strings.ReplaceAll(rec.Body.String(), "&#39;", "'"); !strings.Contains(line, "<p>The App is already installed. On GitHub's page, choose the account, then press Save to finish.</p>") ||
-		!strings.Contains(line, ">Continue on GitHub</a>") {
+	if line := strings.ReplaceAll(rec.Body.String(), "&#39;", "'"); !strings.Contains(line, "<p>The App is already installed on a GitHub account you can reach. On GitHub's page, choose the account, then press Save to finish.</p>") ||
+		!strings.Contains(line, ">Continue on GitHub</a>") || !strings.Contains(line, `<h1 class="q-su-h1">Install the GitHub App</h1>`) || !strings.Contains(line, `<title>Install the GitHub App</title>`) ||
+		strings.Contains(line, "Connect Qory Apiary") || strings.Contains(line, "Step ") {
 		t.Errorf("the Save page %s", rec.Body)
 	}
 }
@@ -2456,7 +2462,7 @@ func TestTheNewestPassOutlivesTheOlderSession(t *testing.T) {
 func TestNoValueInTheAddressChoosesThePage(t *testing.T) {
 	rig := newConnectRig(t)
 	rec := rig.browser(t).get("/v1/connect/refused?" + pageCookie + "=used&page=used&name=used")
-	if strings.Contains(rec.Body.String(), refuseUsed.page) || (rec.Body.String() != refusePass.page+"\n" && rec.Body.String() != refuseQuery.page+"\n") {
+	if shows(rec.Body.String(), refuseUsed.page) || !shows(rec.Body.String(), refusePass.page) {
 		t.Errorf("%d %q", rec.Code, rec.Body)
 	}
 }
