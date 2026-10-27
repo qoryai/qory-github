@@ -1,6 +1,6 @@
 // Package serve is qory-github-server serve: a long-running server that takes the
 // GitHub App's webhook deliveries. The command exists only where the environment
-// variable QORY_FEATURES names factory, and no document describes it.
+// variable QORY_FEATURES names factory.
 //
 // The [Receiver] checks each delivery's signature with the App's webhook secret, keeps
 // it in the [store] and answers GitHub at once. The [Worker] then hands each kept
