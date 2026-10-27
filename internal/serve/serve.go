@@ -715,7 +715,7 @@ func (r *runner) serveApp(a *app, atStart bool) {
 	// it, no call route answers, and the declaration has no call_url.
 	if s.CallURL != "" {
 		r.calls = &Calls{
-			Store: st, Grants: storeGrants{st: st, now: adapter.clock}, GitHub: github.Client{API: s.APIURL}, AppID: a.id, Key: a.key, InstanceID: r.instance, Log: log, creds: r.creds,
+			Store: st, Grants: storeGrants{st: st, now: adapter.clock}, GitHub: github.Client{API: s.APIURL}, Public: github.Public{Git: s.PublicGitURL, Raw: s.PublicRawURL, API: s.PublicAPIURL}, AppID: a.id, Key: a.key, InstanceID: r.instance, Log: log, creds: r.creds,
 			listingToken: func(ctx context.Context, installation int64) (string, error) {
 				return adapter.token(ctx, installation, 0, "")
 			},

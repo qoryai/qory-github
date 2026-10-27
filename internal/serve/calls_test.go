@@ -158,6 +158,7 @@ func (c *callsGitHub) mintsSoFar() []string {
 type callsRig struct {
 	st     *store.Store
 	gh     *callsGitHub
+	pub    *publicGitHub
 	calls  *Calls
 	server *accesskey.Key
 	access *accesskey.Key
@@ -172,7 +173,7 @@ type callsRig struct {
 func newCallsRig(t *testing.T) *callsRig {
 	t.Helper()
 	st := openStore(t, filepath.Join(t.TempDir(), "state"))
-	rig := &callsRig{st: st, gh: newCallsGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}, base: time.Now()}
+	rig := &callsRig{st: st, gh: newCallsGitHub(t), pub: newPublicGitHub(t), server: newKey(t), access: newKey(t), log: &syncBuffer{}, base: time.Now()}
 	if err := grantedLink(st, 42, testConnection, linkLive); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +185,7 @@ func newCallsRig(t *testing.T) *callsRig {
 	gh := github.Client{API: rig.gh.srv.URL}
 	adapter := &Adapter{Store: st, GitHub: gh, AppID: "1", Key: appKey(), Slug: testSlug}
 	rig.calls = &Calls{
-		Store: st, Grants: storeGrants{st: st}, GitHub: gh, AppID: "1", Key: appKey(), InstanceID: testInstance,
+		Store: st, Grants: storeGrants{st: st}, GitHub: gh, Public: rig.pub.client(), AppID: "1", Key: appKey(), InstanceID: testInstance,
 		Log:   slog.New(slog.NewJSONHandler(rig.log, nil)),
 		creds: &credentials{e: enrolment{keyID: testKeyID, key: rig.access, pin: pinOf(rig.server), adapterID: testAdapterID}},
 		listingToken: func(ctx context.Context, installation int64) (string, error) {
@@ -888,4 +889,40 @@ func TestRunServesCallsOnlyWithCallURL(t *testing.T) {
 			t.Errorf("without call_url: declared %s, a call answered %d", declared.raw, resp.StatusCode)
 		}
 	}
+}
+
+// TestRunReadsPublicRepositoriesFromThePublicHosts runs serve with call_url and
+// public_git_url, public_raw_url and public_api_url set to fakes of GitHub's three
+// hosts: a signed read-public call of a missing file at a commit sends one request to
+// each of them, and none of the requests has a credential.
+func TestRunReadsPublicRepositoriesFromThePublicHosts(t *testing.T) {
+	dir := t.TempDir()
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	pub := newPublicGitHub(t)
+	pub.set(func() { pub.public = map[string]bool{"acme/tools": true} })
+	s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+	s.CallURL = "https://github.example.com/v1/calls/"
+	s.PublicGitURL, s.PublicRawURL, s.PublicAPIURL = pub.git.URL, pub.raw.URL, pub.api.URL
+	addr := make(chan net.Addr, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, s, Options{ProgramVersion: testVersion, Listening: func(a net.Addr) { addr <- a }})
+	}()
+	at := <-addr
+	eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
+	rig := &callsRig{srv: &httptest.Server{URL: "http://" + at.String()}, server: apiary.server, access: access}
+	got := rig.send(t, signedCall{path: contracts.ReadPublicPath, instance: apiary.sent(routeAdapter)[0].instance}, callBodyAt(time.Now(), readPublic("github.com/acme/tools", "missing.md", devCommit)))
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	checkAnswer(t, got, 200, "read-answer.schema.json", "")
+	for _, request := range []string{"git /acme/tools.git/info/refs", "raw /acme/tools/" + devCommit + "/missing.md", "api /repos/acme/tools/git/commits/" + devCommit} {
+		if pub.count(request) != 1 {
+			t.Errorf("%s: sent %d times, want 1", request, pub.count(request))
+		}
+	}
+	pub.checkAnonymous(t)
 }

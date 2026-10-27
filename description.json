@@ -77,6 +77,29 @@
       "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",
       "access": "These are the repositories GitHub lets this installation reach. To add or remove one, change the installation's repository access on GitHub.",
       "disconnect": "To uninstall GitHub, remove its installation on GitHub.",
+      "guide": {
+        "setup": {
+          "before": "Sign in to GitHub first, as the user you create the App for, or as an owner of the organisation you create it for.",
+          "steps": [
+            "The page Set up the GitHub App opens. In GitHub account for the App, enter the organisation or user to create the App for, such as example-org.",
+            "Under Who can install the App, keep Only this account (private), or choose Any GitHub account (public) if other GitHub accounts must install the App.",
+            "Press Continue. GitHub opens with the App filled in, named qory-example-org; you can change the name there.",
+            "On GitHub, press Create GitHub App.",
+            "When the page shows that the GitHub App is set up, click Back to Qory Apiary."
+          ]
+        },
+        "connect": {
+          "before": "You need to be the GitHub user whose repositories you connect, or an owner of the organisation they belong to.",
+          "steps": [
+            "If GitHub shows its sign-in page, sign in.",
+            "If GitHub shows a page to authorise the App, press Authorize.",
+            "If GitHub shows a list of accounts, choose the account to install the App on, such as example-org.",
+            "Choose All repositories, or choose Only select repositories and pick the repositories to bring in.",
+            "Press Install. GitHub then sends you back to Qory Apiary."
+          ],
+          "after": "If a page shows The App is already installed, press Continue on GitHub, choose the account, then press Save."
+        }
+      },
       "secrets": ["app", "private-key", "webhook-secret", "client-secret"],
       "credential_scope": "resource",
       "apply": [

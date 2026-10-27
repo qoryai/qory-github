@@ -457,9 +457,10 @@ func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
 // names factory, names the source role, qory-github-server, with every member the
 // integration contract requires, item_noun, issue and issues, collection_noun,
 // repository and repositories, secrets, the four the adapter stores in Qory Apiary,
-// credential_scope and apply, and that the contract's schema, as conformance compiles
-// it, checks that role: the description without any one member the contract requires,
-// or with a member the schema refuses, does not conform.
+// credential_scope, apply, and guide, with steps for setup and for connect in plain
+// text, and that the contract's schema, as conformance compiles it, checks that role:
+// the description without any one member the contract requires, or with a member the
+// schema refuses, does not conform.
 func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 	t.Setenv("QORY_FEATURES", "factory")
 	var out, errs bytes.Buffer
@@ -484,8 +485,22 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+5 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+5, source)
+	if len(source) != len(members)+6 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+6, source)
+	}
+	guide, _ := source["guide"].(map[string]any)
+	for _, part := range []string{"setup", "connect"} {
+		p, _ := guide[part].(map[string]any)
+		steps, _ := p["steps"].([]any)
+		if len(steps) == 0 {
+			t.Errorf("the source role's guide has no steps for %s: %v", part, source["guide"])
+		}
+		lines := append([]any{p["before"], p["after"]}, steps...)
+		for _, l := range lines {
+			if s, _ := l.(string); strings.ContainsAny(s, "`*<>[]_#") {
+				t.Errorf("the guide's %s line %q contains a character of markup; Qory Apiary shows it as plain text", part, s)
+			}
+		}
 	}
 	if got := fmt.Sprint(source["secrets"]); got != "[app private-key webhook-secret client-secret]" {
 		t.Errorf("the source role's secrets are %s, want app, private-key, webhook-secret and client-secret", got)
@@ -553,6 +568,25 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 		},
 		"an apply path with a * after the target": func(s map[string]any) {
 			s["apply"].([]any)[0].(map[string]any)["paths"] = []any{"/{target.path}*"}
+		},
+		"a guide with an unknown part": func(s map[string]any) { s["guide"].(map[string]any)["start"] = s["guide"].(map[string]any)["setup"] },
+		"a guide part without steps": func(s map[string]any) {
+			delete(s["guide"].(map[string]any)["setup"].(map[string]any), "steps")
+		},
+		"a guide part with no step": func(s map[string]any) {
+			s["guide"].(map[string]any)["connect"].(map[string]any)["steps"] = []any{}
+		},
+		"a guide part with 11 steps": func(s map[string]any) {
+			s["guide"].(map[string]any)["connect"].(map[string]any)["steps"] = slices.Repeat([]any{"Press Install."}, 11)
+		},
+		"a guide step with a line break": func(s map[string]any) {
+			s["guide"].(map[string]any)["setup"].(map[string]any)["steps"] = []any{"one\ntwo"}
+		},
+		"a guide step of 301 characters": func(s map[string]any) {
+			s["guide"].(map[string]any)["setup"].(map[string]any)["steps"] = []any{strings.Repeat("a", 301)}
+		},
+		"a guide line before that is empty": func(s map[string]any) {
+			s["guide"].(map[string]any)["connect"].(map[string]any)["before"] = ""
 		},
 	}
 	for _, m := range members {
