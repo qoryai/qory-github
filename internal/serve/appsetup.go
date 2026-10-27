@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,7 +46,9 @@ import (
 //     the App is for, which may be left empty for the person signed in on GitHub; who
 //     can install the App: only its owner, a private App, which the form selects
 //     first, or any GitHub account, a public App; and the App's name, which may be
-//     left empty. The form carries the session's form token.
+//     left empty. The name field is filled with qory- and the pass's
+//     organisation_slug, see [defaultAppName], and is empty when the pass had none.
+//     The form carries the session's form token.
 //  3. POST /setup/continue, with the session's cookie and its form token, takes the
 //     choice only as one of its two values, checks the name, see [checkAppName], looks
 //     the organisation up with GitHub, if one is given, and takes it only as an
@@ -193,13 +196,15 @@ const (
 
 // setupSession is what the store keeps of a setup session: when it expires, in Unix
 // nanoseconds; the nonce of the pass that started it, and when that pass expires, in
-// Unix seconds; the form token Start carries; and, once Start is sent, the
-// organisation's login and kind, both empty when Start had none, whether the App is
-// public, and the state GitHub's redirect must return.
+// Unix seconds; the pass's organisation_slug, empty when the pass had none; the form
+// token Start carries; and, once Start is sent, the organisation's login and kind, both
+// empty when Start had none, whether the App is public, and the state GitHub's redirect
+// must return.
 type setupSession struct {
 	Expires int64  `json:"expires"`
 	Nonce   string `json:"nonce"`
 	Pass    int64  `json:"pass_expires_at"`
+	Slug    string `json:"organisation_slug,omitempty"`
 	Token   string `json:"form_token"`
 	Login   string `json:"login,omitempty"`
 	Kind    string `json:"kind,omitempty"`
@@ -399,7 +404,7 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 	a.pending = nil
 	a.mu.Unlock()
 	id := randomID()
-	s := setupSession{Expires: now.Add(sessionFor).UnixNano(), Nonce: p.Nonce, Pass: expires.Unix(), Token: randomID()}
+	s := setupSession{Expires: now.Add(sessionFor).UnixNano(), Nonce: p.Nonce, Pass: expires.Unix(), Slug: p.OrganisationSlug, Token: randomID()}
 	if err := a.save(id, s); err != nil {
 		a.failed(w, r, "", "session", err)
 		return
@@ -423,8 +428,9 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 //
 //  1. its form and its signature, over [contracts.SetupDomain], under en's pin, see
 //     [signedPayload], before the payload is parsed;
-//  2. the payload is one JSON object with the contract's four members and no other,
-//     each of the contract's shape, and version 1;
+//  2. the payload is one JSON object with the contract's four required members, and
+//     organisation_slug or not, and no other member, each of the contract's shape, see
+//     [organisationSlug], and version 1;
 //  3. adapter_id is en's;
 //  4. expires_at has not passed on serve's clock, and is at most 15 minutes ahead.
 //
@@ -438,10 +444,11 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseSignature
 	}
 	var doc struct {
-		Version   *int    `json:"version"`
-		AdapterID *string `json:"adapter_id"`
-		Nonce     *string `json:"nonce"`
-		ExpiresAt *string `json:"expires_at"`
+		Version   *int            `json:"version"`
+		AdapterID *string         `json:"adapter_id"`
+		Nonce     *string         `json:"nonce"`
+		ExpiresAt *string         `json:"expires_at"`
+		Slug      json.RawMessage `json:"organisation_slug"`
 	}
 	if !strictObject(payload, &doc) || doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
 		doc.Nonce == nil || !nonceShape.MatchString(*doc.Nonce) || doc.ExpiresAt == nil {
@@ -451,7 +458,11 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 	if !ok {
 		return contracts.SetupPass{}, time.Time{}, &setupRefusePayload
 	}
-	p := contracts.SetupPass{Version: *doc.Version, AdapterID: *doc.AdapterID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt}
+	slug, ok := organisationSlug(doc.Slug)
+	if !ok {
+		return contracts.SetupPass{}, time.Time{}, &setupRefusePayload
+	}
+	p := contracts.SetupPass{Version: *doc.Version, AdapterID: *doc.AdapterID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt, OrganisationSlug: slug}
 	if p.AdapterID != en.adapterID {
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseAdapter
 	}
@@ -459,6 +470,28 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseExpired
 	}
 	return p, expires, nil
+}
+
+// slugShape is a setup pass's organisation_slug, the contract's pattern: lower-case
+// letters, digits and hyphens, with no hyphen at either end. maxSlug is the contract's
+// maxLength; slugShape matches only ASCII, so len counts the slug's characters.
+var slugShape = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+
+const maxSlug = 40
+
+// organisationSlug is a setup pass's organisation_slug from its raw JSON value: empty
+// when the pass has no such member, or false when the value is not a string of
+// [maxSlug] characters at most that matches [slugShape]. A null leaves the string
+// empty, which [slugShape] refuses, as the contract's type string does.
+func organisationSlug(raw json.RawMessage) (string, bool) {
+	if raw == nil {
+		return "", true
+	}
+	var slug string
+	if json.Unmarshal(raw, &slug) != nil || len(slug) > maxSlug || !slugShape.MatchString(slug) {
+		return "", false
+	}
+	return slug, true
 }
 
 // flowSession is the request's session, when it is the flow pointer's, or the page
@@ -498,9 +531,7 @@ func (a *appSetup) flowSession(w http.ResponseWriter, r *http.Request) (string, 
 // Start, the setup's form.
 func (a *appSetup) proceed(w http.ResponseWriter, r *http.Request, _ url.Values) {
 	if _, s, ok := a.flowSession(w, r); ok {
-		// No Qory Apiary organisation's name reaches the setup, so the App name starts
-		// empty.
-		def := defaultAppName("")
+		def := defaultAppName(s.Slug)
 		a.startPage(w, startView{Token: s.Token, Name: def, Default: def != ""})
 	}
 }
@@ -526,7 +557,7 @@ func (a *appSetup) account(w http.ResponseWriter, r *http.Request) {
 	org, _ := one(form, "organisation")
 	install, _ := one(form, "install")
 	typed, _ := one(form, "name")
-	def := defaultAppName("")
+	def := defaultAppName(s.Slug)
 	v := startView{Token: s.Token, Organisation: strings.TrimSpace(org), Name: typed, Default: def != "", Public: install == installPublic}
 	if install != installPrivate && install != installPublic {
 		v.InstallError = "Choose who can install the App."
@@ -583,16 +614,17 @@ func checkAppName(typed string) (string, string) {
 	return name, ""
 }
 
-// defaultAppName is the App name Start fills in for the Qory Apiary organisation org:
-// qory- and org, in GitHub's shape, which is lower case, each run of characters other
-// than a to z, 0 to 9 and - written as one -, no - at either end, and at most
-// [maxAppName] characters, cut at the end. It is empty when org is empty, or has none
-// of those characters.
+// defaultAppName is the App name Start fills in for the Qory Apiary organisation org,
+// a setup pass's organisation_slug: qory- and org, in GitHub's shape, which is lower
+// case, each run of characters other than a to z and 0 to 9 written as one -, so a run
+// of - is one - too, no - at either end, and at most [maxAppName] characters, cut at
+// the end, with no - at the end after the cut. It is empty when org is empty, or has
+// no letter a to z or digit.
 func defaultAppName(org string) string {
 	var b strings.Builder
 	run := false
 	for _, c := range strings.ToLower(org) {
-		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' {
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
 			b.WriteRune(c)
 			run = false
 			continue

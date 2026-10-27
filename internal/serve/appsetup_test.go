@@ -182,6 +182,11 @@ func setupPayload(adapter, nonce string, expires time.Time) string {
 	return `{"version":1,"adapter_id":"` + adapter + `","nonce":"` + nonce + `","expires_at":"` + contracts.FormatTime(expires) + `"}`
 }
 
+// withMember is the payload p, one JSON object, with the raw member m added last.
+func withMember(p, m string) string {
+	return strings.TrimSuffix(p, "}") + "," + m + "}"
+}
+
 // signSetupPass is a setup pass of payload p signed with key.
 func signSetupPass(key *accesskey.Key, p string) string {
 	sig := key.Sign(append([]byte(contracts.SetupDomain+"\n"), p...))
@@ -708,6 +713,85 @@ func TestTheContractsSignedSetupPassVerifies(t *testing.T) {
 	if _, _, rf := c.checkPass(setupDoc.Pass, at, c.enrolment()); rf != &refuseSignature {
 		t.Errorf("the setup pass as a connect pass: %v", rf)
 	}
+	if p.OrganisationSlug != "" {
+		t.Errorf("the pass without organisation_slug has the slug %q", p.OrganisationSlug)
+	}
+	var slugDoc struct {
+		Pass     string `json:"pass"`
+		Tampered string `json:"tampered"`
+	}
+	readFixture(t, "setup-pass-organisation-slug.json", &slugDoc)
+	p, expires, rf = checkSetupPass(slugDoc.Pass, at, en)
+	if rf != nil || p.OrganisationSlug != "acme-org" || p.Nonce != "EBESExQVFhcYGRobHB0eHw" || !expires.Equal(at.Add(15*time.Minute)) {
+		t.Errorf("the pass with organisation_slug: %+v %v %v", p, expires, rf)
+	}
+	if _, _, rf := checkSetupPass(slugDoc.Tampered, at, en); rf != &setupRefuseSignature {
+		t.Errorf("the tampered pass with organisation_slug: %v", rf)
+	}
+}
+
+// TestASetupPassMayHaveTheOrganisationSlug pins that a setup pass is taken with
+// organisation_slug of the contract's shape, 1 to 40 characters, and refused, with the
+// page for a link that is not valid, when the slug has another shape or type, or when
+// the pass has any other member the contract does not define.
+func TestASetupPassMayHaveTheOrganisationSlug(t *testing.T) {
+	rig := newSetupRig(t, true)
+	now := time.Now()
+	for _, slug := range []string{`"a"`, `"acme-org"`, `"a--b"`, `"acme\u002dorg"`, `"` + strings.Repeat("a", 40) + `"`} {
+		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"organisation_slug":`+slug))
+		if p, _, rf := checkSetupPass(pass, now, rig.setup.creds.get()); rf != nil || p.OrganisationSlug == "" {
+			t.Errorf("%s: %+v %v", slug, p, rf)
+		}
+	}
+	invalid := "This set-up link is not valid. Press Set up in Qory Apiary again."
+	for name, member := range map[string]string{
+		"upper case":         `"organisation_slug":"Acme-Org"`,
+		"41 characters":      `"organisation_slug":"` + strings.Repeat("a", 41) + `"`,
+		"leading hyphen":     `"organisation_slug":"-acme"`,
+		"trailing hyphen":    `"organisation_slug":"acme-"`,
+		"line feed":          `"organisation_slug":"acme\n"`,
+		"empty":              `"organisation_slug":""`,
+		"space":              `"organisation_slug":"acme org"`,
+		"null":               `"organisation_slug":null`,
+		"number":             `"organisation_slug":5`,
+		"array":              `"organisation_slug":["acme"]`,
+		"unknown member":     `"organisation_name":"acme"`,
+		"another member too": `"organisation_slug":"acme","extra":1`,
+	} {
+		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), member))
+		j := jar{}
+		w := rig.do(j, http.MethodGet, "/setup?state="+url.QueryEscape(pass), nil)
+		if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/setup/refused" || j[setupCookie] != "" {
+			t.Errorf("%s: answered %d %v", name, w.Code, w.Header())
+			continue
+		}
+		refusalShown(t, rig.do(j, http.MethodGet, "/setup/refused", nil), 400, "This set-up link cannot be used", invalid, "https://apiary.example.com")
+	}
+	if n := strings.Count(rig.log.String(), `"reason":"payload"`); n != 12 {
+		t.Errorf("%d refusals for the payload, want 12: %s", n, rig.log.String())
+	}
+}
+
+// TestStartFillsTheAppNameFromThePass pins that Start fills the name field with qory-
+// and the pass's organisation_slug, with the hint for a filled name, that the filled
+// name reaches the manifest, and that the form shown again keeps the hint.
+func TestStartFillsTheAppNameFromThePass(t *testing.T) {
+	rig := newSetupRig(t, true)
+	filled := "qory- and your Qory Apiary organisation's name, in lower case with hyphens. Up to 34 characters. You can change it here or on GitHub's page."
+	pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), time.Now().Add(10*time.Minute)), `"organisation_slug":"acme-org"`))
+	j, token := rig.begin(pass)
+	body := rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String()
+	if !strings.Contains(body, `id="name" name="name" type="text" value="qory-acme-org"`) || !shows(body, filled) || shows(body, "Leave it empty to name the App") {
+		t.Errorf("Start with the slug acme-org: %s", body)
+	}
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"acme"}, "install": {"neither"}, "name": {"qory-acme-org"}})
+	if body := w.Body.String(); !strings.Contains(body, `value="qory-acme-org"`) || !shows(body, filled) || strings.Contains(body, `name="manifest"`) {
+		t.Errorf("Start shown again: %d %s", w.Code, body)
+	}
+	_, _, manifest := rig.startAs(j, token, url.Values{"organisation": {"acme"}, "install": {installPrivate}, "name": {"qory-acme-org"}})
+	if manifest["name"] != "qory-acme-org" {
+		t.Errorf("the manifest's name is %v", manifest["name"])
+	}
 }
 
 // TestPOSTToTheSetupIsRefusedUnread pins that POST /setup answers 405 without reading
@@ -924,9 +1008,10 @@ func TestTheAppNameIsCheckedBeforeGitHubOpens(t *testing.T) {
 }
 
 // TestTheDefaultAppNameHasGitHubsShape pins the default App name: qory- and the Qory
-// Apiary organisation's name in lower case, each run of other characters one hyphen,
-// no hyphen at either end, cut at 34 characters; and no name for an organisation's
-// name that is empty or has none of those characters.
+// Apiary organisation's name in lower case, each run of other characters or of hyphens
+// one hyphen, no hyphen at either end, cut at 34 characters with no hyphen at the end
+// after the cut; and no name for an organisation's name that is empty or has no letter
+// or digit.
 func TestTheDefaultAppNameHasGitHubsShape(t *testing.T) {
 	for org, want := range map[string]string{
 		"":                             "",
@@ -937,12 +1022,19 @@ func TestTheDefaultAppNameHasGitHubsShape(t *testing.T) {
 		"-Acme-":                       "qory-acme",
 		"Café Ünïon 2026":              "qory-caf-n-on-2026",
 		"Acme_Corp.Example":            "qory-acme-corp-example",
-		"a--b":                         "qory-a--b",
+		"a--b":                         "qory-a-b",
+		"a-!-b":                        "qory-a-b",
+		"--acme---org--":               "qory-acme-org",
+		"acme-org":                     "qory-acme-org",
 		strings.Repeat("x", 40):        "qory-" + strings.Repeat("x", 29),
 		strings.Repeat("x", 28) + " y": "qory-" + strings.Repeat("x", 28),
+		// Slugs of 40 characters whose cut at 34 lands on a hyphen.
+		strings.Repeat("x", 28) + "-" + strings.Repeat("y", 11):  "qory-" + strings.Repeat("x", 28),
+		strings.Repeat("x", 28) + "--" + strings.Repeat("y", 10): "qory-" + strings.Repeat("x", 28),
+		strings.Repeat("x", 27) + "--" + strings.Repeat("y", 11): "qory-" + strings.Repeat("x", 27) + "-y",
 	} {
 		got := defaultAppName(org)
-		if got != want || len(got) > 34 {
+		if got != want || len(got) > 34 || strings.HasSuffix(got, "-") || strings.Contains(got, "--") {
 			t.Errorf("%q: %q, want %q", org, got, want)
 		}
 	}
