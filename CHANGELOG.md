@@ -32,9 +32,9 @@ change what the program does, and notes it under Upgrading.
 - On the set-up pages, the optional field GitHub organisation replaces the field for the
   GitHub account. With an organisation, GitHub creates the App under it; with the field
   empty, under the GitHub user signed in on github.com. A login of a GitHub user, which
-  the account field took, is refused with the line "Leave the field empty to create the
-  App under your account." The choice of who can install the App stays, with private
-  selected first.
+  the account field took, is refused with a line that ends "Leave the field empty to
+  create the App under your account." The choice of who can install the App stays, with
+  private selected first.
 - Connect's page for an App that is already installed, and the refusal pages of the
   set-up and of Connect, are HTML in the set-up look. The set-up's refusal lines
   contain "set-up link" and "the GitHub adapter".
