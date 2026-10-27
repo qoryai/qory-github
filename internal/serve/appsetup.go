@@ -283,7 +283,8 @@ func (a *appSetup) owns(path string) bool {
 
 // ServeHTTP answers the App setup's paths. Every answer is never kept by a cache,
 // sends no referrer, and is not sniffed; its Content-Security-Policy allows nothing
-// but what its page needs.
+// but what its page needs. The pages' stylesheet and font, under [assetsPath], are
+// the exception: every cache may keep them, see [serveAsset].
 func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.init()
 	var step func(http.ResponseWriter, *http.Request, url.Values)
@@ -299,7 +300,9 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case setupPath + "/status":
 		step = a.status
 	default:
-		http.NotFound(w, r)
+		if !serveAsset(w, r) {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	h := w.Header()

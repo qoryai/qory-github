@@ -220,9 +220,12 @@ var (
 
 // refusal is a page that refuses a request: its status, the one sentence the browser
 // shows, and why, for the log. name, when set, is how [pageCookie] names the page.
+// heading, for a setup's page, is the page's heading, and link, when set, is the web
+// address in the sentence, which the page shows as a link.
 type refusal struct {
 	status          int
 	page, why, name string
+	heading, link   string
 	// endSession ends the session the request carries, and dropCookie has the browser
 	// drop the cookie, which endSession does too.
 	endSession, dropCookie bool
