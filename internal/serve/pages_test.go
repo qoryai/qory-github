@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -110,6 +111,23 @@ func TestTheAssetsAreServedAtTheirHashedPaths(t *testing.T) {
 			if w.Code != http.StatusNotFound || w.Header().Get("Cache-Control") == "public, max-age=31536000, immutable" {
 				t.Errorf("%s answered %d %v", path, w.Code, w.Header())
 			}
+		}
+	}
+}
+
+// TestEveryPageLoadsTheStylesheet checks that a page of each kind links the
+// stylesheet, has no inline style, and no image.
+func TestEveryPageLoadsTheStylesheet(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	pages := map[string]string{
+		"start":    rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String(),
+		"manifest": rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"acme"}, "install": {installPrivate}}).Body.String(),
+		"refusal":  rig.do(jar{}, http.MethodGet, "/setup/continue", nil).Body.String(),
+	}
+	for name, body := range pages {
+		if !strings.Contains(body, `<link rel="stylesheet" href="`+stylesAsset+`">`) || strings.Contains(body, "style=") || strings.Contains(body, "<style") || strings.Contains(body, "<img") {
+			t.Errorf("the %s page: %s", name, body)
 		}
 	}
 }

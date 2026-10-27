@@ -36,6 +36,26 @@ func TestServeManifestMakesTheWebhookInactiveWithoutAPublicAddress(t *testing.T)
 	}
 }
 
+// TestServeManifestWithoutANameHasNoName pins that [ServeManifest] with an empty name
+// leaves the member name out and keeps every other member, active or not, while
+// [Manifest], which qory-github setup posts, keeps name.
+func TestServeManifestWithoutANameHasNoName(t *testing.T) {
+	for _, active := range []bool{true, false} {
+		named := ServeManifest("qory-acme", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", false, active)
+		m := ServeManifest("", "https://qory-github.example.com/setup/created", "https://qory-github.example.com", false, active)
+		if _, ok := m["name"]; ok {
+			t.Errorf("active %v: the manifest has a name: %v", active, m)
+		}
+		delete(named, "name")
+		if a, b := mustJSON(m), mustJSON(named); a != b {
+			t.Errorf("active %v: %s\nwant %s", active, a, b)
+		}
+	}
+	if m := Manifest("", "https://example.com/callback"); m["name"] != "" {
+		t.Errorf("Manifest's name is %v", m["name"])
+	}
+}
+
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
