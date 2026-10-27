@@ -41,6 +41,12 @@ type Settings struct {
 	// APIURL is GitHub's API, which [github.CheckAPIURL] takes; the field may be left
 	// out for [github.APIURL].
 	APIURL string
+	// PublicGitURL, PublicRawURL and PublicAPIURL are the hosts [Calls] reads
+	// public repositories from without a credential, for a test: git over HTTPS, the raw
+	// file host and the REST API, each http or https on a loopback host, which
+	// [github.CheckPublicBase] takes. Each may be left out, empty, for GitHub's host,
+	// see [github.Public].
+	PublicGitURL, PublicRawURL, PublicAPIURL string
 	// ApiaryURL is Qory Apiary's origin, https, or for a test http on a loopback host:
 	// every request to Qory Apiary goes there, and nowhere else.
 	ApiaryURL string
@@ -131,10 +137,11 @@ func (v SecretValue) LogValue() slog.Value { return slog.StringValue(v.String())
 
 // fields are the settings' fields, in the order an error lists the missing ones. A
 // field that is added later is added here and in [settingsOf]'s switch.
-var fields = []string{"listen", "state_dir", "api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "enrolment_code_file", "public_address", "upload_retry_seconds", "call_url"}
+var fields = []string{"listen", "state_dir", "api_url", "public_git_url", "public_raw_url", "public_api_url", "apiary_url", "apiary_public_url", "public_url", "access_key_id", "access_key_secret_file", "apiary_public_key", "adapter_id", "enrolment_code_file", "public_address", "upload_retry_seconds", "call_url"}
 
 // required are the fields the settings always give. api_url may be left out for
-// GitHub's API, apiary_public_url for apiary_url, enrolment_code_file and call_url,
+// GitHub's API, public_git_url, public_raw_url and public_api_url for GitHub's hosts of
+// a public read, apiary_public_url for apiary_url, enrolment_code_file and call_url,
 // which have no default, public_address for true, and upload_retry_seconds for
 // [defaultUploadRetry]; the others are in a group, see [groups].
 var required = []string{"listen", "state_dir", "apiary_url", "public_url"}
@@ -311,7 +318,8 @@ var adapterIDShape = regexp.MustCompile(`^na_[0-9a-hjkmnp-tv-z]{16}$`)
 
 // ReadSettings reads the settings file at path, one JSON object with nothing after it
 // but white space. listen, state_dir, apiary_url and public_url are required. api_url
-// may be left out for GitHub's API, apiary_public_url for apiary_url,
+// may be left out for GitHub's API; public_git_url, public_raw_url and public_api_url,
+// for a test, for GitHub's hosts of a public read; apiary_public_url for apiary_url,
 // enrolment_code_file, call_url, public_address, a JSON boolean, for true, and
 // upload_retry_seconds, a JSON integer, for [defaultUploadRetry]. The enrolment's
 // fields, access_key_id, access_key_secret_file, apiary_public_key and adapter_id, are
@@ -521,6 +529,12 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 			if s.APIURL, err = text(raw); err == nil {
 				err = github.CheckAPIURL(s.APIURL)
 			}
+		case "public_git_url":
+			s.PublicGitURL, err = publicBase(raw)
+		case "public_raw_url":
+			s.PublicRawURL, err = publicBase(raw)
+		case "public_api_url":
+			s.PublicAPIURL, err = publicBase(raw)
 		case "apiary_url":
 			if s.ApiaryURL, err = text(raw); err == nil {
 				s.ApiaryURL, err = checkOrigin(s.ApiaryURL)
@@ -563,6 +577,9 @@ func settingsOf(doc map[string]json.RawMessage, values map[string]SecretValue, s
 		if err != nil && name == "public_url" {
 			return Settings{}, fmt.Errorf("Set %s %s: %s are invalid: %s: %w", src.name(name), publicURLFix, src.what(), src.pointer(name), err)
 		}
+		if err != nil && slices.Contains(publicBaseFields, name) {
+			return Settings{}, fmt.Errorf("Set %s %s: %s are invalid: %s: %w", src.name(name), publicBaseFix, src.what(), src.pointer(name), err)
+		}
 		if err != nil {
 			return Settings{}, fmt.Errorf("%s are invalid: %s: %w", src.what(), src.pointer(name), err)
 		}
@@ -596,6 +613,23 @@ func filePath(raw json.RawMessage) (string, error) {
 		return "", errors.New("holds a PEM block, which belongs in the file it names")
 	}
 	return s, nil
+}
+
+// publicBaseFields are the fields of the hosts of a public read, for a test.
+var publicBaseFields = []string{"public_git_url", "public_raw_url", "public_api_url"}
+
+// publicBaseFix is the fix every error about a field in [publicBaseFields] starts with,
+// after "Set " and the setting's name.
+const publicBaseFix = "to a loopback URL, such as http://127.0.0.1:8080, or leave it out for GitHub"
+
+// publicBase is a field in [publicBaseFields]: a string that [github.CheckPublicBase]
+// takes, http or https on a loopback host with no path, user, query or fragment.
+func publicBase(raw json.RawMessage) (string, error) {
+	s, err := text(raw)
+	if err == nil && github.CheckPublicBase(s) != nil {
+		err = errors.New("is not http or https on a loopback host with no path, user, query or fragment")
+	}
+	return s, err
 }
 
 // uploadRetry is upload_retry_seconds: an integer from [minUploadRetry] to
