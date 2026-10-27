@@ -12,7 +12,7 @@ change what the program does, and notes it under Upgrading.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens
-  GitHub lists what to do on GitHub's page. Done says who can install the App and what
+  GitHub lists what to do on GitHub's page. Done shows who can install the App and what
   to do next in Qory Apiary. The pages embed their stylesheet and the Geist font, and
   load nothing from another host.
 - Start has the field App name. When the set-up pass has `organisation_slug`, the field
@@ -35,11 +35,11 @@ change what the program does, and notes it under Upgrading.
   the account field took, is refused with a line that says to leave the field empty.
   The choice of who can install the App stays, with private selected first.
 - Connect's page for an App that is already installed, and the refusal pages of the
-  set-up and of Connect, are HTML in the set-up look. The set-up's refusal lines say
-  "set-up link" and "the GitHub adapter".
-- The description's set-up guide and help say to sign in on github.com first, as an
-  owner of the GitHub organisation or as the user who will own the App, and to check
-  the name and create the App on GitHub.
+  set-up and of Connect, are HTML in the set-up look. The set-up's refusal lines
+  contain "set-up link" and "the GitHub adapter".
+- The description's set-up guide and help have these steps: sign in on github.com
+  first, as an owner of the GitHub organisation or as the user who will own the App,
+  then check the name and create the App on GitHub.
 - The description lists `egress_hosts`, the hosts a run of the integration reaches:
   `github.com` and `api.github.com`, the hosts of the credential role.
   `qory-github describe` prints them, and `description.json` lists them. The policy that
