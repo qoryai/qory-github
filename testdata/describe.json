@@ -114,6 +114,7 @@
         "one": "repository",
         "other": "repositories"
       },
+      "targets": true,
       "program": "qory-github-server",
       "setup": {
         "command": "qory-github-server serve --settings /etc/qory-github/serve.json",
