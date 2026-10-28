@@ -134,8 +134,8 @@
         "connect": {
           "before": "You need to be the GitHub user whose repositories you connect, or an owner of the organisation they belong to.",
           "steps": [
-            "GitHub's install page lists the accounts you administer. A private App lists only the account that owns it.",
-            "You choose whether the App reaches all repositories of that account or only the ones you pick. Qory Apiary sees only those.",
+            "GitHub's install page lists your user account and the organisations you belong to. A private App lists only the account that owns it.",
+            "You choose whether the App reaches all repositories of that account or only the ones you pick. Qory Apiary brings in only those.",
             "If the App is installed on that account already, GitHub shows the installation's settings, where you can change the repositories.",
             "The first time, GitHub asks you to authorise the App, so that the GitHub adapter can check that you administer the account. The GitHub adapter does not keep that sign-in.",
             "GitHub then sends you back to Qory Apiary."
