@@ -49,8 +49,9 @@ change what the program does, and notes it under Upgrading.
   `github.com` and `api.github.com`, the hosts of the credential role.
   `qory-github describe` prints them, and `description.json` lists them. The policy that
   `setup` prints takes its hosts from them and allows the same two hosts as before.
-- The GitHub adapter's description sets `targets: true` in `roles.source`, so Qory
-  Apiary offers its repositories as places where a run's changes go.
+- The GitHub adapter's description has `targets: true` in `roles.source`, so Qory
+  Apiary offers the repositories the GitHub App is installed on as places where a
+  run's changes go.
 - `setup` gives the exchange of GitHub's code for the App 30 seconds from the moment you
   approve the App. Before, the exchange had only what was left of the ten-minute wait,
   so an approval near the end of the wait could fail the exchange.
