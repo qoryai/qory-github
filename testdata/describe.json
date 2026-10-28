@@ -135,12 +135,12 @@
           "before": "You need to be the GitHub user whose repositories you connect, or an owner of the organisation they belong to.",
           "steps": [
             "If GitHub shows its sign-in page, sign in.",
-            "If GitHub shows a page to authorise the App, press Authorize.",
             "If GitHub shows a list of accounts, choose the account to install the App on, such as example-org.",
             "Choose All repositories, or choose Only select repositories and pick the repositories to bring in.",
-            "Press Install. GitHub then sends you back to Qory Apiary."
+            "Press Install. If the App is installed on that account already, GitHub shows its settings: press Save.",
+            "The first time, GitHub then asks you to authorise the App: press Authorize. GitHub sends you back to Qory Apiary."
           ],
-          "after": "If a page shows The App is already installed, press Continue on GitHub, choose the account, then press Save."
+          "after": "GitHub asks you to authorise the App so the GitHub adapter can check that you administer the account you installed it on. The GitHub adapter uses that sign-in for the check only and does not keep it."
         }
       },
       "secrets": [

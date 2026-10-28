@@ -35,9 +35,13 @@ change what the program does, and notes it under Upgrading.
   the account field took, is refused with a line that ends "Leave the field empty to
   create the App under your account." The choice of who can install the App stays, with
   private selected first.
-- Connect's page for an App that is already installed, and the refusal pages of the
-  set-up and of Connect, are HTML in the set-up look. The set-up's refusal lines
-  contain "set-up link" and "the GitHub adapter".
+- Connect sends you to GitHub's page to install the App first. GitHub asks you to
+  authorise the App once, after Install, and the GitHub adapter then checks that you
+  administer the account you installed it on. The page that told you to press Save for
+  an App installed already is gone: GitHub shows the installation's settings, and Save
+  sends you back.
+- The refusal pages of the set-up and of Connect are HTML in the set-up look. The
+  set-up's refusal lines contain "set-up link" and "the GitHub adapter".
 - The description's set-up guide and help have these steps: sign in on github.com
   first, as an owner of the GitHub organisation or as the user who will own the App,
   then check the name and create the App on GitHub.
