@@ -456,9 +456,9 @@ func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
 // TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
 // names factory, names the source role, qory-github-server, with every member the
 // integration contract requires, item_noun, issue and issues, collection_noun,
-// repository and repositories, secrets, the four the adapter stores in Qory Apiary,
-// credential_scope, apply, and guide, with steps for setup and for connect in plain
-// text, and that the contract's schema, as conformance compiles it, checks that role:
+// repository and repositories, targets, true, secrets, the four the adapter stores in
+// Qory Apiary, credential_scope, apply, and guide, with steps for setup and for connect
+// in plain text, and that the contract's schema, as conformance compiles it, checks that role:
 // the description without any one member the contract requires, or with a member the
 // schema refuses, does not conform.
 func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
@@ -485,8 +485,8 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+6 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+6, source)
+	if len(source) != len(members)+7 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+7, source)
 	}
 	guide, _ := source["guide"].(map[string]any)
 	for _, part := range []string{"setup", "connect"} {
@@ -513,6 +513,9 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 	}
 	if noun, _ := source["collection_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "repository" || noun["other"] != "repositories" {
 		t.Errorf("the source role's collection_noun is %v, want repository and repositories", source["collection_noun"])
+	}
+	if source["targets"] != true {
+		t.Errorf("the source role's targets is %v, want true: Qory Apiary offers the repositories as places where a run's changes go", source["targets"])
 	}
 	if source["program"] != "qory-github-server" {
 		t.Errorf("the source role's program is %v, want qory-github-server", source["program"])
@@ -551,6 +554,8 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 		"an item noun in capitals":  func(s map[string]any) { s["item_noun"].(map[string]any)["one"] = "Issue" },
 		"an item noun without one":  func(s map[string]any) { delete(s["item_noun"].(map[string]any), "one") },
 		"an item noun and items":    func(s map[string]any) { s["items"] = false },
+		"targets that is false":     func(s map[string]any) { s["targets"] = false },
+		"targets that is a string":  func(s map[string]any) { s["targets"] = "true" },
 		"a collection noun in capitals": func(s map[string]any) {
 			s["collection_noun"].(map[string]any)["other"] = "Repositories"
 		},

@@ -114,10 +114,11 @@
         "one": "repository",
         "other": "repositories"
       },
+      "targets": true,
       "program": "qory-github-server",
       "setup": {
         "command": "qory-github-server serve --settings /etc/qory-github/serve.json",
-        "help": "Click Set up in Qory Apiary to open the server's setup page. Enter the GitHub account for the App, an organisation or a user. GitHub then opens with the App filled in, named qory- and that account's handle, which you can change. The server stores the App's keys in Qory Apiary."
+        "help": "Click Set up in Qory Apiary to open the GitHub adapter's set-up page. Sign in on github.com first, as an owner of the GitHub organisation that will own the App, or as the user who will. On GitHub, check the name and create the App. The GitHub adapter stores the App's keys in Qory Apiary."
       },
       "start": "qory-github-server serve --settings /etc/qory-github/serve.json",
       "connect": "Install takes you to GitHub. There you choose the account to install it on, and whether it reaches all of that account's repositories or only those you select.",
@@ -125,25 +126,21 @@
       "disconnect": "To uninstall GitHub, remove its installation on GitHub.",
       "guide": {
         "setup": {
-          "before": "Sign in to GitHub first, as the user you create the App for, or as an owner of the organisation you create it for.",
+          "before": "Sign in on github.com first, as an owner of the GitHub organisation that will own the App, or as the user who will.",
           "steps": [
-            "The page Set up the GitHub App opens. In GitHub account for the App, enter the organisation or user to create the App for, such as example-org.",
-            "Under Who can install the App, keep Only this account (private), or choose Any GitHub account (public) if other GitHub accounts must install the App.",
-            "Press Continue. GitHub opens with the App filled in, named qory-example-org; you can change the name there.",
-            "On GitHub, press Create GitHub App.",
-            "When the page shows that the GitHub App is set up, click Back to Qory Apiary."
-          ]
+            "On GitHub, check the name and create the App."
+          ],
+          "after": "This step shows Set up when GitHub sends you back."
         },
         "connect": {
           "before": "You need to be the GitHub user whose repositories you connect, or an owner of the organisation they belong to.",
           "steps": [
-            "If GitHub shows its sign-in page, sign in.",
-            "If GitHub shows a page to authorise the App, press Authorize.",
-            "If GitHub shows a list of accounts, choose the account to install the App on, such as example-org.",
-            "Choose All repositories, or choose Only select repositories and pick the repositories to bring in.",
-            "Press Install. GitHub then sends you back to Qory Apiary."
-          ],
-          "after": "If a page shows The App is already installed, press Continue on GitHub, choose the account, then press Save."
+            "GitHub's install page lists your user account and the organisations you belong to. A private App lists only the account that owns it.",
+            "You choose whether the App reaches all repositories of that account or only the ones you pick. Qory Apiary brings in only those.",
+            "If the App is installed on that account already, GitHub shows the installation's settings, where you can change the repositories.",
+            "The first time, GitHub asks you to authorise the App, so that the GitHub adapter can check that you administer the account. The GitHub adapter does not keep that sign-in.",
+            "GitHub then sends you back to Qory Apiary."
+          ]
         }
       },
       "secrets": [

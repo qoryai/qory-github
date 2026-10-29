@@ -9,16 +9,18 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
@@ -40,20 +42,24 @@ import (
 //     <public_url>/setup/continue, so the pass leaves the address bar; a pass refused
 //     answers 303 too, to <public_url>/setup/refused, which shows the page a
 //     short-lived cookie names.
-//  2. GET /setup/continue shows the form that asks for the GitHub account the App is
-//     for, an organisation or a user, and who can install the App: only that account,
-//     a private App, which the form selects first, or any GitHub account, a public
-//     App. The form carries the session's form token.
+//  2. GET /setup/continue shows Start, the form that asks for the GitHub organisation
+//     the App is for, which may be left empty for the person signed in on GitHub; who
+//     can install the App: only its owner, a private App, which the form selects
+//     first, or any GitHub account, a public App; and the App's name, which may be
+//     left empty. The name field is filled with qory- and the pass's
+//     organisation_slug, see [defaultAppName], and is empty when the pass had none.
+//     The form carries the session's form token.
 //  3. POST /setup/continue, with the session's cookie and its form token, takes the
-//     choice only as one of its two values, looks the account up with GitHub, see
-//     [github.Client.Account], keeps the account and the choice in the session, and
-//     answers the page that posts the App's manifest to GitHub,
-//     [github.ServeManifest], named qory- and the account's login, private or public
-//     as chosen, with a new state, which GitHub's redirect returns. A later POST
-//     replaces the account, the choice and the state, so GitHub's redirect for an
-//     earlier page is refused. The page posts itself with its one script, which the
-//     page's Content-Security-Policy allows by its SHA-256, and its button does where
-//     the script does not run.
+//     choice only as one of its two values, checks the name, see [checkAppName], looks
+//     the organisation up with GitHub, if one is given, and takes it only as an
+//     organisation, see [github.Client.Account], keeps the organisation and the choice
+//     in the session, and answers the page that posts the App's manifest to GitHub,
+//     [github.ServeManifest], with the name, private or public as chosen, with a new
+//     state, which GitHub's redirect returns. A later POST replaces the organisation,
+//     the choice and the state, so GitHub's redirect for an earlier page is refused.
+//     The page posts itself with its one script, which the page's
+//     Content-Security-Policy allows by its SHA-256, and its button does where the
+//     script does not run.
 //  4. GET /setup/created?code=...&state=..., GitHub's redirect once the admin pressed
 //     Create on GitHub, needs the session's cookie and state, and that the session is
 //     still the flow pointer's. Under the lock, it checks again that no App is set up
@@ -76,8 +82,8 @@ import (
 // contains a random id, and the store keeps the session under the id's SHA-256. Every
 // end of a flow drops the cookie. serve reads no cookie but the two it sets, by name,
 // and logs no header: a cookie it did not set is never logged, kept or sent on. Every
-// redirect's target is built from the settings and the session, and a page says
-// nothing the request carries.
+// redirect's target is built from the settings and the session, and a page shows
+// nothing the request carries but Start's fields, sent back in their inputs.
 //
 // Once an App is set up, every setup pass is refused with a page that says the App is
 // set up already.
@@ -180,9 +186,9 @@ const (
 	// keyFlow is the key, in nsSetup, of the flow pointer: the store's key of the one
 	// session that may go on.
 	keyFlow = "flow"
-	// maxAccountForm is the most bytes the account form's body may hold.
+	// maxAccountForm is the most bytes the body of Start's form may hold.
 	maxAccountForm = 4 << 10
-	// installPrivate and installPublic are the two values of the account form's
+	// installPrivate and installPublic are the two values of Start's
 	// field install: the App is private, or public.
 	installPrivate = "private"
 	installPublic  = "public"
@@ -190,13 +196,15 @@ const (
 
 // setupSession is what the store keeps of a setup session: when it expires, in Unix
 // nanoseconds; the nonce of the pass that started it, and when that pass expires, in
-// Unix seconds; the form token the account form carries; and, once the account is
-// known, its login and kind, whether the App is public, and the state GitHub's redirect
+// Unix seconds; the pass's organisation_slug, empty when the pass had none; the form
+// token Start carries; and, once Start is sent, the organisation's login and kind, both
+// empty when Start had none, whether the App is public, and the state GitHub's redirect
 // must return.
 type setupSession struct {
 	Expires int64  `json:"expires"`
 	Nonce   string `json:"nonce"`
 	Pass    int64  `json:"pass_expires_at"`
+	Slug    string `json:"organisation_slug,omitempty"`
 	Token   string `json:"form_token"`
 	Login   string `json:"login,omitempty"`
 	Kind    string `json:"kind,omitempty"`
@@ -207,25 +215,39 @@ type setupSession struct {
 	Uploading bool `json:"uploading,omitempty"`
 }
 
-// The App setup's pages, each with its status, the one sentence the browser shows,
-// and the reason the log names. name, when set, is how [setupPageCookie] names the
-// page; endSession ends the session the request carries, and dropCookie has the
-// browser drop the cookie.
+// The App setup's refusal pages, each with its status, its heading, the one sentence
+// the browser shows, and the reason the log names. name, when set, is how
+// [setupPageCookie] names the page; endSession ends the session the request carries,
+// and dropCookie has the browser drop the cookie.
 var (
-	setupRefuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers only GET requests.", why: "method"}
-	setupRefuseQuery     = refusal{status: http.StatusBadRequest, page: "This setup link is not valid. Press Set up in Qory Apiary again.", why: "query", name: "invalid"}
-	setupRefusePass      = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "pass", name: "invalid"}
-	setupRefuseSignature = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "signature", name: "invalid"}
-	setupRefusePayload   = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "payload", name: "invalid"}
-	setupRefuseAdapter   = refusal{status: http.StatusForbidden, page: "This setup link is for another adapter. Press Set up on this adapter's page in Qory Apiary.", why: "adapter", name: "adapter"}
-	setupRefuseExpired   = refusal{status: http.StatusBadRequest, page: "This setup link has expired. Press Set up in Qory Apiary again.", why: "expired", name: "expired"}
-	setupRefuseUsed      = refusal{status: http.StatusBadRequest, page: "This setup link was used already. Press Set up in Qory Apiary again.", why: "used", name: "used"}
-	setupRefuseFailed    = refusal{status: http.StatusInternalServerError, page: "Something failed on this server. Press Set up in Qory Apiary again.", why: "failed", name: "failed", endSession: true}
-	setupRefuseNoSession = refusal{status: http.StatusBadRequest, page: "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.", why: "no_session", dropCookie: true}
-	setupRefuseForm      = refusal{status: http.StatusBadRequest, page: setupRefuseNoSession.page, why: "form"}
-	setupRefuseState     = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "state", endSession: true}
-	setupRefuseSetUp     = refusal{status: http.StatusConflict, page: "This adapter's GitHub App is set up already.", why: "set_up", name: "set-up", endSession: true}
-	setupRefusePending   = refusal{status: http.StatusConflict, page: "Wait until the earlier setup ends, then press Set up in Qory Apiary again if this adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.", why: "pending", name: "pending"}
+	setupRefuseMethod    = refusal{status: http.StatusMethodNotAllowed, page: "This address answers only GET requests.", why: "method", heading: headingLink}
+	setupRefuseQuery     = refusal{status: http.StatusBadRequest, page: "This set-up link is not valid. Press Set up in Qory Apiary again.", why: "query", name: "invalid", heading: headingLink}
+	setupRefusePass      = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "pass", name: "invalid", heading: headingLink}
+	setupRefuseSignature = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "signature", name: "invalid", heading: headingLink}
+	setupRefusePayload   = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "payload", name: "invalid", heading: headingLink}
+	setupRefuseAdapter   = refusal{status: http.StatusForbidden, page: "This set-up link is for another adapter. Press Set up on the GitHub adapter's page in Qory Apiary.", why: "adapter", name: "adapter", heading: headingLink}
+	setupRefuseExpired   = refusal{status: http.StatusBadRequest, page: "This set-up link has expired. Press Set up in Qory Apiary again.", why: "expired", name: "expired", heading: headingLink}
+	setupRefuseUsed      = refusal{status: http.StatusBadRequest, page: "This set-up link was used already. Press Set up in Qory Apiary again.", why: "used", name: "used", heading: headingLink}
+	setupRefuseFailed    = refusal{status: http.StatusInternalServerError, page: "Something failed on this server. Press Set up in Qory Apiary again.", why: "failed", name: "failed", endSession: true, heading: headingFailed}
+	setupRefuseNoSession = refusal{status: http.StatusBadRequest, page: "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.", why: "no_session", dropCookie: true, heading: headingNoSession}
+	setupRefuseForm      = refusal{status: http.StatusBadRequest, page: setupRefuseNoSession.page, why: "form", heading: headingNoSession}
+	setupRefuseState     = refusal{status: http.StatusBadRequest, page: setupRefuseQuery.page, why: "state", endSession: true, heading: headingLink}
+	setupRefuseSetUp     = refusal{status: http.StatusConflict, page: "Qory Apiary has this App's keys. No action needed.", why: "set_up", name: "set-up", endSession: true, heading: headingSetUp}
+	setupRefusePending   = refusal{status: http.StatusConflict, page: "Wait until the earlier setup ends, then press Set up in Qory Apiary again if the GitHub adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.", why: "pending", name: "pending", heading: headingPending}
+)
+
+// The headings of the setup's refusal pages, by what each refuses: a set-up link that
+// cannot be used, an App set up already, an earlier setup that still stores its App, no
+// session, a session a newer setup replaced, an App GitHub created that serve does not
+// keep, and a failure on serve.
+const (
+	headingLink      = "This set-up link cannot be used"
+	headingSetUp     = "The GitHub App is set up already"
+	headingPending   = "An earlier set-up is still running"
+	headingNoSession = "No set-up is under way in this browser"
+	headingReplaced  = "A newer set-up replaced this one"
+	headingNotStored = "The GitHub App could not be stored"
+	headingFailed    = "Something failed on the GitHub adapter"
 )
 
 // setupPages are the pages [setupPageCookie] names, by name.
@@ -234,23 +256,18 @@ var setupPages = map[string]*refusal{
 	"used": &setupRefuseUsed, "failed": &setupRefuseFailed, "set-up": &setupRefuseSetUp, "pending": &setupRefusePending,
 }
 
-// The pages that end a setup with an App on GitHub that serve does not use: a newer
-// setup replaced the session's, which links to the account's Apps on GitHub; the App
-// GitHub created could not be used, which links to its settings page; or the code's
-// exchange failed, and GitHub may have created an App, which links to the account's
-// Apps. pageNotStored ends a setup whose every upload of the App failed, see
-// [appSetup.status].
+// The lines of the pages that end a setup with an App on GitHub that serve does not
+// use: a newer setup replaced the session's, which links to the Apps of the session's
+// organisation on GitHub, or of the person signed in on GitHub; the App GitHub created
+// could not be used, which links to its settings page; or the code's exchange failed,
+// and GitHub may have created an App, which links to the Apps as a replaced session's
+// page does. Each link is the address the line shows.
 const (
 	pageReplaced     = "A newer setup replaced this one. If you created an App on GitHub for it, delete it at "
 	pageNotKeptStart = "GitHub created the App "
 	pageNotKeptMid   = ", and this server could not use it. Delete it at "
 	pageNotKeptEnd   = ", then press Set up in Qory Apiary again."
 	pageMayHave      = "GitHub may have created an App; delete it at "
-	// pageNotStored is followed by the App's slug, pageNotStoredAt, its settings page,
-	// pageNotStoredEnd, and when the tries ended.
-	pageNotStored    = "Delete the GitHub App "
-	pageNotStoredAt  = " at "
-	pageNotStoredEnd = ", then press Set up in Qory Apiary again. This server could not store the App in Qory Apiary by "
 )
 
 func (a *appSetup) init() {
@@ -283,7 +300,8 @@ func (a *appSetup) owns(path string) bool {
 
 // ServeHTTP answers the App setup's paths. Every answer is never kept by a cache,
 // sends no referrer, and is not sniffed; its Content-Security-Policy allows nothing
-// but what its page needs.
+// but what its page needs. The pages' stylesheet and font, under [assetsPath], are
+// the exception: every cache may keep them, see [serveAsset].
 func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.init()
 	var step func(http.ResponseWriter, *http.Request, url.Values)
@@ -299,7 +317,9 @@ func (a *appSetup) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case setupPath + "/status":
 		step = a.status
 	default:
-		http.NotFound(w, r)
+		if !serveAsset(w, r) {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	h := w.Header()
@@ -384,7 +404,7 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 	a.pending = nil
 	a.mu.Unlock()
 	id := randomID()
-	s := setupSession{Expires: now.Add(sessionFor).UnixNano(), Nonce: p.Nonce, Pass: expires.Unix(), Token: randomID()}
+	s := setupSession{Expires: now.Add(sessionFor).UnixNano(), Nonce: p.Nonce, Pass: expires.Unix(), Slug: p.OrganisationSlug, Token: randomID()}
 	if err := a.save(id, s); err != nil {
 		a.failed(w, r, "", "session", err)
 		return
@@ -408,8 +428,9 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 //
 //  1. its form and its signature, over [contracts.SetupDomain], under en's pin, see
 //     [signedPayload], before the payload is parsed;
-//  2. the payload is one JSON object with the contract's four members and no other,
-//     each of the contract's shape, and version 1;
+//  2. the payload is one JSON object with the contract's four required members, and
+//     organisation_slug or not, and no other member, each of the contract's shape, see
+//     [organisationSlug], and version 1;
 //  3. adapter_id is en's;
 //  4. expires_at has not passed on serve's clock, and is at most 15 minutes ahead.
 //
@@ -423,10 +444,11 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseSignature
 	}
 	var doc struct {
-		Version   *int    `json:"version"`
-		AdapterID *string `json:"adapter_id"`
-		Nonce     *string `json:"nonce"`
-		ExpiresAt *string `json:"expires_at"`
+		Version   *int            `json:"version"`
+		AdapterID *string         `json:"adapter_id"`
+		Nonce     *string         `json:"nonce"`
+		ExpiresAt *string         `json:"expires_at"`
+		Slug      json.RawMessage `json:"organisation_slug"`
 	}
 	if !strictObject(payload, &doc) || doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
 		doc.Nonce == nil || !nonceShape.MatchString(*doc.Nonce) || doc.ExpiresAt == nil {
@@ -436,7 +458,11 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 	if !ok {
 		return contracts.SetupPass{}, time.Time{}, &setupRefusePayload
 	}
-	p := contracts.SetupPass{Version: *doc.Version, AdapterID: *doc.AdapterID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt}
+	slug, ok := organisationSlug(doc.Slug)
+	if !ok {
+		return contracts.SetupPass{}, time.Time{}, &setupRefusePayload
+	}
+	p := contracts.SetupPass{Version: *doc.Version, AdapterID: *doc.AdapterID, Nonce: *doc.Nonce, ExpiresAt: *doc.ExpiresAt, OrganisationSlug: slug}
 	if p.AdapterID != en.adapterID {
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseAdapter
 	}
@@ -444,6 +470,28 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 		return contracts.SetupPass{}, time.Time{}, &setupRefuseExpired
 	}
 	return p, expires, nil
+}
+
+// slugShape is a setup pass's organisation_slug, the contract's pattern: lower-case
+// letters, digits and hyphens, with no hyphen at either end. maxSlug is the contract's
+// maxLength; slugShape matches only ASCII, so len counts the slug's characters.
+var slugShape = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+
+const maxSlug = 40
+
+// organisationSlug is a setup pass's organisation_slug from its raw JSON value: empty
+// when the pass has no such member, or false when the value is not a string of
+// [maxSlug] characters at most that matches [slugShape]. A null leaves the string
+// empty, which [slugShape] refuses, as the contract's type string does.
+func organisationSlug(raw json.RawMessage) (string, bool) {
+	if raw == nil {
+		return "", true
+	}
+	var slug string
+	if json.Unmarshal(raw, &slug) != nil || len(slug) > maxSlug || !slugShape.MatchString(slug) {
+		return "", false
+	}
+	return slug, true
 }
 
 // flowSession is the request's session, when it is the flow pointer's, or the page
@@ -480,18 +528,21 @@ func (a *appSetup) flowSession(w http.ResponseWriter, r *http.Request) (string, 
 }
 
 // proceed is GET /setup/continue, where a pass accepted sends the browser: it shows
-// the account form.
+// Start, the setup's form.
 func (a *appSetup) proceed(w http.ResponseWriter, r *http.Request, _ url.Values) {
 	if _, s, ok := a.flowSession(w, r); ok {
-		a.accountPage(w, s.Token, "", false)
+		def := defaultAppName(s.Slug)
+		a.startPage(w, startView{Token: s.Token, Name: def, Default: def != ""})
 	}
 }
 
-// account is POST /setup/continue, the account form: with the session's form token,
-// it shows the form again when install is not exactly one of its two values, before
-// any call to GitHub; it looks the account up with GitHub, shows the form again when
-// GitHub has none by that name, and otherwise keeps the account and the choice in the
-// session and answers the page that posts the App's manifest to GitHub.
+// account is POST /setup/continue, Start's form: with the session's form token, it
+// checks the form and shows it again, with a line under each field it refuses, when
+// install is not exactly one of its two values, when the App name is not one GitHub
+// takes, see [checkAppName], or when the organisation, if one is given, is not a
+// GitHub organisation, see [github.Client.Account], which it looks up only when install
+// passes. Otherwise it keeps the organisation and the choice in the session and answers
+// the page that posts the App's manifest to GitHub.
 func (a *appSetup) account(w http.ResponseWriter, r *http.Request) {
 	id, s, ok := a.flowSession(w, r)
 	if !ok {
@@ -499,34 +550,99 @@ func (a *appSetup) account(w http.ResponseWriter, r *http.Request) {
 	}
 	form, err := readForm(w, r)
 	token, _ := one(form, "token")
-	handle, _ := one(form, "account")
-	install, _ := one(form, "install")
 	if err != nil || subtle.ConstantTimeCompare([]byte(token), []byte(s.Token)) != 1 {
 		a.refuse(w, r, setupRefuseForm, "")
 		return
 	}
+	org, _ := one(form, "organisation")
+	install, _ := one(form, "install")
+	typed, _ := one(form, "name")
+	def := defaultAppName(s.Slug)
+	v := startView{Token: s.Token, Organisation: strings.TrimSpace(org), Name: typed, Default: def != "", Public: install == installPublic}
 	if install != installPrivate && install != installPublic {
-		a.accountPage(w, s.Token, "Choose who can install the App: only this account, or any GitHub account.", false)
+		v.InstallError = "Choose who can install the App."
+	}
+	name, nameErr := checkAppName(typed)
+	v.NameError = nameErr
+	login := ""
+	if v.Organisation != "" && v.InstallError == "" {
+		ctx, cancel := context.WithTimeout(r.Context(), connectBound)
+		defer cancel()
+		found, kind, err := a.GitHub.Account(ctx, v.Organisation)
+		switch {
+		case errors.Is(err, github.ErrNoAccount):
+			v.OrgError = "GitHub has no account by that name."
+		case err != nil:
+			a.failed(w, r, id, "account", err)
+			return
+		case kind != github.AccountOrganization:
+			v.OrgError = found + " is a personal GitHub account. Leave the field empty to create the App under your account."
+		default:
+			login = found
+		}
+	}
+	if v.InstallError != "" || v.NameError != "" || v.OrgError != "" {
+		a.startPage(w, v)
 		return
 	}
-	public := install == installPublic
-	ctx, cancel := context.WithTimeout(r.Context(), connectBound)
-	defer cancel()
-	login, kind, err := a.GitHub.Account(ctx, strings.TrimSpace(handle))
-	if errors.Is(err, github.ErrNoAccount) {
-		a.accountPage(w, s.Token, "GitHub has no account by that name.", public)
-		return
+	s.Login, s.Kind, s.Public, s.State = login, "", v.Public, randomID()
+	if login != "" {
+		s.Kind = github.AccountOrganization
 	}
-	if err != nil {
-		a.failed(w, r, id, "account", err)
-		return
-	}
-	s.Login, s.Kind, s.Public, s.State = login, kind, public, randomID()
 	if err := a.save(id, s); err != nil {
 		a.failed(w, r, id, "session", err)
 		return
 	}
-	a.manifestPage(w, s)
+	a.manifestPage(w, s, name)
+}
+
+// maxAppName is the most characters GitHub takes in an App's name.
+const maxAppName = 34
+
+// checkAppName checks the App name typed on Start, and returns it without white space
+// at either end, or the line that refuses it: one with a control character, or one of
+// more than [maxAppName] characters. An empty name passes: the manifest then has no
+// name, and the person names the App on GitHub's page.
+func checkAppName(typed string) (string, string) {
+	if strings.ContainsFunc(typed, unicode.IsControl) {
+		return "", "Remove the line break or tab from the name."
+	}
+	name := strings.TrimSpace(typed)
+	if utf8.RuneCountInString(name) > maxAppName {
+		return "", "Shorten the name to 34 characters or fewer. GitHub refuses longer App names."
+	}
+	return name, ""
+}
+
+// defaultAppName is the App name Start fills in for the Qory Apiary organisation org,
+// a setup pass's organisation_slug: qory- and org, in GitHub's shape, which is lower
+// case, each run of characters other than a to z and 0 to 9 written as one -, so a run
+// of - is one - too, no - at either end, and at most [maxAppName] characters, cut at
+// the end, with no - at the end after the cut. It is empty when org is empty, or has
+// no letter a to z or digit.
+func defaultAppName(org string) string {
+	var b strings.Builder
+	run := false
+	for _, c := range strings.ToLower(org) {
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			b.WriteRune(c)
+			run = false
+			continue
+		}
+		if !run {
+			b.WriteByte('-')
+			run = true
+		}
+	}
+	shaped := strings.Trim(b.String(), "-")
+	if shaped == "" {
+		return ""
+	}
+	name := "qory-" + shaped
+	if len(name) > maxAppName {
+		name = name[:maxAppName]
+	}
+	return strings.TrimRight(name, "-")
 }
 
 // readForm reads the request's body, a form of application/x-www-form-urlencoded,
@@ -746,7 +862,7 @@ func (a *appSetup) status(w http.ResponseWriter, r *http.Request, _ url.Values) 
 		a.donePage(w, p.app, p.public)
 	case uploadFailed:
 		a.endSession(w, id)
-		plainPage(w, http.StatusBadGateway, pageNotStored+p.app.slug+pageNotStoredAt+p.app.settingsURL(a.GitHub.Web())+pageNotStoredEnd+uploadTime(p.until)+".")
+		a.failedPage(w, p)
 	default:
 		a.tryingPage(w, p)
 	}
@@ -755,23 +871,40 @@ func (a *appSetup) status(w http.ResponseWriter, r *http.Request, _ url.Values) 
 // uploadTime is t as the status pages write it, in UTC to the minute.
 func uploadTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04") + " UTC" }
 
-// tryingPageHTML is the page the browser shows while the setup tries again to store the
-// App, which reloads itself.
-var tryingPageHTML = template.Must(template.New("trying").Parse(`<!doctype html>
-<meta charset="utf-8"><meta http-equiv="refresh" content="{{.Every}}"><title>qory-github</title>
-<p>{{.Line}}</p>
-<p>{{.Wait}}</p>
-`))
-
-// tryingPage answers the page that says the setup tries again to store the App of p.
+// tryingPage answers the page that says the setup tries again to store the App of p,
+// which reloads itself every [statusEvery] seconds.
 func (a *appSetup) tryingPage(w http.ResponseWriter, p pendingUpload) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusAccepted)
-	tryingPageHTML.Execute(w, map[string]any{
-		"Every": statusEvery,
-		"Line":  "GitHub created the App " + p.app.slug + ". Storing it in Qory Apiary failed, and this server tries again until " + uploadTime(p.until) + ".",
-		"Wait":  "Keep this page open: it reloads every " + strconv.Itoa(statusEvery) + " seconds and shows the result.",
+	v := statusView{
+		pageFrame: a.frame(3, true), Trying: true,
+		Line: "Storing the App in Qory Apiary failed. The GitHub adapter tries again until " + uploadTime(p.until) + ", and this page reloads every " + strconv.Itoa(statusEvery) + " seconds to show the result.",
+	}
+	v.Refresh = statusEvery
+	writePage(w, http.StatusAccepted, pageCSP(""), statusPageHTML, v)
+}
+
+// failedPage answers the page that says to delete the App of p on GitHub, whose every
+// upload to Qory Apiary failed, and links to the App's settings page.
+func (a *appSetup) failedPage(w http.ResponseWriter, p pendingUpload) {
+	writePage(w, http.StatusBadGateway, pageCSP(""), statusPageHTML, statusView{
+		pageFrame: a.frame(3, false), Settings: p.app.settingsURL(a.GitHub.Web()),
+		Line: "Delete the GitHub App " + p.app.slug + " on GitHub, then press Set up in Qory Apiary again. The GitHub adapter could not store the App in Qory Apiary by " + uploadTime(p.until) + ".",
 	})
+}
+
+// statusPageHTML is the page /setup/status shows while the setup tries again to store
+// the App, Trying, or once every try failed, with Settings, the App's settings page.
+var statusPageHTML = pageTemplate(`{{define "main"}}{{if .Trying}}<div class="alert alert-warning" role="note">{{template "ic-warning"}}<div class="alert-body"><p>{{.Line}}</p></div></div>
+<div class="q-su-acts"><a class="btn btn-md" href="{{.Apiary}}">Back to Qory Apiary</a></div>
+{{- else}}<div class="alert alert-error" role="alert">{{template "ic-error"}}<div class="alert-body"><p>{{.Line}}</p></div></div>
+<div class="q-su-acts"><a class="btn btn-md btn-primary" href="{{.Settings}}">Open the App's settings on GitHub</a><a class="btn btn-md" href="{{.Apiary}}">Back to Qory Apiary</a></div>
+{{- end}}{{end}}
+{{- define "ctx"}}<p>You can close this tab. Your first Qory Apiary tab updates without a reload.</p>{{end}}`)
+
+// statusView is what [statusPageHTML] shows.
+type statusView struct {
+	pageFrame
+	Trying         bool
+	Line, Settings string
 }
 
 // keep checks the App conv, as GitHub answered the code's exchange, and returns it, kept
@@ -783,8 +916,8 @@ func (a *appSetup) tryingPage(w http.ResponseWriter, p pendingUpload) {
 // GitHub made the App no webhook secret, keep makes one and sets it on the App's
 // webhook; when GitHub does not confirm it, the App is used all the same, its webhook
 // secret not confirmed, which serve sets again at its next start, see [Run]. The
-// account that owns the App is GitHub's answer's, or the session's when the answer
-// names none serve takes, see [ownerOf].
+// account that owns the App is GitHub's answer's, or the session's organisation when
+// the answer has none serve takes, see [ownerOf]; with neither, the App is not kept.
 func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSession) (*app, error) {
 	pemBytes := bytes.TrimRight([]byte(conv.PEM), "\r\n")
 	if len(pemBytes) > contracts.SecretValueMaxBytes {
@@ -806,6 +939,10 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 	if !appIDShape.MatchString(conv.ClientID) || conv.ClientSecret == "" || len(conv.ClientSecret) > maxClientSecret || strings.ContainsFunc(conv.ClientSecret, unkeepable) {
 		return nil, errors.New(answerNoClient)
 	}
+	owner, kind, ok := ownerOf(conv, s)
+	if !ok {
+		return nil, errors.New(answerNoOwner)
+	}
 	secret, confirmed := conv.WebhookSecret, true
 	if secret == "" {
 		secret = github.NewWebhookSecret()
@@ -821,7 +958,6 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 			return nil, errors.New(answerBadWebhookSecret)
 		}
 	}
-	owner, kind := ownerOf(conv, s)
 	return &app{
 		id: strconv.FormatInt(conv.ID, 10), numericID: conv.ID, slug: conv.Slug, clientID: conv.ClientID, pem: pemBytes, key: key,
 		webhookSecret: []byte(secret), clientSecret: []byte(conv.ClientSecret), webhookActive: a.Active, owner: owner, ownerKind: kind, confirmed: confirmed,
@@ -832,7 +968,8 @@ func (a *appSetup) keep(ctx context.Context, conv github.Conversion, s setupSess
 // answerBadWebhookSecret say a client id, client secret or webhook secret serve cannot
 // keep; answerNoSlug says a slug serve cannot keep, answerLargeKey a private key larger
 // than serve reads back from the state directory, and answerAccessKey and answerRunKey
-// what looks like an access key secret or a run key in the answer's key or a secret.
+// what looks like an access key secret or a run key in the answer's key or a secret;
+// answerNoOwner says an owner serve cannot keep when Start had no organisation.
 const (
 	answerAccessKey        = "GitHub's answer holds what looks like an access key secret, qak_, which belongs nowhere in it"
 	answerRunKey           = "GitHub's answer holds what looks like a run key, qrk_, which belongs nowhere in it"
@@ -840,6 +977,7 @@ const (
 	answerNoSlug           = "GitHub's answer holds no App slug setup can keep"
 	answerNoClient         = "GitHub's answer holds no client id, or no client secret setup can keep"
 	answerBadWebhookSecret = "GitHub's answer holds a webhook secret qory-github-server serve cannot use"
+	answerNoOwner          = "GitHub's answer contains no owner setup can keep, and the setup has no organisation"
 )
 
 // noKeyInAnswer refuses the bytes b of the private key or a secret in GitHub's answer
@@ -859,41 +997,50 @@ func noKeyInAnswer(b []byte) error {
 // the App has.
 func unkeepable(r rune) bool { return r <= ' ' || r >= 0x7f }
 
-// ownerOf is the account that owns the App conv, as GitHub's answer names it, or the
-// session s's account when the answer names none serve takes: a login of 39 characters
-// at most and an organisation or a user.
-func ownerOf(conv github.Conversion, s setupSession) (string, string) {
-	owner, kind := conv.Owner.Login, conv.Owner.Type
-	if len(owner) > 39 || !loginShape.MatchString(owner) || (kind != github.AccountOrganization && kind != github.AccountUser) {
-		return s.Login, s.Kind
+// ownerOf is the account that owns the App conv, as GitHub's answer has it: a login of
+// 39 characters at most, of an organisation or a user. When the answer has none serve
+// takes, it is the organisation the session s has, if any. ok is false when neither
+// has one.
+func ownerOf(conv github.Conversion, s setupSession) (owner, kind string, ok bool) {
+	owner, kind = conv.Owner.Login, conv.Owner.Type
+	if len(owner) <= 39 && loginShape.MatchString(owner) && (kind == github.AccountOrganization || kind == github.AccountUser) {
+		return owner, kind, true
 	}
-	return owner, kind
+	if s.Login != "" {
+		return s.Login, s.Kind, true
+	}
+	return "", "", false
 }
 
 // notKept ends the flow whose App GitHub created, or may have, and serve does not
 // keep: it logs what failed with the error, and the page says to delete the App on
-// GitHub, at its settings page when conv names a slug serve takes, or else at the
-// account's Apps.
+// GitHub, at its settings page when conv has a slug serve takes, or else at the Apps
+// of the session's organisation, or of the person signed in on GitHub when the session
+// has none.
 func (a *appSetup) notKept(w http.ResponseWriter, r *http.Request, id string, s setupSession, conv *github.Conversion, what string, err error) {
 	a.log().LogAttrs(r.Context(), slog.LevelError, "setup failed", slog.String("step", a.step(r)), slog.String("what", what), slog.String("error", err.Error()))
 	web := a.GitHub.Web()
-	rf := refusal{status: http.StatusBadGateway, why: "not_kept", endSession: true}
+	rf := refusal{status: http.StatusBadGateway, why: "not_kept", endSession: true, heading: headingNotStored}
 	if conv == nil || github.CheckSlug(conv.Slug) != nil {
-		rf.page = pageMayHave + github.AppsURL(web, orgOf(s.Login, s.Kind)) + pageNotKeptEnd
+		rf.link = github.AppsURL(web, orgOf(s.Login, s.Kind))
+		rf.page = pageMayHave + rf.link + pageNotKeptEnd
 	} else {
 		rf.status = http.StatusInternalServerError
-		owner := app{slug: conv.Slug}
-		owner.owner, owner.ownerKind = ownerOf(*conv, s)
-		rf.page = pageNotKeptStart + conv.Slug + pageNotKeptMid + owner.settingsURL(web) + pageNotKeptEnd
+		k := app{slug: conv.Slug}
+		k.owner, k.ownerKind, _ = ownerOf(*conv, s)
+		rf.link = k.settingsURL(web)
+		rf.page = pageNotKeptStart + conv.Slug + pageNotKeptMid + rf.link + pageNotKeptEnd
 	}
 	a.refuse(w, r, rf, id)
 }
 
 // replaced ends the session id, which a newer flow replaced: its page says to delete
-// an App created for it, at the Apps of the account it named, if any.
+// an App created for it, at the Apps of the session's organisation, or of the person
+// signed in on GitHub when the session has none.
 func (a *appSetup) replaced(w http.ResponseWriter, r *http.Request, id string, s setupSession) {
-	rf := refusal{status: http.StatusConflict, why: "replaced", endSession: true}
-	rf.page = pageReplaced + github.AppsURL(a.GitHub.Web(), orgOf(s.Login, s.Kind)) + "."
+	rf := refusal{status: http.StatusConflict, why: "replaced", endSession: true, heading: headingReplaced}
+	rf.link = github.AppsURL(a.GitHub.Web(), orgOf(s.Login, s.Kind))
+	rf.page = pageReplaced + rf.link + "."
 	a.refuse(w, r, rf, id)
 }
 
@@ -906,7 +1053,7 @@ func (a *appSetup) showPage(w http.ResponseWriter, r *http.Request, _ url.Values
 		rf = *setupPages[ck.Value]
 	}
 	http.SetCookie(w, &http.Cookie{Name: setupPageCookie, Value: "", Path: setupPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-	plainPage(w, rf.status, rf.page)
+	a.refusalPage(w, rf)
 }
 
 // plainPage answers status with the one line line, as text.
@@ -916,58 +1063,78 @@ func plainPage(w http.ResponseWriter, status int, line string) {
 	io.WriteString(w, line+"\n")
 }
 
-// accountPageHTML is the account form, which posts the account's handle, who can
-// install the App, and the session's form token to /setup/continue.
-var accountPageHTML = template.Must(template.New("account").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github</title>
-<h1>{{.Heading}}</h1>
-{{if .Line}}<p>{{.Line}}</p>
-{{end}}<form method="post" action="{{.Action}}">
-<label>{{.Label}} <input name="account" required maxlength="39" autocomplete="off"></label>
-<fieldset>
-<legend>{{.Question}}</legend>
-<label><input type="radio" name="install" value="` + installPrivate + `" required{{if not .Public}} checked{{end}}> {{.Private}}</label>
-<label><input type="radio" name="install" value="` + installPublic + `"{{if .Public}} checked{{end}}> {{.Any}}</label>
-</fieldset>
-<input type="hidden" name="token" value="{{.Token}}">
-<button type="submit">{{.Button}}</button>
-</form>
-`))
-
-// accountForm is what [accountPageHTML] shows. Public selects the public App's option
-// in place of the private App's.
-type accountForm struct {
-	Heading, Line, Action, Label, Question, Private, Any, Token, Button string
-	Public                                                              bool
+// frame is the frame of the setup's page at step, from 1 to 3, with a context column
+// when ctx is set.
+func (a *appSetup) frame(step int, ctx bool) pageFrame {
+	return pageFrame{
+		Title: setupSteps[step-1] + " · Set up the GitHub App", Heading: "Set up the GitHub App",
+		Where: true, Context: ctx, Step: step, Apiary: a.ApiaryPublicURL,
+	}
 }
 
-// accountPage answers the account form, with line above it when it is set, and the
-// public App's option selected when public is set.
-func (a *appSetup) accountPage(w http.ResponseWriter, token, line string, public bool) {
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; form-action 'self'")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	accountPageHTML.Execute(w, accountForm{
-		Heading: "Set up the GitHub App", Line: line, Action: setupPath + "/continue",
-		Label:    "GitHub account for the App, an organisation or a user",
-		Question: "Who can install the App", Private: "Only this account (private)", Any: "Any GitHub account (public)",
-		Public: public, Token: token, Button: "Continue",
-	})
+// refusalPage answers the page of the setup's refusal rf.
+func (a *appSetup) refusalPage(w http.ResponseWriter, rf refusal) {
+	refusalPage(w, pageFrame{Heading: rf.heading, Where: true, Apiary: a.ApiaryPublicURL}, rf)
+}
+
+// startPageHTML is Start, the setup's form, which posts the GitHub organisation, who
+// can install the App, the App's name, and the session's form token to
+// /setup/continue. Who can install the App is a select with no script: a details
+// element whose summary shows the option checked, see setup.css.
+var startPageHTML = pageTemplate(`{{define "main"}}<p>You create the GitHub App that this Qory Apiary instance's GitHub adapter uses to work with GitHub. GitHub's page opens next, where you create it, and GitHub then sends you back here.</p>
+<form class="q-su-form" method="post" action="` + setupPath + `/continue">
+<div class="fieldset"><label class="label" for="organisation">GitHub organisation (optional)</label><input class="input{{if .OrgError}} input-error{{end}}" id="organisation" name="organisation" type="text" value="{{.Organisation}}" maxlength="39" autocomplete="off" spellcheck="false" aria-describedby="organisation-{{if .OrgError}}error{{else}}hint{{end}}"{{if .OrgError}} aria-invalid="true"{{end}}>
+{{- if .OrgError}}<p id="organisation-error" class="field-error">{{template "ic-error"}}{{.OrgError}}</p>{{else}}<p id="organisation-hint" class="hint">Leave it empty to create the App under your GitHub user.</p>{{end}}</div>
+<fieldset class="fieldset"><legend class="label">Who can install the App</legend><details class="q-pick"><summary class="q-pick-btn"><span class="q-pick-text q-pick-none"><span class="q-pick-t">Who can install the App</span></span><span class="q-pick-text q-pick-sum q-pick-sum1"><span class="q-pick-t">Only the owner (private)</span><span class="q-pick-s">The organisation above, or your user if you leave it empty.</span></span><span class="q-pick-text q-pick-sum q-pick-sum2"><span class="q-pick-t">Any GitHub account (public)</span><span class="q-pick-s">Other organisations can install it too.</span></span><svg class="q-pick-chev" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 8 10 4.5 13.5 8M6.5 12l3.5 3.5 3.5-3.5"/></svg></summary><div class="q-pick-panel">
+<label class="q-pick-opt q-pick-o1"><input class="q-pick-radio" type="radio" name="install" value="` + installPrivate + `" required{{if not .Public}} checked{{end}}>{{template "ic-check" " q-pick-ck"}}<span class="q-pick-text"><span class="q-pick-t">Only the owner (private)</span><span class="q-pick-s">The organisation above, or your user if you leave it empty.</span></span></label>
+<label class="q-pick-opt q-pick-o2"><input class="q-pick-radio" type="radio" name="install" value="` + installPublic + `"{{if .Public}} checked{{end}}>{{template "ic-check" " q-pick-ck"}}<span class="q-pick-text"><span class="q-pick-t">Any GitHub account (public)</span><span class="q-pick-s">Other organisations can install it too.</span></span></label>
+</div></details>{{if .InstallError}}<p class="field-error">{{template "ic-error"}}{{.InstallError}}</p>{{end}}</fieldset>
+<div class="fieldset"><label class="label" for="name">App name</label><input class="input{{if .NameError}} input-error{{end}}" id="name" name="name" type="text" value="{{.Name}}" autocomplete="off" spellcheck="false" aria-describedby="name-{{if .NameError}}error{{else}}hint{{end}}"{{if .NameError}} aria-invalid="true"{{end}}>
+{{- if .NameError}}<p id="name-error" class="field-error">{{template "ic-error"}}{{.NameError}}</p>{{else if .Default}}<p id="name-hint" class="hint">qory- and your Qory Apiary organisation's name, in lower case with hyphens. Up to 34 characters. You can change it here or on GitHub's page.</p>{{else}}<p id="name-hint" class="hint">Up to 34 characters. Leave it empty to name the App on GitHub's page.</p>{{end}}</div>
+<section class="q-sec"><h2 class="q-sec-h">What the App may do on an account that installs it</h2><ul class="q-list"><li>Read and write issues and their comments</li><li>Read and write code and pull requests</li><li>Start GitHub Actions workflows, and write checks</li><li>Read an organisation's members</li><li>Read repository settings and metadata</li></ul></section>
+<input type="hidden" name="token" value="{{.Token}}">
+<div class="q-su-acts"><button class="btn btn-md btn-primary" type="submit">Continue on GitHub</button></div>
+</form>{{end}}
+{{- define "ctx"}}<p><strong class="q-ctx-b">Owner.</strong> The organisation or user that owns the App holds its settings and keys on GitHub. An organisation keeps the App when a person leaves. An App owned by your user leaves with you. Sign in on github.com in this browser first: as an owner of the organisation, or as the user who will own the App.</p>
+<p><strong class="q-ctx-b">Who can install.</strong> A private App can be installed only by its owner. A public App can be installed by any GitHub account. Either way, the GitHub adapter uses only installations made with Install or Connect in Qory Apiary. You can change this later on GitHub, in the App's settings under Advanced.</p>
+<p>Nothing is installed yet. The App reaches no repository until an organisation in Qory Apiary installs it.</p>{{end}}`)
+
+// startView is what [startPageHTML] shows: the session's form token, the fields as the
+// form was sent, the line under each field the form refused, and Default, whether Name
+// is a default App name, which changes the name's hint.
+type startView struct {
+	pageFrame
+	Token, Organisation, Name         string
+	OrgError, InstallError, NameError string
+	Public, Default                   bool
+}
+
+// startPage answers Start with v, under a Content-Security-Policy that lets the form
+// post to serve alone.
+func (a *appSetup) startPage(w http.ResponseWriter, v startView) {
+	v.pageFrame = a.frame(1, true)
+	writePage(w, http.StatusOK, pageCSP("form-action 'self'"), startPageHTML, v)
 }
 
 // manifestPageHTML is the page that posts the App's manifest to GitHub, as setup's
 // does: its one script posts the form, and its button does where the script does not
 // run.
-var manifestPageHTML = template.Must(template.New("manifest").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github</title>
-<p>{{.Line}}</p>
-{{if .SignIn}}<p>{{.SignIn}}</p>
-{{end}}<form id="f" method="post" action="{{.Action}}">
+var manifestPageHTML = pageTemplate(`{{define "main"}}<p>Opening GitHub…</p>
+<form id="f" method="post" action="{{.Action}}">
 <input type="hidden" name="manifest" value="{{.Manifest}}">
-<button type="submit">{{.Button}}</button>
+<div class="q-su-acts"><button class="btn btn-md btn-primary" type="submit">Open GitHub</button></div>
 </form>
-<script>` + github.SubmitScript + `</script>
-`))
+<script>` + github.SubmitScript + `</script>{{end}}
+{{- define "ctx"}}<h3>On GitHub</h3>
+<ol><li>If GitHub asks you to sign in, sign in as {{if .Org}}an owner of {{.Org}}{{else}}the user who will own the App{{end}}.</li><li>Check the App name. If GitHub says the name is taken, change it.</li><li>Press Create GitHub App{{if .Org}} for {{.Org}}{{end}}. GitHub then brings you back here.</li></ol>
+<p>When you press Create GitHub App, GitHub sends you back here with a one-time code. The GitHub adapter exchanges the code with GitHub for the App's ID, private key and secrets, and stores them in Qory Apiary. You copy nothing.</p>{{end}}`)
+
+// manifestView is what [manifestPageHTML] shows: where the form posts, the manifest,
+// and the organisation the App is created under, if any.
+type manifestView struct {
+	pageFrame
+	Action, Manifest, Org string
+}
 
 // submitScriptHash is the source of a Content-Security-Policy that allows the manifest
 // page's one script, [github.SubmitScript], by its SHA-256.
@@ -976,55 +1143,43 @@ var submitScriptHash = func() string {
 	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 }()
 
-// manifestPage answers the page that posts the manifest of the App, named qory- and the
-// login of the account s names, public when s says so, to GitHub, with s's state, to be
-// created under the account: an organisation's, or, for a user, the person signed in on
-// GitHub, whom the page asks to be that user.
-func (a *appSetup) manifestPage(w http.ResponseWriter, s setupSession) {
+// manifestPage answers the page that posts the manifest of the App, named name, or
+// with no name when name is empty, public when s says so, to GitHub, with s's state, to
+// be created under the organisation s has, or, without one, under the person signed in
+// on GitHub.
+func (a *appSetup) manifestPage(w http.ResponseWriter, s setupSession, name string) {
 	web := a.GitHub.Web()
-	manifest, _ := json.Marshal(github.ServeManifest("qory-"+s.Login, a.PublicURL+setupPath+"/created", a.PublicURL, s.Public, a.Active))
-	signIn := ""
-	if s.Kind == github.AccountUser {
-		signIn = "Sign in to GitHub as " + s.Login + " to create the App."
-	}
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; form-action "+web+"; script-src "+submitScriptHash)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	manifestPageHTML.Execute(w, map[string]string{
-		"Line":   "GitHub opens with the App filled in, named qory-" + s.Login + "; you can change the name there.",
-		"SignIn": signIn, "Action": github.ManifestAction(web, orgOf(s.Login, s.Kind), s.State), "Manifest": string(manifest),
-		"Button": "Create the GitHub App",
+	org := orgOf(s.Login, s.Kind)
+	manifest, _ := json.Marshal(github.ServeManifest(name, a.PublicURL+setupPath+"/created", a.PublicURL, s.Public, a.Active))
+	writePage(w, http.StatusOK, pageCSP("form-action "+web+"; script-src "+submitScriptHash), manifestPageHTML, manifestView{
+		pageFrame: a.frame(2, true), Action: github.ManifestAction(web, org, s.State), Manifest: string(manifest), Org: org,
 	})
 }
 
 // donePageHTML is the page that ends a setup that kept the App, which links back to
 // Qory Apiary.
-var donePageHTML = template.Must(template.New("done").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github</title>
-<p>{{.Line}}</p>
-{{if .Pulls}}<p>{{.Pulls}}</p>
-{{end}}<p><a href="{{.Target}}">{{.Link}}</a></p>
-`))
+var donePageHTML = pageTemplate(`{{define "main"}}<div class="alert alert-success" role="note">{{template "ic-success"}}<div class="alert-body"><p>The GitHub App <strong>{{.Slug}}</strong> is set up and connected to Qory Apiary: its keys are stored there. {{if .Public}}Any GitHub account can install it.{{else}}Only <strong>{{.Owner}}</strong> can install it.{{end}} The GitHub step in your Qory Apiary tab now shows Set up.</p>
+{{- if .Public}}<p><strong>Next</strong><br>In Qory Apiary, each organisation installs the App, with Install in Settings › Integrations or with Connect on the Work source step. GitHub's install page then lists the GitHub accounts you can install it on.</p>
+{{- else}}<p><strong>Next</strong><br>In Qory Apiary, the organisation installs the App, with Install in Settings › Integrations or with Connect on the Work source step. GitHub's install page then asks which repositories the App may reach.</p>{{end}}</div></div>
+{{if .NoWebhooks}}<div class="alert alert-info" role="note">{{template "ic-info"}}<div class="alert-body"><p>GitHub sends this App no webhooks, because the GitHub adapter has no public address. Changes on GitHub arrive with each pull.</p></div></div>
+{{end}}<div class="q-su-acts"><a class="btn btn-md btn-primary" href="{{.Apiary}}">Back to Qory Apiary</a></div>{{end}}
+{{- define "ctx"}}<p>GitHub sent the App's ID, private key and secrets to the GitHub adapter, which stored them in Qory Apiary. There is nothing to copy.</p>
+<p>You can close this tab. Your first Qory Apiary tab updates without a reload.</p>{{end}}`)
+
+// doneView is what [donePageHTML] shows.
+type doneView struct {
+	pageFrame
+	Slug, Owner        string
+	Public, NoWebhooks bool
+}
 
 // donePage answers the page that says the App k is set up and who can install it, as
-// the account form chose: any organisation when public is set, and otherwise only the
-// account that owns it, GitHub's rule for a private App; and, when its webhook is
-// inactive, that GitHub sends it none.
+// Start chose: any GitHub account when public is set, and otherwise only the account
+// that owns it, GitHub's rule for a private App; and, when its webhook is inactive,
+// that GitHub sends it none.
 func (a *appSetup) donePage(w http.ResponseWriter, k *app, public bool) {
-	line := "The GitHub App " + k.slug + " is set up. Only " + k.owner + " can install it, with Install in Qory Apiary."
-	if public {
-		line = "The GitHub App " + k.slug + " is set up. Organisations install it with Install in Qory Apiary."
-	}
-	pulls := ""
-	if !a.Active {
-		pulls = "GitHub sends this App no webhooks: changes on GitHub arrive with each pull."
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	donePageHTML.Execute(w, map[string]string{
-		"Line":   line,
-		"Pulls":  pulls,
-		"Target": a.ApiaryPublicURL, "Link": "Back to Qory Apiary",
+	writePage(w, http.StatusOK, pageCSP(""), donePageHTML, doneView{
+		pageFrame: a.frame(3, true), Slug: k.slug, Owner: k.owner, Public: public, NoWebhooks: !a.Active,
 	})
 }
 
@@ -1140,7 +1295,7 @@ func (a *appSetup) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id
 		})
 		redirect(w, setupPath+"/refused")
 	} else {
-		plainPage(w, rf.status, rf.page)
+		a.refusalPage(w, rf)
 	}
 	ok, dropped := a.refusals.allow()
 	if !ok {

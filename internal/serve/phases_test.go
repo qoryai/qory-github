@@ -283,7 +283,7 @@ func TestRunWithoutAnAppServesTheSetup(t *testing.T) {
 		}
 		j := jar{}
 		fetch(t, j, http.MethodGet, addr, "/setup?state="+signSetupPass(apiary.server, setupPayload(testAdapterID, newNonce(), time.Now().Add(time.Minute))), nil, nil)
-		if resp, body := fetch(t, j, http.MethodGet, addr, "/setup/refused", nil, nil); resp.StatusCode != http.StatusConflict || body != "This adapter's GitHub App is set up already.\n" {
+		if resp, body := fetch(t, j, http.MethodGet, addr, "/setup/refused", nil, nil); resp.StatusCode != http.StatusConflict || !shows(body, "The GitHub App is set up already") || !shows(body, "Qory Apiary has this App's keys. No action needed.") {
 			t.Errorf("public %v: a pass in serving answered %d %q", public, resp.StatusCode, body)
 		}
 		if !strings.Contains(log.String(), `"msg":"serving"`) {
@@ -355,7 +355,7 @@ func onlyAllowedFiles(t *testing.T, dir string) {
 }
 
 // setUpThrough sets the App up through serve's listener at addr, with a pass the fake
-// Qory Apiary signs, the account acme, and the fake GitHub's code, and returns the
+// Qory Apiary signs, the organisation acme, and the fake GitHub's code, and returns the
 // pass and the answer of the last step.
 func setUpThrough(t *testing.T, apiary *fakeApiary, addr string) (string, *http.Response, string) {
 	t.Helper()
@@ -370,7 +370,7 @@ func setUpThrough(t *testing.T, apiary *fakeApiary, addr string) (string, *http.
 	if token == nil {
 		t.Fatalf("the form %s", body)
 	}
-	_, body = fetch(t, j, http.MethodPost, addr, "/setup/continue", strings.NewReader(url.Values{"token": {token[1]}, "account": {"acme"}, "install": {installPrivate}}.Encode()), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
+	_, body = fetch(t, j, http.MethodPost, addr, "/setup/continue", strings.NewReader(url.Values{"token": {token[1]}, "organisation": {"acme"}, "install": {installPrivate}}.Encode()), http.Header{"Content-Type": {"application/x-www-form-urlencoded"}})
 	action := formAction.FindStringSubmatch(body)
 	if action == nil {
 		t.Fatalf("the manifest page %s", body)

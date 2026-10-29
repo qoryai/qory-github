@@ -4,5 +4,8 @@ Copyright 8wonders GmbH and contributors
 This product is licensed under the Apache License, Version 2.0.
 See LICENSE for the full text.
 
+The set-up pages embed the Geist font, licensed under the SIL Open Font
+License, Version 1.1. See internal/serve/assets/OFL.txt for the full text.
+
 Qory is a trademark of 8wonders GmbH. The licence grants no right to
 use it; see TRADEMARKS.md.
