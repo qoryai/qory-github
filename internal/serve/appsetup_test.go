@@ -182,6 +182,11 @@ func setupPayload(adapter, nonce string, expires time.Time) string {
 	return `{"version":1,"adapter_id":"` + adapter + `","nonce":"` + nonce + `","expires_at":"` + contracts.FormatTime(expires) + `"}`
 }
 
+// withMember is the payload p, one JSON object, with the raw member m added last.
+func withMember(p, m string) string {
+	return strings.TrimSuffix(p, "}") + "," + m + "}"
+}
+
 // signSetupPass is a setup pass of payload p signed with key.
 func signSetupPass(key *accesskey.Key, p string) string {
 	sig := key.Sign(append([]byte(contracts.SetupDomain+"\n"), p...))
@@ -329,8 +334,8 @@ var (
 	manifestVal = regexp.MustCompile(`name="manifest" value="([^"]+)"`)
 )
 
-// begin takes a pass in a new browser and shows the account form, and returns the
-// browser and the form's token.
+// begin takes a pass in a new browser and shows Start, and returns the browser and
+// the form's token.
 func (rig *setupRig) begin(pass string) (jar, string) {
 	rig.t.Helper()
 	j := jar{}
@@ -341,23 +346,31 @@ func (rig *setupRig) begin(pass string) (jar, string) {
 	w = rig.do(j, http.MethodGet, "/setup/continue", nil)
 	m := tokenField.FindStringSubmatch(w.Body.String())
 	if w.Code != http.StatusOK || m == nil {
-		rig.t.Fatalf("the account form answered %d %s", w.Code, w.Body)
+		rig.t.Fatalf("Start answered %d %s", w.Code, w.Body)
 	}
 	return j, m[1]
 }
 
-// account posts the account form for a private App, and returns the manifest page's
-// action and manifest.
-func (rig *setupRig) account(j jar, token, handle string) (*httptest.ResponseRecorder, string, map[string]any) {
+// account posts Start for a private App under the organisation org, with no name, and
+// returns the manifest page's action and manifest.
+func (rig *setupRig) account(j jar, token, org string) (*httptest.ResponseRecorder, string, map[string]any) {
 	rig.t.Helper()
-	return rig.accountAs(j, token, handle, installPrivate)
+	return rig.accountAs(j, token, org, installPrivate)
 }
 
-// accountAs posts the account form with install, and returns the manifest page's
-// action and manifest.
-func (rig *setupRig) accountAs(j jar, token, handle, install string) (*httptest.ResponseRecorder, string, map[string]any) {
+// accountAs posts Start under the organisation org with install, and no name, and
+// returns the manifest page's action and manifest.
+func (rig *setupRig) accountAs(j jar, token, org, install string) (*httptest.ResponseRecorder, string, map[string]any) {
 	rig.t.Helper()
-	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}, "install": {install}})
+	return rig.startAs(j, token, url.Values{"organisation": {org}, "install": {install}})
+}
+
+// startAs posts Start with form and the token, and returns the manifest page's action
+// and manifest.
+func (rig *setupRig) startAs(j jar, token string, form url.Values) (*httptest.ResponseRecorder, string, map[string]any) {
+	rig.t.Helper()
+	form.Set("token", token)
+	w := rig.do(j, http.MethodPost, "/setup/continue", form)
 	a, m := formAction.FindStringSubmatch(w.Body.String()), manifestVal.FindStringSubmatch(w.Body.String())
 	if w.Code != http.StatusOK || a == nil || m == nil {
 		rig.t.Fatalf("the account answered %d %s", w.Code, w.Body)
@@ -380,18 +393,28 @@ func stateOf(t *testing.T, action string) string {
 }
 
 // TestTheSetupFlowKeepsTheAppGitHubCreated runs the App setup whole for an
-// organisation's public App, and for a user's private App, against the fake GitHub:
-// every page, its headers and its sentences, the manifest it posts and where, the App
-// stored in Qory Apiary as GitHub's answer says it, the cookie at each step, and the
-// lines it logs, none of which, nor any answer, contains the pass, the code, a cookie
-// or a secret. Nothing but the store is written to the state directory.
+// organisation's public App with a name, and for a private App under the person signed
+// in on GitHub with no name, against the fake GitHub: every page, its headers and its
+// sentences, the manifest it posts and where, the App stored in Qory Apiary as GitHub's
+// answer says it, the cookie at each step, and the lines it logs, none of which, nor
+// any answer, contains the pass, the code, a cookie or a secret. Nothing but the store
+// is written to the state directory.
 func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 	for _, tc := range []struct {
-		handle, org, install, owner, ownerKind, end string
-		signIn                                      bool
+		org, wantOrg, install, name, owner, ownerKind, done, next, signIn, press string
 	}{
-		{"Acme", "acme", installPublic, "acme", github.AccountOrganization, "Organisations install it with Install in Qory Apiary.", false},
-		{"alice", "", installPrivate, "alice", github.AccountUser, "Only alice can install it, with Install in Qory Apiary.", true},
+		{
+			"Acme", "acme", installPublic, "qory-acme", "acme", github.AccountOrganization,
+			"Any GitHub account can install it.",
+			"In Qory Apiary, each organisation installs the App, with Install in Settings › Integrations or with Connect on the Work source step. GitHub's install page then lists the GitHub accounts you can install it on.",
+			"If GitHub asks you to sign in, sign in as an owner of acme.", "Press Create GitHub App for acme. GitHub then brings you back here.",
+		},
+		{
+			"", "", installPrivate, "", "alice", github.AccountUser,
+			"Only alice can install it.",
+			"In Qory Apiary, the organisation installs the App, with Install in Settings › Integrations or with Connect on the Work source step. GitHub's install page then asks which repositories the App may reach.",
+			"If GitHub asks you to sign in, sign in as the user who will own the App.", "Press Create GitHub App. GitHub then brings you back here.",
+		},
 	} {
 		rig := newSetupRig(t, true)
 		rig.gh.owner, rig.gh.ownerKind = tc.owner, tc.ownerKind
@@ -405,43 +428,76 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 		}
 		w = rig.do(j, http.MethodGet, "/setup/continue", nil)
 		body := w.Body.String()
-		for _, want := range []string{"<h1>Set up the GitHub App</h1>", "GitHub account for the App, an organisation or a user", ">Continue</button>", `action="/setup/continue"`} {
+		for _, want := range []string{
+			"<title>Start · Set up the GitHub App</title>", `<p class="q-su-where">Connect Qory Apiary › GitHub</p>`, `<h1 class="q-su-h1">Set up the GitHub App</h1>`,
+			`<p id="set-up-step" class="q-su-count-wide">Step 1 of 3</p>`, `<p class="q-su-count-bar">Step 1 of 3: Start</p>`,
+			`<span class="q-su-step is-current" aria-current="step"><span class="q-su-mark" aria-hidden="true"></span><span class="q-su-nm">Start</span></span>`,
+			`<label class="label" for="organisation">GitHub organisation (optional)</label>`, `<label class="label" for="name">App name</label>`,
+			`id="name" name="name" type="text" value=""`, `<legend class="label">Who can install the App</legend>`,
+			`<button class="btn btn-md btn-primary" type="submit">Continue on GitHub</button>`, `method="post" action="/setup/continue"`,
+			`<h2 id="set-up-context-h" class="q-context-h">About this step</h2>`, `<a class="q-brand" href="https://apiary.example.com">`,
+		} {
 			if !strings.Contains(body, want) {
-				t.Errorf("the account form lacks %q: %s", want, body)
+				t.Errorf("Start lacks %q: %s", want, body)
 			}
 		}
-		if csp := w.Header().Get("Content-Security-Policy"); csp != "default-src 'none'; frame-ancestors 'none'; form-action 'self'" {
-			t.Errorf("the account form's policy is %q", csp)
+		for _, line := range []string{
+			"You create the GitHub App that this Qory Apiary instance's GitHub adapter uses to work with GitHub. GitHub's page opens next, where you create it, and GitHub then sends you back here.",
+			"Leave it empty to create the App under your GitHub user.",
+			"Up to 34 characters. Leave it empty to name the App on GitHub's page.",
+			"What the App may do on an account that installs it Read and write issues and their comments Read and write code and pull requests Start GitHub Actions workflows, and write checks Read an organisation's members Read repository settings and metadata",
+			"Owner. The organisation or user that owns the App holds its settings and keys on GitHub. An organisation keeps the App when a person leaves. An App owned by your user leaves with you. Sign in on github.com in this browser first: as an owner of the organisation, or as the user who will own the App.",
+			"Who can install. A private App can be installed only by its owner. A public App can be installed by any GitHub account. Either way, the GitHub adapter uses only installations made with Install or Connect in Qory Apiary. You can change this later on GitHub, in the App's settings under Advanced.",
+			"Nothing is installed yet. The App reaches no repository until an organisation in Qory Apiary installs it.",
+		} {
+			if !shows(body, line) {
+				t.Errorf("Start does not show %q: %s", line, visible(body))
+			}
+		}
+		if csp := w.Header().Get("Content-Security-Policy"); csp != "default-src 'none'; frame-ancestors 'none'; form-action 'self'; style-src 'self'; font-src 'self'" {
+			t.Errorf("Start's policy is %q", csp)
 		}
 		token := tokenField.FindStringSubmatch(body)[1]
-		w, action, manifest := rig.accountAs(j, token, tc.handle, tc.install)
+		w, action, manifest := rig.startAs(j, token, url.Values{"organisation": {tc.org}, "install": {tc.install}, "name": {tc.name}})
 		body = w.Body.String()
-		login := strings.ToLower(tc.handle)
-		if !strings.Contains(body, "<p>GitHub opens with the App filled in, named qory-"+login+"; you can change the name there.</p>") || !strings.Contains(body, ">Create the GitHub App</button>") {
+		for _, line := range []string{"Opening GitHub…", "Open GitHub", "Step 2 of 3", "On GitHub " + tc.signIn + " Check the App name. If GitHub says the name is taken, change it. " + tc.press,
+			"When you press Create GitHub App, GitHub sends you back here with a one-time code. The GitHub adapter exchanges the code with GitHub for the App's ID, private key and secrets, and stores them in Qory Apiary. You copy nothing."} {
+			if !shows(body, line) {
+				t.Errorf("the manifest page does not show %q: %s", line, visible(body))
+			}
+		}
+		if !strings.Contains(body, "<title>On GitHub · Set up the GitHub App</title>") || !strings.Contains(body, `<button class="btn btn-md btn-primary" type="submit">Open GitHub</button>`) {
 			t.Errorf("the manifest page: %s", body)
 		}
-		if got := strings.Contains(body, "<p>Sign in to GitHub as "+login+" to create the App.</p>"); got != tc.signIn {
-			t.Errorf("the manifest page's sign-in line is there %v: %s", got, body)
-		}
 		sum := sha256.Sum256([]byte(github.SubmitScript))
-		wantCSP := "default-src 'none'; frame-ancestors 'none'; form-action " + rig.gh.srv.URL + "; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
-		if csp := w.Header().Get("Content-Security-Policy"); csp != wantCSP || !strings.Contains(body, "<script>"+github.SubmitScript+"</script>") {
+		wantCSP := "default-src 'none'; frame-ancestors 'none'; form-action " + rig.gh.srv.URL + "; script-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'; style-src 'self'; font-src 'self'"
+		if csp := w.Header().Get("Content-Security-Policy"); csp != wantCSP || !strings.Contains(body, "<script>"+github.SubmitScript+"</script>") || strings.Count(body, "<script") != 1 {
 			t.Errorf("the manifest page's policy is %q, want %q", csp, wantCSP)
 		}
-		wantAction := github.ManifestAction(rig.gh.srv.URL, tc.org, stateOf(t, action))
+		wantAction := github.ManifestAction(rig.gh.srv.URL, tc.wantOrg, stateOf(t, action))
 		if action != wantAction {
 			t.Errorf("the manifest page posts to %s, want %s", action, wantAction)
 		}
 		hook, _ := manifest["hook_attributes"].(map[string]any)
-		if manifest["name"] != "qory-"+login || manifest["redirect_url"] != "https://qory-github.example.com/setup/created" ||
+		name, named := manifest["name"]
+		if named != (tc.name != "") || (named && name != tc.name) || manifest["redirect_url"] != "https://qory-github.example.com/setup/created" ||
 			hook["url"] != "https://qory-github.example.com/v1/events" || hook["active"] != true || manifest["setup_url"] != "https://qory-github.example.com/v1/connect/return" ||
 			manifest["public"] != (tc.install == installPublic) {
 			t.Errorf("the manifest is %v", manifest)
 		}
 		w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
 		body = w.Body.String()
-		if w.Code != http.StatusOK || !strings.Contains(body, "<p>The GitHub App "+setupSlug+" is set up. "+tc.end+"</p>") ||
-			!strings.Contains(body, `<a href="https://apiary.example.com">Back to Qory Apiary</a>`) || strings.Contains(body, "webhooks") {
+		for _, line := range []string{
+			"The GitHub App " + setupSlug + " is set up and connected to Qory Apiary: its keys are stored there. " + tc.done + " The GitHub step in your Qory Apiary tab now shows Set up.",
+			"Next " + tc.next, "Step 3 of 3",
+			"GitHub sent the App's ID, private key and secrets to the GitHub adapter, which stored them in Qory Apiary. There is nothing to copy. You can close this tab. Your first Qory Apiary tab updates without a reload.",
+		} {
+			if !shows(body, line) {
+				t.Errorf("the end page does not show %q: %s", line, visible(body))
+			}
+		}
+		if w.Code != http.StatusOK || !strings.Contains(body, `<a class="btn btn-md btn-primary" href="https://apiary.example.com">Back to Qory Apiary</a>`) || strings.Contains(body, "webhooks") ||
+			!strings.Contains(body, "<strong>"+setupSlug+"</strong>") || w.Header().Get("Content-Security-Policy") != pageCSP("") {
 			t.Errorf("the end answered %d %s", w.Code, body)
 		}
 		if _, ok := j[setupCookie]; ok {
@@ -494,9 +550,7 @@ func TestTheSetupFlowKeepsTheAppGitHubCreated(t *testing.T) {
 			t.Errorf("a pass after the setup answered %d %v", w.Code, w.Header())
 		}
 		w = rig.do(j2, http.MethodGet, "/setup/refused", nil)
-		if w.Code != http.StatusConflict || w.Body.String() != "This adapter's GitHub App is set up already.\n" {
-			t.Errorf("the refusal shows %d %q", w.Code, w.Body)
-		}
+		refusalShown(t, w, http.StatusConflict, "The GitHub App is set up already", "Qory Apiary has this App's keys. No action needed.", "https://apiary.example.com")
 	}
 }
 
@@ -524,7 +578,7 @@ func TestASetupWithoutAPublicAddressMakesTheWebhookInactive(t *testing.T) {
 		t.Errorf("the manifest's webhook is %v", hook)
 	}
 	w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-	if !strings.Contains(w.Body.String(), "<p>GitHub sends this App no webhooks: changes on GitHub arrive with each pull.</p>") {
+	if !strings.Contains(w.Body.String(), "<p>GitHub sends this App no webhooks, because the GitHub adapter has no public address. Changes on GitHub arrive with each pull.</p>") {
 		t.Errorf("the end page: %s", w.Body)
 	}
 	if a := rig.storedApp(); a == nil || a.webhookActive {
@@ -553,7 +607,7 @@ func TestASetupAtAHostOnlyPublicURLSendsItsAddresses(t *testing.T) {
 		}
 		w = rig.do(j, http.MethodGet, "/setup/continue", nil)
 		if !strings.Contains(w.Body.String(), `action="/setup/continue"`) {
-			t.Errorf("%s: the account form: %s", in, w.Body)
+			t.Errorf("%s: Start: %s", in, w.Body)
 		}
 		token := tokenField.FindStringSubmatch(w.Body.String())[1]
 		_, _, manifest := rig.account(j, token, "acme")
@@ -580,7 +634,7 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 	rig := newSetupRig(t, true)
 	now := time.Now()
 	other := newKey(t)
-	invalid := "This setup link is not valid. Press Set up in Qory Apiary again.\n"
+	invalid := "This set-up link is not valid. Press Set up in Qory Apiary again."
 	expiredNonce := newNonce()
 	for name, tc := range map[string]struct {
 		pass   string
@@ -594,9 +648,9 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 		"connect pass":                         {signPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
 		"connect payload under setup's domain": {signSetupPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "payload"},
 		"version 2":                            {signSetupPass(rig.server, strings.Replace(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"version":1`, `"version":2`, 1)), 400, invalid, "payload"},
-		"another adapter":                      {signSetupPass(rig.server, setupPayload("na_fedcba9876543210", newNonce(), now.Add(time.Minute))), 403, "This setup link is for another adapter. Press Set up on this adapter's page in Qory Apiary.\n", "adapter"},
-		"expired":                              {signSetupPass(rig.server, setupPayload(testAdapterID, expiredNonce, now.Add(-time.Second))), 400, "This setup link has expired. Press Set up in Qory Apiary again.\n", "expired"},
-		"too far ahead":                        {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(16*time.Minute))), 400, "This setup link has expired. Press Set up in Qory Apiary again.\n", "expired"},
+		"another adapter":                      {signSetupPass(rig.server, setupPayload("na_fedcba9876543210", newNonce(), now.Add(time.Minute))), 403, "This set-up link is for another adapter. Press Set up on the GitHub adapter's page in Qory Apiary.", "adapter"},
+		"expired":                              {signSetupPass(rig.server, setupPayload(testAdapterID, expiredNonce, now.Add(-time.Second))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
+		"too far ahead":                        {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(16*time.Minute))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
 	} {
 		j := jar{}
 		w := rig.do(j, http.MethodGet, "/setup?state="+url.QueryEscape(tc.pass), nil)
@@ -605,9 +659,7 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 			continue
 		}
 		w = rig.do(j, http.MethodGet, "/setup/refused", nil)
-		if w.Code != tc.status || w.Body.String() != tc.page {
-			t.Errorf("%s: shows %d %q", name, w.Code, w.Body)
-		}
+		refusalShown(t, w, tc.status, "This set-up link cannot be used", tc.page, "https://apiary.example.com")
 		if !strings.Contains(rig.log.String(), `"reason":"`+tc.reason+`"`) {
 			t.Errorf("%s: the log lacks the reason %s: %s", name, tc.reason, rig.log.String())
 		}
@@ -620,9 +672,7 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 	rig.begin(pass)
 	j := jar{}
 	rig.do(j, http.MethodGet, "/setup?state="+pass, nil)
-	if w := rig.do(j, http.MethodGet, "/setup/refused", nil); w.Code != 400 || w.Body.String() != "This setup link was used already. Press Set up in Qory Apiary again.\n" {
-		t.Errorf("a pass taken again shows %d %q", w.Code, w.Body)
-	}
+	refusalShown(t, rig.do(j, http.MethodGet, "/setup/refused", nil), 400, "This set-up link cannot be used", "This set-up link was used already. Press Set up in Qory Apiary again.", "https://apiary.example.com")
 	// Under a pin of two keys, a pass either signs passes.
 	rig.setup.creds.set(enrolment{pin: append(pinOf(other), pinOf(rig.server)...), adapterID: testAdapterID})
 	for _, k := range []*accesskey.Key{other, rig.server} {
@@ -663,10 +713,89 @@ func TestTheContractsSignedSetupPassVerifies(t *testing.T) {
 	if _, _, rf := c.checkPass(setupDoc.Pass, at, c.enrolment()); rf != &refuseSignature {
 		t.Errorf("the setup pass as a connect pass: %v", rf)
 	}
+	if p.OrganisationSlug != "" {
+		t.Errorf("the pass without organisation_slug has the slug %q", p.OrganisationSlug)
+	}
+	var slugDoc struct {
+		Pass     string `json:"pass"`
+		Tampered string `json:"tampered"`
+	}
+	readFixture(t, "setup-pass-organisation-slug.json", &slugDoc)
+	p, expires, rf = checkSetupPass(slugDoc.Pass, at, en)
+	if rf != nil || p.OrganisationSlug != "acme-org" || p.Nonce != "EBESExQVFhcYGRobHB0eHw" || !expires.Equal(at.Add(15*time.Minute)) {
+		t.Errorf("the pass with organisation_slug: %+v %v %v", p, expires, rf)
+	}
+	if _, _, rf := checkSetupPass(slugDoc.Tampered, at, en); rf != &setupRefuseSignature {
+		t.Errorf("the tampered pass with organisation_slug: %v", rf)
+	}
+}
+
+// TestASetupPassMayHaveTheOrganisationSlug pins that a setup pass is taken with
+// organisation_slug of the contract's shape, 1 to 40 characters, and refused, with the
+// page for a link that is not valid, when the slug has another shape or type, or when
+// the pass has any other member the contract does not define.
+func TestASetupPassMayHaveTheOrganisationSlug(t *testing.T) {
+	rig := newSetupRig(t, true)
+	now := time.Now()
+	for _, slug := range []string{`"a"`, `"acme-org"`, `"a--b"`, `"acme\u002dorg"`, `"` + strings.Repeat("a", 40) + `"`} {
+		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"organisation_slug":`+slug))
+		if p, _, rf := checkSetupPass(pass, now, rig.setup.creds.get()); rf != nil || p.OrganisationSlug == "" {
+			t.Errorf("%s: %+v %v", slug, p, rf)
+		}
+	}
+	invalid := "This set-up link is not valid. Press Set up in Qory Apiary again."
+	for name, member := range map[string]string{
+		"upper case":         `"organisation_slug":"Acme-Org"`,
+		"41 characters":      `"organisation_slug":"` + strings.Repeat("a", 41) + `"`,
+		"leading hyphen":     `"organisation_slug":"-acme"`,
+		"trailing hyphen":    `"organisation_slug":"acme-"`,
+		"line feed":          `"organisation_slug":"acme\n"`,
+		"empty":              `"organisation_slug":""`,
+		"space":              `"organisation_slug":"acme org"`,
+		"null":               `"organisation_slug":null`,
+		"number":             `"organisation_slug":5`,
+		"array":              `"organisation_slug":["acme"]`,
+		"unknown member":     `"organisation_name":"acme"`,
+		"another member too": `"organisation_slug":"acme","extra":1`,
+	} {
+		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), member))
+		j := jar{}
+		w := rig.do(j, http.MethodGet, "/setup?state="+url.QueryEscape(pass), nil)
+		if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/setup/refused" || j[setupCookie] != "" {
+			t.Errorf("%s: answered %d %v", name, w.Code, w.Header())
+			continue
+		}
+		refusalShown(t, rig.do(j, http.MethodGet, "/setup/refused", nil), 400, "This set-up link cannot be used", invalid, "https://apiary.example.com")
+	}
+	if n := strings.Count(rig.log.String(), `"reason":"payload"`); n != 12 {
+		t.Errorf("%d refusals for the payload, want 12: %s", n, rig.log.String())
+	}
+}
+
+// TestStartFillsTheAppNameFromThePass pins that Start fills the name field with qory-
+// and the pass's organisation_slug, with the hint for a filled name, that the filled
+// name reaches the manifest, and that the form shown again keeps the hint.
+func TestStartFillsTheAppNameFromThePass(t *testing.T) {
+	rig := newSetupRig(t, true)
+	filled := "qory- and your Qory Apiary organisation's name, in lower case with hyphens. Up to 34 characters. You can change it here or on GitHub's page."
+	pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), time.Now().Add(10*time.Minute)), `"organisation_slug":"acme-org"`))
+	j, token := rig.begin(pass)
+	body := rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String()
+	if !strings.Contains(body, `id="name" name="name" type="text" value="qory-acme-org"`) || !shows(body, filled) || shows(body, "Leave it empty to name the App") {
+		t.Errorf("Start with the slug acme-org: %s", body)
+	}
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"acme"}, "install": {"neither"}, "name": {"qory-acme-org"}})
+	if body := w.Body.String(); !strings.Contains(body, `value="qory-acme-org"`) || !shows(body, filled) || strings.Contains(body, `name="manifest"`) {
+		t.Errorf("Start shown again: %d %s", w.Code, body)
+	}
+	_, _, manifest := rig.startAs(j, token, url.Values{"organisation": {"acme"}, "install": {installPrivate}, "name": {"qory-acme-org"}})
+	if manifest["name"] != "qory-acme-org" {
+		t.Errorf("the manifest's name is %v", manifest["name"])
+	}
 }
 
 // TestPOSTToTheSetupIsRefusedUnread pins that POST /setup answers 405 without reading
-// its body, and that the account form needs the session's cookie and its token.
+// its body, and that Start's form needs the session's cookie and its token.
 func TestPOSTToTheSetupIsRefusedUnread(t *testing.T) {
 	rig := newSetupRig(t, true)
 	body := &countingReader{r: strings.NewReader("state=" + rig.pass() + "&_csrf_token=x")}
@@ -674,24 +803,22 @@ func TestPOSTToTheSetupIsRefusedUnread(t *testing.T) {
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	rig.setup.ServeHTTP(w, r)
-	if w.Code != http.StatusMethodNotAllowed || w.Body.String() != "This address answers only GET requests.\n" || w.Header().Get("Allow") != "GET" || body.n != 0 {
+	if w.Code != http.StatusMethodNotAllowed || !shows(w.Body.String(), "This address answers only GET requests.") || w.Header().Get("Allow") != "GET" || body.n != 0 {
 		t.Errorf("POST /setup answered %d %q, read %d", w.Code, w.Body, body.n)
 	}
-	noSession := "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.\n"
+	noSession := "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again."
 	// A form without the cookie finds no session, and its body is not read.
-	body = &countingReader{r: strings.NewReader("account=acme&token=x")}
+	body = &countingReader{r: strings.NewReader("organisation=acme&token=x")}
 	r = httptest.NewRequest(http.MethodPost, "/setup/continue", body)
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w = httptest.NewRecorder()
 	rig.setup.ServeHTTP(w, r)
-	if w.Code != http.StatusBadRequest || w.Body.String() != noSession || body.n != 0 {
+	if w.Code != http.StatusBadRequest || !shows(w.Body.String(), noSession) || body.n != 0 {
 		t.Errorf("a form without the cookie answered %d %q, read %d", w.Code, w.Body, body.n)
 	}
 	j, token := rig.begin(rig.pass())
-	for _, form := range []url.Values{{"account": {"acme"}}, {"account": {"acme"}, "token": {strings.Repeat("A", 43)}}, {"account": {"acme"}, "token": {token, token}}} {
-		if w := rig.do(j, http.MethodPost, "/setup/continue", form); w.Code != http.StatusBadRequest || w.Body.String() != noSession {
-			t.Errorf("%v answered %d %q", form, w.Code, w.Body)
-		}
+	for _, form := range []url.Values{{"organisation": {"acme"}}, {"organisation": {"acme"}, "token": {strings.Repeat("A", 43)}}, {"organisation": {"acme"}, "token": {token, token}}} {
+		refusalShown(t, rig.do(j, http.MethodPost, "/setup/continue", form), http.StatusBadRequest, "No set-up is under way in this browser", noSession, "https://apiary.example.com")
 	}
 	// The session lasts a refused form: the right token goes on.
 	w, _, _ = rig.account(j, token, "acme")
@@ -715,48 +842,94 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// TestAnUnknownAccountShowsTheFormAgain pins that an account GitHub has none by shows
-// the form again, with the line that says so, and the flow goes on.
+// fieldError is the start of the line Start shows under its field id when the form
+// refused it.
+func fieldError(id string) string {
+	return `<p id="` + id + `-error" class="field-error"><svg class="ic"`
+}
+
+// TestAnUnknownAccountShowsTheFormAgain pins that an organisation GitHub has no
+// account by shows the form again, with the line that says so under the field and the
+// name typed in it, and the flow goes on.
 func TestAnUnknownAccountShowsTheFormAgain(t *testing.T) {
 	rig := newSetupRig(t, true)
 	j, token := rig.begin(rig.pass())
-	for _, handle := range []string{"nobody", "not a handle", strings.Repeat("a", 40)} {
-		w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {handle}, "install": {installPrivate}})
-		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>GitHub has no account by that name.</p>") || !strings.Contains(w.Body.String(), token) {
-			t.Errorf("%q answered %d %s", handle, w.Code, w.Body)
+	for _, org := range []string{"nobody", "not a handle", strings.Repeat("a", 40)} {
+		w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {org}, "install": {installPrivate}})
+		body := w.Body.String()
+		if w.Code != http.StatusOK || !shows(body, "GitHub has no account by that name.") || !strings.Contains(body, fieldError("organisation")) ||
+			!strings.Contains(body, `value="`+html.EscapeString(org)+`"`) || !strings.Contains(body, `aria-describedby="organisation-error" aria-invalid="true"`) ||
+			!strings.Contains(body, token) || strings.Contains(body, `name="manifest"`) {
+			t.Errorf("%q answered %d %s", org, w.Code, body)
 		}
 	}
 	rig.account(j, token, "acme")
 }
 
-// The account form's question and its two options, as the page shows them, with the
-// private App's option selected and with the public App's.
+// TestAPersonalAccountShowsTheFormAgain pins that a user's login in the organisation
+// field shows the form again, with the line that names the login as GitHub writes it,
+// and posts no manifest.
+func TestAPersonalAccountShowsTheFormAgain(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"Alice"}, "install": {installPublic}})
+	body := w.Body.String()
+	if w.Code != http.StatusOK || !shows(body, "alice is a personal GitHub account. Leave the field empty to create the App under your account.") ||
+		!strings.Contains(body, fieldError("organisation")) || strings.Contains(body, `name="manifest"`) || !strings.Contains(body, publicOn) {
+		t.Errorf("a user's login answered %d %s", w.Code, body)
+	}
+	if n := rig.gh.looked(); n != 1 {
+		t.Errorf("the account was looked up %d times", n)
+	}
+}
+
+// TestAnEmptyOrganisationCreatesTheAppUnderThePerson pins that Start with no
+// organisation, or only white space, looks nothing up on GitHub and posts the manifest
+// to the App settings of the person signed in on GitHub; an organisation posts it to
+// the organisation's.
+func TestAnEmptyOrganisationCreatesTheAppUnderThePerson(t *testing.T) {
+	for org, want := range map[string]string{"": "", "  ": "", " acme ": "acme", "ACME": "acme"} {
+		rig := newSetupRig(t, true)
+		j, token := rig.begin(rig.pass())
+		_, action, _ := rig.account(j, token, org)
+		if wantAction := github.ManifestAction(rig.gh.srv.URL, want, stateOf(t, action)); action != wantAction {
+			t.Errorf("%q: posts to %s, want %s", org, action, wantAction)
+		}
+		if n := rig.gh.looked(); n != map[bool]int{true: 0, false: 1}[want == ""] {
+			t.Errorf("%q: looked up %d times", org, n)
+		}
+	}
+}
+
+// The select's two options, as Start shows them, with the private App's option
+// checked and with the public App's.
 const (
-	installQuestion = "<fieldset>\n<legend>Who can install the App</legend>\n"
-	privateOption   = `<label><input type="radio" name="install" value="private" required checked> Only this account (private)</label>`
-	publicOption    = `<label><input type="radio" name="install" value="public"> Any GitHub account (public)</label>`
-	privateOff      = `<label><input type="radio" name="install" value="private" required> Only this account (private)</label>`
-	publicOn        = `<label><input type="radio" name="install" value="public" checked> Any GitHub account (public)</label>`
-	chooseLine      = "<p>Choose who can install the App: only this account, or any GitHub account.</p>"
+	privateOption = `<input class="q-pick-radio" type="radio" name="install" value="private" required checked>`
+	publicOption  = `<input class="q-pick-radio" type="radio" name="install" value="public">`
+	privateOff    = `<input class="q-pick-radio" type="radio" name="install" value="private" required>`
+	publicOn      = `<input class="q-pick-radio" type="radio" name="install" value="public" checked>`
+	chooseLine    = "Choose who can install the App."
 )
 
-// TestTheAccountFormAsksWhoCanInstallTheApp pins the form's question, in a fieldset
-// with its legend, after the account field and before the button, its two options
-// with the private App's selected, and that a form shown again for an unknown account
-// keeps the public App's option selected when it was chosen.
+// TestTheAccountFormAsksWhoCanInstallTheApp pins Start's fields in order: the
+// organisation, the select of who can install the App, with the private App's option
+// first and checked, and the name, before the button; and that a form shown again
+// keeps the public App's option checked when it was chosen.
 func TestTheAccountFormAsksWhoCanInstallTheApp(t *testing.T) {
 	rig := newSetupRig(t, true)
 	j, token := rig.begin(rig.pass())
 	body := rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String()
-	field := strings.Index(body, `name="account"`)
-	question := strings.Index(body, installQuestion+privateOption+"\n"+publicOption+"\n</fieldset>")
-	button := strings.Index(body, ">Continue</button>")
-	if field < 0 || question < field || button < question {
-		t.Errorf("the account form: %s", body)
+	org := strings.Index(body, `name="organisation"`)
+	private := strings.Index(body, privateOption)
+	public := strings.Index(body, publicOption)
+	name := strings.Index(body, `name="name"`)
+	button := strings.Index(body, ">Continue on GitHub</button>")
+	if org < 0 || private < org || public < private || name < public || button < name || !strings.Contains(body, `<details class="q-pick">`) {
+		t.Errorf("Start: %s", body)
 	}
-	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "account": {"nobody"}, "install": {installPublic}})
+	w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"nobody"}, "install": {installPublic}})
 	body = w.Body.String()
-	if w.Code != http.StatusOK || !strings.Contains(body, "<p>GitHub has no account by that name.</p>") || !strings.Contains(body, privateOff) || !strings.Contains(body, publicOn) {
+	if w.Code != http.StatusOK || !shows(body, "GitHub has no account by that name.") || !strings.Contains(body, privateOff) || !strings.Contains(body, publicOn) {
 		t.Errorf("the form again answered %d %s", w.Code, body)
 	}
 }
@@ -776,19 +949,19 @@ func TestTheChoiceSetsWhetherTheAppIsPublic(t *testing.T) {
 
 // TestAMissingOrUnknownChoiceShowsTheFormAgain pins that a form whose install is not
 // exactly one of its two values shows the form again, with the line that says what to
-// do and the private App's option selected, without looking the account up with
+// do and the private App's option selected, without looking the organisation up with
 // GitHub, and that the flow goes on.
 func TestAMissingOrUnknownChoiceShowsTheFormAgain(t *testing.T) {
 	rig := newSetupRig(t, true)
 	j, token := rig.begin(rig.pass())
 	for _, install := range [][]string{nil, {""}, {"Private"}, {"true"}, {"private "}, {installPrivate, installPublic}, {installPublic, installPublic}} {
-		form := url.Values{"token": {token}, "account": {"acme"}}
+		form := url.Values{"token": {token}, "organisation": {"acme"}}
 		if install != nil {
 			form["install"] = install
 		}
 		w := rig.do(j, http.MethodPost, "/setup/continue", form)
 		body := w.Body.String()
-		if w.Code != http.StatusOK || !strings.Contains(body, chooseLine) || !strings.Contains(body, privateOption) || !strings.Contains(body, token) || strings.Contains(body, `name="manifest"`) {
+		if w.Code != http.StatusOK || !shows(body, chooseLine) || !strings.Contains(body, privateOption) || !strings.Contains(body, token) || strings.Contains(body, `name="manifest"`) {
 			t.Errorf("%q answered %d %s", install, w.Code, body)
 		}
 	}
@@ -796,6 +969,95 @@ func TestAMissingOrUnknownChoiceShowsTheFormAgain(t *testing.T) {
 		t.Errorf("the account was looked up on GitHub %d times", n)
 	}
 	rig.account(j, token, "acme")
+}
+
+// TestTheAppNameIsCheckedBeforeGitHubOpens pins the name's checks: more than 34
+// characters, or a control character, shows the form again with the line under the
+// name and the name as typed; 34 characters, white space at either end, and an empty
+// name pass, and an empty name posts a manifest without a name.
+func TestTheAppNameIsCheckedBeforeGitHubOpens(t *testing.T) {
+	rig := newSetupRig(t, true)
+	j, token := rig.begin(rig.pass())
+	for name, line := range map[string]string{
+		strings.Repeat("a", 35): "Shorten the name to 34 characters or fewer. GitHub refuses longer App names.",
+		strings.Repeat("é", 35): "Shorten the name to 34 characters or fewer. GitHub refuses longer App names.",
+		"qory-acme\nprod":       "Remove the line break or tab from the name.",
+		"qory\tacme":            "Remove the line break or tab from the name.",
+		"qory-acme\x7f":         "Remove the line break or tab from the name.",
+		"qory-acme\u0085suffix": "Remove the line break or tab from the name.",
+	} {
+		w := rig.do(j, http.MethodPost, "/setup/continue", url.Values{"token": {token}, "organisation": {"acme"}, "install": {installPrivate}, "name": {name}})
+		body := w.Body.String()
+		if w.Code != http.StatusOK || !shows(body, line) || !strings.Contains(body, fieldError("name")) || strings.Contains(body, `name="manifest"`) ||
+			!strings.Contains(body, `aria-describedby="name-error" aria-invalid="true"`) {
+			t.Errorf("%q answered %d %s", name, w.Code, body)
+		}
+	}
+	for name, want := range map[string]string{strings.Repeat("a", 34): strings.Repeat("a", 34), strings.Repeat("é", 34): strings.Repeat("é", 34), "  qory-acme ": "qory-acme"} {
+		_, _, manifest := rig.startAs(j, token, url.Values{"organisation": {"acme"}, "install": {installPrivate}, "name": {name}})
+		if manifest["name"] != want {
+			t.Errorf("%q: the manifest's name is %v", name, manifest["name"])
+		}
+	}
+	for _, name := range []string{"", "   "} {
+		_, _, manifest := rig.startAs(j, token, url.Values{"organisation": {"acme"}, "install": {installPrivate}, "name": {name}})
+		if _, ok := manifest["name"]; ok || manifest["redirect_url"] != "https://qory-github.example.com/setup/created" {
+			t.Errorf("%q: the manifest is %v", name, manifest)
+		}
+	}
+}
+
+// TestTheDefaultAppNameHasGitHubsShape pins the default App name: qory- and the Qory
+// Apiary organisation's name in lower case, each run of other characters or of hyphens
+// one hyphen, no hyphen at either end, cut at 34 characters with no hyphen at the end
+// after the cut; and no name for an organisation's name that is empty or has no letter
+// or digit.
+func TestTheDefaultAppNameHasGitHubsShape(t *testing.T) {
+	for org, want := range map[string]string{
+		"":                             "",
+		"!!!":                          "",
+		"Acme Corp":                    "qory-acme-corp",
+		"acme-corp":                    "qory-acme-corp",
+		"  Acme   Corp!  ":             "qory-acme-corp",
+		"-Acme-":                       "qory-acme",
+		"Café Ünïon 2026":              "qory-caf-n-on-2026",
+		"Acme_Corp.Example":            "qory-acme-corp-example",
+		"a--b":                         "qory-a-b",
+		"a-!-b":                        "qory-a-b",
+		"--acme---org--":               "qory-acme-org",
+		"acme-org":                     "qory-acme-org",
+		strings.Repeat("x", 40):        "qory-" + strings.Repeat("x", 29),
+		strings.Repeat("x", 28) + " y": "qory-" + strings.Repeat("x", 28),
+		// Slugs of 40 characters whose cut at 34 lands on a hyphen.
+		strings.Repeat("x", 28) + "-" + strings.Repeat("y", 11):  "qory-" + strings.Repeat("x", 28),
+		strings.Repeat("x", 28) + "--" + strings.Repeat("y", 10): "qory-" + strings.Repeat("x", 28),
+		strings.Repeat("x", 27) + "--" + strings.Repeat("y", 11): "qory-" + strings.Repeat("x", 27) + "-y",
+	} {
+		got := defaultAppName(org)
+		if got != want || len(got) > 34 || strings.HasSuffix(got, "-") || strings.Contains(got, "--") {
+			t.Errorf("%q: %q, want %q", org, got, want)
+		}
+	}
+}
+
+// TestStartFillsTheDefaultAppName pins that Start fills the name field with a default
+// App name, and then shows its hint, and that with no default the field is empty with
+// the hint that says GitHub's page names the App.
+func TestStartFillsTheDefaultAppName(t *testing.T) {
+	rig := newSetupRig(t, true)
+	w := httptest.NewRecorder()
+	rig.setup.startPage(w, startView{Token: "t", Name: defaultAppName("Acme Corp"), Default: true})
+	body := w.Body.String()
+	if !strings.Contains(body, `id="name" name="name" type="text" value="qory-acme-corp"`) ||
+		!shows(body, "qory- and your Qory Apiary organisation's name, in lower case with hyphens. Up to 34 characters. You can change it here or on GitHub's page.") ||
+		shows(body, "Leave it empty to name the App") {
+		t.Errorf("Start with a default name: %s", body)
+	}
+	j, _ := rig.begin(rig.pass())
+	body = rig.do(j, http.MethodGet, "/setup/continue", nil).Body.String()
+	if !strings.Contains(body, `id="name" name="name" type="text" value=""`) || !shows(body, "Up to 34 characters. Leave it empty to name the App on GitHub's page.") {
+		t.Errorf("Start with no default name: %s", body)
+	}
 }
 
 // TestTheChoiceChangesOnlyWithTheAccountForm pins that the choice is kept in the
@@ -818,7 +1080,7 @@ func TestTheChoiceChangesOnlyWithTheAccountForm(t *testing.T) {
 	j, token = rig.begin(rig.pass())
 	_, action, _ := rig.account(j, token, "acme")
 	w = rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action)+"&install=public&public=true", nil)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>The GitHub App "+setupSlug+" is set up. Only acme can install it, with Install in Qory Apiary.</p>") {
+	if w.Code != http.StatusOK || !shows(w.Body.String(), "Only acme can install it.") {
 		t.Errorf("the redirect answered %d %s", w.Code, w.Body)
 	}
 }
@@ -838,11 +1100,11 @@ func TestAWrongStateOrCodeIsRefusedWithoutAnExchange(t *testing.T) {
 		j, token := rig.begin(rig.pass())
 		_, action, _ := rig.account(j, token, "acme")
 		w := rig.do(j, http.MethodGet, "/setup/created?"+q(stateOf(t, action)), nil)
-		if w.Code != http.StatusBadRequest || w.Body.String() != "This setup link is not valid. Press Set up in Qory Apiary again.\n" || j[setupCookie] != "" {
+		if w.Code != http.StatusBadRequest || !shows(w.Body.String(), "This set-up link is not valid. Press Set up in Qory Apiary again.") || j[setupCookie] != "" {
 			t.Errorf("%s answered %d %q", q("S"), w.Code, w.Body)
 		}
 	}
-	// A redirect before the account form has no state to match.
+	// A redirect before Start is sent has no state to match.
 	j, _ := rig.begin(rig.pass())
 	if w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state=", nil); w.Code != http.StatusBadRequest {
 		t.Errorf("a redirect before the form answered %d", w.Code)
@@ -861,9 +1123,11 @@ func TestANewerPassReplacesTheOpenFlow(t *testing.T) {
 	ja, tokenA := rig.begin(rig.pass())
 	_, actionA, _ := rig.account(ja, tokenA, "acme")
 	jb, tokenB := rig.begin(rig.pass())
-	replaced := "A newer setup replaced this one. If you created an App on GitHub for it, delete it at " + rig.gh.srv.URL + "/organizations/acme/settings/apps.\n"
+	apps := rig.gh.srv.URL + "/organizations/acme/settings/apps"
+	replaced := "A newer setup replaced this one. If you created an App on GitHub for it, delete it at " + apps + "."
 	w := rig.do(ja, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, actionA), nil)
-	if w.Code != http.StatusConflict || w.Body.String() != replaced || ja[setupCookie] != "" {
+	refusalShown(t, w, http.StatusConflict, "A newer set-up replaced this one", replaced, "https://apiary.example.com")
+	if !strings.Contains(w.Body.String(), `<a class="q-link" href="`+apps+`">`+apps+`</a>`) || ja[setupCookie] != "" {
 		t.Errorf("the older flow's redirect answered %d %q", w.Code, w.Body)
 	}
 	if c := rig.gh.converted(); len(c) != 0 {
@@ -872,11 +1136,11 @@ func TestANewerPassReplacesTheOpenFlow(t *testing.T) {
 	// The older flow's form, in a browser that is still at it, is refused as well.
 	jc, _ := rig.begin(rig.pass())
 	rig.begin(rig.pass())
-	if w := rig.do(jc, http.MethodGet, "/setup/continue", nil); w.Code != http.StatusConflict || !strings.HasPrefix(w.Body.String(), "A newer setup replaced this one.") || !strings.Contains(w.Body.String(), rig.gh.srv.URL+"/settings/apps.") {
+	if w := rig.do(jc, http.MethodGet, "/setup/continue", nil); w.Code != http.StatusConflict || !shows(w.Body.String(), "A newer setup replaced this one. If you created an App on GitHub for it, delete it at "+rig.gh.srv.URL+"/settings/apps.") {
 		t.Errorf("a replaced flow's form answered %d %q", w.Code, w.Body)
 	}
 	// The newest pass now is the fourth's: B's is replaced too, and goes back.
-	if w := rig.do(jb, http.MethodPost, "/setup/continue", url.Values{"token": {tokenB}, "account": {"acme"}}); w.Code != http.StatusConflict {
+	if w := rig.do(jb, http.MethodPost, "/setup/continue", url.Values{"token": {tokenB}, "organisation": {"acme"}}); w.Code != http.StatusConflict {
 		t.Errorf("B's form answered %d", w.Code)
 	}
 	je, tokenE := rig.begin(rig.pass())
@@ -948,7 +1212,7 @@ func TestANewerPassWhileTheRedirectWaitsEndsIt(t *testing.T) {
 	}
 	<-rig.setup.lock
 	w := <-done
-	if w.Code != http.StatusConflict || !strings.HasPrefix(w.Body.String(), "A newer setup replaced this one.") {
+	if w.Code != http.StatusConflict || !shows(w.Body.String(), "A newer setup replaced this one.") {
 		t.Errorf("the redirect answered %d %q", w.Code, w.Body)
 	}
 	if c := rig.gh.converted(); len(c) != 0 {
@@ -986,20 +1250,26 @@ func TestAPassWhileAnAppIsKeptIsRefused(t *testing.T) {
 }
 
 // TestAnAppThatCannotBeKeptSaysToDeleteIt pins the page of a setup whose code's
-// exchange failed, so GitHub may have created an App: it links to the account's Apps.
+// exchange failed, so GitHub may have created an App: it links to the organisation's
+// Apps, or to the Apps of the person signed in on GitHub when Start had no
+// organisation.
 func TestAnAppThatCannotBeKeptSaysToDeleteIt(t *testing.T) {
-	rig := newSetupRig(t, true)
-	rig.gh.convStatus = http.StatusInternalServerError
-	j, token := rig.begin(rig.pass())
-	_, action, _ := rig.account(j, token, "acme")
-	w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
-	if w.Code != http.StatusBadGateway || w.Body.String() != "GitHub may have created an App; delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps, then press Set up in Qory Apiary again.\n" || j[setupCookie] != "" {
-		t.Errorf("a failed exchange answered %d %q", w.Code, w.Body)
+	for org, path := range map[string]string{"acme": "/organizations/acme/settings/apps", "": "/settings/apps"} {
+		rig := newSetupRig(t, true)
+		rig.gh.convStatus = http.StatusInternalServerError
+		j, token := rig.begin(rig.pass())
+		_, action, _ := rig.account(j, token, org)
+		w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
+		apps := rig.gh.srv.URL + path
+		refusalShown(t, w, http.StatusBadGateway, "The GitHub App could not be stored", "GitHub may have created an App; delete it at "+apps+", then press Set up in Qory Apiary again.", "https://apiary.example.com")
+		if !strings.Contains(w.Body.String(), `<a class="q-link" href="`+apps+`">`+apps+`</a>`) || j[setupCookie] != "" {
+			t.Errorf("%q: a failed exchange answered %d %q", org, w.Code, w.Body)
+		}
+		if !strings.Contains(rig.log.String(), `"what":"conversion"`) {
+			t.Errorf("the log: %s", rig.log.String())
+		}
+		noSetupLeak(t, rig.log.String())
 	}
-	if !strings.Contains(rig.log.String(), `"what":"conversion"`) {
-		t.Errorf("the log: %s", rig.log.String())
-	}
-	noSetupLeak(t, rig.log.String())
 }
 
 // TestGitHubsAnswerIsCheckedBeforeTheAppIsKept pins each check of GitHub's answer to
@@ -1010,8 +1280,8 @@ func TestAnAppThatCannotBeKeptSaysToDeleteIt(t *testing.T) {
 // serve takes, stores nothing in Qory Apiary, and logs an error that names no file
 // of the state directory and no secret: the private key's says the key is not one, and every other
 // names GitHub's answer. An owner's login that is not one, or one longer than 39
-// characters, makes the page name the session's account; one of 39 characters is the
-// account the page names.
+// characters, makes the page link to the session's organisation; one of 39 characters
+// is the account the page links to.
 func TestGitHubsAnswerIsCheckedBeforeTheAppIsKept(t *testing.T) {
 	const accessKey = "qak_" + "0123456789abcdefghijklmnopqrstuvwxyzABCDEF"
 	const (
@@ -1062,12 +1332,13 @@ func TestGitHubsAnswerIsCheckedBeforeTheAppIsKept(t *testing.T) {
 		if tc.owner != "" {
 			owner = tc.owner
 		}
-		page, status := "GitHub created the App qory-acme, and this server could not use it. Delete it at "+rig.gh.srv.URL+"/organizations/"+owner+"/settings/apps/qory-acme, then press Set up in Qory Apiary again.\n", http.StatusInternalServerError
+		page, status := "GitHub created the App qory-acme, and this server could not use it. Delete it at "+rig.gh.srv.URL+"/organizations/"+owner+"/settings/apps/qory-acme, then press Set up in Qory Apiary again.", http.StatusInternalServerError
 		if tc.noSlug {
-			page, status = "GitHub may have created an App; delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps, then press Set up in Qory Apiary again.\n", http.StatusBadGateway
+			page, status = "GitHub may have created an App; delete it at "+rig.gh.srv.URL+"/organizations/acme/settings/apps, then press Set up in Qory Apiary again.", http.StatusBadGateway
 		}
-		if w.Code != status || w.Body.String() != page || j[setupCookie] != "" {
-			t.Errorf("%s: answered %d %q", name, w.Code, w.Body)
+		refusalShown(t, w, status, "The GitHub App could not be stored", page, "https://apiary.example.com")
+		if j[setupCookie] != "" {
+			t.Errorf("%s: the cookie is kept", name)
 		}
 		want, _ := json.Marshal(tc.err)
 		if !strings.Contains(rig.log.String(), `"msg":"setup failed","step":"created","what":"keep","error":`+string(want)) {
@@ -1163,9 +1434,7 @@ func TestASessionThatEndedFindsNone(t *testing.T) {
 	rig := newSetupRig(t, true)
 	for _, target := range []string{"/setup/continue", "/setup/created?code=" + setupCode + "&state=x"} {
 		w := rig.do(jar{connectCookie: randomID()}, http.MethodGet, target, nil)
-		if w.Code != http.StatusBadRequest || w.Body.String() != "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.\n" {
-			t.Errorf("%s answered %d %q", target, w.Code, w.Body)
-		}
+		refusalShown(t, w, http.StatusBadRequest, "No set-up is under way in this browser", "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.", "https://apiary.example.com")
 	}
 	if w := rig.do(jar{}, http.MethodGet, "/setup/other", nil); w.Code != http.StatusNotFound {
 		t.Errorf("an unknown path answered %d", w.Code)
@@ -1220,18 +1489,17 @@ func TestAFailedUploadIsTriedAgainUntilItSucceeds(t *testing.T) {
 	w = rig.do(j, http.MethodGet, "/setup/status", nil)
 	body := w.Body.String()
 	if w.Code != http.StatusAccepted || !strings.Contains(body, `<meta http-equiv="refresh" content="10">`) ||
-		!strings.Contains(body, "<p>GitHub created the App qory-acme. Storing it in Qory Apiary failed, and this server tries again until "+uploadTime(now.Add(time.Minute))+".</p>") ||
-		!strings.Contains(body, "<p>Keep this page open: it reloads every 10 seconds and shows the result.</p>") {
+		!strings.Contains(body, "<p>Storing the App in Qory Apiary failed. The GitHub adapter tries again until "+uploadTime(now.Add(time.Minute))+", and this page reloads every 10 seconds to show the result.</p>") ||
+		!shows(body, "Step 3 of 3") || !shows(body, "You can close this tab. Your first Qory Apiary tab updates without a reload.") || shows(body, "There is nothing to copy.") ||
+		!strings.Contains(body, `<a class="btn btn-md" href="https://apiary.example.com">Back to Qory Apiary</a>`) || w.Header().Get("Content-Security-Policy") != pageCSP("") {
 		t.Errorf("the status page answered %d %s", w.Code, body)
 	}
 	// Another setup is refused while the tries go on.
 	w = rig.do(jar{}, http.MethodGet, "/setup?state="+rig.pass(), nil)
 	j2 := jar{}
 	j2.take(w.Header())
-	if w = rig.do(j2, http.MethodGet, "/setup/refused", nil); w.Code != http.StatusConflict ||
-		w.Body.String() != "Wait until the earlier setup ends, then press Set up in Qory Apiary again if this adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.\n" {
-		t.Errorf("a pass while the setup tries again answered %d %q", w.Code, w.Body)
-	}
+	refusalShown(t, rig.do(j2, http.MethodGet, "/setup/refused", nil), http.StatusConflict, "An earlier set-up is still running",
+		"Wait until the earlier setup ends, then press Set up in Qory Apiary again if the GitHub adapter's GitHub App is still not set up. An earlier setup is storing its App in Qory Apiary.", "https://apiary.example.com")
 	for range 6 {
 		rig.released <- struct{}{}
 	}
@@ -1244,7 +1512,7 @@ func TestAFailedUploadIsTriedAgainUntilItSucceeds(t *testing.T) {
 		t.Fatal("the App is not set up")
 	}
 	w = rig.do(j, http.MethodGet, "/setup/status", nil)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "<p>The GitHub App qory-acme is set up. Only acme can install it, with Install in Qory Apiary.</p>") || j[setupCookie] != "" {
+	if w.Code != http.StatusOK || !shows(w.Body.String(), "The GitHub App qory-acme is set up and connected to Qory Apiary: its keys are stored there. Only acme can install it.") || j[setupCookie] != "" {
 		t.Errorf("the status page answered %d %s", w.Code, w.Body)
 	}
 	rig.mu.Lock()
@@ -1289,8 +1557,11 @@ func TestAnUploadThatFailsForGoodSaysWhichAppToDelete(t *testing.T) {
 		t.Errorf("the log: %s", rig.log.String())
 	}
 	w = rig.do(j, http.MethodGet, "/setup/status", nil)
+	body := w.Body.String()
 	if w.Code != http.StatusBadGateway || j[setupCookie] != "" ||
-		w.Body.String() != "Delete the GitHub App qory-acme at "+rig.gh.srv.URL+"/organizations/acme/settings/apps/qory-acme, then press Set up in Qory Apiary again. This server could not store the App in Qory Apiary by "+uploadTime(now)+".\n" {
+		!strings.Contains(body, "<p>Delete the GitHub App qory-acme on GitHub, then press Set up in Qory Apiary again. The GitHub adapter could not store the App in Qory Apiary by "+uploadTime(now)+".</p>") ||
+		!strings.Contains(body, `<a class="btn btn-md btn-primary" href="`+rig.gh.srv.URL+`/organizations/acme/settings/apps/qory-acme">Open the App's settings on GitHub</a>`) ||
+		!strings.Contains(body, `<a class="btn btn-md" href="https://apiary.example.com">Back to Qory Apiary</a>`) || strings.Contains(body, "About this step") || !shows(body, "Step 3 of 3") {
 		t.Errorf("the status page answered %d %q", w.Code, w.Body)
 	}
 	rig.setup.mu.Lock()
@@ -1315,8 +1586,46 @@ func TestTheStatusPageNeedsTheSessionThatSetTheAppUp(t *testing.T) {
 	rig.createdAfterFailedUpload()
 	for _, j := range []jar{{}, {setupCookie: randomID()}} {
 		w := rig.do(j, http.MethodGet, "/setup/status", nil)
-		if w.Code != http.StatusBadRequest || w.Body.String() != "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.\n" {
-			t.Errorf("%v: answered %d %q", j, w.Code, w.Body)
+		refusalShown(t, w, http.StatusBadRequest, "No set-up is under way in this browser", "No setup is under way in this browser, or it took too long. Press Set up in Qory Apiary again.", "https://apiary.example.com")
+	}
+}
+
+// TestTheOwnerIsGitHubsAnswer pins whose App the setup keeps: the owner GitHub's answer
+// to the code's exchange has, with or without an organisation on Start; the
+// organisation when the answer has no owner serve takes; and, with neither, no App,
+// with the page that says to delete it at the App's settings page of the person signed
+// in on GitHub.
+func TestTheOwnerIsGitHubsAnswer(t *testing.T) {
+	for name, tc := range map[string]struct {
+		org, owner, kind  string
+		wantOwner, wantKd string
+	}{
+		"an organisation's App":            {"acme", "acme", github.AccountOrganization, "acme", github.AccountOrganization},
+		"another owner in the answer":      {"acme", "other-org", github.AccountOrganization, "other-org", github.AccountOrganization},
+		"no owner serve takes, with org":   {"acme", "acme/x", github.AccountOrganization, "acme", github.AccountOrganization},
+		"a user's App":                     {"", "alice", github.AccountUser, "alice", github.AccountUser},
+		"an organisation's App, no org":    {"", "acme", github.AccountOrganization, "acme", github.AccountOrganization},
+		"no owner serve takes, no org":     {"", "acme/x", github.AccountUser, "", ""},
+		"an owner of another kind, no org": {"", "acme", "Bot", "", ""},
+	} {
+		rig := newSetupRig(t, true)
+		rig.gh.owner, rig.gh.ownerKind = tc.owner, tc.kind
+		j, token := rig.begin(rig.pass())
+		_, action, _ := rig.account(j, token, tc.org)
+		w := rig.do(j, http.MethodGet, "/setup/created?code="+setupCode+"&state="+stateOf(t, action), nil)
+		stored := rig.storedApp()
+		if tc.wantOwner == "" {
+			settings := rig.gh.srv.URL + "/settings/apps/" + setupSlug
+			refusalShown(t, w, http.StatusInternalServerError, "The GitHub App could not be stored",
+				"GitHub created the App qory-acme, and this server could not use it. Delete it at "+settings+", then press Set up in Qory Apiary again.", "https://apiary.example.com")
+			if stored != nil || !strings.Contains(w.Body.String(), `<a class="q-link" href="`+settings+`">`) ||
+				!strings.Contains(rig.log.String(), `"what":"keep","error":"GitHub's answer contains no owner setup can keep, and the setup has no organisation"`) || len(rig.gh.patched()) != 0 {
+				t.Errorf("%s: answered %d, stored %+v, log %s", name, w.Code, stored, rig.log.String())
+			}
+			continue
+		}
+		if w.Code != http.StatusOK || stored == nil || stored.owner != tc.wantOwner || stored.ownerKind != tc.wantKd {
+			t.Errorf("%s: answered %d, stored %+v", name, w.Code, stored)
 		}
 	}
 }

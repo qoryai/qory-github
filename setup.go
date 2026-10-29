@@ -150,12 +150,16 @@ func serveManifest(m map[string]any, publicURL string, public bool) {
 // instance admin picks on the setup page. Without active, its webhook is inactive at
 // the address [Manifest] gives a webhook, since GitHub cannot reach publicURL: GitHub
 // then sends the App no deliveries until a person sets the webhook's address and turns
-// it on, on the App's settings page; the API cannot turn it on.
+// it on, on the App's settings page; the API cannot turn it on. An empty name leaves
+// the member name out, and GitHub's page then opens with its name field empty.
 func ServeManifest(name, redirect, publicURL string, public, active bool) map[string]any {
 	m := Manifest(name, redirect)
 	serveManifest(m, publicURL, public)
 	if !active {
 		m["hook_attributes"] = Manifest(name, redirect)["hook_attributes"]
+	}
+	if name == "" {
+		delete(m, "name")
 	}
 	return m
 }

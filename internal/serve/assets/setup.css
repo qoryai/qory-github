@@ -1,0 +1,739 @@
+/* The GitHub adapter's set-up pages.
+   Copied from Qory Apiary Core assets/css/app.css at 86938770.
+   Only the tokens and rules these pages use: the light theme (qory), the dark theme
+   (qory-dark) by the browser's setting, the header, the page, the set-up frame, the
+   step indicator laid out as a row, buttons, fields, notices and the context column.
+   The select's chevron is an inline SVG in the page, not a data: image, because the
+   pages' Content-Security-Policy allows no image source. */
+
+@font-face {
+  font-family: "Geist";
+  src: url("Geist-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---- Tokens: qory ---- */
+:root {
+  color-scheme: light;
+  --color-base-100: oklch(99.3% 0.003 85);
+  --color-base-200: oklch(97.6% 0.005 85);
+  --color-base-300: oklch(94.6% 0.007 85);
+  --color-base-content: oklch(21% 0.012 65);
+  --color-primary: oklch(78% 0.15 76);
+  --color-primary-content: oklch(22% 0.045 70);
+  --color-accent: oklch(50% 0.11 66);
+  --color-error: oklch(54% 0.2 27);
+  --q-border-subtle: oklch(91.5% 0.008 80);
+  --q-border-strong: oklch(84% 0.01 80);
+  --q-border-field: oklch(66% 0.01 80);
+  --q-muted: oklch(47% 0.012 65);
+  --q-faint: oklch(54% 0.01 65);
+  --q-ring: oklch(62% 0.15 70);
+  --q-code-bg: oklch(96.8% 0.006 85);
+  --q-primary-soft: oklch(95.5% 0.04 85);
+  --q-primary-soft-content: oklch(42% 0.095 66);
+  --q-success-soft: oklch(95.5% 0.035 152);
+  --q-success-soft-content: oklch(40% 0.1 152);
+  --q-error-soft: oklch(95.5% 0.025 27);
+  --q-error-soft-content: oklch(45% 0.17 27);
+  --q-info-soft: oklch(95.5% 0.025 248);
+  --q-info-soft-content: oklch(42% 0.12 248);
+  --q-shadow-xs: 0 1px 2px oklch(21% 0.02 70 / 0.06);
+  --q-highlight: inset 0 1px 0 oklch(100% 0 0 / 0.28);
+  --q-ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --radius-selector: 0.25rem;
+  --radius-field: 0.375rem;
+  --radius-box: 0.625rem;
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ---- Tokens: qory-dark, by the browser's setting ---- */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-base-100: oklch(19.5% 0.006 70);
+    --color-base-200: oklch(16.5% 0.006 70);
+    --color-base-300: oklch(24.5% 0.008 70);
+    --color-base-content: oklch(94% 0.008 80);
+    --color-primary: oklch(80% 0.145 78);
+    --color-primary-content: oklch(20% 0.04 70);
+    --color-accent: oklch(82% 0.12 80);
+    --color-error: oklch(68% 0.18 25);
+    --q-border-subtle: oklch(27% 0.008 70);
+    --q-border-strong: oklch(35% 0.01 70);
+    --q-border-field: oklch(50% 0.01 70);
+    --q-muted: oklch(71% 0.012 75);
+    --q-faint: oklch(60% 0.012 75);
+    --q-ring: oklch(80% 0.145 78);
+    --q-code-bg: oklch(15% 0.006 70);
+    --q-primary-soft: oklch(27% 0.04 78);
+    --q-primary-soft-content: oklch(85% 0.12 80);
+    --q-success-soft: oklch(26% 0.04 152);
+    --q-success-soft-content: oklch(82% 0.12 152);
+    --q-error-soft: oklch(27% 0.05 25);
+    --q-error-soft-content: oklch(80% 0.11 25);
+    --q-info-soft: oklch(26% 0.04 248);
+    --q-info-soft-content: oklch(82% 0.09 248);
+    --q-shadow-xs: 0 1px 2px oklch(0% 0 0 / 0.4);
+    --q-highlight: inset 0 1px 0 oklch(100% 0 0 / 0.22);
+  }
+}
+
+/* ---- Base ---- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+fieldset {
+  margin: 0;
+}
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+}
+a {
+  color: inherit;
+}
+::selection {
+  background-color: var(--color-primary);
+  color: var(--color-primary-content);
+}
+:focus-visible {
+  outline: 2px solid var(--q-ring);
+  outline-offset: 2px;
+}
+.ic {
+  display: inline-block;
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+.ic-sm {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+.q-skip {
+  position: absolute;
+  left: -9999px;
+}
+.q-skip:focus {
+  left: 12px;
+  top: 12px;
+  z-index: 70;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- Header (Layouts.set_up): the mark and name, the GitHub adapter on the right ---- */
+.q-top {
+  display: flex;
+  height: 3rem;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-inline: 1rem;
+  border-bottom: 1px solid var(--q-border-subtle);
+}
+.q-brand {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: var(--radius-field);
+  color: var(--color-base-content);
+  text-decoration: none;
+}
+.q-brand svg {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+.q-brand span {
+  overflow: hidden;
+  font-size: 1rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-top-side {
+  color: var(--q-muted);
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* ---- The page ---- */
+.q-page {
+  --q-gutter: 1rem;
+  padding: 1.25rem var(--q-gutter) 3rem;
+}
+@media (min-width: 768px) {
+  .q-page {
+    --q-gutter: 1.5rem;
+    padding-top: 1.5rem;
+  }
+}
+@media (min-width: 1024px) {
+  .q-page {
+    --q-gutter: 2rem;
+  }
+}
+
+/* ---- The set-up frame: the title and the indicator on top, then the form and its
+   context. From 1024 px the context is a 320 px column beside the 480 px form; below,
+   it follows the form. ---- */
+.q-su-frame {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+  max-width: 30rem;
+}
+@media (min-width: 1024px) {
+  .q-su-frame.q-su-has-ctx {
+    max-width: none;
+    grid-template-columns: minmax(0, 480px) minmax(0, 320px);
+    column-gap: 40px;
+  }
+  .q-su-frame > .q-su-head,
+  .q-su-frame > .q-su-steps {
+    grid-column: 1 / -1;
+  }
+}
+.q-su-head {
+  display: grid;
+  gap: 6px;
+}
+.q-su-where {
+  color: var(--q-muted);
+  font-size: 13px;
+  line-height: 18px;
+}
+.q-su-h1 {
+  overflow-wrap: anywhere;
+  font-size: 1.5rem;
+  line-height: 2rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+.q-su-form {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 20px;
+}
+.q-su-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* ---- The step indicator as a row: "Step 2 of 3", its bar, the steps' names ----
+   Below 768 px the bar only, under "Step 2 of 3: On GitHub". */
+.q-su-steps {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--q-border-subtle);
+  border-radius: var(--radius-box);
+  background: var(--color-base-200);
+}
+.q-su-count {
+  display: grid;
+  gap: 10px;
+}
+.q-su-count-wide {
+  color: var(--q-muted);
+  font-size: 13px;
+}
+.q-su-count-bar {
+  display: none;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.q-su-progress {
+  display: block;
+  width: 100%;
+  height: 4px;
+  appearance: none;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-base-300);
+  overflow: hidden;
+}
+.q-su-progress::-webkit-progress-bar {
+  background: var(--color-base-300);
+  border-radius: 9999px;
+}
+.q-su-progress::-webkit-progress-value {
+  background: var(--color-primary);
+  border-radius: 9999px;
+}
+.q-su-progress::-moz-progress-bar {
+  background: var(--color-primary);
+  border-radius: 9999px;
+}
+.q-su-list {
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 4px;
+  padding: 0;
+  list-style: none;
+}
+.q-su-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border-radius: var(--radius-field);
+  color: var(--q-muted);
+  font-size: 13.5px;
+  line-height: 18px;
+}
+.q-su-nm {
+  min-width: 0;
+}
+.q-su-mark {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 9999px;
+  border: 1.5px solid var(--q-border-strong);
+  background: var(--color-base-100);
+  color: var(--q-faint);
+}
+.q-su-step.is-done .q-su-mark {
+  border-color: transparent;
+  background: var(--color-primary);
+  color: var(--color-primary-content);
+}
+.q-su-step.is-current {
+  background: var(--color-base-100);
+  color: var(--color-base-content);
+  font-weight: 500;
+}
+.q-su-step.is-current .q-su-mark {
+  border: 2px solid var(--color-primary);
+  box-shadow: 0 0 0 3px var(--q-primary-soft);
+}
+.q-su-step.is-current .q-su-mark::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--color-primary);
+}
+@media (max-width: 767.98px) {
+  .q-su-count-wide,
+  .q-su-list {
+    display: none;
+  }
+  .q-su-count-bar {
+    display: block;
+  }
+}
+
+/* ---- Prose and lists in the form ---- */
+.q-sec {
+  display: grid;
+  gap: 6px;
+}
+.q-sec-h {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+}
+.q-list {
+  display: grid;
+  gap: 4px;
+  padding-left: 1.25rem;
+  list-style: disc;
+}
+.q-list li::marker {
+  color: var(--q-faint);
+}
+.q-link {
+  color: var(--color-accent);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--color-accent) 40%, transparent);
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- Buttons ---- */
+.btn {
+  --size: 2rem;
+  display: inline-flex;
+  height: var(--size);
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  padding-inline: 0.75rem;
+  border: 1px solid var(--q-border-strong);
+  border-radius: var(--radius-field);
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+  font: inherit;
+  font-size: 0.8125rem;
+  line-height: 1rem;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  box-shadow: var(--q-shadow-xs);
+  cursor: pointer;
+  transition-property: color, background-color, border-color, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: var(--q-ease-out);
+}
+.btn:hover {
+  background-color: var(--color-base-200);
+  border-color: var(--q-border-field);
+}
+.btn-md {
+  --size: 2.5rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  padding-inline: 1rem;
+}
+.btn-primary {
+  background-color: var(--color-primary);
+  color: var(--color-primary-content);
+  border-color: color-mix(in oklab, var(--color-primary) 82%, black);
+  box-shadow: var(--q-shadow-xs), var(--q-highlight);
+}
+.btn-primary:hover {
+  background-color: color-mix(in oklab, var(--color-primary) 92%, black);
+  border-color: color-mix(in oklab, var(--color-primary) 74%, black);
+}
+@media (max-width: 767.98px) {
+  .btn {
+    --size: 2.5rem;
+    font-size: 0.875rem;
+    padding-inline: 1rem;
+  }
+}
+
+/* ---- Fields ---- */
+.fieldset {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+}
+.label {
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 500;
+}
+.input {
+  --size: 2.5rem;
+  width: 100%;
+  min-width: 0;
+  height: var(--size);
+  padding-inline: 0.75rem;
+  border: 1px solid var(--q-border-field);
+  border-radius: var(--radius-field);
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+  font: inherit;
+  font-size: 0.9375rem;
+  line-height: 1.25rem;
+  box-shadow: var(--q-shadow-xs);
+  outline: none;
+  transition-property: border-color, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: var(--q-ease-out);
+}
+.input:hover {
+  border-color: var(--q-muted);
+}
+.input:focus {
+  border-color: var(--q-ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--q-ring) 28%, transparent);
+}
+.input-error,
+.input-error:hover {
+  border-color: var(--color-error);
+}
+.input-error:focus {
+  border-color: var(--color-error);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-error) 24%, transparent);
+}
+@media (max-width: 767.98px) {
+  .input {
+    font-size: 1rem;
+  }
+}
+.hint {
+  color: var(--q-muted);
+  font-size: 12.5px;
+  line-height: 18px;
+}
+.field-error {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--color-error);
+  font-size: 12.5px;
+  line-height: 18px;
+}
+
+/* ---- Notices (CoreComponents.notice) ---- */
+.alert {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.625rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: var(--radius-field);
+  font-size: 0.8125rem;
+  line-height: 1.125rem;
+}
+.alert > .ic {
+  margin-top: 1px;
+}
+.alert-body {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+.alert-body strong {
+  font-weight: 600;
+}
+.alert-success {
+  background: var(--q-success-soft);
+  color: var(--q-success-soft-content);
+}
+.alert-info {
+  background: var(--q-info-soft);
+  color: var(--q-info-soft-content);
+}
+.alert-warning {
+  background: var(--q-primary-soft);
+  color: var(--q-primary-soft-content);
+}
+.alert-error {
+  background: var(--q-error-soft);
+  color: var(--q-error-soft-content);
+}
+.alert .q-link {
+  color: inherit;
+  text-decoration-color: currentColor;
+}
+
+/* ---- The context column (PageComponents.context_column) ---- */
+.q-context {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 10px;
+  padding-top: 4px;
+  color: var(--q-muted);
+  font-size: 0.84375rem;
+  line-height: 1.3125rem;
+}
+.q-context-h,
+.q-context h3 {
+  color: var(--color-base-content);
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+}
+.q-context h3 {
+  margin-top: 8px;
+}
+.q-context ol {
+  display: grid;
+  gap: 4px;
+  padding-left: 1.25rem;
+  list-style: decimal;
+}
+.q-context ol li::marker {
+  color: var(--q-faint);
+}
+
+/* ---- A choice without a script: Core's select (`input/1`, `type="choice"`) as a
+   <details>. The summary is the select's button and shows the checked option's title and
+   subtitle; the panel opens in place under it, in the flow, with the options as radios.
+   The radio's circle is hidden; a check marks the chosen option, and the row shows the
+   focus. Without :has(), the summary shows the field's name. ---- */
+.fieldset > legend.label {
+  float: left;
+  width: 100%;
+  margin-bottom: 0.375rem;
+  padding: 0;
+}
+.fieldset > legend.label + * {
+  clear: both;
+}
+.q-pick {
+  min-width: 0;
+}
+.q-pick > summary {
+  list-style: none;
+}
+.q-pick > summary::-webkit-details-marker {
+  display: none;
+}
+.q-pick-btn {
+  display: grid;
+  width: 100%;
+  min-height: 2.5rem;
+  grid-template-columns: minmax(0, 1fr) 1rem;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid var(--q-border-field);
+  border-radius: var(--radius-field);
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+  box-shadow: var(--q-shadow-xs);
+  text-align: left;
+  cursor: pointer;
+  transition-property: border-color, box-shadow;
+  transition-duration: 120ms;
+  transition-timing-function: var(--q-ease-out);
+}
+.q-pick-chev {
+  width: 1rem;
+  height: 1rem;
+  color: var(--q-faint);
+}
+.q-pick-btn:hover {
+  border-color: var(--q-muted);
+}
+.q-pick-btn:focus-visible,
+.q-pick[open] > .q-pick-btn {
+  outline: none;
+  border-color: var(--q-ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--q-ring) 28%, transparent);
+}
+.q-pick-text {
+  display: grid;
+  min-width: 0;
+}
+.q-pick-t {
+  font-size: 0.875rem;
+  line-height: 20px;
+}
+.q-pick-s {
+  color: var(--q-muted);
+  font-size: 0.78125rem;
+  line-height: 17px;
+}
+.q-pick-sum {
+  display: none;
+}
+@supports selector(:has(*)) {
+  .q-pick-none {
+    display: none;
+  }
+  .q-pick:has(.q-pick-o1 :checked) .q-pick-sum1,
+  .q-pick:has(.q-pick-o2 :checked) .q-pick-sum2 {
+    display: grid;
+  }
+}
+.q-pick-panel {
+  display: grid;
+  gap: 1px;
+  margin-top: 4px;
+  padding: 4px;
+  border: 1px solid var(--q-border-strong);
+  border-radius: var(--radius-box);
+  background-color: var(--color-base-100);
+  box-shadow: 0 0 0 1px oklch(21% 0.02 70 / 0.06), 0 10px 28px -8px oklch(21% 0.02 70 / 0.18);
+}
+.q-pick-opt {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0 10px;
+  padding: 7px 8px;
+  border-radius: var(--radius-selector);
+  cursor: pointer;
+}
+.q-pick-opt:hover {
+  background-color: var(--color-base-200);
+}
+.q-pick-opt:has(:focus-visible) {
+  background-color: var(--color-base-300);
+  box-shadow: inset 0 0 0 2px var(--q-ring);
+}
+.q-pick-radio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  opacity: 0;
+}
+.q-pick-ck {
+  margin-top: 2px;
+  color: var(--color-accent);
+  visibility: hidden;
+}
+.q-pick-opt:has(:checked) .q-pick-ck {
+  visibility: visible;
+}
+.q-pick-opt:has(:checked) .q-pick-t {
+  font-weight: 500;
+}
+.q-ctx-b {
+  color: var(--color-base-content);
+  font-weight: 600;
+}

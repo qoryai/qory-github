@@ -72,13 +72,16 @@ type SourceRole struct {
 	ItemNoun *Noun `json:"item_noun,omitempty"`
 	// CollectionNoun is what Qory Apiary calls one of the source's collections and many
 	// of them: repository and repositories.
-	CollectionNoun *Noun      `json:"collection_noun,omitempty"`
-	Program        string     `json:"program"`
-	Setup          SourceStep `json:"setup"`
-	Start          string     `json:"start"`
-	Connect        string     `json:"connect"`
-	Access         string     `json:"access"`
-	Disconnect     string     `json:"disconnect"`
+	CollectionNoun *Noun `json:"collection_noun,omitempty"`
+	// Targets is true: a repository can be the target of a run, the place where the
+	// run's changes go, so Qory Apiary offers the repositories as targets.
+	Targets    bool       `json:"targets,omitempty"`
+	Program    string     `json:"program"`
+	Setup      SourceStep `json:"setup"`
+	Start      string     `json:"start"`
+	Connect    string     `json:"connect"`
+	Access     string     `json:"access"`
+	Disconnect string     `json:"disconnect"`
 	// Guide is the short step-by-step help Qory Apiary shows for the set-up step and the
 	// connect step, after the first step that Qory Apiary writes: what a person does on
 	// the setup page and on GitHub.

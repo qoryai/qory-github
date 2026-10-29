@@ -7,12 +7,51 @@ change what the program does, and notes it under Upgrading.
 
 ## [Unreleased]
 
+### Added
+
+- The set-up pages of `qory-github-server serve`, where an instance admin creates the
+  GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
+  App, and the steps Start, On GitHub and Done. Start has the form. The page that opens
+  GitHub lists what to do on GitHub's page. Done shows who can install the App and what
+  to do next in Qory Apiary. The pages embed their stylesheet and the Geist font, and
+  load nothing from another host.
+- Start has the field App name. When the set-up pass has `organisation_slug`, the field
+  starts with `qory-` and the slug in GitHub's shape, at most 34 characters, such as
+  `qory-acme-org`; without it, the field starts empty. You can change the name on Start
+  or on GitHub's page. A name of more than 34 characters, or with a control character,
+  is refused before GitHub opens. With the field empty, the App's manifest has no name,
+  and you name the App on GitHub's page.
+- A set-up pass may have the member `organisation_slug`, the slug of the Qory Apiary
+  organisation, signed with the other members: 1 to 40 lower-case letters, digits and
+  hyphens, with no hyphen at either end. A pass with a slug of another shape, or with
+  any other member the contract does not define, is refused as a link that is not
+  valid.
+
 ### Changed
 
+- On the set-up pages, the optional field GitHub organisation replaces the field for the
+  GitHub account. With an organisation, GitHub creates the App under it; with the field
+  empty, under the GitHub user signed in on github.com. A login of a GitHub user, which
+  the account field took, is refused with a line that ends "Leave the field empty to
+  create the App under your account." The choice of who can install the App stays, with
+  private selected first.
+- Connect sends you to GitHub's page to install the App first. GitHub asks you to
+  authorise the App once, after Install, and the GitHub adapter then checks that you
+  administer the account you installed it on. The page that told you to press Save for
+  an App installed already is gone: GitHub shows the installation's settings, and Save
+  sends you back.
+- The refusal pages of the set-up and of Connect are HTML in the set-up look. The
+  set-up's refusal lines contain "set-up link" and "the GitHub adapter".
+- The description's set-up guide and help have these steps: sign in on github.com
+  first, as an owner of the GitHub organisation or as the user who will own the App,
+  then check the name and create the App on GitHub.
 - The description lists `egress_hosts`, the hosts a run of the integration reaches:
   `github.com` and `api.github.com`, the hosts of the credential role.
   `qory-github describe` prints them, and `description.json` lists them. The policy that
   `setup` prints takes its hosts from them and allows the same two hosts as before.
+- The GitHub adapter's description has `targets: true` in `roles.source`, so Qory
+  Apiary offers the repositories the GitHub App is installed on as places where a
+  run's changes go.
 - `setup` gives the exchange of GitHub's code for the App 30 seconds from the moment you
   approve the App. Before, the exchange had only what was left of the ten-minute wait,
   so an approval near the end of the wait could fail the exchange.
@@ -20,6 +59,12 @@ change what the program does, and notes it under Upgrading.
   from GitHub's API quotes the code, the error shows `[the code]` in its place.
 - Building `qory-github` from source needs Go 1.27.3, up from 1.27.1: the integrations
   and Forager modules it builds against require it.
+
+### Upgrading
+
+- Deploy this `qory-github-server` together with, or before, a Qory Apiary that sends
+  `organisation_slug` in its set-up pass. An earlier `qory-github-server` refuses such a
+  pass as a link that is not valid.
 
 ## [0.2.1] - 2026-10-24
 

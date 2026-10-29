@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
@@ -41,27 +40,28 @@ import (
 //     answers 303 to <public_url>/v1/connect/continue, so the pass leaves the address
 //     bar. A pass refused answers 303 too: to the pass_expired return, or to
 //     <public_url>/v1/connect/refused, which shows the page a short-lived cookie names.
-//  2. GET /v1/connect/continue sends the browser to GitHub's sign-in with the session's
-//     state; the pass never leaves serve.
-//  3. GET /v1/connect/authorized, the App's callback URL, takes the sign-in's code,
-//     which needs the session's state, exchanges it for the person's token, and reads
-//     the installations the person reaches. Then it sends the browser to install the App
-//     on GitHub, with a new state; when the person reaches an installation of the App
-//     already, it first shows a page that says to press Save on GitHub's page, since
-//     only then does GitHub send the browser back. The token is not kept.
-//  4. GET /v1/connect/return, the App's Setup URL, where GitHub sends the browser after
-//     the installation, or after its change once Save is pressed. A state it carries
-//     must be the session's. The installation it names is only a candidate, which the
-//     session keeps, and nothing is linked here: it sends the browser to GitHub's
-//     sign-in again, with a new state, which GitHub answers at once for a person who
-//     authorised the App.
-//  5. GET /v1/connect/authorized again, with that state and the session's cookie, under
-//     a new token: the candidate is linked only once GitHub, under that token, lists it
-//     among the person's installations, not suspended and with the permissions the
-//     adapter needs, and says the person administers the account it is installed on, an
-//     organisation's active administrator or the user the account is. So a grant is
-//     linked only once it is finished in the browser that brought the pass, under that
-//     pass, never on a value the browser sends back alone.
+//  2. GET /v1/connect/continue sends the browser to GitHub's page to install the App,
+//     with the session's state; the pass never leaves serve. The session notes that the
+//     browser went there, and a second request to the continue address goes back
+//     refused, so each state goes to GitHub once.
+//  3. GET /v1/connect/return, the App's Setup URL, where GitHub sends the browser after
+//     the installation, or after its change once Save is pressed on an installation's
+//     settings, needs a session that went to GitHub's page to install the App. A state
+//     it carries must be the session's. A return without a state is taken, since GitHub
+//     may send none after Save, and the sign-in's state binds the grant. The
+//     installation it names is only a candidate, which the session keeps, and nothing
+//     is linked here: it sends the browser to GitHub's sign-in, with a new state.
+//     GitHub asks a person who has not authorised the App to press Authorize, and
+//     answers at once for a person who has.
+//  4. GET /v1/connect/authorized, the App's callback URL, with that state and the
+//     session's cookie: a callback for a session that holds no candidate goes back
+//     refused before its code is exchanged. The code is exchanged for the person's
+//     token, which is not kept, and the candidate is linked only once GitHub, under
+//     that token, lists it among the person's installations, not suspended and with the
+//     permissions the adapter needs, and says the person administers the account it is
+//     installed on, an organisation's active administrator or the user the account is.
+//     So a grant is linked only once it is finished in the browser that brought the
+//     pass, under that pass, never on a value the browser sends back alone.
 //
 // Every step past the pass's checks ends with a connect return, see
 // [Connect.connectReturn]: the browser goes back to Qory Apiary, to
@@ -72,8 +72,7 @@ import (
 // that is forged or malformed, one taken already, or one for another adapter; a request
 // without a session; a store that fails, or a connect return that fails to be made; and
 // a connection that holds another installation already; and a pass no newer than the
-// newest a linked return was minted under for the connection, see [Connect.link]. So
-// does the request that tells the person to press Save.
+// newest a linked return was minted under for the connection, see [Connect.link].
 //
 // An installation is linked to one connection at a time, and a connection holds one
 // installation, pending from the linked connect return, live once Qory Apiary takes a
@@ -220,9 +219,12 @@ var (
 
 // refusal is a page that refuses a request: its status, the one sentence the browser
 // shows, and why, for the log. name, when set, is how [pageCookie] names the page.
+// heading, for a setup's page, is the page's heading, and link, when set, is the web
+// address in the sentence, which the page shows as a link.
 type refusal struct {
 	status          int
 	page, why, name string
+	heading, link   string
 	// endSession ends the session the request carries, and dropCookie has the browser
 	// drop the cookie, which endSession does too.
 	endSession, dropCookie bool
@@ -287,26 +289,27 @@ type verdict struct {
 
 // The verdicts, by what went wrong.
 var (
-	verdictExpired   = verdict{outcomeRefused, reasonPassExpired, passExpired.why}
-	verdictCancelled = verdict{outcomeCancelled, "", "the person cancelled on GitHub"}
-	verdictState     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's state is not the session's"}
-	verdictReplay    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session's sign-in is taken already"}
-	verdictSetup     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's state is not the session's"}
-	verdictDenied    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in sent back no code"}
-	verdictSignIn    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's code could not be exchanged"}
-	verdictGitHub    = verdict{outcomeRefused, reasonSourceUnavailable, "GitHub failed"}
-	verdictNoSignIn  = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session holds no sign-in"}
-	verdictAnswer    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's query is not GitHub's"}
-	verdictWaits     = verdict{outcomeRefused, reasonPersonNotPermitted, "the installation waits for an owner's approval"}
-	verdictNoAccess  = verdict{outcomeRefused, reasonGrantNotConfirmed, "the person does not reach the installation"}
-	verdictSuspended = verdict{outcomeRefused, reasonGrantSuspended, "GitHub has suspended the installation"}
-	verdictPermitted = verdict{outcomeRefused, reasonPermissionMissing, "the installation does not grant a permission the adapter needs"}
-	verdictNotAdmin  = verdict{outcomeRefused, reasonPersonNotPermitted, "the person does not administer the installation's account"}
-	verdictTaken     = verdict{outcomeRefused, reasonGrantTaken, "the installation is linked to another connection that is made"}
-	verdictBusy      = verdict{outcomeRefused, reasonSourceUnavailable, "another connect, or a listing, held the link past the deadline"}
-	verdictApiary    = verdict{outcomeRefused, reasonSourceUnavailable, "the listing of the connection the installation is linked to failed"}
-	verdictDeleted   = verdict{outcomeRefused, reasonGrantNotConfirmed, "GitHub deleted the installation meanwhile"}
-	verdictPaused    = verdict{outcomeRefused, reasonSourceUnavailable, "Qory Apiary has suspended the connection the installation is linked to"}
+	verdictExpired     = verdict{outcomeRefused, reasonPassExpired, passExpired.why}
+	verdictCancelled   = verdict{outcomeCancelled, "", "the person cancelled on GitHub"}
+	verdictState       = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's state is not the session's"}
+	verdictReplay      = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session went to GitHub's install page already"}
+	verdictSetup       = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's state is not the session's"}
+	verdictDenied      = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in sent back no code"}
+	verdictSignIn      = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in's code could not be exchanged"}
+	verdictGitHub      = verdict{outcomeRefused, reasonSourceUnavailable, "GitHub failed"}
+	verdictNotSent     = verdict{outcomeRefused, reasonGrantNotConfirmed, "the session did not go to GitHub's install page"}
+	verdictNoCandidate = verdict{outcomeRefused, reasonGrantNotConfirmed, "the sign-in came back before the Setup URL named an installation"}
+	verdictAnswer      = verdict{outcomeRefused, reasonGrantNotConfirmed, "the Setup URL's query is not GitHub's"}
+	verdictWaits       = verdict{outcomeRefused, reasonPersonNotPermitted, "the installation waits for an owner's approval"}
+	verdictNoAccess    = verdict{outcomeRefused, reasonGrantNotConfirmed, "the person does not reach the installation"}
+	verdictSuspended   = verdict{outcomeRefused, reasonGrantSuspended, "GitHub has suspended the installation"}
+	verdictPermitted   = verdict{outcomeRefused, reasonPermissionMissing, "the installation does not grant a permission the adapter needs"}
+	verdictNotAdmin    = verdict{outcomeRefused, reasonPersonNotPermitted, "the person does not administer the installation's account"}
+	verdictTaken       = verdict{outcomeRefused, reasonGrantTaken, "the installation is linked to another connection that is made"}
+	verdictBusy        = verdict{outcomeRefused, reasonSourceUnavailable, "another connect, or a listing, held the link past the deadline"}
+	verdictApiary      = verdict{outcomeRefused, reasonSourceUnavailable, "the listing of the connection the installation is linked to failed"}
+	verdictDeleted     = verdict{outcomeRefused, reasonGrantNotConfirmed, "GitHub deleted the installation meanwhile"}
+	verdictPaused      = verdict{outcomeRefused, reasonSourceUnavailable, "Qory Apiary has suspended the connection the installation is linked to"}
 )
 
 // needs are the permissions an installation grants the App that the adapter needs,
@@ -323,15 +326,16 @@ var levels = map[string]int{"read": 1, "write": 2, "admin": 3}
 // session is what the store keeps of a connect session: when it expires, in Unix
 // nanoseconds; the connection and the nonce of the pass that started it, and when that
 // pass expires, in Unix seconds; the state GitHub must send back next, a new one for
-// each trip to GitHub, so each is taken once; whether the person signed in once; and
-// the installation the Setup URL named, the candidate, which the second sign-in links.
+// each trip to GitHub, so each is taken once; whether the continue address sent the
+// browser to GitHub's page to install the App, which it does once; and the
+// installation the Setup URL named, the candidate, which the sign-in after it links.
 type session struct {
 	Expires    int64  `json:"expires"`
 	Connection string `json:"connection_id"`
 	Nonce      string `json:"nonce"`
 	Pass       int64  `json:"pass_expires_at"`
 	State      string `json:"state"`
-	SignedIn   bool   `json:"signed_in,omitempty"`
+	Installing bool   `json:"installing,omitempty"`
 	Candidate  int64  `json:"installation_id,omitempty"`
 }
 
@@ -490,8 +494,9 @@ func (c *Connect) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 }
 
 // proceed is GET /v1/connect/continue, where a pass accepted sends the browser, with no
-// pass in its address: it sends the browser to GitHub's sign-in with the session's
-// state. Once the person has signed in, it goes back refused.
+// pass in its address: it keeps in the session that it sends the browser to GitHub's
+// page to install the App, then sends it there with the session's state. A session it
+// sent there already goes back refused, so each state goes to GitHub once.
 func (c *Connect) proceed(w http.ResponseWriter, r *http.Request, _ url.Values) {
 	id, s, ok, err := c.session(r)
 	if err != nil {
@@ -502,11 +507,16 @@ func (c *Connect) proceed(w http.ResponseWriter, r *http.Request, _ url.Values) 
 		c.refuse(w, r, refuseNoSession, "")
 		return
 	}
-	if s.SignedIn {
+	if s.Installing {
 		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictReplay)
 		return
 	}
-	c.signIn(w, s.State)
+	s.Installing = true
+	if err := c.save(id, s); err != nil {
+		c.failed(w, r, id, "keeping the session", err)
+		return
+	}
+	redirect(w, github.App{Slug: c.Adapter.Slug}.InstallURL(c.Adapter.GitHub.Web())+"?"+url.Values{"state": {s.State}}.Encode())
 }
 
 // signIn sends the browser to GitHub's sign-in, with state, and the callback URL under
@@ -526,9 +536,7 @@ func (c *Connect) showPage(w http.ResponseWriter, r *http.Request, _ url.Values)
 		rf = *pages[ck.Value]
 	}
 	http.SetCookie(w, &http.Cookie{Name: pageCookie, Value: "", Path: connectPath, MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(rf.status)
-	io.WriteString(w, rf.page+"\n")
+	c.refusalPage(w, rf)
 }
 
 // checkPass checks a connect pass, in this order, and returns its payload and when it
@@ -651,10 +659,10 @@ func expiredPass(expires, now time.Time) bool {
 }
 
 // authorized is GitHub's sign-in sending the browser back, GET
-// /v1/connect/authorized?code=...&state=..., which needs the session and its state. The
-// first sign-in reads the installations the person reaches and sends the browser to
-// install the App; the second, once the Setup URL named a candidate, links it, see
-// [Connect.bind]. A sign-in brought again goes back refused, its state taken.
+// /v1/connect/authorized?code=...&state=..., which needs the session and its state, and
+// the candidate the Setup URL named: a session without one goes back refused before
+// the code is exchanged, so serve exchanges a code only to check a candidate. The code
+// is exchanged for the person's token, under which [Connect.bind] links the candidate.
 func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Values) {
 	id, s, ok, err := c.session(r)
 	if err != nil {
@@ -670,8 +678,8 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictState)
 		return
 	}
-	if s.SignedIn && s.Candidate == 0 {
-		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictReplay)
+	if s.Candidate == 0 {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNoCandidate)
 		return
 	}
 	if e, _ := one(q, "error"); e == "access_denied" {
@@ -695,35 +703,15 @@ func (c *Connect) authorized(w http.ResponseWriter, r *http.Request, q url.Value
 		c.giveBack(w, r, id, s.Connection, s.Nonce, v, slog.String("error", err.Error()))
 		return
 	}
-	if s.Candidate != 0 {
-		c.bind(ctx, w, r, id, s, token)
-		return
-	}
-	reached, err := gh.UserInstallations(ctx, token)
-	if err != nil {
-		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictGitHub, slog.String("error", err.Error()))
-		return
-	}
-	// The sign-in is taken once: its state gives way to the installation's.
-	s.State, s.SignedIn = randomID(), true
-	if err := c.save(id, s); err != nil {
-		c.failed(w, r, id, "keeping the session", err)
-		return
-	}
-	install := github.App{Slug: c.Adapter.Slug}.InstallURL(gh.Web()) + "?" + url.Values{"state": {s.State}}.Encode()
-	if len(reached) > 0 {
-		c.savePage(w, install)
-		return
-	}
-	redirect(w, install)
+	c.bind(ctx, w, r, id, s, token)
 }
 
 // installed is GitHub's Setup URL, GET
 // /v1/connect/return?installation_id=...&setup_action=..., which needs the session,
-// after its first sign-in, and the session's state when it carries one. The
-// installation it names is kept in the session as the candidate, and nothing is linked
-// here: the browser goes to GitHub's sign-in again, with a new state, see
-// [Connect.bind].
+// after the continue address sent it to GitHub's page to install the App, and the
+// session's state when it carries one. The installation it names is kept in the
+// session as the candidate, and nothing is linked here: the browser goes to GitHub's
+// sign-in, with a new state, see [Connect.bind].
 func (c *Connect) installed(w http.ResponseWriter, r *http.Request, q url.Values) {
 	id, s, ok, err := c.session(r)
 	if err != nil {
@@ -734,13 +722,13 @@ func (c *Connect) installed(w http.ResponseWriter, r *http.Request, q url.Values
 		c.refuse(w, r, refuseNoSession, "")
 		return
 	}
-	if !s.SignedIn {
-		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNoSignIn)
+	if !s.Installing {
+		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictNotSent)
 		return
 	}
 	// GitHub sends back the state the installation's address carried; whether it does
-	// once Save is pressed on an installation's page is not relied on, since the second
-	// sign-in's state binds the grant.
+	// once Save is pressed on an installation's settings is not relied on, since the
+	// sign-in's state after this step binds the grant.
 	if states, has := q["state"]; has && (len(states) != 1 || subtle.ConstantTimeCompare([]byte(states[0]), []byte(s.State)) != 1) {
 		c.giveBack(w, r, id, s.Connection, s.Nonce, verdictSetup)
 		return
@@ -768,10 +756,10 @@ func (c *Connect) installed(w http.ResponseWriter, r *http.Request, q url.Values
 	c.signIn(w, s.State)
 }
 
-// bind links the session's candidate, under the person's token from the second
-// sign-in: it checks that GitHub lists the installation among the person's, that GitHub
-// has not suspended it, that it grants the permissions the adapter needs, and that the
-// person administers its account, see [Connect.administers]; then it links the
+// bind links the session's candidate, under the person's token from the sign-in after
+// the Setup URL: it checks that GitHub lists the installation among the person's, that
+// GitHub has not suspended it, that it grants the permissions the adapter needs, and
+// that the person administers its account, see [Connect.administers]; then it links the
 // installation to the session's connection, see [Connect.link]. Once it has minted the
 // linked connect return, it stops each grant end being sent again for the account, see
 // [Adapter.stopEnd], and reports the grant, see [Connect.reportSoon]. The session ends
@@ -1341,26 +1329,12 @@ func (c *Connect) toApiary(w http.ResponseWriter, connection, ret string) {
 	redirect(w, c.ApiaryPublicURL+"/integrations/"+url.PathEscape(connection)+"?"+url.Values{"return": {ret}}.Encode())
 }
 
-// savePageHTML is the page that tells the person to press Save on GitHub's page, which
-// links to GitHub's page to install the App.
-var savePageHTML = template.Must(template.New("save").Parse(`<!doctype html>
-<meta charset="utf-8"><title>qory-github</title>
-<p>{{.Line}}</p>
-<p><a href="{{.Target}}">{{.Link}}</a></p>
-`))
+// installHeading is the heading of Connect's pages.
+const installHeading = "Install the GitHub App"
 
-// savePage answers the page that tells the person, who reaches an installation of the
-// App already, to press Save on GitHub's page: GitHub sends the browser back to the
-// Setup URL for an installation that exists only once Save is pressed. target is
-// GitHub's page to install the App, built from the settings.
-func (c *Connect) savePage(w http.ResponseWriter, target string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	savePageHTML.Execute(w, map[string]string{
-		"Line":   "The App is already installed. On GitHub's page, choose the account, then press Save to finish.",
-		"Link":   "Continue on GitHub",
-		"Target": target,
-	})
+// refusalPage answers the page of Connect's refusal rf.
+func (c *Connect) refusalPage(w http.ResponseWriter, rf refusal) {
+	refusalPage(w, pageFrame{Heading: installHeading, Apiary: c.ApiaryPublicURL}, rf)
 }
 
 // sessionKey is the store's key for the session id: its SHA-256, so the store's
@@ -1465,9 +1439,7 @@ func (c *Connect) refuse(w http.ResponseWriter, r *http.Request, rf refusal, id 
 		})
 		redirect(w, connectPath+"/refused")
 	} else {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(rf.status)
-		io.WriteString(w, rf.page+"\n")
+		c.refusalPage(w, rf)
 	}
 	ok, dropped := c.refusals.allow()
 	if !ok {
