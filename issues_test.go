@@ -564,7 +564,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 	if it.Body != "" || it.Labels == nil || len(it.Labels) != 0 || it.FiledBy != (contracts.Person{Name: "renovate[bot]", Kind: "automation"}) {
 		t.Errorf("item %+v", it)
 	}
-	c, why, _ := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"})
+	c, why, _ := commentOf(ghComment{ID: 1234567890123, HTMLURL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Body: str("Same here."), User: &ghUser{Login: "ci", Type: "Bot"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}, "qory-test", false)
 	if why != "" || !reflect.DeepEqual(c, contracts.Comment{Ref: "1234567890123", URL: "https://github.com/acme/widgets/issues/42#issuecomment-1234567890123", Author: contracts.Person{Name: "ci", Kind: "automation"}, Body: "Same here.", BodyFormat: "markdown", CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}) {
 		t.Errorf("comment %+v, %s", c, why)
 	}
@@ -725,6 +725,54 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 			}
 		}
 		if line != tc.want || len(got.Items) != 0 || len(got.Comments) > 1 {
+			t.Errorf("%s %v: %q, want %q", tc.action, tc.comment["id"], line, tc.want)
+		}
+	}
+}
+
+// The App's bot's comment for the person's comment sc_0123456789abcdef in Qory Apiary,
+// as GitHub has it.
+const botsComment = "Dana Example wrote in Qory Apiary:\n\nPlease check the steps.\n\n<!-- qory:comment sc_0123456789abcdef -->"
+
+// TestTheBotsCommentForAPersonsCommentHasItsCommentID sends issue_comment events and
+// checks that the App's bot's comment for a person's comment in Qory Apiary is sent
+// with its comment_id, created, edited and deleted, the deletion without its body; that
+// a comment whose last line is the marker is sent without comment_id when a person,
+// another App's bot or a user with the bot's login wrote it, or when the marker is not
+// its last line; and that the work item comment is still left out. Each request
+// passes the contract's schema.
+func TestTheBotsCommentForAPersonsCommentHasItsCommentID(t *testing.T) {
+	for _, tc := range []struct {
+		action  string
+		comment map[string]any
+		want    string // ref author kind comment_id deleted, or "" for nothing
+	}{
+		{"created", comment(5, "qory-test[bot]", "Bot", botsComment), "5 qory-test[bot] automation sc_0123456789abcdef false"},
+		{"edited", comment(5, "QORY-TEST[bot]", "Bot", botsComment+"\n"), "5 QORY-TEST[bot] automation sc_0123456789abcdef false"},
+		{"deleted", comment(5, "qory-test[bot]", "Bot", botsComment), "5 qory-test[bot] automation sc_0123456789abcdef true"},
+		{"created", comment(6, "bob", "User", botsComment), "6 bob person  false"},
+		{"created", comment(7, "other-app[bot]", "Bot", botsComment), "7 other-app[bot] automation  false"},
+		{"created", comment(8, "qory-test[bot]", "User", botsComment), "8 qory-test[bot] person  false"},
+		{"created", comment(9, "qory-test[bot]", "Bot", botsComment+"\nmore"), "9 qory-test[bot] automation  false"},
+		{"deleted", comment(9, "qory-test[bot]", "Bot", "An automation's comment."), "9 qory-test[bot] automation  true"},
+		{"created", comment(10, "qory-test[bot]", "Bot", "<!-- qory:work-item wi_3 -->\nQory took this into Factory."), ""},
+	} {
+		got, err := IssueCommentWebhook(event(tc.action, issue(1, 1), map[string]any{"comment": tc.comment}), "qory-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := ""
+		if len(got.Comments) == 1 && len(got.Comments[0].Comments) == 1 {
+			c := got.Comments[0].Comments[0]
+			line = fmt.Sprintf("%s %s %s %s %v", c.Ref, c.Author.Name, c.Author.Kind, c.CommentID, c.Deleted)
+			if c.Deleted && c.Body != "" {
+				t.Errorf("%s %v: a deletion is sent with its body", tc.action, tc.comment["id"])
+			}
+			if bad := check(got.Comments[0]); bad != "" {
+				t.Errorf("%s %v: %s", tc.action, tc.comment["id"], bad)
+			}
+		}
+		if line != tc.want || len(got.Comments) > 1 {
 			t.Errorf("%s %v: %q, want %q", tc.action, tc.comment["id"], line, tc.want)
 		}
 	}
@@ -1310,7 +1358,7 @@ func TestACutFieldIsNamedInTruncated(t *testing.T) {
 	} {
 		c := ghComment{ID: 5, HTMLURL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Body: str("Same here."), User: &ghUser{Login: "bob", Type: "User"}, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z"}
 		tc.edit(&c)
-		sc, why, _ := commentOf(c)
+		sc, why, _ := commentOf(c, "qory-test", false)
 		got, ok := truncatedMember(t, sc)
 		if why != "" || !reflect.DeepEqual(sc.Truncated, tc.want) || ok != (tc.want != nil) || !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("comment, %s: truncated %q, member %v %q, %s", tc.name, sc.Truncated, ok, got, why)

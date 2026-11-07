@@ -58,6 +58,7 @@ type fakeTakeIn struct {
 	issueStatus int // the status of every request on the issue, when set: 404 or 410
 	nextHost    string
 	answers     map[string]fakeAnswer // by method and path: what GitHub answers instead
+	lostPosts   int                   // the first posts of a comment that GitHub creates, then answers 502
 	mu          sync.Mutex
 	requests    []string // method and path with its query
 	auth        []string
@@ -137,6 +138,12 @@ func (f *fakeTakeIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(b, &got)
 		f.comments = append(f.comments, commentBy(takeInBot, "Bot", got.Body))
+		if f.lostPosts > 0 {
+			f.lostPosts--
+			w.WriteHeader(502)
+			io.WriteString(w, `{"message":"Bad Gateway"}`)
+			return
+		}
 		w.WriteHeader(201)
 		io.WriteString(w, `{"id":1}`)
 	default:
@@ -798,6 +805,305 @@ func TestTheRefsParseStrictly(t *testing.T) {
 	for _, id := range []int64{0, -1} {
 		if ref := CollectionRef(id); ref != "" || checkRef(ref) == "" {
 			t.Errorf("CollectionRef(%d) is %q", id, ref)
+		}
+	}
+}
+
+// The comment entry the comment tests post on the fake issue, and what the App's bot
+// posts for it.
+const (
+	testCommentID     = "sc_0123456789abcdef"
+	postedTestComment = "Dana Example wrote in Qory Apiary:\n\nPlease check the steps in the description.\n\n<!-- qory:comment sc_0123456789abcdef -->"
+)
+
+var testComment = Comment{CommentID: testCommentID, Ref: "1296269#7", AuthorName: "Dana Example", Body: "Please check the steps in the description."}
+
+// TestACommentIsPostedOnceWithItsNameLineAndMarker posts a comment entry, and checks the
+// requests, the token, the comment's text, which is the name line, the person's text
+// unchanged and the marker as its last line, and that posting the same entry again
+// posts no second comment.
+func TestACommentIsPostedOnceWithItsNameLineAndMarker(t *testing.T) {
+	f := &fakeTakeIn{}
+	c, token, asked := serveTakeIn(t, f)
+	for range 2 {
+		if err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		"GET /repositories/1296269/issues/7/comments?per_page=100",
+		"POST /repositories/1296269/issues/7/comments",
+		"GET /repositories/1296269/issues/7/comments?per_page=100",
+	}
+	if strings.Join(f.requests, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests:\n%s\nwant:\n%s", strings.Join(f.requests, "\n"), strings.Join(want, "\n"))
+	}
+	if got := f.posts(); len(got) != 1 || got[0] != postedTestComment {
+		t.Errorf("the comments posted are %q, want %q", got, postedTestComment)
+	}
+	for _, a := range f.auth {
+		if a != "Bearer "+takeInToken {
+			t.Errorf("a request has the Authorization %q", a)
+		}
+	}
+	if !slices.Equal(*asked, []int64{1296269, 1296269}) {
+		t.Errorf("tokens were asked for %v", *asked)
+	}
+}
+
+// TestTheCommentMarkerIsFoundOnALaterPage pages the issue's comments, one to a page, with
+// the bot's comment, a trailing newline after its marker, on the third page, and checks
+// that it is found and nothing is posted.
+func TestTheCommentMarkerIsFoundOnALaterPage(t *testing.T) {
+	f := &fakeTakeIn{pageSize: 1, comments: []takeInComment{
+		commentBy("someone", "User", "first"),
+		commentBy(takeInBot, "Bot", takenInComment),
+		commentBy(takeInBot, "Bot", postedTestComment+"\n"),
+	}}
+	c, token, _ := serveTakeIn(t, f)
+	if err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.posts(); len(got) != 0 {
+		t.Errorf("a comment was posted again: %q", got)
+	}
+	if !slices.Contains(f.requests, "GET /repositories/1296269/issues/7/comments?per_page=100&page=3") {
+		t.Errorf("the third page was not read: %v", f.requests)
+	}
+}
+
+// TestOnlyTheBotsLastLineMarkerCounts puts the comment's marker on the issue where it
+// does not count: in a person's comment, as its last line; in the bot's comment, quoted
+// inside the text, with text after it; in another App's bot's comment; in a comment by
+// a user with the bot's login; with two trailing newlines; and as the marker of
+// sc_0123456789abcdefg, whose id starts with the entry's. The comment is posted all the
+// same.
+func TestOnlyTheBotsLastLineMarkerCounts(t *testing.T) {
+	mark := "<!-- qory:comment " + testCommentID + " -->"
+	f := &fakeTakeIn{comments: []takeInComment{
+		commentBy("someone", "User", "Copied from the issue:\n\n"+mark),
+		commentBy(takeInBot, "Bot", "Bob wrote in Qory Apiary:\n\n"+mark+"\n\n<!-- qory:comment sc_0123456789abcdeg -->"),
+		commentBy("other-app[bot]", "Bot", postedTestComment),
+		commentBy(takeInBot, "User", postedTestComment),
+		commentBy(takeInBot, "Bot", postedTestComment+"\n\n"),
+		commentBy(takeInBot, "Bot", "Bob wrote in Qory Apiary:\n\nx\n\n<!-- qory:comment sc_0123456789abcdefg -->"),
+		commentBy(takeInBot, "Bot", mark+" and more"),
+	}}
+	c, token, _ := serveTakeIn(t, f)
+	if err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.posts(); len(got) != 1 || got[0] != postedTestComment {
+		t.Errorf("the comments posted are %q", got)
+	}
+}
+
+// TestTheNameLineCleansAndEscapesTheName posts comments whose author's name would
+// mention a user, link an issue, change the formatting or reorder the line, and checks
+// the exact first line: a zero-width space after each @ and #, each Markdown character,
+// & and $ after a backslash, the bidirectional controls and invisible characters
+// removed, and the leading and trailing spaces trimmed. The person's text is posted
+// unchanged.
+func TestTheNameLineCleansAndEscapesTheName(t *testing.T) {
+	for name, want := range map[string]string{
+		"@octocat":                       "@\u200boctocat",
+		"**x**":                          `\*\*x\*\*`,
+		"#123":                           "\\#\u200b123",
+		"&#8238;x":                       "\\&\\#\u200b8238;x",
+		"$x$":                            `\$x\$`,
+		"Dana \u202eelpmaxE":             "Dana elpmaxE",
+		"\u200bDana\u2066 Example\ufeff": "Dana Example",
+		"Dana\u2028Example":              "Dana Example",
+		"\u2029Dana Example\u2028":       "Dana Example",
+		"Dana @octo-org/team **x**":      "Dana @\u200bocto\\-org/team \\*\\*x\\*\\*",
+		"\\`*_{}[]()#+-.!|<>~&$":         "\\\\\\`\\*\\_\\{\\}\\[\\]\\(\\)\\#\u200b\\+\\-\\.\\!\\|\\<\\>\\~\\&\\$",
+		"    Dana Example ":              "Dana Example",
+		"\u00a0\u3000Dana Example\u2009": "Dana Example",
+		"José Ñandú :tada:":              "José Ñandú :tada:",
+	} {
+		f := &fakeTakeIn{}
+		c, token, _ := serveTakeIn(t, f)
+		e := testComment
+		e.AuthorName = name
+		e.Body = "@octocat **x**"
+		if err := c.PostComment(context.Background(), nil, token, takeInSlug, e); err != nil {
+			t.Fatalf("%q: %v", name, err)
+		}
+		posted := f.posts()
+		if len(posted) != 1 {
+			t.Fatalf("%q: posted %q", name, posted)
+		}
+		first, rest, _ := strings.Cut(posted[0], "\n")
+		if first != want+" wrote in Qory Apiary:" {
+			t.Errorf("%q: the first line is %q, want %q", name, first, want+" wrote in Qory Apiary:")
+		}
+		if rest != "\n@octocat **x**\n\n<!-- qory:comment "+testCommentID+" -->" {
+			t.Errorf("%q: the rest is %q", name, rest)
+		}
+	}
+}
+
+// TestACommentWhoseAnswerIsLostIsPostedOnce has GitHub create the comment and then
+// answer the post 502, as when the answer is lost, and checks that the post fails with
+// an error that may pass, and that the retry finds the comment and posts nothing.
+func TestACommentWhoseAnswerIsLostIsPostedOnce(t *testing.T) {
+	f := &fakeTakeIn{lostPosts: 1}
+	c, token, _ := serveTakeIn(t, f)
+	err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment)
+	var refused *CommentRefused
+	if err == nil || errors.As(err, &refused) {
+		t.Fatalf("err %v, want an error that may pass", err)
+	}
+	if err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.posts(); len(got) != 1 || len(f.comments) != 1 || f.comments[0].Body != postedTestComment {
+		t.Errorf("posted %q, the issue's comments %v", got, f.comments)
+	}
+}
+
+// TestACommentGitHubRefusesHasItsReason has GitHub answer the post, or the read of the
+// issue's comments, with each status that asking again would get, and checks the
+// reason of the [*CommentRefused]; a rate limit's 403, a 500 and a 401 are no refusal.
+// No error contains the token, the name or the text.
+func TestACommentGitHubRefusesHasItsReason(t *testing.T) {
+	const post = "POST /repositories/1296269/issues/7/comments"
+	const read = "GET /repositories/1296269/issues/7/comments"
+	for _, tc := range []struct {
+		name   string
+		on     string
+		answer fakeAnswer
+		want   string // the reason, or "" for an error that may pass
+	}{
+		{"404", post, fakeAnswer{status: 404, body: `{"message":"Not Found"}`}, ReasonItemGone},
+		{"410", post, fakeAnswer{status: 410, body: `{"message":"Gone"}`}, ReasonItemGone},
+		{"301", post, fakeAnswer{status: 301, header: map[string]string{"Location": "https://api.github.com/repositories/1/issues/7/comments"}, body: `{"message":"Moved Permanently"}`}, ReasonItemGone},
+		{"308", post, fakeAnswer{status: 308, header: map[string]string{"Location": "https://api.github.com/repositories/1/issues/7/comments"}, body: `{"message":"Permanent Redirect"}`}, ReasonItemGone},
+		{"read 404", read, fakeAnswer{status: 404, body: `{"message":"Not Found"}`}, ReasonItemGone},
+		{"read 301", read, fakeAnswer{status: 301, header: map[string]string{"Location": "https://api.github.com/repositories/1/issues/7/comments"}, body: `{"message":"Moved Permanently"}`}, ReasonItemGone},
+		{"403", post, fakeAnswer{status: 403, body: `{"message":"Resource not accessible by integration"}`}, ReasonNotPermitted},
+		{"422 body", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body","message":"body is too long (maximum is 65536 characters)"}]}`}, ReasonTooLong},
+		{"422 other", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"unprocessable","field":"data"}]}`}, ReasonNotPermitted},
+		{"422 without errors", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed"}`}, ReasonNotPermitted},
+		{"403 rate limit", post, fakeAnswer{status: 403, header: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1"}, body: `{"message":"API rate limit exceeded"}`}, ""},
+		{"500", post, fakeAnswer{status: 500, body: `{"message":"Server Error"}`}, ""},
+		{"401", post, fakeAnswer{status: 401, body: `{"message":"Bad credentials"}`}, ""},
+	} {
+		f := &fakeTakeIn{answers: map[string]fakeAnswer{tc.on: tc.answer}}
+		c, token, _ := serveTakeIn(t, f)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c.PostComment(ctx, &Pacer{Sleep: func(context.Context, time.Duration) error { return errors.New("no wait in the test") }}, token, takeInSlug, testComment)
+		cancel()
+		var refused *CommentRefused
+		switch {
+		case err == nil:
+			t.Errorf("%s: no error", tc.name)
+		case tc.want == "" && errors.As(err, &refused):
+			t.Errorf("%s: refused as %s: %v", tc.name, refused.Reason, err)
+		case tc.want != "" && (!errors.As(err, &refused) || refused.Reason != tc.want):
+			t.Errorf("%s: err %v, want the reason %s", tc.name, err, tc.want)
+		}
+		if err != nil && (strings.Contains(err.Error(), takeInToken) || strings.Contains(err.Error(), "Dana") || strings.Contains(err.Error(), "steps")) {
+			t.Errorf("%s: the error contains a secret or a text: %v", tc.name, err)
+		}
+	}
+}
+
+// TestACommentTooLongIsRefusedBeforeAnything posts a comment whose text, with the name
+// line and the marker, is one character over 65,536, and checks it is refused as
+// too_long, with no token asked for and nothing sent; one character less is posted.
+func TestACommentTooLongIsRefusedBeforeAnything(t *testing.T) {
+	over := maxCommentBody - len("Dana Example wrote in Qory Apiary:\n\n\n\n<!-- qory:comment "+testCommentID+" -->") + 1
+	f := &fakeTakeIn{}
+	c, token, asked := serveTakeIn(t, f)
+	e := testComment
+	e.Body = strings.Repeat("é", over)
+	err := c.PostComment(context.Background(), nil, token, takeInSlug, e)
+	var refused *CommentRefused
+	if !errors.As(err, &refused) || refused.Reason != ReasonTooLong {
+		t.Errorf("err %v, want too_long", err)
+	}
+	if len(f.requests) != 0 || len(*asked) != 0 {
+		t.Errorf("requests %v, tokens %v", f.requests, *asked)
+	}
+	e.Body = strings.Repeat("é", over-1)
+	if err := c.PostComment(context.Background(), nil, token, takeInSlug, e); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.posts(); len(got) != 1 || len([]rune(got[0])) != maxCommentBody {
+		t.Errorf("posted %d comments", len(got))
+	}
+}
+
+// TestAnInvalidCommentEntryIsRefusedBeforeAnything posts comment entries whose ref,
+// comment_id or author_name the contract forbids, or whose author_name is empty once
+// cleaned, and checks each is refused as ErrInvalidChange
+// with the rule, not the value, and that no token is asked for and nothing is sent.
+func TestAnInvalidCommentEntryIsRefusedBeforeAnything(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*Comment)
+		want string
+	}{
+		{"no number", func(e *Comment) { e.Ref = "1296269" }, "ref"},
+		{"a name", func(e *Comment) { e.Ref = "acme/widgets#7" }, "ref"},
+		{"empty id", func(e *Comment) { e.CommentID = "" }, "comment_id"},
+		{"a Thread comment's id", func(e *Comment) { e.CommentID = "cm_0123456789abcdef" }, "comment_id"},
+		{"upper case", func(e *Comment) { e.CommentID = "sc_0123456789ABCDEF" }, "comment_id"},
+		{"not Crockford", func(e *Comment) { e.CommentID = "sc_0123456789abcdeu" }, "comment_id"},
+		{"too long", func(e *Comment) { e.CommentID = testCommentID + "g" }, "comment_id"},
+		{"a marker breaker", func(e *Comment) { e.CommentID = "sc_0123456789abcdef -->" }, "comment_id"},
+		{"empty name", func(e *Comment) { e.AuthorName = "" }, "author_name"},
+		{"spaces alone", func(e *Comment) { e.AuthorName = "   " }, "author_name"},
+		{"Unicode spaces alone", func(e *Comment) { e.AuthorName = "\u00a0\u3000\u202f" }, "author_name"},
+		{"invisible alone", func(e *Comment) { e.AuthorName = " \u200b\u202e " }, "author_name"},
+		{"a line break", func(e *Comment) { e.AuthorName = "Dana\nExample" }, "author_name"},
+		{"a tab", func(e *Comment) { e.AuthorName = "Dana\tExample" }, "author_name"},
+		{"a delete", func(e *Comment) { e.AuthorName = "Dana\x7fExample" }, "author_name"},
+		{"a C1 control", func(e *Comment) { e.AuthorName = "Dana\u0085Example" }, "author_name"},
+		{"101 characters", func(e *Comment) { e.AuthorName = strings.Repeat("é", 101) }, "author_name"},
+		{"not UTF-8", func(e *Comment) { e.AuthorName = "Dana \xff" }, "author_name"},
+	} {
+		tr := &sentTransport{}
+		var asked bool
+		token := func(context.Context, int64) (string, error) { asked = true; return takeInToken, nil }
+		e := testComment
+		tc.edit(&e)
+		err := Client{HTTP: &http.Client{Transport: tr}}.PostComment(context.Background(), nil, token, takeInSlug, e)
+		if err == nil || !strings.HasPrefix(err.Error(), "the comment's "+tc.want+" ") || !errors.Is(err, ErrInvalidChange) {
+			t.Errorf("%s: err %v, want the rule of %s", tc.name, err, tc.want)
+		}
+		if asked || tr.sent {
+			t.Errorf("%s: token asked %v, sent %v", tc.name, asked, tr.sent)
+		}
+	}
+	e := testComment
+	e.AuthorName = strings.Repeat("é", 100)
+	f := &fakeTakeIn{}
+	c, token, _ := serveTakeIn(t, f)
+	if err := c.PostComment(context.Background(), nil, token, takeInSlug, e); err != nil {
+		t.Errorf("a name of 100 characters: %v", err)
+	}
+}
+
+// TestMarkedIDReadsTheLastLineAlone checks which bodies have a comment marker of an id
+// as their last line.
+func TestMarkedIDReadsTheLastLineAlone(t *testing.T) {
+	for body, want := range map[string]string{
+		postedTestComment:                              testCommentID,
+		postedTestComment + "\n":                       testCommentID,
+		postedTestComment + "\n\n":                     "",
+		postedTestComment + "\r\n":                     "",
+		"<!-- qory:comment " + testCommentID + " -->":  testCommentID,
+		"<!-- qory:comment sc_0123456789abcdefg -->":   "",
+		"<!-- qory:comment sc_0123456789abcde -->":     "",
+		"<!-- qory:comment  " + testCommentID + " -->": "",
+		" <!-- qory:comment " + testCommentID + " -->": "",
+		"<!-- qory:work-item wi_42 -->":                "",
+		"":                                             "",
+	} {
+		if got := markedID(body); got != want {
+			t.Errorf("%q: %q, want %q", body, got, want)
 		}
 	}
 }

@@ -73,6 +73,10 @@ type SourceRole struct {
 	// CollectionNoun is what Qory Apiary calls one of the source's collections and many
 	// of them: repository and repositories.
 	CollectionNoun *Noun `json:"collection_noun,omitempty"`
+	// Comments is true: the adapter posts on the issue each comment a person writes in
+	// Qory Apiary on a work item taken in from it, so Qory Apiary writes a comment entry
+	// to the change feed for each.
+	Comments bool `json:"comments,omitempty"`
 	// Targets is true: a repository can be the target of a run, the place where the
 	// run's changes go, so Qory Apiary offers the repositories as targets.
 	Targets    bool       `json:"targets,omitempty"`

@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -99,10 +100,12 @@ func (f *feed) unknownLog() *throttle {
 // longer, a wait that doubles. The cursor is kept in the store, and moves only once
 // every entry of the page it ends is applied, or failed for good and logged, so an
 // entry is never skipped by a stop or a restart, and one may be applied again, which
-// does no harm: every entry's action is one a repeat finds done. An entry that fails,
-// not for good, is read again after the wait, and passed and logged once it has failed
-// for stuckFor, see [feed.step], so no entry stops the feed for ever. An answer that holds an entry
-// serve cannot apply is refused whole, see [feed.step], and read again after the wait.
+// does no harm: every entry's action is one a repeat finds done, a comment's post among
+// them, see [github.Client.PostComment]. An entry that fails, not for good, is read
+// again after the wait, and passed and logged once it has failed for stuckFor, see
+// [feed.step], so no entry stops the feed for ever; a comment entry is reported as not
+// posted first, see [feed.report]. An answer that contains an entry serve cannot apply
+// is refused whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
 	backoff := feedFirstBackoff
@@ -200,6 +203,8 @@ func known(ch contracts.Change) bool {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
 		return ch.Status == github.StatusTakenIn || ch.Status == github.StatusUndone
+	case contracts.ChangeComment:
+		return true
 	case contracts.ChangeCollection, contracts.ChangeGrant:
 		return ch.Status == "linked" || ch.Status == "unlinked"
 	case contracts.ChangeSync:
@@ -210,10 +215,15 @@ func known(ch contracts.Change) bool {
 
 // step reads one page of the feed after the cursor kept, applies its entries in order,
 // and keeps the page's cursor. An entry that fails for good is logged and passed; any
-// other error stops the page, whose cursor is not kept, to be read again.
+// other error stops the page, whose cursor is not kept, to be read again. A comment
+// entry whose comment GitHub does not take for good is reported to Qory Apiary as not
+// posted, with the reason, before it is passed, see [feed.comment].
 //
 // An entry that fails, not for good, is timed from its first failure: once it has
-// failed for stuckFor, it is logged and passed too. The feed keeps, for the page read
+// failed for stuckFor, it is logged and passed too. A comment entry is reported first,
+// with the reason unreachable, or with the reason of a report that failed before, see
+// [reportPending]; a report that fails, not for good, stops the page, so no comment
+// entry is passed before Qory Apiary has its report. The feed keeps, for the page read
 // after the cursor, each entry's first failure and the entries passed, which a read
 // of the same page again skips, so every entry of a page is timed and passed alone,
 // and the page's cursor is kept once none is left; it forgets them when the cursor
@@ -260,6 +270,16 @@ func (f *feed) step(ctx context.Context) error {
 		if err != nil {
 			if f.failedFor(i) < stuckFor {
 				return err
+			}
+			if ch.Kind == contracts.ChangeComment {
+				reason := github.ReasonUnreachable
+				var p *reportPending
+				if errors.As(err, &p) {
+					reason = p.reason
+				}
+				if err := f.report(ctx, ch.CommentID, reason, err); !IsPermanent(err) {
+					return err
+				}
 			}
 			f.log.Error("a change of the feed has failed for a day, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
 			f.failing.passed[i] = true
@@ -313,11 +333,12 @@ func (f *feed) failedFor(index int) time.Duration {
 }
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for
-// good. A collection's entry whose ref is not a repository's id fails for good, before the
-// store is written. A grant's entry, linked or unlinked, reads Qory Apiary's copy of the
-// grants again, once for each page, see [Adapter.syncGrants]: the copy wins, so the
-// entries after the first of a page find it read; one whose grant_ref is not an
-// installation's id, or whose connection_id is not a connection's, fails for good.
+// good. A comment entry posts its comment, see [feed.comment]. A collection's entry
+// whose ref is not a repository's id fails for good, before the store is written. A
+// grant's entry, linked or unlinked, reads Qory Apiary's copy of the grants again, once
+// for each page, see [Adapter.syncGrants]: the copy wins, so the entries after the
+// first of a page find it read; one whose grant_ref is not an installation's id, or
+// whose connection_id is not a connection's, fails for good.
 func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
@@ -325,6 +346,8 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 			break
 		}
 		return f.adapter.applyChange(ctx, ch)
+	case contracts.ChangeComment:
+		return f.comment(ctx, ch)
 	case contracts.ChangeCollection:
 		if _, err := repositoryID(ch.CollectionRef); err != nil {
 			return Permanent(err)
@@ -359,3 +382,44 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	}
 	return Permanent(errors.New("the change is not one serve knows"))
 }
+
+// comment posts the comment of a comment entry, see [Adapter.applyComment]. When
+// GitHub does not take the comment for good, a [*github.CommentRefused], it reports the
+// comment as not posted, with the refusal's reason, see [feed.report], before the
+// entry is passed.
+func (f *feed) comment(ctx context.Context, ch contracts.Change) error {
+	err := f.adapter.applyComment(ctx, ch)
+	var refused *github.CommentRefused
+	if !errors.As(err, &refused) {
+		return err
+	}
+	return f.report(ctx, ch.CommentID, refused.Reason, err)
+}
+
+// report sends Qory Apiary the failure report of the comment entry with commentID, for
+// reason, after cause, the post's failure, see [Apiary.ChangesFailed]. Sent, or refused
+// for good, as Qory Apiary's 400 or 403 is, it is a [Permanent] error, so the feed logs
+// the entry and passes it. A report that fails otherwise is a [*reportPending], which
+// may pass, so the page stays and the entry is posted again: the report is sent before
+// the entry is passed, whatever the time.
+func (f *feed) report(ctx context.Context, commentID, reason string, cause error) error {
+	err := f.apiary.ChangesFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, CommentID: commentID, Reason: reason})
+	switch {
+	case err == nil:
+		return Permanent(fmt.Errorf("%w; reported to Qory Apiary as %s", cause, reason))
+	case IsPermanent(err):
+		return Permanent(fmt.Errorf("%w; Qory Apiary refused the report: %w", cause, err))
+	}
+	// The cause is kept as text alone: an error it wraps may be one IsPermanent takes.
+	return &reportPending{reason: reason, err: fmt.Errorf("%s; %w", cause.Error(), err)}
+}
+
+// reportPending is a failure report of a comment entry that failed, not for good: its
+// reason, and the report's error.
+type reportPending struct {
+	reason string
+	err    error
+}
+
+func (e *reportPending) Error() string { return e.err.Error() }
+func (e *reportPending) Unwrap() error { return e.err }

@@ -25,6 +25,7 @@ import (
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/store"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // wired is the adapter whole: a receiver and a worker with the adapter's handlers, the
@@ -1604,6 +1605,344 @@ func TestTheFeedTakesInAWorkItemOnceThroughAReplay(t *testing.T) {
 		if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != want {
 			t.Errorf("the interval %s, want %s", v, want)
 		}
+	}
+}
+
+// testCommentID is the id of the comment entries the comment tests read.
+const testCommentID = "sc_0123456789abcdef"
+
+// commentEntry is a comment entry of the feed for the issue n of the repository name,
+// by Dana Example.
+func commentEntry(name string, n int) contracts.Change {
+	return contracts.Change{Kind: contracts.ChangeComment, CommentID: testCommentID, Ref: itemOf(name, n), AuthorName: "Dana Example", Body: "Please check the steps."}
+}
+
+// reports are the failure reports the fake received, refused ones too, each its
+// comment_id and its reason.
+func (f *fakeApiary) reports() []string {
+	var out []string
+	for _, r := range f.sent(routeChangesFailed) {
+		out = append(out, fmt.Sprint(r.body["comment_id"], " ", r.body["reason"]))
+	}
+	return out
+}
+
+// TestTheFeedPostsACommentOnceThroughAReplay reads a comment entry, which posts the
+// comment on the issue with a token that writes the repository's issues, and reads the
+// feed again from the start, which posts no second comment and sends no report.
+func TestTheFeedPostsACommentOnceThroughAReplay(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	for range 2 {
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+			t.Errorf("the cursor %q", c)
+		}
+		if err := w.st.Delete(nsAdapter, keyCursor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := "Dana Example wrote in Qory Apiary:\n\nPlease check the steps.\n\n<!-- qory:comment " + testCommentID + " -->"
+	if posted := w.gh.postedComments(); len(posted) != 1 || posted[0] != want {
+		t.Errorf("posted %q, want %q", posted, want)
+	}
+	if !strings.Contains(strings.Join(w.gh.mints, " "), `{"permissions":{"issues":"write"},"repository_ids":[`+widgetsRef+`]}`) {
+		t.Errorf("mints %v", w.gh.mints)
+	}
+	if r := w.apiary.reports(); len(r) != 0 || strings.Contains(w.log.String(), "failed") {
+		t.Errorf("reports %v, the log %s", r, w.log.String())
+	}
+}
+
+// TestACommentNotPostedIsReportedWithItsReason reads a comment entry that GitHub does not
+// take for good, and checks that the failure report is sent once with the reason, that
+// its body passes the contract's schema, that the entry is passed and logged with its
+// comment_id and without the name or the text, and that nothing is posted.
+func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
+	widgets7 := commentEntry("acme/widgets", 7)
+	long := widgets7
+	long.Body = strings.Repeat("a", 65_500)
+	answer := func(status int, body string) func(f *fakeGitHub) {
+		return func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = status, body }
+	}
+	for _, tc := range []struct {
+		name  string
+		entry contracts.Change
+		set   func(f *fakeGitHub)
+		want  string
+		quiet bool // GitHub is asked nothing
+	}{
+		{"an issue that is gone", commentEntry("acme/widgets", 8), nil, "item_gone", false},
+		{"410", widgets7, answer(410, `{"message":"Gone"}`), "item_gone", false},
+		{"a repository moved", commentEntry("acme/moved", 9), nil, "item_gone", false},
+		{"308", widgets7, answer(308, `{"message":"Permanent Redirect"}`), "item_gone", false},
+		{"no installation", commentEntry("acme/gadgets", 7), nil, "item_gone", true},
+		{"403", widgets7, answer(403, `{"message":"Resource not accessible by integration"}`), "not_permitted", false},
+		{"a mint refused", commentEntry("acme/old", 9), nil, "not_permitted", false},
+		{"a suspended installation", widgets7, func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", false},
+		{"422 for the body", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body"}]}`), "too_long", false},
+		{"another 422", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"issue"}]}`), "not_permitted", false},
+		{"a text too long", long, nil, "too_long", true},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		for _, repo := range []string{"acme/widgets", "acme/moved", "acme/old"} {
+			setReach(w.st, refOf(repo), 42)
+		}
+		if tc.set != nil {
+			setGitHub(w.gh, tc.set)
+		}
+		w.apiary.add(tc.entry)
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+			t.Errorf("%s: the cursor %q", tc.name, c)
+		}
+		if r := w.apiary.reports(); len(r) != 1 || r[0] != testCommentID+" "+tc.want {
+			t.Errorf("%s: reports %v, want %s", tc.name, r, tc.want)
+		}
+		logged := w.log.String()
+		if !strings.Contains(logged, `"msg":"a change of the feed failed, and is passed","kind":"comment","error":"posting the comment `+testCommentID+`: `) ||
+			!strings.Contains(logged, "reported to Qory Apiary as "+tc.want) {
+			t.Errorf("%s: the log %s", tc.name, logged)
+		}
+		if strings.Contains(logged, "Dana") || strings.Contains(logged, "steps") || strings.Contains(logged, "aaaa") {
+			t.Errorf("%s: the log contains the name or the text: %s", tc.name, logged)
+		}
+		w.gh.mu.Lock()
+		asked := slices.Clone(w.gh.requests)
+		w.gh.mu.Unlock()
+		if tc.quiet && len(asked) != 0 {
+			t.Errorf("%s: GitHub was asked %v", tc.name, asked)
+		}
+		if posted := w.gh.postedComments(); len(posted) != 0 {
+			t.Errorf("%s: posted %q", tc.name, posted)
+		}
+	}
+}
+
+// TestACommentThatFailsForADayIsReportedUnreachable has GitHub answer the post 502 for a
+// day: the entry stays, with no report, until a day of its failures has passed, and is
+// then reported as unreachable and passed.
+func TestACommentThatFailsForADayIsReportedUnreachable(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 502, `{"message":"Bad Gateway"}` })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	for _, after := range []time.Duration{0, stuckFor - time.Second} {
+		now = now.Add(after)
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("after %v: err %v", after, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v: the cursor is kept", after)
+		}
+	}
+	if r := w.apiary.reports(); len(r) != 0 {
+		t.Errorf("reported before a day: %v", r)
+	}
+	now = now.Add(time.Second)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := w.apiary.reports(); len(r) != 1 || r[0] != testCommentID+" unreachable" {
+		t.Errorf("reports %v", r)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	if !strings.Contains(w.log.String(), `"msg":"a change of the feed has failed for a day, and is passed","kind":"comment"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAReportThatFailsKeepsThePage has Qory Apiary answer the failure report of a
+// comment GitHub answers 404 with 503: the step fails, the cursor stays, also once a day
+// has passed, when the report keeps its reason, item_gone, rather than unreachable. Once
+// Qory Apiary takes the report, the entry is passed.
+func TestAReportThatFailsKeepsThePage(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 404, `{"message":"Not Found"}` })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	down := true
+	w.apiary.mu.Lock()
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeChangesFailed && down {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	for _, after := range []time.Duration{0, stuckFor + time.Hour} {
+		now = now.Add(after)
+		err := w.feed.step(context.Background())
+		if err == nil || IsPermanent(err) || !IsOutage(err) {
+			t.Fatalf("after %v: err %v", after, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v: the cursor is kept", after)
+		}
+	}
+	w.apiary.mu.Lock()
+	down = false
+	w.apiary.mu.Unlock()
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	r := w.apiary.reports()
+	if len(r) < 3 {
+		t.Errorf("reports %v", r)
+	}
+	for _, x := range r {
+		if x != testCommentID+" item_gone" {
+			t.Errorf("reports %v, want item_gone each", r)
+			break
+		}
+	}
+}
+
+// TestPostAgainPostsTheCommentOnce has GitHub answer the first post 404, which is
+// reported as item_gone, then take the comment: a later entry with the same comment_id,
+// as Post again writes it, posts the comment once, and a second such entry posts
+// nothing, since the comment has the marker. No other report is sent.
+func TestPostAgainPostsTheCommentOnce(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 404, `{"message":"Not Found"}` })
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := w.apiary.reports(); len(r) != 1 || r[0] != testCommentID+" item_gone" {
+		t.Fatalf("reports %v", r)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus = 0 })
+	for n := range 2 {
+		w.apiary.add(commentEntry("acme/widgets", 7))
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_"+strconv.Itoa(n+2) {
+			t.Errorf("the cursor %q", c)
+		}
+		if posted := w.gh.postedComments(); len(posted) != 1 {
+			t.Errorf("after the entry %d: posted %q", n+2, posted)
+		}
+	}
+	if r := w.apiary.reports(); len(r) != 1 {
+		t.Errorf("reports %v", r)
+	}
+}
+
+// TestAReportQoryApiaryRefusesPassesTheEntry has Qory Apiary answer the failure report
+// 403 forbidden: the report is not sent again, and the entry is passed and logged.
+func TestAReportQoryApiaryRefusesPassesTheEntry(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 410, `{"message":"Gone"}` })
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeChangesFailed {
+			return 403, `{"error":"forbidden"}`
+		}
+		return 0, ""
+	}
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	if r := w.apiary.reports(); len(r) != 1 {
+		t.Errorf("reports %v", r)
+	}
+	if !strings.Contains(w.log.String(), "Qory Apiary refused the report") || !strings.Contains(w.log.String(), "403 forbidden") {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAMalformedCommentEntryIsPassedWithoutAReport reads comment entries whose
+// comment_id, ref or author_name is not one: each is logged and passed, no report is
+// sent, GitHub is asked nothing, and the cursor moves.
+func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	var chs []contracts.Change
+	for _, edit := range []func(c *contracts.Change){
+		func(c *contracts.Change) { c.CommentID = "" },
+		func(c *contracts.Change) { c.CommentID = "cm_0123456789abcdef" },
+		func(c *contracts.Change) { c.CommentID = "sc_0123456789ABCDEF" },
+		func(c *contracts.Change) { c.Ref = "acme/widgets#7" },
+		func(c *contracts.Change) { c.Ref = widgetsRef },
+		func(c *contracts.Change) { c.AuthorName = "Dana\nExample" },
+		func(c *contracts.Change) { c.AuthorName = "" },
+	} {
+		c := commentEntry("acme/widgets", 7)
+		edit(&c)
+		chs = append(chs, c)
+	}
+	w.apiary.add(chs...)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_"+strconv.Itoa(len(chs)) {
+		t.Errorf("the cursor %q", c)
+	}
+	if n := strings.Count(w.log.String(), `"msg":"a change of the feed failed, and is passed","kind":"comment"`); n != len(chs) {
+		t.Errorf("%d passed, want %d: %s", n, len(chs), w.log.String())
+	}
+	w.gh.mu.Lock()
+	asked := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if r := w.apiary.reports(); len(r) != 0 || len(asked) != 0 {
+		t.Errorf("reports %v, GitHub was asked %v", r, asked)
+	}
+}
+
+// TestACommentEntryIsKnownAndDecodes reads a page of the feed with a comment entry, as
+// Qory Apiary writes it, which passes the contract's schema and which serve knows and
+// decodes with no member left over, and
+// one with a member the comment entry does not define, which is refused.
+func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
+	body := `{"version":1,"revision":` + strconv.Itoa(contracts.Revision) + `,"cursor":"c_1","changes":[` +
+		`{"kind":"comment","comment_id":"sc_0123456789abcdef","ref":"1296269#7","author_name":"Dana Example","body":"Please check the steps."}]}`
+	schema, err := contracts.Compile("changes.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(strings.NewReader(body))
+	if err == nil {
+		err = schema.Validate(doc)
+	}
+	if err != nil {
+		t.Errorf("the page breaks the contract: %v", err)
+	}
+	page, err := checkChanges([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := commentEntry("acme/widgets", 7)
+	if len(page.Changes) != 1 || !reflect.DeepEqual(page.Changes[0], want) || !known(page.Changes[0]) {
+		t.Errorf("the page %+v", page)
+	}
+	b, err := json.Marshal(want)
+	if err != nil || !strings.Contains(body, string(b)) {
+		t.Errorf("the entry marshals as %s, %v", b, err)
+	}
+	if _, err := checkChanges([]byte(strings.Replace(body, `"body":`, `"url":"https://apiary.example.com/","extra":1,"body":`, 1))); err == nil {
+		t.Error("an entry with a member the contract does not define is decoded")
 	}
 }
 

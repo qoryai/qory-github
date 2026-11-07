@@ -182,6 +182,39 @@ func sentItems(t *testing.T, s *sink) []string {
 	return out
 }
 
+// TestAPullSendsTheBotsCommentWithItsCommentID pulls the comments that changed, among
+// them the App's bot's comment for a person's comment in Qory Apiary, another bot's
+// comment with the same text, and the work item comment, and checks that the first is
+// sent with its comment_id, the second without one, and the third not at all.
+func TestAPullSendsTheBotsCommentWithItsCommentID(t *testing.T) {
+	f := &fakeChanged{
+		issues: []map[string]any{changedIssue(1, 1)},
+		comments: []map[string]any{
+			repoComment(11, "issues", 1, 1, "qory-test[bot]", "Bot", botsComment),
+			repoComment(12, "issues", 1, 2, "dependabot[bot]", "Bot", botsComment),
+			repoComment(13, "issues", 1, 3, "qory-test[bot]", "Bot", "<!-- qory:work-item wi_7 -->"),
+		},
+	}
+	s := &sink{}
+	var logs []string
+	l := f.lister(t, s, &logs)
+	if _, err := l.ListChanged(context.Background(), widgetsID, pullSince); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range s.comments() {
+		for _, x := range c.Comments {
+			got = append(got, c.ItemRef+" "+x.Ref+" "+x.Author.Kind+" "+x.CommentID)
+		}
+	}
+	if strings.Join(got, ", ") != "1296269#1 11 automation sc_0123456789abcdef, 1296269#1 12 automation " {
+		t.Errorf("comments %q", got)
+	}
+	if len(logs) != 0 || len(s.broken) != 0 {
+		t.Errorf("logged %v, broken %v", logs, s.broken)
+	}
+}
+
 // TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem lists what changed, an
 // issue closed and a pull request among it, and checks the requests ask from the time
 // given, every state's, oldest change first; the items are sent as an event, each with

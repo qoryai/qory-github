@@ -68,6 +68,7 @@
       "description": "Brings in the tickets of the repositories an organisation installs the GitHub App on.",
       "item_noun": {"one": "issue", "other": "issues"},
       "collection_noun": {"one": "repository", "other": "repositories"},
+      "comments": true,
       "targets": true,
       "program": "qory-github-server",
       "setup": {

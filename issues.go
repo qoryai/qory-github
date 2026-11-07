@@ -53,7 +53,9 @@ const (
 // workItemMarker begins the comment the App writes on an issue that is work in
 // Qory Apiary, see [Client.ApplyChange]. Such a comment by the App's bot is the
 // adapter's, not the issue's, so it is never sent; the same words in a comment by anyone
-// else are that person's comment.
+// else are that person's comment. The comment the App's bot posts for a person's
+// comment in Qory Apiary, see [Client.PostComment], is sent, with its comment_id, see
+// [apiaryCommentID].
 const workItemMarker = "<!-- qory:work-item "
 
 // Sink is where the wire's requests go: Qory Apiary's client, or a test's. Each method
@@ -388,20 +390,26 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 }
 
 // commentOf is a comment as the wire says it, or why it is skipped, and the texts cut
-// to fit it.
-func commentOf(c ghComment) (contracts.Comment, string, []Cut) {
+// to fit it. slug is the App's: a comment its bot posted for a person's comment in Qory
+// Apiary has that comment's comment_id, see [apiaryCommentID]. A deleted comment is
+// sent without its body, so the size limits never lose a deletion; its comment_id is
+// read before the body is dropped.
+func commentOf(c ghComment, slug string, deleted bool) (contracts.Comment, string, []Cut) {
 	var cuts []Cut
 	ref := strconv.FormatInt(c.ID, 10)
+	id := apiaryCommentID(c, slug)
 	body := ""
-	if c.Body != nil {
+	if c.Body != nil && !deleted {
 		body = *c.Body
 	}
 	sc := contracts.Comment{
 		Ref:        ref,
 		URL:        c.HTMLURL,
+		CommentID:  id,
 		Author:     authorOf(c.User, &cuts, ref, "author.name"),
 		Body:       fit(&cuts, ref, "body", body, contractLimits().body),
 		BodyFormat: FormatMarkdown,
+		Deleted:    deleted,
 	}
 	var ok1, ok2 bool
 	sc.CreatedAt, ok1 = utc(c.CreatedAt)
@@ -556,9 +564,12 @@ func IssuesWebhook(payload []byte, system string, active func(collectionRef stri
 }
 
 // IssueCommentWebhook is what an issue_comment event, GitHub's webhook payload, becomes;
-// slug is the App's, whose bot writes the work item comment. Created and edited send the
-// comment, and deleted sends it deleted. A comment on a pull request, the work item
-// comment by the App's bot, and every other action send nothing. It does no I/O.
+// slug is the App's, whose bot writes the work item comment and the comments it posts
+// for people's comments in Qory Apiary. Created and edited send the comment, and
+// deleted sends it deleted, without its body. A comment the App's bot posted for a
+// person's comment is sent with that comment's comment_id, deleted or not, see
+// [apiaryCommentID]. A comment on a pull request, the work item comment by the App's
+// bot, and every other action send nothing. It does no I/O.
 func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	var ev struct {
 		Action     string    `json:"action"`
@@ -578,13 +589,7 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 	default:
 		return t, nil
 	}
-	// A deleted comment is sent without its body, so the size limits never lose a
-	// deletion.
-	if ev.Action == "deleted" {
-		ev.Comment.Body = nil
-	}
-	c, why, cuts := commentOf(ev.Comment)
-	c.Deleted = ev.Action == "deleted"
+	c, why, cuts := commentOf(ev.Comment, slug, ev.Action == "deleted")
 	coll := collectionOf(ev.Repository)
 	req := contracts.SourceItemComments{
 		Version:  contracts.Version,
@@ -610,10 +615,27 @@ func IssueCommentWebhook(payload []byte, slug string) (ToSend, error) {
 }
 
 // workItemComment is whether c is the App's work item comment: written by the App's bot,
-// slug[bot] of type Bot, and beginning with the marker. Logins are ASCII, so EqualFold
-// folds ASCII's cases alone.
+// see [byBot], and beginning with the marker.
 func workItemComment(c ghComment, slug string) bool {
-	return slug != "" && c.User != nil && c.User.Type == "Bot" && strings.EqualFold(c.User.Login, slug+"[bot]") && c.Body != nil && strings.HasPrefix(*c.Body, workItemMarker)
+	return byBot(c, slug) && c.Body != nil && strings.HasPrefix(*c.Body, workItemMarker)
+}
+
+// apiaryCommentID is the comment_id of the person's comment in Qory Apiary that the
+// App's bot posted c for, see [Client.PostComment], or "": c is written by the App's
+// bot, see [byBot], and its body's last line, after one trailing newline is trimmed,
+// is exactly the marker <!-- qory:comment {comment_id} -->. Any other comment by a bot
+// is an automation's comment, without comment_id.
+func apiaryCommentID(c ghComment, slug string) string {
+	if !byBot(c, slug) || c.Body == nil {
+		return ""
+	}
+	return markedID(*c.Body)
+}
+
+// byBot is whether c is written by the App's bot, slug[bot] of type Bot. Logins are
+// ASCII, so EqualFold folds ASCII's cases alone.
+func byBot(c ghComment, slug string) bool {
+	return slug != "" && c.User != nil && c.User.Type == "Bot" && strings.EqualFold(c.User.Login, slug+"[bot]")
 }
 
 // Lister lists what one installation of the App reaches on GitHub and sends it to
@@ -633,7 +655,8 @@ type Lister struct {
 	// is called before every request, so it keeps a token until shortly before it
 	// expires.
 	Token func(context.Context) (string, error)
-	// Slug is the App's, whose bot writes the work item comment.
+	// Slug is the App's, whose bot writes the work item comment and the comments it
+	// posts for people's comments in Qory Apiary.
 	Slug string
 	// ConnectionID is the connection in Qory Apiary the installation is linked to, which
 	// every part of [Lister.ListRepositories] names.
@@ -1249,7 +1272,7 @@ items:
 				if workItemComment(c, l.Slug) {
 					continue
 				}
-				sc, why, cuts := commentOf(c)
+				sc, why, cuts := commentOf(c, l.Slug, false)
 				n := size(sc)
 				if why == "" && envelope+n > contracts.MaxRequest {
 					why = "it is larger than a request may be"

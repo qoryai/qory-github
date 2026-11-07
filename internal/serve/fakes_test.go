@@ -204,6 +204,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 		routeDisconnect:  "sources-disconnect.schema.json",
 
 		routeConnectionsDisconnect: "connections-disconnect.schema.json",
+		routeChangesFailed:         "changes-failed.schema.json",
 		routeSecrets:               "adapter-secrets.schema.json",
 		routeGrants:                "grant.schema.json",
 		routeGrantsEnd:             "grant-end.schema.json",
@@ -818,8 +819,12 @@ type fakeGitHub struct {
 	// installation deleted meanwhile.
 	installStatus, goneAfterChecks int
 	// labelStatus, when set, answers the creation of the label in acme/widgets with
-	// that status, as GitHub answers a write in an archived repository.
-	labelStatus int
+	// that status, as GitHub answers a write in an archived repository. commentStatus,
+	// when set, answers a comment posted on acme/widgets's issue 7 with that status and
+	// the body commentAnswer.
+	labelStatus   int
+	commentStatus int
+	commentAnswer string
 	// oldMintStatus, when set, answers a mint for acme/old with that status in place of
 	// 422; oldPublic answers GET /repositories/{id} for acme/old 200, as GitHub answers
 	// it for a public repository under any token.
@@ -1106,6 +1111,9 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `[{"name":"qory"}]`)
 	case r.Method == "DELETE" && r.URL.Path == widgets+"/issues/7/labels/qory":
 		io.WriteString(w, `[]`)
+	case r.Method == "POST" && r.URL.Path == widgets+"/issues/7/comments" && f.commentStatus != 0:
+		w.WriteHeader(f.commentStatus)
+		io.WriteString(w, f.commentAnswer)
 	case r.Method == "POST" && r.URL.Path == widgets+"/issues/7/comments":
 		var c struct {
 			Body string `json:"body"`
