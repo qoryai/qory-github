@@ -1,7 +1,7 @@
 # Trademarks
 
 *Qory* is a trademark of 8wonders GmbH. The Apache License,
-Version 2.0, grants no right to use it (section 6). This page says what you
+Version 2.0, grants no right to use it (section 6). This page lists what you
 may do with it without asking.
 
 ## You may
@@ -20,8 +20,8 @@ may do with it without asking.
 
 ## Integrations
 
-The `qory-` prefix on a program, `qory-github` say, marks it as one Qory
-publishes and maintains, each in a repository of the `qoryai` organisation. An
+Qory publishes and maintains every program whose name starts with `qory-`,
+such as `qory-github`, each in a repository of the `qoryai` organisation. An
 integration kept in a repository outside the `qoryai` organisation takes a
 name without Qory in it, `acme-tracker` say. Saying it is built for Qory is
 allowed, as above.

@@ -1,7 +1,9 @@
-# qory-github
+# Qory GitHub Integration
 
-Gives a Qory run a GitHub token for the repositories it works on, without the agent ever
-holding the token.
+This repository is part of [Qory](https://github.com/qoryai/qory). Its README lists every part and how to install Qory.
+
+`qory-github` gives a Qory run a GitHub token for the repositories the run works on,
+without the agent ever holding the token.
 
 `qory-github` is a credential adapter for [Forager](https://github.com/qoryai/forager)'s gateway.
 For each run it mints a
