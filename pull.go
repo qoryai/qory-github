@@ -42,12 +42,13 @@ type ghRepoComment struct {
 // complete, so Qory Apiary closes and drops nothing for it. Items go in requests of at
 // most 100 items and 1 MiB. Comments go after every item, grouped by their item on each
 // page GitHub answers, in requests of at most 100 comments and 1 MiB; a comment on a pull
-// request and the App's work item comment are left out. The skip and cut rules are the
-// listing's. GitHub lists neither a deleted comment nor an issue deleted or transferred:
-// a deleted comment reaches Qory Apiary only by its webhook's event; such an issue
-// reaches it by its webhook's event, or Qory Apiary closes it after the next daily
-// listing of open issues, which leaves it out and says it is complete, unless it
-// skipped an item.
+// request and the App's work item comment are left out, and a comment the App's bot
+// posted for a person's comment in Qory Apiary has that comment's comment_id. The skip
+// and cut rules are the listing's. GitHub lists neither a deleted comment nor an issue
+// deleted or transferred: a deleted comment reaches Qory Apiary only by its webhook's
+// event; such an issue reaches it by its webhook's event, or Qory Apiary closes it after
+// the next daily listing of open issues, which leaves it out and says it is complete,
+// unless it skipped an item.
 //
 // Both are read oldest change first, by time rather than by page number, see
 // [changedPages]: each page is asked for from the latest change the page before it
@@ -311,7 +312,7 @@ func (l Lister) changedComments(ctx context.Context, p *Pacer, coll contracts.Co
 				if workItemComment(c.ghComment, l.Slug) || onPullRequest(c.HTMLURL) {
 					continue
 				}
-				sc, why, cuts := commentOf(c.ghComment)
+				sc, why, cuts := commentOf(c.ghComment, l.Slug, false)
 				number, ok := issueNumber(c.IssueURL)
 				itemRef := coll.Ref + "#" + strconv.FormatInt(number, 10)
 				switch {

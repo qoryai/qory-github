@@ -950,6 +950,43 @@ func TestTheCompleteListingReadsCommentsWhereThereAreAny(t *testing.T) {
 	}
 }
 
+// TestTheListingSendsTheBotsCommentWithItsCommentID lists an issue whose comments are
+// the App's bot's comment for a person's comment in Qory Apiary, another bot's comment
+// with the same text, and the work item comment, and checks that the first is sent with
+// its comment_id, the second without one, and the third not at all.
+func TestTheListingSendsTheBotsCommentWithItsCommentID(t *testing.T) {
+	g := &fakeGraphQL{
+		fakeIssues: &fakeIssues{comments: map[int][]map[string]any{
+			1: {
+				comment(11, "qory-test[bot]", "Bot", "<!-- qory:work-item wi_7 -->\nQory took this into Factory."),
+				comment(12, "qory-test[bot]", "Bot", botsComment),
+				comment(13, "dependabot[bot]", "Bot", botsComment),
+			},
+		}},
+		nodes: []map[string]any{node(1, 3)},
+	}
+	s := &sink{}
+	var logs []string
+	l, _ := g.lister(t, s, &logs)
+	if err := l.ListOpenIssuesComplete(context.Background(), widgetsID, widgets); err != nil {
+		t.Fatal(err)
+	}
+	cs := s.comments()
+	if len(cs) != 1 {
+		t.Fatalf("comments requests %+v", cs)
+	}
+	var got []string
+	for _, c := range cs[0].Comments {
+		got = append(got, c.Ref+" "+c.Author.Kind+" "+c.CommentID)
+	}
+	if strings.Join(got, ", ") != "12 automation sc_0123456789abcdef, 13 automation " {
+		t.Errorf("comments on #1: %q", got)
+	}
+	if len(logs) != 0 || len(s.broken) != 0 {
+		t.Errorf("logged %v, broken %v", logs, s.broken)
+	}
+}
+
 // TestAnItemsCommentsGoInRequestsOfAMebibyte lists an issue with many long comments
 // and checks they go in several requests of at most 1 MiB, none complete.
 func TestAnItemsCommentsGoInRequestsOfAMebibyte(t *testing.T) {

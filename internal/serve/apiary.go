@@ -33,6 +33,9 @@ const (
 	routeDisconnect  = "/v1/sources/disconnect"
 	routeChanges     = "/v1/work-items/changes"
 	changesAfter     = "after"
+	// routeChangesFailed reports a comment entry of the feed whose comment was not
+	// posted.
+	routeChangesFailed = "/v1/work-items/changes/failed"
 	// routeConnectionsDisconnect ends a connection the source no longer grants access.
 	routeConnectionsDisconnect = "/v1/connections/disconnect"
 	// headerContractVersion carries contracts.Revision on every request. It is not
@@ -349,6 +352,16 @@ func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments)
 		a.Log.Info("Qory Apiary answered collection_not_linked to the comments, so they are dropped", slog.String("item", req.ItemRef), slog.String("collection", collection))
 	}
 	return nil
+}
+
+// ChangesFailed sends POST /v1/work-items/changes/failed: the adapter stopped trying to
+// post the comment of the comment entry with the comment_id in req, for req's reason.
+// Qory Apiary answers the signed 204 for a comment_id that has no comment entry, and
+// for one whose comment it matched to a posted comment already, so a repeated
+// report is no error. Its 400 and 403 are [Permanent], as every request's are: the
+// report is not sent again.
+func (a *Apiary) ChangesFailed(ctx context.Context, req contracts.ChangesFailed) error {
+	return a.post(ctx, "reporting that the comment "+req.CommentID+" was not posted", routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
 }
 
 // Disconnect sends POST /v1/sources/disconnect, which names the collection's ref and the

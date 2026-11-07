@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Change is one entry of Qory Apiary's change feed: a work item Qory Apiary took in
@@ -179,7 +180,8 @@ func marker(workItemID string) string {
 // the App's bot has posted it already. On [StatusUndone] it removes the label from the
 // issue and posts nothing; the comment stays. Any other status is not acted on, and nil
 // is returned. Each step is one a repeat finds done, so a change applied again after a
-// failure or a crash writes nothing twice. The comment is never edited nor deleted.
+// failure or a crash writes nothing twice. The comment is never edited nor deleted. A
+// comment entry of the feed, a person's comment, is posted by [Client.PostComment].
 //
 // Three errors are permanent, since asking again would get the same answer, and a
 // caller drops the change rather than retry it: one that wraps [ErrInvalidChange], a
@@ -242,12 +244,14 @@ func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue is
 	if a.status != http.StatusOK {
 		return failed(a, adding, issueGone|mayNotWrite)
 	}
-	found, err := c.commented(ctx, p, tok, slug, issue, marker(e.WorkItemID))
+	mark := marker(e.WorkItemID)
+	takeInFailed := func(a *apiReply, what string) error { return failed(a, what, issueGone) }
+	found, err := c.commented(ctx, p, tok, slug, issue, func(body string) bool { return strings.HasPrefix(body, mark) }, takeInFailed)
 	if err != nil || found {
 		return err
 	}
 	const commenting = "commenting on the issue"
-	body := marker(e.WorkItemID) + "\nQory took this into Factory: <" + e.URL + ">"
+	body := mark + "\nQory took this into Factory: <" + e.URL + ">"
 	a, err = c.send(ctx, p, false, commenting, http.MethodPost, issue.path()+"/comments", tok, map[string]string{"body": body})
 	if err != nil {
 		return err
@@ -258,11 +262,265 @@ func (c Client) takeIn(ctx context.Context, p *Pacer, tok, slug string, issue is
 	return nil
 }
 
+// Comment is a comment entry of Qory Apiary's change feed: a comment a person wrote in
+// Qory Apiary on a work item taken in from an issue, which [Client.PostComment] posts on
+// the issue. It has the members of the comment entry of changes.schema.json, in the
+// integration/v1 contract of github.com/qoryai/integrations, without kind.
+type Comment struct {
+	// CommentID is the comment's id in Qory Apiary: sc_ and 16 lower-case Crockford
+	// base32 characters, see [CheckCommentID].
+	CommentID string
+	// Ref is the item ref of the issue, see [ParseItemRef].
+	Ref string
+	// AuthorName is the name of the person who wrote the comment, as members of Qory
+	// Apiary see it: 1 to 100 characters on one line.
+	AuthorName string
+	// Body is the person's text, posted unchanged.
+	Body string
+}
+
+// The values of a failure report's reason, for a comment the adapter stopped trying to
+// post, changes-failed.schema.json.
+const (
+	// ReasonItemGone: GitHub answered that the issue does not exist or moved, or no
+	// installation reaches its repository.
+	ReasonItemGone = "item_gone"
+	// ReasonNotPermitted: GitHub answered that the App may not comment on the issue.
+	ReasonNotPermitted = "not_permitted"
+	// ReasonTooLong: the comment with its first line is longer than GitHub takes.
+	ReasonTooLong = "too_long"
+	// ReasonUnreachable: GitHub did not take the comment before the retries ended.
+	ReasonUnreachable = "unreachable"
+)
+
+// CommentRefused is the error of a comment GitHub does not take for good: asking again
+// would get the same answer. Reason is the failure report's reason, one of the Reason
+// constants; Err is GitHub's answer or the check that refused the comment.
+type CommentRefused struct {
+	Reason string
+	Err    error
+}
+
+func (e *CommentRefused) Error() string { return e.Err.Error() }
+func (e *CommentRefused) Unwrap() error { return e.Err }
+
+// maxCommentBody is the most characters GitHub takes in a comment's body.
+const maxCommentBody = 65536
+
+// maxAuthorName is the most characters of a comment entry's author_name.
+const maxAuthorName = 100
+
+var (
+	// commentIDShape is a comment's id in Qory Apiary, definitions.schema.json's
+	// comment_id.
+	commentIDShape = regexp.MustCompile(`^sc_[0-9a-hjkmnp-tv-z]{16}$`)
+	// nameControls are the control characters, C0, DEL and C1, which the contract's
+	// rule of a prose line, description.schema.json's line, forbids in author_name.
+	nameControls = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f]`)
+	// nameBreaks are the line and paragraph separators, which that rule forbids too.
+	// Each becomes a space in the name before it is posted, so the words on either
+	// side stay apart.
+	nameBreaks = strings.NewReplacer("\u2028", " ", "\u2029", " ")
+	// nameHidden are the other characters that rule forbids: the bidirectional
+	// controls and the format characters that are usually not shown. They are removed
+	// from the name before it is posted.
+	nameHidden = regexp.MustCompile(`[\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+)
+
+// CheckCommentID refuses what is not a comment's id in Qory Apiary: sc_ and 16
+// lower-case Crockford base32 characters. The error contains the rule, never the value.
+func CheckCommentID(id string) error {
+	if !commentIDShape.MatchString(id) {
+		return invalidChange("the comment's comment_id is not sc_ and 16 lower-case Crockford base32 characters")
+	}
+	return nil
+}
+
+// commentMarker begins the last line of a comment the App posts for a comment entry,
+// see [Client.PostComment]; the comment's id and " -->" end that line.
+const commentMarker = "<!-- qory:comment "
+
+// commentMark is the last line of the comment posted for the comment entry with id.
+func commentMark(id string) string { return commentMarker + id + " -->" }
+
+// lastLine is body's last line, after one trailing newline is trimmed.
+func lastLine(body string) string {
+	body = strings.TrimSuffix(body, "\n")
+	return body[strings.LastIndexByte(body, '\n')+1:]
+}
+
+// markedID is the comment id of the comment marker that is body's last line, see
+// [lastLine], or "" when that line is no comment marker of an id.
+func markedID(body string) string {
+	id, ok := strings.CutPrefix(lastLine(body), commentMarker)
+	if !ok {
+		return ""
+	}
+	id, ok = strings.CutSuffix(id, " -->")
+	if !ok || !commentIDShape.MatchString(id) {
+		return ""
+	}
+	return id
+}
+
+// nameEscapes are the characters of Markdown, and & and $, that a backslash escapes in
+// the author's name: & so no character reference, such as &#8238;, is read, and $ so
+// no math is read.
+const nameEscapes = "\\`*_{}[]()#+-.!|<>~&$"
+
+// zeroWidthSpace follows each @ and # in the author's name, see [escapeName].
+const zeroWidthSpace = "\u200b"
+
+// cleanName is the author's name as the first line contains it, before it is escaped:
+// each line or paragraph separator a space, see nameBreaks, without the characters
+// nameHidden matches, and without leading and trailing spaces, ASCII or Unicode, such
+// as U+00A0 and U+3000, since four leading spaces would make the line a code block.
+func cleanName(name string) string {
+	return strings.TrimSpace(nameHidden.ReplaceAllString(nameBreaks.Replace(name), ""))
+}
+
+// escapeName is the author's name as the first line contains it: each character of
+// nameEscapes after a backslash, so the name changes no formatting, and a zero-width
+// space after each @ and #, as Dependabot writes them. GitHub finds mentions and issue
+// references in the rendered text, so a backslash or a character reference such as
+// &#64; still mentions the user; the zero-width space breaks the pattern, so @octocat
+// notifies no one and #123 links to nothing.
+func escapeName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if strings.ContainsRune(nameEscapes, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+		if r == '@' || r == '#' {
+			b.WriteString(zeroWidthSpace)
+		}
+	}
+	return b.String()
+}
+
+// commentBody is the comment posted for e: the first line, which contains the author's
+// name, cleaned and escaped, see [cleanName] and [escapeName], an empty line, the
+// person's text unchanged, an empty line, and the marker, see [commentMark], as the last
+// line.
+func commentBody(e Comment) string {
+	return escapeName(cleanName(e.AuthorName)) + " wrote in Qory Apiary:\n\n" + e.Body + "\n\n" + commentMark(e.CommentID)
+}
+
+// parseComment checks a comment entry before anything is sent: its ref is an item's
+// ref, see [ParseItemRef], so no path is built from any other text; its comment_id has
+// the shape of one, see [CheckCommentID]; and its author_name is 1 to 100 characters of
+// UTF-8 with no control character, as the contract's rule of a prose line has it, and
+// is not empty once cleaned, see [cleanName]. The errors contain the rule, never the
+// value.
+func parseComment(e Comment) (issueRef, error) {
+	repository, number, ok := ParseItemRef(e.Ref)
+	if !ok {
+		return issueRef{}, invalidChange("the comment's ref is not a repository's id, #, and an issue's number")
+	}
+	if err := CheckCommentID(e.CommentID); err != nil {
+		return issueRef{}, err
+	}
+	name := e.AuthorName
+	if !utf8.ValidString(name) || utf8.RuneCountInString(name) > maxAuthorName || nameControls.MatchString(name) || cleanName(name) == "" {
+		return issueRef{}, invalidChange("the comment's author_name is not 1 to 100 characters with no control character, or has no character to show")
+	}
+	return issueRef{repository: repository, number: number}, nil
+}
+
+// PostComment posts on the issue the comment of one comment entry of Qory Apiary's
+// change feed, as the App's bot, with a token token returns for the issue's
+// repository, each request paced by p, the installation's [Pacer], or a new Pacer when
+// p is nil. slug is the App's slug. Each request reaches the repository through the id
+// in the comment's ref, /repositories/{id}.
+//
+// The entry is checked before anything is sent, see [Comment], and refused whole with
+// an error that wraps [ErrInvalidChange] when it fails. The comment is
+// "<author_name> wrote in Qory Apiary:", an empty line, the person's text unchanged, an
+// empty line, and the marker <!-- qory:comment {comment_id} --> as its last line; the
+// name is cleaned and escaped so it mentions no one and changes no formatting, see
+// [cleanName] and [escapeName].
+// Before it posts, PostComment reads the issue's comments, and posts nothing when the
+// App's bot, slug[bot] of type Bot, has a comment whose last line is that marker: the
+// comment of a repeated entry, or of a post whose answer was lost, is posted once.
+// Text a person wrote cannot be that last line, since the marker follows it. The
+// comment is never edited nor deleted.
+//
+// A comment GitHub does not take for good is a [*CommentRefused], with its reason: a
+// comment longer than 65,536 characters with its first line and marker, too_long, with
+// no request sent; a 404 or 410, or a permanent redirect, 301 or 308, item_gone; a 403
+// that is no rate limit, not_permitted; a 422 whose errors have the field body,
+// too_long, and any other 422, not_permitted. Every other error may pass, and the entry
+// can be posted again. No error contains the token, the name or the text.
+func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug string, e Comment) error {
+	issue, err := parseComment(e)
+	if err != nil {
+		return err
+	}
+	if !slugShape.MatchString(slug) {
+		return errors.New("the App's slug is not one, 1 to 100 letters, digits, dots, underscores or hyphens")
+	}
+	body := commentBody(e)
+	if n := utf8.RuneCountInString(body); n > maxCommentBody {
+		return &CommentRefused{Reason: ReasonTooLong, Err: fmt.Errorf("the comment with its first line is %d characters, and GitHub takes at most %d", n, maxCommentBody)}
+	}
+	if err := CheckAPIURL(c.base()); err != nil {
+		return err
+	}
+	if token == nil {
+		return errors.New("no token function")
+	}
+	tok, err := token(ctx, issue.repository)
+	if err != nil {
+		return fmt.Errorf("the installation token for the repository %d: %w", issue.repository, err)
+	}
+	if tok == "" {
+		return fmt.Errorf("the installation token for the repository %d is empty", issue.repository)
+	}
+	if p == nil {
+		p = &Pacer{}
+	}
+	mark := commentMark(e.CommentID)
+	found, err := c.commented(ctx, p, tok, slug, issue, func(body string) bool { return lastLine(body) == mark }, commentFailed)
+	if err != nil || found {
+		return err
+	}
+	const commenting = "posting the comment on the issue"
+	a, err := c.send(ctx, p, false, commenting, http.MethodPost, issue.path()+"/comments", tok, map[string]string{"body": body})
+	if err != nil {
+		return err
+	}
+	if a.status != http.StatusCreated {
+		return commentFailed(a, commenting)
+	}
+	return nil
+}
+
+// commentFailed is the error for an answer to a step of [Client.PostComment] whose
+// status is not the one the step wants: a [*CommentRefused] when asking again would get
+// the same answer, and GitHub's answer alone otherwise.
+func commentFailed(a *apiReply, what string) error {
+	err := a.err(what)
+	switch {
+	case a.status == http.StatusNotFound || a.status == http.StatusGone ||
+		a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
+		return &CommentRefused{Reason: ReasonItemGone, Err: err}
+	case a.status == http.StatusForbidden && !a.rateLimited():
+		return &CommentRefused{Reason: ReasonNotPermitted, Err: err}
+	case a.status == http.StatusUnprocessableEntity && a.fieldRefused("body"):
+		return &CommentRefused{Reason: ReasonTooLong, Err: err}
+	case a.status == http.StatusUnprocessableEntity:
+		return &CommentRefused{Reason: ReasonNotPermitted, Err: err}
+	}
+	return err
+}
+
 // commented is whether the App's bot, slug[bot] of type Bot, has a comment on the issue
-// that starts with the marker. It reads the comments a page at a time, following the
-// next page [nextPage] reads, on the API alone; a comment anyone else wrote counts for
-// nothing, so pasting the marker does not stop the comment.
-func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, mark string) (bool, error) {
+// whose body match takes. It reads the comments a page at a time, following the next
+// page [nextPage] reads, on the API alone; a comment anyone else wrote counts for
+// nothing, so pasting the marker does not stop the comment. fail is the error of a page
+// GitHub does not answer 200.
+func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue issueRef, match func(body string) bool, fail func(a *apiReply, what string) error) (bool, error) {
 	const reading = "reading the issue's comments"
 	bot := slug + "[bot]"
 	path := issue.path() + "/comments?per_page=100"
@@ -272,7 +530,7 @@ func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue
 			return false, err
 		}
 		if a.status != http.StatusOK {
-			return false, failed(a, reading, issueGone)
+			return false, fail(a, reading)
 		}
 		var comments []struct {
 			Body string `json:"body"`
@@ -286,7 +544,7 @@ func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue
 		}
 		for _, cm := range comments {
 			// Logins are ASCII, so EqualFold folds ASCII's cases alone.
-			if cm.User.Type == "Bot" && strings.EqualFold(cm.User.Login, bot) && strings.HasPrefix(cm.Body, mark) {
+			if cm.User.Type == "Bot" && strings.EqualFold(cm.User.Login, bot) && match(cm.Body) {
 				return true, nil
 			}
 		}
@@ -357,6 +615,28 @@ func (a *apiReply) rateLimited() bool {
 	}
 	json.Unmarshal(a.body, &e)
 	return strings.Contains(strings.ToLower(e.Message), "rate limit")
+}
+
+// fieldRefused is whether the answer is GitHub's 422 with an error whose field is
+// field.
+func (a *apiReply) fieldRefused(field string) bool {
+	if a.status != http.StatusUnprocessableEntity {
+		return false
+	}
+	var e struct {
+		Errors []struct {
+			Field string `json:"field"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(a.body, &e) != nil {
+		return false
+	}
+	for _, x := range e.Errors {
+		if x.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 // labelExists is whether the answer is GitHub's 422 for a label the repository has

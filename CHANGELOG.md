@@ -26,6 +26,11 @@ change what the program does, and notes it under Upgrading.
   hyphens, with no hyphen at either end. A pass with a slug of another shape, or with
   any other member the contract does not define, is refused as a link that is not
   valid.
+- A comment a person writes in Qory Apiary when they take in an issue is posted on the
+  issue by the App's bot, once, with the first line `<name> wrote in Qory Apiary:`. The
+  adapter sends that comment back to Qory Apiary with its `comment_id`, and reports a
+  comment it cannot post with the reason: `item_gone`, `not_permitted`, `too_long` or
+  `unreachable`. The description has `comments: true` in `roles.source`.
 
 ### Changed
 

@@ -37,7 +37,8 @@ type Adapter struct {
 	// AppID and Key are the App's id and private key, which mint installation tokens.
 	AppID string
 	Key   *rsa.PrivateKey
-	// Slug is the App's slug, whose bot writes the work item comment.
+	// Slug is the App's slug, whose bot writes the work item comment and the comments
+	// it posts for people's comments in Qory Apiary.
 	Slug string
 	// Sink is Qory Apiary's client.
 	Sink github.Sink
@@ -1705,6 +1706,55 @@ func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 		return Permanent(err)
 	}
 	return err
+}
+
+// applyComment posts on GitHub the comment of a comment entry of the feed, as the App's
+// bot, with a token that writes the issues of that one repository, from the
+// installation that reaches it, see [github.Client.PostComment]. An entry whose ref is
+// not an item's, see [github.ParseItemRef], or whose comment_id is not one, see
+// [github.CheckCommentID], fails for good before the store is read or GitHub is asked,
+// and the feed logs it and passes it with no failure report. So does an entry whose
+// author_name [github.Client.PostComment] refuses.
+//
+// A comment GitHub does not take for good is a [*github.CommentRefused], whose reason
+// is the reason of the feed's failure report, see [feed.comment]: GitHub's answer, see
+// [github.Client.PostComment]; item_gone when no installation reaches the repository;
+// and not_permitted when GitHub refuses to mint the token for good,
+// [github.ErrMintRefused], or answers that the installation is suspended,
+// [github.ErrSuspended]. Every other error may pass, and the entry is posted again.
+func (a *Adapter) applyComment(ctx context.Context, ch contracts.Change) error {
+	id, _, ok := github.ParseItemRef(ch.Ref)
+	if !ok {
+		return Permanent(fmt.Errorf("posting a comment: %w", errNotItemRef))
+	}
+	if err := github.CheckCommentID(ch.CommentID); err != nil {
+		return Permanent(fmt.Errorf("posting a comment: %w", err))
+	}
+	what := "posting the comment " + ch.CommentID
+	installation, ok, err := reachOf(a.Store, github.CollectionRef(id))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &github.CommentRefused{Reason: github.ReasonItemGone, Err: fmt.Errorf("%s: %w", what, errNoInstallation)}
+	}
+	token := func(ctx context.Context, repository int64) (string, error) {
+		return a.token(ctx, installation, repository, "write")
+	}
+	c := github.Comment{CommentID: ch.CommentID, Ref: ch.Ref, AuthorName: ch.AuthorName, Body: ch.Body}
+	err = a.forgetOn401(installation, a.GitHub.PostComment(ctx, a.pacer(installation), token, a.Slug, c))
+	var refused *github.CommentRefused
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &refused):
+		return &github.CommentRefused{Reason: refused.Reason, Err: fmt.Errorf("%s: %w", what, err)}
+	case errors.Is(err, github.ErrMintRefused) || errors.Is(err, github.ErrSuspended):
+		return &github.CommentRefused{Reason: github.ReasonNotPermitted, Err: fmt.Errorf("%s: %w", what, err)}
+	case errors.Is(err, github.ErrInvalidChange):
+		return Permanent(fmt.Errorf("%s: %w", what, err))
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 // errNotItemRef refuses a change's ref that is not an item's, see [github.ParseItemRef].

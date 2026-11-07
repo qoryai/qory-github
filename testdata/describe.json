@@ -114,6 +114,7 @@
         "one": "repository",
         "other": "repositories"
       },
+      "comments": true,
       "targets": true,
       "program": "qory-github-server",
       "setup": {

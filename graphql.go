@@ -313,8 +313,9 @@ func rateLimited(errs []gqlError) bool {
 // collection and its items are. Items go in parts of at most 100 items and 1 MiB, and
 // after each part the comments of its items, for an issue that has any, read by REST
 // through the repository's id in requests of at most 100 comments and 1 MiB, the App's
-// work item comment left out. It reads at most 2,000 pages of 100 issues, and 100 pages
-// of an issue's comments.
+// work item comment left out, and a comment the App's bot posted for a person's comment
+// in Qory Apiary with that comment's comment_id. It reads at most 2,000 pages of 100
+// issues, and 100 pages of an issue's comments.
 //
 // The last part says the listing is complete, since paging by cursor does not skip an
 // issue, so Qory Apiary closes every item of the collection the listing left out and
