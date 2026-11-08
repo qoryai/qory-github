@@ -26,18 +26,23 @@ change what the program does, and notes it under Upgrading.
   hyphens, with no hyphen at either end. A pass with a slug of another shape, or with
   any other member the contract does not define, is refused as a link that is not
   valid.
-- A comment a person writes in Qory Apiary when they take in an issue is posted on the
-  issue by the App's bot, once, with the first line `<name> wrote in Qory Apiary:`. The
-  adapter sends that comment back to Qory Apiary with its `comment_id`, and reports a
-  comment it cannot post with the reason: `item_gone`, `not_permitted`, `too_long` or
-  `unreachable`. The description has `comments: true` in `roles.source`.
-- The name in that first line shows as plain text. A backslash escapes each Markdown
-  character, and a zero-width space follows each `@`, `#` and `:`, so the name mentions
-  no one and makes no issue link, emoji or web link.
-- A comment that GitHub returns 400 for, or 422 for any cause other than a body too
-  long, or a comment on an issue with more than 100 pages of comments, is reported
-  `unreachable` at once. If the failure report still fails a day after the first day of
-  failures, the adapter logs one line with the `comment_id` and moves past the comment.
+- The App's bot posts on the issue, once, each comment a person writes in Qory Apiary
+  when they take in the issue. The comment's first line is
+  `<name> wrote in Qory Apiary:` and ends with the marker
+  `<!-- qory:comment <comment_id> -->`, which GitHub does not show, even when the
+  person's text leaves a code block open. The adapter sends the posted comment back to
+  Qory Apiary with its `comment_id`. For a comment that the adapter cannot post, it
+  sends Qory Apiary a failure report with the reason `item_gone`, `not_permitted`,
+  `too_long`, or `unreachable`. The description has `comments: true` in
+  `roles.source`.
+- The name in the first line shows as plain text. The adapter puts a backslash before
+  each Markdown character and a zero-width space after each `@`, `#`, and `:`, so
+  GitHub makes no mention, issue link, emoji, or web link from the name.
+- The adapter reports a comment as `unreachable` at once when GitHub returns 400 for
+  it, or 422 for any cause other than a body too long, or when the issue has more than
+  100 pages of comments. If the failure report still fails two days after the
+  comment's first failure, the adapter logs one line with the `comment_id` and moves
+  past the comment.
 
 ### Changed
 

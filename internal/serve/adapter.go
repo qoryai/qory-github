@@ -1710,33 +1710,34 @@ func (a *Adapter) applyChange(ctx context.Context, ch contracts.Change) error {
 
 // applyComment posts on GitHub the comment of a comment entry of the feed, as the App's
 // bot, with a token that writes the issues of that one repository, from the
-// installation that reaches it, see [github.Client.PostComment]. An entry whose ref is
-// not an item's, see [github.ParseItemRef], or whose comment_id is not one, see
-// [github.CheckCommentID], fails for good before the store is read or GitHub is asked,
-// and the feed logs it and passes it with no failure report. So does an entry whose
-// author_name [github.Client.PostComment] refuses.
+// installation that reaches it, see [github.Client.PostComment]. An entry whose
+// comment_id is not one, see [github.CheckCommentID], or whose ref is not an item's,
+// see [github.ParseItemRef], fails permanently before the store is read or a request
+// is sent to GitHub, and the feed logs it and passes it with no failure report. So
+// does an entry whose author_name fails the check of [github.Client.PostComment].
+// Every error but the first ends with the comment_id, as "(comment {comment_id})".
 //
-// A comment GitHub does not take for good is a [*github.CommentRefused], whose reason
-// is the reason of the feed's failure report, see [feed.comment]: GitHub's answer, see
-// [github.Client.PostComment]; item_gone when no installation reaches the repository;
-// and not_permitted when GitHub refuses to mint the token for good,
-// [github.ErrMintRefused], or answers that the installation is suspended,
+// A comment that a retry cannot post is a [*github.CommentRefused], whose reason is the
+// reason of the feed's failure report, see [feed.comment]: the reason that GitHub's
+// response sets, see [github.Client.PostComment]; item_gone when no installation
+// reaches the repository; and not_permitted when the token mint fails permanently,
+// [github.ErrMintRefused], or GitHub returns that the installation is suspended,
 // [github.ErrSuspended]. Every other error may pass, and the entry is posted again.
 func (a *Adapter) applyComment(ctx context.Context, ch contracts.Change) error {
+	// The comment_id is checked first, so every later error can end with it.
+	if err := github.CheckCommentID(ch.CommentID); err != nil {
+		return Permanent(err)
+	}
 	id, _, ok := github.ParseItemRef(ch.Ref)
 	if !ok {
-		return Permanent(fmt.Errorf("posting a comment: %w", errNotItemRef))
+		return Permanent(fmt.Errorf("report this Qory Apiary defect: %w (comment %s)", errNotItemRef, ch.CommentID))
 	}
-	if err := github.CheckCommentID(ch.CommentID); err != nil {
-		return Permanent(fmt.Errorf("posting a comment: %w", err))
-	}
-	what := "posting the comment " + ch.CommentID
 	installation, ok, err := reachOf(a.Store, github.CollectionRef(id))
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return &github.CommentRefused{Reason: github.ReasonItemGone, Err: fmt.Errorf("%s: %w", what, errNoInstallation)}
+		return &github.CommentRefused{Reason: github.ReasonItemGone, Err: fmt.Errorf("%w (comment %s)", errNoInstallation, ch.CommentID)}
 	}
 	token := func(ctx context.Context, repository int64) (string, error) {
 		return a.token(ctx, installation, repository, "write")
@@ -1748,13 +1749,14 @@ func (a *Adapter) applyComment(ctx context.Context, ch contracts.Change) error {
 	case err == nil:
 		return nil
 	case errors.As(err, &refused):
-		return &github.CommentRefused{Reason: refused.Reason, Err: fmt.Errorf("%s: %w", what, err)}
+		// refused.Err, not err: the new error's text starts with the fix once.
+		return &github.CommentRefused{Reason: refused.Reason, Err: fmt.Errorf("%w (comment %s)", refused.Err, ch.CommentID)}
 	case errors.Is(err, github.ErrMintRefused) || errors.Is(err, github.ErrSuspended):
-		return &github.CommentRefused{Reason: github.ReasonNotPermitted, Err: fmt.Errorf("%s: %w", what, err)}
+		return &github.CommentRefused{Reason: github.ReasonNotPermitted, Err: fmt.Errorf("%w (comment %s)", err, ch.CommentID)}
 	case errors.Is(err, github.ErrInvalidChange):
-		return Permanent(fmt.Errorf("%s: %w", what, err))
+		return Permanent(fmt.Errorf("%w (comment %s)", err, ch.CommentID))
 	}
-	return fmt.Errorf("%s: %w", what, err)
+	return fmt.Errorf("%w (comment %s)", err, ch.CommentID)
 }
 
 // errNotItemRef refuses a change's ref that is not an item's, see [github.ParseItemRef].

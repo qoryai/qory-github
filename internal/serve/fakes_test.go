@@ -820,8 +820,8 @@ type fakeGitHub struct {
 	installStatus, goneAfterChecks int
 	// labelStatus, when set, answers the creation of the label in acme/widgets with
 	// that status, as GitHub answers a write in an archived repository. commentStatus,
-	// when set, answers a comment posted on acme/widgets's issue 7 with that status and
-	// the body commentAnswer.
+	// when set, is the status returned for a comment posted on acme/widgets's issue 7,
+	// with the body commentAnswer.
 	labelStatus   int
 	commentStatus int
 	commentAnswer string
