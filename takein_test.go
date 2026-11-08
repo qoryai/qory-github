@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The App's slug, its bot, and the installation token the fake GitHub takes: synthetic,
@@ -899,27 +900,36 @@ func TestOnlyTheBotsLastLineMarkerCounts(t *testing.T) {
 }
 
 // TestTheNameLineCleansAndEscapesTheName posts comments whose author's name would
-// mention a user, link an issue, change the formatting or reorder the line, and checks
-// the exact first line: a zero-width space after each @ and #, each Markdown character,
-// & and $ after a backslash, the bidirectional controls and invisible characters
-// removed, and the leading and trailing spaces trimmed. The person's text is posted
-// unchanged.
+// mention a user, link an issue, show an emoji, make a link, change the formatting or
+// reorder the line, and checks the exact first line: a zero-width space after each @,
+// # and :, each other Markdown character, & and $ after a backslash, the bidirectional
+// controls and invisible characters removed, and the leading and trailing spaces
+// trimmed. The person's text is posted unchanged.
 func TestTheNameLineCleansAndEscapesTheName(t *testing.T) {
 	for name, want := range map[string]string{
 		"@octocat":                       "@\u200boctocat",
 		"**x**":                          `\*\*x\*\*`,
-		"#123":                           "\\#\u200b123",
-		"&#8238;x":                       "\\&\\#\u200b8238;x",
+		"#123":                           "#\u200b123",
+		"# Dana":                         "#\u200b Dana",
+		"acme/widgets#123":               "acme/widgets#\u200b123",
+		"&#8238;x":                       "\\&#\u200b8238;x",
 		"$x$":                            `\$x\$`,
 		"Dana \u202eelpmaxE":             "Dana elpmaxE",
 		"\u200bDana\u2066 Example\ufeff": "Dana Example",
 		"Dana\u2028Example":              "Dana Example",
 		"\u2029Dana Example\u2028":       "Dana Example",
 		"Dana @octo-org/team **x**":      "Dana @\u200bocto\\-org/team \\*\\*x\\*\\*",
-		"\\`*_{}[]()#+-.!|<>~&$":         "\\\\\\`\\*\\_\\{\\}\\[\\]\\(\\)\\#\u200b\\+\\-\\.\\!\\|\\<\\>\\~\\&\\$",
+		"\\`*_{}[]()#+-.!|<>~&$:@":       "\\\\\\`\\*\\_\\{\\}\\[\\]\\(\\)#\u200b\\+\\-\\.\\!\\|\\<\\>\\~\\&\\$:\u200b@\u200b",
 		"    Dana Example ":              "Dana Example",
+		"    code":                       "code",
 		"\u00a0\u3000Dana Example\u2009": "Dana Example",
-		"José Ñandú :tada:":              "José Ñandú :tada:",
+		"José Ñandú :tada:":              "José Ñandú :\u200btada:\u200b",
+		"https://example.com/x":          "https:\u200b//example\\.com/x",
+		"```go":                          "\\`\\`\\`go",
+		"~~~":                            "\\~\\~\\~",
+		"1. Dana":                        "1\\. Dana",
+		"<!-- Dana":                      "\\<\\!\\-\\- Dana",
+		"<!-- qory:work-item wi_1 -->":   "\\<\\!\\-\\- qory:\u200bwork\\-item wi\\_1 \\-\\-\\>",
 	} {
 		f := &fakeTakeIn{}
 		c, token, _ := serveTakeIn(t, f)
@@ -940,6 +950,49 @@ func TestTheNameLineCleansAndEscapesTheName(t *testing.T) {
 		if rest != "\n@octocat **x**\n\n<!-- qory:comment "+testCommentID+" -->" {
 			t.Errorf("%q: the rest is %q", name, rest)
 		}
+	}
+}
+
+// TestAnEscapedNameFitsTheContractsRoom builds the comment for names of 100 copies of
+// one character, for every printable ASCII character and a few others, and checks that
+// each character of the name becomes at most 2 characters, that the escaped name, "
+// wrote in Qory Apiary:", the line breaks and the marker are at most 536 characters
+// together, as the contract has it, and that the comment's marker is its last line and
+// its comment_id is read back, with no <! in the first line and no work item's marker
+// at its start.
+func TestAnEscapedNameFitsTheContractsRoom(t *testing.T) {
+	var chars []rune
+	for r := rune('!'); r <= '~'; r++ {
+		chars = append(chars, r)
+	}
+	chars = append(chars, 'é', '＠', ' ', ' ')
+	const body = "x"
+	for _, r := range chars {
+		e := testComment
+		e.AuthorName = strings.Repeat(string(r), maxAuthorName)
+		escaped := escapeName(cleanName(e.AuthorName))
+		if n := utf8.RuneCountInString(escaped); n > 2*maxAuthorName {
+			t.Errorf("%q: the escaped name is %d characters, over %d", r, n, 2*maxAuthorName)
+		}
+		e.Body = body
+		posted := commentBody(e)
+		if n := utf8.RuneCountInString(posted) - utf8.RuneCountInString(body); n > 536 {
+			t.Errorf("%q: the name line, the line breaks and the marker are %d characters, over 536", r, n)
+		}
+		first, _, _ := strings.Cut(posted, "\n")
+		if strings.Contains(first, "<!") || strings.HasPrefix(posted, workItemMarker) {
+			t.Errorf("%q: the first line is %q", r, first)
+		}
+		if id := markedID(posted); id != testCommentID {
+			t.Errorf("%q: the marker's id is %q", r, id)
+		}
+	}
+	// A name of 100 characters that each become 2: the longest escaped name.
+	e := testComment
+	e.AuthorName = strings.Repeat("@", maxAuthorName)
+	e.Body = body
+	if n := utf8.RuneCountInString(commentBody(e)) - len(body); n != 200+len(" wrote in Qory Apiary:\n\n\n\n"+commentMark(testCommentID)) {
+		t.Errorf("the longest name line, line breaks and marker are %d characters", n)
 	}
 }
 
@@ -983,8 +1036,12 @@ func TestACommentGitHubRefusesHasItsReason(t *testing.T) {
 		{"read 301", read, fakeAnswer{status: 301, header: map[string]string{"Location": "https://api.github.com/repositories/1/issues/7/comments"}, body: `{"message":"Moved Permanently"}`}, ReasonItemGone},
 		{"403", post, fakeAnswer{status: 403, body: `{"message":"Resource not accessible by integration"}`}, ReasonNotPermitted},
 		{"422 body", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body","message":"body is too long (maximum is 65536 characters)"}]}`}, ReasonTooLong},
-		{"422 other", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"unprocessable","field":"data"}]}`}, ReasonNotPermitted},
-		{"422 without errors", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed"}`}, ReasonNotPermitted},
+		{"422 too long in the message", post, fakeAnswer{status: 422, body: `{"message":"Body is too long"}`}, ReasonTooLong},
+		{"422 body not too long", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"body","message":"body is invalid"}]}`}, ReasonUnreachable},
+		{"422 other", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"unprocessable","field":"data"}]}`}, ReasonUnreachable},
+		{"422 without errors", post, fakeAnswer{status: 422, body: `{"message":"Validation Failed"}`}, ReasonUnreachable},
+		{"400", post, fakeAnswer{status: 400, body: `{"message":"Problems parsing JSON"}`}, ReasonUnreachable},
+		{"read 400", read, fakeAnswer{status: 400, body: `{"message":"Bad Request"}`}, ReasonUnreachable},
 		{"403 rate limit", post, fakeAnswer{status: 403, header: map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1"}, body: `{"message":"API rate limit exceeded"}`}, ""},
 		{"500", post, fakeAnswer{status: 500, body: `{"message":"Server Error"}`}, ""},
 		{"401", post, fakeAnswer{status: 401, body: `{"message":"Bad credentials"}`}, ""},
@@ -1006,6 +1063,29 @@ func TestACommentGitHubRefusesHasItsReason(t *testing.T) {
 		if err != nil && (strings.Contains(err.Error(), takeInToken) || strings.Contains(err.Error(), "Dana") || strings.Contains(err.Error(), "steps")) {
 			t.Errorf("%s: the error contains a secret or a text: %v", tc.name, err)
 		}
+	}
+}
+
+// TestACommentOnAnIssueWithTooManyCommentsIsUnreachable posts a comment on an issue
+// whose comments fill more than maxMarkerPages pages, one to a page, and checks that the
+// post stops with the reason unreachable, with no comment posted and no page read after
+// the last one allowed.
+func TestACommentOnAnIssueWithTooManyCommentsIsUnreachable(t *testing.T) {
+	f := &fakeTakeIn{pageSize: 1}
+	for range maxMarkerPages + 1 {
+		f.comments = append(f.comments, commentBy("someone", "User", "Same here."))
+	}
+	c, token, _ := serveTakeIn(t, f)
+	err := c.PostComment(context.Background(), nil, token, takeInSlug, testComment)
+	var refused *CommentRefused
+	if !errors.As(err, &refused) || refused.Reason != ReasonUnreachable {
+		t.Fatalf("err %v, want the reason unreachable", err)
+	}
+	if got := f.posts(); len(got) != 0 {
+		t.Errorf("posted %q", got)
+	}
+	if n := len(f.requests); n != maxMarkerPages {
+		t.Errorf("%d requests, want %d", n, maxMarkerPages)
 	}
 }
 

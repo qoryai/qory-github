@@ -1683,8 +1683,9 @@ func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
 		{"403", widgets7, answer(403, `{"message":"Resource not accessible by integration"}`), "not_permitted", false},
 		{"a mint refused", commentEntry("acme/old", 9), nil, "not_permitted", false},
 		{"a suspended installation", widgets7, func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", false},
-		{"422 for the body", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body"}]}`), "too_long", false},
-		{"another 422", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"issue"}]}`), "not_permitted", false},
+		{"422 for the body", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", false},
+		{"another 422", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"issue"}]}`), "unreachable", false},
+		{"400", widgets7, answer(400, `{"message":"Problems parsing JSON"}`), "unreachable", false},
 		{"a text too long", long, nil, "too_long", true},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
@@ -1813,6 +1814,60 @@ func TestAReportThatFailsKeepsThePage(t *testing.T) {
 	}
 }
 
+// TestAReportThatFailsForADayMorePassesTheEntry has GitHub return 404 for the post and
+// Qory Apiary 503 for every failure report: the page stays until the entry has failed
+// for two days, then one line with the comment_id and the reason item_gone is logged,
+// without the name or the text, the entry is passed and the cursor moves. Every report
+// sent has the reason item_gone.
+func TestAReportThatFailsForADayMorePassesTheEntry(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 404, `{"message":"Not Found"}` })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.mu.Lock()
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeChangesFailed {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	for _, after := range []time.Duration{0, stuckFor, stuckFor - time.Second} {
+		now = now.Add(after)
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("after %v more: err %v", after, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v more: the cursor is kept", after)
+		}
+	}
+	now = now.Add(time.Second)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	logged := w.log.String()
+	const line = `"msg":"the failure report of a comment failed for a day, and the entry is passed with no report in Qory Apiary","comment_id":"` + testCommentID + `","reason":"item_gone"`
+	if n := strings.Count(logged, line); n != 1 {
+		t.Errorf("the line is logged %d times: %s", n, logged)
+	}
+	if strings.Contains(logged, "a change of the feed has failed for a day") {
+		t.Errorf("a second line is logged: %s", logged)
+	}
+	if strings.Contains(logged, "Dana") || strings.Contains(logged, "steps") {
+		t.Errorf("the log contains the name or the text: %s", logged)
+	}
+	for _, r := range w.apiary.reports() {
+		if r != testCommentID+" item_gone" {
+			t.Errorf("a report is %q, want item_gone", r)
+		}
+	}
+}
+
 // TestPostAgainPostsTheCommentOnce has GitHub answer the first post 404, which is
 // reported as item_gone, then take the comment: a later entry with the same comment_id,
 // as Post again writes it, posts the comment once, and a second such entry posts
@@ -1868,7 +1923,7 @@ func TestAReportQoryApiaryRefusesPassesTheEntry(t *testing.T) {
 	if r := w.apiary.reports(); len(r) != 1 {
 		t.Errorf("reports %v", r)
 	}
-	if !strings.Contains(w.log.String(), "Qory Apiary refused the report") || !strings.Contains(w.log.String(), "403 forbidden") {
+	if !strings.Contains(w.log.String(), "the report to Qory Apiary failed for good") || !strings.Contains(w.log.String(), "403 forbidden") {
 		t.Errorf("the log %s", w.log.String())
 	}
 }

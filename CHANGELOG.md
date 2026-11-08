@@ -31,6 +31,13 @@ change what the program does, and notes it under Upgrading.
   adapter sends that comment back to Qory Apiary with its `comment_id`, and reports a
   comment it cannot post with the reason: `item_gone`, `not_permitted`, `too_long` or
   `unreachable`. The description has `comments: true` in `roles.source`.
+- The name in that first line shows as plain text. A backslash escapes each Markdown
+  character, and a zero-width space follows each `@`, `#` and `:`, so the name mentions
+  no one and makes no issue link, emoji or web link.
+- A comment that GitHub returns 400 for, or 422 for any cause other than a body too
+  long, or a comment on an issue with more than 100 pages of comments, is reported
+  `unreachable` at once. If the failure report still fails a day after the first day of
+  failures, the adapter logs one line with the `comment_id` and moves past the comment.
 
 ### Changed
 

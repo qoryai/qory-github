@@ -282,20 +282,22 @@ type Comment struct {
 // The values of a failure report's reason, for a comment the adapter stopped trying to
 // post, changes-failed.schema.json.
 const (
-	// ReasonItemGone: GitHub answered that the issue does not exist or moved, or no
+	// ReasonItemGone: GitHub returned that the issue does not exist or moved, or no
 	// installation reaches its repository.
 	ReasonItemGone = "item_gone"
-	// ReasonNotPermitted: GitHub answered that the App may not comment on the issue.
+	// ReasonNotPermitted: GitHub returned that the App may not comment on the issue.
 	ReasonNotPermitted = "not_permitted"
 	// ReasonTooLong: the comment with its first line is longer than GitHub takes.
 	ReasonTooLong = "too_long"
-	// ReasonUnreachable: GitHub did not take the comment before the retries ended.
+	// ReasonUnreachable: GitHub did not take the comment before the retries ended, or
+	// returned a 400 or a 422 that a retry gets again, or the issue has more comments
+	// than are read.
 	ReasonUnreachable = "unreachable"
 )
 
-// CommentRefused is the error of a comment GitHub does not take for good: asking again
-// would get the same answer. Reason is the failure report's reason, one of the Reason
-// constants; Err is GitHub's answer or the check that refused the comment.
+// CommentRefused is the error of a comment that a retry cannot post, since the retry
+// would fail the same way. Reason is the failure report's reason, one of the Reason
+// constants; Err is GitHub's status and message, or the check that stopped the post.
 type CommentRefused struct {
 	Reason string
 	Err    error
@@ -365,10 +367,16 @@ func markedID(body string) string {
 
 // nameEscapes are the characters of Markdown, and & and $, that a backslash escapes in
 // the author's name: & so no character reference, such as &#8238;, is read, and $ so
-// no math is read.
-const nameEscapes = "\\`*_{}[]()#+-.!|<>~&$"
+// no math is read. # is not among them: a zero-width space follows it, see
+// [nameBreakers], so it starts no heading.
+const nameEscapes = "\\`*_{}[]()+-.!|<>~&$"
 
-// zeroWidthSpace follows each @ and # in the author's name, see [escapeName].
+// nameBreakers are the characters a zero-width space follows in the author's name, see
+// [escapeName]: @ for a mention, # for an issue link, and : for an emoji such as :tada:
+// and a link such as https://example.com.
+const nameBreakers = "@#:"
+
+// zeroWidthSpace follows each character of nameBreakers in the author's name.
 const zeroWidthSpace = "\u200b"
 
 // cleanName is the author's name as the first line contains it, before it is escaped:
@@ -379,12 +387,18 @@ func cleanName(name string) string {
 	return strings.TrimSpace(nameHidden.ReplaceAllString(nameBreaks.Replace(name), ""))
 }
 
-// escapeName is the author's name as the first line contains it: each character of
-// nameEscapes after a backslash, so the name changes no formatting, and a zero-width
-// space after each @ and #, as Dependabot writes them. GitHub finds mentions and issue
-// references in the rendered text, so a backslash or a character reference such as
-// &#64; still mentions the user; the zero-width space breaks the pattern, so @octocat
-// notifies no one and #123 links to nothing.
+// escapeName is the author's name as the first line contains it, shown as plain text:
+// each character of nameEscapes after a backslash, so the name changes no formatting,
+// and a zero-width space after each character of nameBreakers, as Dependabot writes an
+// @. GitHub finds mentions, issue links, emoji and links in the rendered text, after
+// Markdown removes a backslash, so a backslash or a character reference such as &#64;
+// still mentions the user; the zero-width space breaks the pattern, so @octocat
+// notifies no one, #123 links to nothing, :tada: stays text, and https://example.com is
+// no link. Each character becomes at most 2 characters, so a name of 100 characters,
+// the contract's limit, becomes at most 200, and the first line, the empty line and the
+// marker fit the 536 characters the contract leaves them. Each < and ! follows a
+// backslash, so the name contains no <!: it starts no HTML comment, which could hide
+// the marker, and no marker.
 func escapeName(name string) string {
 	var b strings.Builder
 	for _, r := range name {
@@ -392,7 +406,7 @@ func escapeName(name string) string {
 			b.WriteByte('\\')
 		}
 		b.WriteRune(r)
-		if r == '@' || r == '#' {
+		if strings.ContainsRune(nameBreakers, r) {
 			b.WriteString(zeroWidthSpace)
 		}
 	}
@@ -446,12 +460,13 @@ func parseComment(e Comment) (issueRef, error) {
 // Text a person wrote cannot be that last line, since the marker follows it. The
 // comment is never edited nor deleted.
 //
-// A comment GitHub does not take for good is a [*CommentRefused], with its reason: a
-// comment longer than 65,536 characters with its first line and marker, too_long, with
-// no request sent; a 404 or 410, or a permanent redirect, 301 or 308, item_gone; a 403
-// that is no rate limit, not_permitted; a 422 whose errors have the field body,
-// too_long, and any other 422, not_permitted. Every other error may pass, and the entry
-// can be posted again. No error contains the token, the name or the text.
+// A comment that a retry cannot post is a [*CommentRefused], with its reason: a comment
+// longer than 65,536 characters with its first line and marker, too_long, with no
+// request sent; a 404 or 410, or a permanent redirect, 301 or 308, item_gone; a 403 that
+// is no rate limit, not_permitted; a 422 whose message is that the body is too long,
+// too_long; a 400, any other 422, or an issue with more than maxMarkerPages pages of
+// comments, unreachable. Every other error may pass, and the entry can be posted again.
+// No error contains the token, the name or the text.
 func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug string, e Comment) error {
 	issue, err := parseComment(e)
 	if err != nil {
@@ -482,6 +497,9 @@ func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug
 	}
 	mark := commentMark(e.CommentID)
 	found, err := c.commented(ctx, p, tok, slug, issue, func(body string) bool { return lastLine(body) == mark }, commentFailed)
+	if errors.Is(err, errTooManyComments) {
+		return &CommentRefused{Reason: ReasonUnreachable, Err: err}
+	}
 	if err != nil || found {
 		return err
 	}
@@ -496,9 +514,11 @@ func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug
 	return nil
 }
 
-// commentFailed is the error for an answer to a step of [Client.PostComment] whose
-// status is not the one the step wants: a [*CommentRefused] when asking again would get
-// the same answer, and GitHub's answer alone otherwise.
+// commentFailed is the error for a response to a step of [Client.PostComment] whose
+// status is not the one the step wants: a [*CommentRefused] when a retry would get the
+// same status, and GitHub's status and message alone otherwise. A 400 or a 422 that is
+// not for a body too long is unreachable: the post fails the same way every time, and no
+// other reason of the contract fits it.
 func commentFailed(a *apiReply, what string) error {
 	err := a.err(what)
 	switch {
@@ -507,13 +527,17 @@ func commentFailed(a *apiReply, what string) error {
 		return &CommentRefused{Reason: ReasonItemGone, Err: err}
 	case a.status == http.StatusForbidden && !a.rateLimited():
 		return &CommentRefused{Reason: ReasonNotPermitted, Err: err}
-	case a.status == http.StatusUnprocessableEntity && a.fieldRefused("body"):
+	case a.status == http.StatusUnprocessableEntity && a.bodyTooLong():
 		return &CommentRefused{Reason: ReasonTooLong, Err: err}
-	case a.status == http.StatusUnprocessableEntity:
-		return &CommentRefused{Reason: ReasonNotPermitted, Err: err}
+	case a.status == http.StatusBadRequest || a.status == http.StatusUnprocessableEntity:
+		return &CommentRefused{Reason: ReasonUnreachable, Err: err}
 	}
 	return err
 }
+
+// errTooManyComments is the error of [Client.commented] for an issue with more than
+// maxMarkerPages pages of comments. A retry reads the same pages again.
+var errTooManyComments = errors.New("the issue has more than " + strconv.Itoa(maxMarkerPages) + " pages of comments; none is posted, since one may be there already")
 
 // commented is whether the App's bot, slug[bot] of type Bot, has a comment on the issue
 // whose body match takes. It reads the comments a page at a time, following the next
@@ -557,7 +581,7 @@ func (c Client) commented(ctx context.Context, p *Pacer, tok, slug string, issue
 		}
 		path = next
 	}
-	return false, fmt.Errorf("%s: the issue has more than %d pages of comments; none is posted, since one may be there already", reading, maxMarkerPages)
+	return false, fmt.Errorf("%s: %w", reading, errTooManyComments)
 }
 
 // undo removes the label from the issue. A 404, the label not on the issue, and a 410,
@@ -617,22 +641,28 @@ func (a *apiReply) rateLimited() bool {
 	return strings.Contains(strings.ToLower(e.Message), "rate limit")
 }
 
-// fieldRefused is whether the answer is GitHub's 422 with an error whose field is
-// field.
-func (a *apiReply) fieldRefused(field string) bool {
+// bodyTooLong is whether the response is GitHub's 422 for a body longer than GitHub
+// takes: its message, or the message of an error whose field is body, contains
+// "too long", as in "body is too long (maximum is 65536 characters)".
+func (a *apiReply) bodyTooLong() bool {
 	if a.status != http.StatusUnprocessableEntity {
 		return false
 	}
 	var e struct {
-		Errors []struct {
-			Field string `json:"field"`
+		Message string `json:"message"`
+		Errors  []struct {
+			Field   string `json:"field"`
+			Message string `json:"message"`
 		} `json:"errors"`
 	}
 	if json.Unmarshal(a.body, &e) != nil {
 		return false
 	}
+	if strings.Contains(strings.ToLower(e.Message), "too long") {
+		return true
+	}
 	for _, x := range e.Errors {
-		if x.Field == field {
+		if x.Field == "body" && strings.Contains(strings.ToLower(x.Message), "too long") {
 			return true
 		}
 	}

@@ -222,17 +222,19 @@ func known(ch contracts.Change) bool {
 // An entry that fails, not for good, is timed from its first failure: once it has
 // failed for stuckFor, it is logged and passed too. A comment entry is reported first,
 // with the reason unreachable, or with the reason of a report that failed before, see
-// [reportPending]; a report that fails, not for good, stops the page, so no comment
-// entry is passed before Qory Apiary has its report. The feed keeps, for the page read
-// after the cursor, each entry's first failure and the entries passed, which a read
-// of the same page again skips, so every entry of a page is timed and passed alone,
-// and the page's cursor is kept once none is left; it forgets them when the cursor
-// moves. A time the feed cannot be read, its read failing or its answer refused, does
-// not count: the first failures are moved later by as long, so an outage that stops the
-// feed's reads does not count toward the day. One that fails an entry's requests to
-// Qory Apiary while the feed's reads are answered does count, as any failure of the
-// entry does. All this is kept in memory alone, so a restart times the entries from
-// their next failures again.
+// [reportPending]; a report that fails, not for good, stops the page, so the report is
+// sent again. Once the entry has failed for 2*stuckFor, a failed report is logged once,
+// with the comment_id and the reason, and the entry is passed with no report, so a
+// report that keeps failing stops the feed for one more day at most. The feed keeps,
+// for the page read after the cursor, each entry's first failure and the entries
+// passed, which a read of the same page again skips, so every entry of a page is timed
+// and passed alone, and the page's cursor is kept once none is left; it forgets them
+// when the cursor moves. A time the feed cannot be read, its read failing or its
+// response rejected, does not count: the first failures are moved later by as long, so
+// an outage that stops the feed's reads does not count toward the day. One that fails
+// an entry's requests to Qory Apiary while the feed's reads succeed does count, as any
+// failure of the entry does. All this is kept in memory alone, so a restart times
+// the entries from their next failures again.
 //
 // A page that holds an entry serve does not know is refused whole, an
 // [*unknownChange], before any of its entries is applied, and its cursor is not kept:
@@ -268,7 +270,8 @@ func (f *feed) step(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			if f.failedFor(i) < stuckFor {
+			failed := f.failedFor(i)
+			if failed < stuckFor {
 				return err
 			}
 			if ch.Kind == contracts.ChangeComment {
@@ -277,8 +280,13 @@ func (f *feed) step(ctx context.Context) error {
 				if errors.As(err, &p) {
 					reason = p.reason
 				}
-				if err := f.report(ctx, ch.CommentID, reason, err); !IsPermanent(err) {
-					return err
+				if rerr := f.report(ctx, ch.CommentID, reason, err); !IsPermanent(rerr) {
+					if failed < 2*stuckFor {
+						return rerr
+					}
+					f.log.Error("the failure report of a comment failed for a day, and the entry is passed with no report in Qory Apiary", slog.String("comment_id", ch.CommentID), slog.String("reason", reason), slog.String("error", rerr.Error()))
+					f.failing.passed[i] = true
+					continue
 				}
 			}
 			f.log.Error("a change of the feed has failed for a day, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
@@ -397,18 +405,18 @@ func (f *feed) comment(ctx context.Context, ch contracts.Change) error {
 }
 
 // report sends Qory Apiary the failure report of the comment entry with commentID, for
-// reason, after cause, the post's failure, see [Apiary.ChangesFailed]. Sent, or refused
-// for good, as Qory Apiary's 400 or 403 is, it is a [Permanent] error, so the feed logs
-// the entry and passes it. A report that fails otherwise is a [*reportPending], which
-// may pass, so the page stays and the entry is posted again: the report is sent before
-// the entry is passed, whatever the time.
+// reason, after cause, the post's failure, see [Apiary.ChangesFailed]. Sent, or failed
+// for good, as with Qory Apiary's 400 or 403, it is a [Permanent] error, so the feed
+// logs the entry and passes it. A report that fails otherwise is a [*reportPending],
+// which may pass, so the page stays and the entry is posted again, until the entry has
+// failed for 2*stuckFor, see [feed.step].
 func (f *feed) report(ctx context.Context, commentID, reason string, cause error) error {
 	err := f.apiary.ChangesFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, CommentID: commentID, Reason: reason})
 	switch {
 	case err == nil:
 		return Permanent(fmt.Errorf("%w; reported to Qory Apiary as %s", cause, reason))
 	case IsPermanent(err):
-		return Permanent(fmt.Errorf("%w; Qory Apiary refused the report: %w", cause, err))
+		return Permanent(fmt.Errorf("%w; the report to Qory Apiary failed for good: %w", cause, err))
 	}
 	// The cause is kept as text alone: an error it wraps may be one IsPermanent takes.
 	return &reportPending{reason: reason, err: fmt.Errorf("%s; %w", cause.Error(), err)}
