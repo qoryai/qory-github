@@ -392,8 +392,8 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 // commentOf is a comment as the wire says it, or why it is skipped, and the texts cut
 // to fit it. slug is the App's: a comment its bot posted for a person's comment in Qory
 // Apiary has that comment's comment_id, see [apiaryCommentID]. A deleted comment is
-// sent without its body, so the size limits never lose a deletion; its comment_id is
-// read before the body is dropped.
+// sent without its body, so no deletion is cut or skipped for its size; its comment_id
+// is read before the body is dropped.
 func commentOf(c ghComment, slug string, deleted bool) (contracts.Comment, string, []Cut) {
 	var cuts []Cut
 	ref := strconv.FormatInt(c.ID, 10)
@@ -622,9 +622,9 @@ func workItemComment(c ghComment, slug string) bool {
 
 // apiaryCommentID is the comment_id of the person's comment in Qory Apiary that the
 // App's bot posted c for, see [Client.PostComment], or "": c is written by the App's
-// bot, see [byBot], and its body's last line, after one trailing newline is trimmed,
-// is exactly the marker <!-- qory:comment {comment_id} -->. Any other comment by a bot
-// is an automation's comment, without comment_id.
+// bot, see [byBot], and its body's first line ends with the marker
+// <!-- qory:comment {comment_id} -->, see [markedID]. Any other comment by a bot is an
+// automation's comment, without comment_id.
 func apiaryCommentID(c ghComment, slug string) string {
 	if !byBot(c, slug) || c.Body == nil {
 		return ""

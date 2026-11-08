@@ -1617,8 +1617,8 @@ func commentEntry(name string, n int) contracts.Change {
 	return contracts.Change{Kind: contracts.ChangeComment, CommentID: testCommentID, Ref: itemOf(name, n), AuthorName: "Dana Example", Body: "Please check the steps."}
 }
 
-// reports are the failure reports the fake received, refused ones too, each its
-// comment_id and its reason.
+// reports are the failure reports the fake received, the ones it returned an error
+// for too, each its comment_id and its reason.
 func (f *fakeApiary) reports() []string {
 	var out []string
 	for _, r := range f.sent(routeChangesFailed) {
@@ -1645,7 +1645,7 @@ func TestTheFeedPostsACommentOnceThroughAReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := "Dana Example wrote in Qory Apiary:\n\nPlease check the steps.\n\n<!-- qory:comment " + testCommentID + " -->"
+	want := "Dana Example wrote in Qory Apiary: <!-- qory:comment " + testCommentID + " -->\n\nPlease check the steps."
 	if posted := w.gh.postedComments(); len(posted) != 1 || posted[0] != want {
 		t.Errorf("posted %q, want %q", posted, want)
 	}
@@ -1657,10 +1657,11 @@ func TestTheFeedPostsACommentOnceThroughAReplay(t *testing.T) {
 	}
 }
 
-// TestACommentNotPostedIsReportedWithItsReason reads a comment entry that GitHub does not
-// take for good, and checks that the failure report is sent once with the reason, that
-// its body passes the contract's schema, that the entry is passed and logged with its
-// comment_id and without the name or the text, and that nothing is posted.
+// TestACommentNotPostedIsReportedWithItsReason reads a comment entry whose comment a
+// retry cannot post, and checks that the failure report is sent once with the reason,
+// that its body passes the contract's schema, that the entry is passed and logged with
+// the fix for the reason once, at the start, with its comment_id and without the name
+// or the text, and that nothing is posted.
 func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
 	widgets7 := commentEntry("acme/widgets", 7)
 	long := widgets7
@@ -1683,8 +1684,9 @@ func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
 		{"403", widgets7, answer(403, `{"message":"Resource not accessible by integration"}`), "not_permitted", false},
 		{"a mint refused", commentEntry("acme/old", 9), nil, "not_permitted", false},
 		{"a suspended installation", widgets7, func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", false},
-		{"422 for the body", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body"}]}`), "too_long", false},
-		{"another 422", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"issue"}]}`), "not_permitted", false},
+		{"422 for the body", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","field":"body","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", false},
+		{"another 422", widgets7, answer(422, `{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"invalid","field":"issue"}]}`), "unreachable", false},
+		{"400", widgets7, answer(400, `{"message":"Problems parsing JSON"}`), "unreachable", false},
 		{"a text too long", long, nil, "too_long", true},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
@@ -1706,8 +1708,11 @@ func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
 			t.Errorf("%s: reports %v, want %s", tc.name, r, tc.want)
 		}
 		logged := w.log.String()
-		if !strings.Contains(logged, `"msg":"a change of the feed failed, and is passed","kind":"comment","error":"posting the comment `+testCommentID+`: `) ||
-			!strings.Contains(logged, "reported to Qory Apiary as "+tc.want) {
+		fix := strings.TrimSuffix((&github.CommentRefused{Reason: tc.want, Err: errors.New("x")}).Error(), ": x")
+		if !strings.Contains(logged, `"msg":"a change of the feed failed, and is passed","kind":"comment","error":"`+fix+`: `) ||
+			strings.Count(logged, fix) != 1 ||
+			!strings.Contains(logged, "(comment "+testCommentID+")") ||
+			!strings.Contains(logged, "failure report sent to Qory Apiary with the reason "+tc.want) {
 			t.Errorf("%s: the log %s", tc.name, logged)
 		}
 		if strings.Contains(logged, "Dana") || strings.Contains(logged, "steps") || strings.Contains(logged, "aaaa") {
@@ -1725,9 +1730,10 @@ func TestACommentNotPostedIsReportedWithItsReason(t *testing.T) {
 	}
 }
 
-// TestACommentThatFailsForADayIsReportedUnreachable has GitHub answer the post 502 for a
-// day: the entry stays, with no report, until a day of its failures has passed, and is
-// then reported as unreachable and passed.
+// TestACommentThatFailsForADayIsReportedUnreachable has the fake GitHub return 502 for
+// the post for a day: the entry stays, with no report, until a day of its failures has
+// passed, and is then reported as unreachable and passed, and logged with the fix for
+// unreachable once, at the start of the error.
 func TestACommentThatFailsForADayIsReportedUnreachable(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
@@ -1757,15 +1763,18 @@ func TestACommentThatFailsForADayIsReportedUnreachable(t *testing.T) {
 	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
 		t.Errorf("the cursor %q", c)
 	}
-	if !strings.Contains(w.log.String(), `"msg":"a change of the feed has failed for a day, and is passed","kind":"comment"`) {
-		t.Errorf("the log %s", w.log.String())
+	const fix = "post the comment again from Qory Apiary later, or post it on GitHub by hand"
+	if logged := w.log.String(); !strings.Contains(logged, `"msg":"a change of the feed has failed for a day, and is passed","kind":"comment","error":"`+fix+`: `) ||
+		strings.Count(logged, fix) != 1 || !strings.Contains(logged, "with the reason unreachable") {
+		t.Errorf("the log %s", logged)
 	}
 }
 
-// TestAReportThatFailsKeepsThePage has Qory Apiary answer the failure report of a
-// comment GitHub answers 404 with 503: the step fails, the cursor stays, also once a day
-// has passed, when the report keeps its reason, item_gone, rather than unreachable. Once
-// Qory Apiary takes the report, the entry is passed.
+// TestAReportThatFailsKeepsThePage has the fake Qory Apiary return 503 for the
+// failure report of a comment that the fake GitHub returns 404 for: the step fails,
+// the cursor stays, also once a day has passed, when the report keeps its reason,
+// item_gone, rather than unreachable. Once the fake Qory Apiary returns 204 for the
+// report, the entry is passed.
 func TestAReportThatFailsKeepsThePage(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
@@ -1813,10 +1822,64 @@ func TestAReportThatFailsKeepsThePage(t *testing.T) {
 	}
 }
 
-// TestPostAgainPostsTheCommentOnce has GitHub answer the first post 404, which is
-// reported as item_gone, then take the comment: a later entry with the same comment_id,
-// as Post again writes it, posts the comment once, and a second such entry posts
-// nothing, since the comment has the marker. No other report is sent.
+// TestAReportThatFailsForADayMorePassesTheEntry has GitHub return 404 for the post and
+// Qory Apiary 503 for every failure report: the page stays until the entry has failed
+// for two days, then one line with the comment_id and the reason item_gone is logged,
+// without the name or the text, the entry is passed and the cursor moves. Every report
+// sent has the reason item_gone.
+func TestAReportThatFailsForADayMorePassesTheEntry(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 404, `{"message":"Not Found"}` })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.mu.Lock()
+	w.apiary.refuse = func(route string, _ int) (int, string) {
+		if route == routeChangesFailed {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	w.apiary.add(commentEntry("acme/widgets", 7))
+	for _, after := range []time.Duration{0, stuckFor, stuckFor - time.Second} {
+		now = now.Add(after)
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("after %v more: err %v", after, err)
+		}
+		if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("after %v more: the cursor is kept", after)
+		}
+	}
+	now = now.Add(time.Second)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+		t.Errorf("the cursor %q", c)
+	}
+	logged := w.log.String()
+	const line = `"msg":"check that Qory Apiary returns 204 for failure reports: one failed for a day; the entry is passed","comment_id":"` + testCommentID + `","reason":"item_gone"`
+	if n := strings.Count(logged, line); n != 1 {
+		t.Errorf("the line is logged %d times: %s", n, logged)
+	}
+	if strings.Contains(logged, "a change of the feed has failed for a day") {
+		t.Errorf("a second line is logged: %s", logged)
+	}
+	if strings.Contains(logged, "Dana") || strings.Contains(logged, "steps") {
+		t.Errorf("the log contains the name or the text: %s", logged)
+	}
+	for _, r := range w.apiary.reports() {
+		if r != testCommentID+" item_gone" {
+			t.Errorf("a report is %q, want item_gone", r)
+		}
+	}
+}
+
+// TestPostAgainPostsTheCommentOnce has the fake GitHub return 404 for the first post,
+// which is reported as item_gone, then create the comment: a later entry with the same
+// comment_id, as Post again writes it, posts the comment once, and a second such entry
+// posts nothing, since the comment has the marker. No other report is sent.
 func TestPostAgainPostsTheCommentOnce(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
@@ -1846,9 +1909,10 @@ func TestPostAgainPostsTheCommentOnce(t *testing.T) {
 	}
 }
 
-// TestAReportQoryApiaryRefusesPassesTheEntry has Qory Apiary answer the failure report
-// 403 forbidden: the report is not sent again, and the entry is passed and logged.
-func TestAReportQoryApiaryRefusesPassesTheEntry(t *testing.T) {
+// TestAReportWith403PassesTheEntry has the fake Qory Apiary return 403 forbidden for
+// the failure report: the report is not sent again, and the entry is passed and
+// logged.
+func TestAReportWith403PassesTheEntry(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.commentStatus, f.commentAnswer = 410, `{"message":"Gone"}` })
@@ -1868,14 +1932,14 @@ func TestAReportQoryApiaryRefusesPassesTheEntry(t *testing.T) {
 	if r := w.apiary.reports(); len(r) != 1 {
 		t.Errorf("reports %v", r)
 	}
-	if !strings.Contains(w.log.String(), "Qory Apiary refused the report") || !strings.Contains(w.log.String(), "403 forbidden") {
+	if !strings.Contains(w.log.String(), "the failure report to Qory Apiary failed permanently") || !strings.Contains(w.log.String(), "403 forbidden") {
 		t.Errorf("the log %s", w.log.String())
 	}
 }
 
 // TestAMalformedCommentEntryIsPassedWithoutAReport reads comment entries whose
 // comment_id, ref or author_name is not one: each is logged and passed, no report is
-// sent, GitHub is asked nothing, and the cursor moves.
+// sent, no request reaches GitHub, and the cursor moves.
 func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
@@ -1900,7 +1964,7 @@ func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
 	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_"+strconv.Itoa(len(chs)) {
 		t.Errorf("the cursor %q", c)
 	}
-	if n := strings.Count(w.log.String(), `"msg":"a change of the feed failed, and is passed","kind":"comment"`); n != len(chs) {
+	if n := strings.Count(w.log.String(), `"msg":"a change of the feed failed, and is passed","kind":"comment","error":"report this Qory Apiary defect: `); n != len(chs) {
 		t.Errorf("%d passed, want %d: %s", n, len(chs), w.log.String())
 	}
 	w.gh.mu.Lock()
@@ -1912,9 +1976,9 @@ func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
 }
 
 // TestACommentEntryIsKnownAndDecodes reads a page of the feed with a comment entry, as
-// Qory Apiary writes it, which passes the contract's schema and which serve knows and
-// decodes with no member left over, and
-// one with a member the comment entry does not define, which is refused.
+// Qory Apiary writes it, which passes the contract's schema and which serve accepts and
+// decodes with no member left over, and one with a member the comment entry does not
+// define, which serve rejects.
 func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	body := `{"version":1,"revision":` + strconv.Itoa(contracts.Revision) + `,"cursor":"c_1","changes":[` +
 		`{"kind":"comment","comment_id":"sc_0123456789abcdef","ref":"1296269#7","author_name":"Dana Example","body":"Please check the steps."}]}`

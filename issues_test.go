@@ -732,15 +732,15 @@ func TestAnIssueCommentEventIsTheComment(t *testing.T) {
 
 // The App's bot's comment for the person's comment sc_0123456789abcdef in Qory Apiary,
 // as GitHub has it.
-const botsComment = "Dana Example wrote in Qory Apiary:\n\nPlease check the steps.\n\n<!-- qory:comment sc_0123456789abcdef -->"
+const botsComment = "Dana Example wrote in Qory Apiary: <!-- qory:comment sc_0123456789abcdef -->\n\nPlease check the steps."
 
 // TestTheBotsCommentForAPersonsCommentHasItsCommentID sends issue_comment events and
 // checks that the App's bot's comment for a person's comment in Qory Apiary is sent
 // with its comment_id, created, edited and deleted, the deletion without its body; that
-// a comment whose last line is the marker is sent without comment_id when a person,
-// another App's bot or a user with the bot's login wrote it, or when the marker is not
-// its last line; and that the work item comment is still left out. Each request
-// passes the contract's schema.
+// a comment whose first line ends with the marker is sent without comment_id when a
+// person, another App's bot or a user with the bot's login wrote it, or when the marker
+// is the last line rather than the end of the first; and that the work item comment is
+// still left out. Each request passes the contract's schema.
 func TestTheBotsCommentForAPersonsCommentHasItsCommentID(t *testing.T) {
 	for _, tc := range []struct {
 		action  string
@@ -748,12 +748,12 @@ func TestTheBotsCommentForAPersonsCommentHasItsCommentID(t *testing.T) {
 		want    string // ref author kind comment_id deleted, or "" for nothing
 	}{
 		{"created", comment(5, "qory-test[bot]", "Bot", botsComment), "5 qory-test[bot] automation sc_0123456789abcdef false"},
-		{"edited", comment(5, "QORY-TEST[bot]", "Bot", botsComment+"\n"), "5 QORY-TEST[bot] automation sc_0123456789abcdef false"},
+		{"edited", comment(5, "QORY-TEST[bot]", "Bot", strings.ReplaceAll(botsComment, "\n", "\r\n")), "5 QORY-TEST[bot] automation sc_0123456789abcdef false"},
 		{"deleted", comment(5, "qory-test[bot]", "Bot", botsComment), "5 qory-test[bot] automation sc_0123456789abcdef true"},
 		{"created", comment(6, "bob", "User", botsComment), "6 bob person  false"},
 		{"created", comment(7, "other-app[bot]", "Bot", botsComment), "7 other-app[bot] automation  false"},
 		{"created", comment(8, "qory-test[bot]", "User", botsComment), "8 qory-test[bot] person  false"},
-		{"created", comment(9, "qory-test[bot]", "Bot", botsComment+"\nmore"), "9 qory-test[bot] automation  false"},
+		{"created", comment(9, "qory-test[bot]", "Bot", "Dana Example wrote in Qory Apiary:\n\nPlease check the steps.\n\n<!-- qory:comment sc_0123456789abcdef -->"), "9 qory-test[bot] automation  false"},
 		{"deleted", comment(9, "qory-test[bot]", "Bot", "An automation's comment."), "9 qory-test[bot] automation  true"},
 		{"created", comment(10, "qory-test[bot]", "Bot", "<!-- qory:work-item wi_3 -->\nQory took this into Factory."), ""},
 	} {
