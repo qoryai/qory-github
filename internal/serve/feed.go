@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,7 +27,9 @@ const (
 	feedFloor        = time.Second
 	unknownEvery     = time.Minute
 	// stuckFor is how long one entry may fail, not for good, before it is logged and
-	// passed, so no entry stops the feed for ever.
+	// passed, so no entry stops the feed for ever: stuckFor of failures, the time that
+	// counts as down left out, or 2*stuckFor since its first failure, whichever ends
+	// first, see [retriesEnded].
 	stuckFor = 24 * time.Hour
 )
 
@@ -44,19 +47,24 @@ type feed struct {
 	// entry's failures are timed by; nil is time.Now.
 	sleep func(ctx context.Context, d time.Duration) error
 	now   func() time.Time
+	// keepInterval keeps the interval of a sync entry, in seconds; nil puts it in the
+	// store.
+	keepInterval func(seconds int) error
 	// declared, when set, is closed once the adapter is declared.
 	declared chan struct{}
 
-	// failing is what the feed keeps of the page read after the cursor after, by the
-	// entries' places in it: when each entry that failed, not for good, first failed,
-	// and the entries passed, which a read of the same page again skips. down is when
-	// the feed's reads began to fail, or zero. They are kept in memory alone, so a
-	// restart times the entries from their next failures again.
+	// failing is what the feed keeps of the page read after the cursor after: the
+	// state of each entry the feed has tried, by its place in the page, see
+	// [entryState]. down is when the feed's reads began to fail, or zero; allFailed
+	// is when the last step in which every entry tried failed ended, or zero. entries
+	// has at most one key for each entry of that one page, and a page is at most
+	// maxChangesAnswer bytes. They are kept in memory alone, so a restart applies the
+	// page's entries again and times them from their next failures.
 	failing struct {
-		after  string
-		since  map[int]time.Time
-		passed map[int]bool
-		down   time.Time
+		after     string
+		entries   map[int]*entryState
+		down      time.Time
+		allFailed time.Time
 	}
 
 	// grantsRead is whether the page being applied has read Qory Apiary's copy of the
@@ -101,11 +109,12 @@ func (f *feed) unknownLog() *throttle {
 // every entry of the page it ends is applied, or failed for good and logged, so an
 // entry is never skipped by a stop or a restart, and one may be applied again, which
 // does no harm: every entry's action is one a repeat finds done, a comment's post among
-// them, see [github.Client.PostComment]. An entry that fails, not for good, is read
-// again after the wait, and passed and logged once it has failed for stuckFor, see
-// [feed.step], so no entry stops the feed for ever; a comment entry is reported as not
-// posted first, see [feed.report]. A response that contains an entry serve cannot apply
-// is rejected whole, see [feed.step], and read again after the wait.
+// them, see [github.Client.PostComment]. An entry that fails, not for good, is applied
+// again after the wait, while the entries after it that do not wait for it apply, see
+// [feed.step]; it is passed and logged once its retries end, see [retriesEnded], so no
+// entry stops the feed for ever; a comment entry is reported as not posted first, see
+// [feed.report]. A response that contains an entry serve cannot apply is rejected
+// whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
 	backoff := feedFirstBackoff
@@ -214,27 +223,41 @@ func known(ch contracts.Change) bool {
 }
 
 // step reads one page of the feed after the cursor kept, applies its entries in order,
-// and keeps the page's cursor. An entry that fails for good is logged and passed; any
-// other error stops the page, whose cursor is not kept, to be read again. A comment
-// entry whose comment a retry cannot post is reported to Qory Apiary as not posted,
-// with the reason, before it is passed, see [feed.comment].
+// and keeps the page's cursor once every entry is done. An entry that fails for good
+// is logged and passed; one that fails otherwise is not done, and the page's cursor is
+// not kept, so the next step reads the page again, and a restart applies it again. A
+// comment entry whose comment a retry cannot post is reported to Qory Apiary as not
+// posted, with the reason, before it is passed, see [feed.comment]. The error of a
+// step that leaves an entry not done is the first error of the step, with the count
+// of the other entries that failed in it, see [failures].
 //
-// An entry that fails, not for good, is timed from its first failure: once it has
-// failed for stuckFor, it is logged and passed too. A comment entry is reported first,
-// with the reason unreachable, or with the reason of a report that failed before, see
-// [reportPending]; a report that fails, not permanently, stops the page, so the report
-// is sent again. Once the entry has failed for 2*stuckFor, a failed report is logged
-// once, with the comment_id and the reason, and the entry is passed with no report, so
-// a report that keeps failing stops the feed for one more day at most. The feed keeps,
-// for the page read after the cursor, each entry's first failure and the entries
-// passed, which a read of the same page again skips, so every entry of a page is timed
-// and passed alone, and the page's cursor is kept once none is left; it forgets them
-// when the cursor moves. A time the feed cannot be read, its read failing or its
-// response rejected, does not count: the first failures are moved later by as long, so
-// an outage that stops the feed's reads does not count toward the day. One that fails
-// an entry's requests to Qory Apiary while the feed's reads succeed does count, as any
-// failure of the entry does. All this is kept in memory alone, so a restart times
-// the entries from their next failures again.
+// An entry that is not done does not stop the page: the entries after it apply,
+// except those that wait for it, see [notDone.waits], so a work item's or a comment's
+// entries apply in the feed's order for each item. The feed keeps, for the page read
+// after the cursor, each entry's first failure and whether it is done, see
+// [entryState]; a read of the same page again skips the entries done, and the feed
+// forgets them all when the cursor moves. The page read again contains the entries
+// Qory Apiary has added to the feed since, up to the page's limit, so they apply too.
+// A step stops when ctx is done, before the next entry. A restart applies the done
+// entries again, which does no harm, see [feed.run].
+//
+// An entry that fails, not for good, is timed from its first failure: once its retries
+// end, after stuckFor of failures or 2*stuckFor since the first failure, see
+// [retriesEnded], it is logged and passed too, and the line has the limit that ended
+// them. A comment entry is reported first, with the reason unreachable, or with the
+// reason of a report that failed before, see [reportPending]; a report that fails, not
+// permanently, leaves the entry not done, so the report is sent again. Once each limit
+// has passed by one more stuckFor, a failed report is logged once, with the comment_id
+// and the reason, and the entry is passed with no report, so a report that keeps
+// failing keeps the cursor for one more day at most.
+// A time the feed cannot be read, its read failing or its response rejected, counts
+// toward neither limit: the first failures are moved later by as long, so an outage
+// that stops the feed's reads passes no entry. The time after a step in which 2 or
+// more entries failed and none applied, up to the next step, counts toward 2*stuckFor
+// since the first failure alone, so an outage of GitHub shorter than 2*stuckFor does
+// not pass the first entry of every item at once. The time after a step in which only
+// one entry failed, or an entry applied, counts toward both. All this is kept in
+// memory alone, so a restart times the entries from their next failures again.
 //
 // A page that holds an entry serve does not know is refused whole, an
 // [*unknownChange], before any of its entries is applied, and its cursor is not kept:
@@ -259,50 +282,220 @@ func (f *feed) step(ctx context.Context) error {
 	}
 	f.feedUp(string(cursor))
 	f.grantsRead = false
+	var errs []error
+	open := newNotDone()
+	applied := false
 	for i, ch := range page.Changes {
-		if f.failing.passed[i] {
+		state := f.state(i, ch)
+		if state.done {
 			continue
 		}
-		err := f.apply(ctx, ch)
-		if IsPermanent(err) {
-			f.log.Error("a change of the feed failed, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
-			f.failing.passed[i] = true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if open.waits(ch) {
+			open.add(ch)
 			continue
 		}
+		ok, err := f.entry(ctx, state, ch)
 		if err != nil {
-			failed := f.failedFor(i)
-			if failed < stuckFor {
-				return err
-			}
-			if ch.Kind == contracts.ChangeComment {
-				reason := github.ReasonUnreachable
-				// The cause's text starts with the fix for its reason: a pending
-				// report's text has it already, and any other error gets it here.
-				var cause error = &github.CommentRefused{Reason: reason, Err: err}
-				var p *reportPending
-				if errors.As(err, &p) {
-					reason, cause = p.reason, err
-				}
-				rerr := f.report(ctx, ch.CommentID, reason, cause)
-				if !IsPermanent(rerr) {
-					if failed < 2*stuckFor {
-						return rerr
-					}
-					f.log.Error("check that Qory Apiary returns 204 for failure reports: one failed for a day; the entry is passed", slog.String("comment_id", ch.CommentID), slog.String("reason", reason), slog.String("error", rerr.Error()))
-					f.failing.passed[i] = true
-					continue
-				}
-				err = rerr
-			}
-			f.log.Error("a change of the feed has failed for a day, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
-			f.failing.passed[i] = true
+			errs = append(errs, err)
+			open.add(ch)
+			continue
 		}
+		applied = applied || ok
+		state.done = true
+	}
+	if len(errs) > 0 {
+		if !applied && len(errs) >= 2 {
+			// Every entry tried failed, as in an outage of GitHub, which leaves the
+			// feed's reads alone: the time to the next step does not count toward
+			// stuckFor of failures, see [feed.feedUp].
+			if f.failing.allFailed.IsZero() {
+				f.failing.allFailed = f.clock()
+			}
+		}
+		return failures(errs)
 	}
 	if err := f.store.Put(nsAdapter, keyCursor, []byte(page.Cursor), 0); err != nil {
 		return err
 	}
-	f.failing.after, f.failing.since, f.failing.passed = page.Cursor, map[int]time.Time{}, map[int]bool{}
+	f.failing.after, f.failing.entries = page.Cursor, map[int]*entryState{}
 	return nil
+}
+
+// entryState is what the feed keeps of an entry of the page read: its kind, status,
+// ref and comment_id, which identify it; when it first failed, not for good, or zero,
+// as first and as since, which [feed.feedUp] moves later; and whether
+// it is done, applied or passed. A collection's entry has its collection_ref as its
+// ref, and a grant's its grant_ref.
+type entryState struct {
+	kind, status, ref, commentID string
+	first, since                 time.Time
+	done                         bool
+}
+
+// entryRef is the ref that identifies ch in its [entryState].
+func entryRef(ch contracts.Change) string {
+	switch ch.Kind {
+	case contracts.ChangeCollection:
+		return ch.CollectionRef
+	case contracts.ChangeGrant:
+		return ch.GrantRef
+	}
+	return ch.Ref
+}
+
+// state is what the feed keeps of ch, the entry at index i of the page read: a new
+// state when the feed keeps none for that place, or one of another entry, as when
+// the page read again has other entries there.
+func (f *feed) state(i int, ch contracts.Change) *entryState {
+	s := f.failing.entries[i]
+	if s == nil || s.kind != ch.Kind || s.status != ch.Status || s.ref != entryRef(ch) || s.commentID != ch.CommentID {
+		s = &entryState{kind: ch.Kind, status: ch.Status, ref: entryRef(ch), commentID: ch.CommentID}
+		f.failing.entries[i] = s
+	}
+	return s
+}
+
+// failures is the error of a step whose entries failed with errs, at least one: the
+// first error, and the count of the others, so the error stays one entry's long.
+func failures(errs []error) error {
+	switch n := len(errs) - 1; n {
+	case 0:
+		return errs[0]
+	case 1:
+		return fmt.Errorf("%w; and 1 more entry failed", errs[0])
+	default:
+		return fmt.Errorf("%w; and %d more entries failed", errs[0], n)
+	}
+}
+
+// notDone are the entries of a page that are not done, read so far: the refs of the
+// work item and comment entries; the repositories, by id, of those entries and of the
+// collection entries; whether a grant entry is among them, whether a sync entry is,
+// and whether any entry other than a sync entry is. Each map has at most one key for
+// each entry of the page.
+type notDone struct {
+	refs, itemRepos, collections map[string]bool
+	grant, any, sync             bool
+}
+
+func newNotDone() *notDone {
+	return &notDone{refs: map[string]bool{}, itemRepos: map[string]bool{}, collections: map[string]bool{}}
+}
+
+// itemRepository is the repository id of an item's ref, the part before #.
+func itemRepository(ref string) string {
+	repo, _, _ := strings.Cut(ref, "#")
+	return repo
+}
+
+// waits is whether ch waits for an earlier entry of the page that is not done, so the
+// entries apply in the feed's order wherever one reads what another writes:
+//   - A work item's or a comment's entry reads the reach of its repository, and writes
+//     on GitHub alone. It waits for an entry with the same ref, so one item's entries
+//     keep their order, and for a collection entry of its repository.
+//   - A collection entry writes the link and the pull mark of its collection_ref, and
+//     its fill reads the reach of that repository. It waits for any entry of that
+//     repository, and no other repository's entry waits for it.
+//   - A grant entry reads Qory Apiary's copy of the grants, which can drop the links
+//     and the reach of any repository, see [Adapter.syncGrants]. It waits for every
+//     earlier entry, and every later entry except a sync entry waits for it.
+//   - A sync entry writes the sync interval alone, which only the pulls read, see
+//     [syncInterval]. It waits for an earlier sync entry, so the last one sets the
+//     interval, and only a later sync entry waits for it.
+func (p *notDone) waits(ch contracts.Change) bool {
+	switch ch.Kind {
+	case contracts.ChangeSync:
+		return p.sync
+	case contracts.ChangeGrant:
+		return p.any
+	case contracts.ChangeCollection:
+		return p.grant || p.itemRepos[ch.CollectionRef] || p.collections[ch.CollectionRef]
+	}
+	return p.grant || p.refs[ch.Ref] || p.collections[itemRepository(ch.Ref)]
+}
+
+// add adds ch to the entries not done.
+func (p *notDone) add(ch contracts.Change) {
+	switch ch.Kind {
+	case contracts.ChangeSync:
+		p.sync = true
+		return
+	case contracts.ChangeGrant:
+		p.grant = true
+	case contracts.ChangeCollection:
+		p.collections[ch.CollectionRef] = true
+	default:
+		p.refs[ch.Ref] = true
+		p.itemRepos[itemRepository(ch.Ref)] = true
+	}
+	p.any = true
+}
+
+// entry applies ch, an entry of the page read whose state is state. It returns a nil
+// error once ch is done, and true when ch is applied rather than passed and logged.
+// Any other error leaves ch to be applied again on the next read of the page, see
+// [feed.step].
+func (f *feed) entry(ctx context.Context, state *entryState, ch contracts.Change) (bool, error) {
+	err := f.apply(ctx, ch)
+	if err == nil {
+		return true, nil
+	}
+	if IsPermanent(err) {
+		f.log.Error("a change of the feed failed, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()))
+		return false, nil
+	}
+	failed, since := f.failedFor(state)
+	limit := retriesEnded(failed, since, 0)
+	if limit == "" {
+		return false, err
+	}
+	if ch.Kind == contracts.ChangeComment {
+		reason := github.ReasonUnreachable
+		// The cause's text starts with the fix for its reason: a pending
+		// report's text has it already, and any other error gets it here.
+		var cause error = &github.CommentRefused{Reason: reason, Err: err}
+		var p *reportPending
+		if errors.As(err, &p) {
+			reason, cause = p.reason, err
+		}
+		rerr := f.report(ctx, ch.CommentID, reason, cause)
+		if !IsPermanent(rerr) {
+			reportLimit := retriesEnded(failed, since, stuckFor)
+			if reportLimit == "" {
+				return false, rerr
+			}
+			f.log.Error("check that Qory Apiary returns 204 for failure reports: one failed for a day or more; the entry is passed", slog.String("comment_id", ch.CommentID), slog.String("reason", reason), slog.String("error", rerr.Error()), slog.String("retries_ended", reportLimit))
+			return false, nil
+		}
+		err = rerr
+	}
+	f.log.Error("a change of the feed kept failing until its retries ended, and is passed", slog.String("kind", ch.Kind), slog.String("error", err.Error()), slog.String("retries_ended", limit))
+	return false, nil
+}
+
+// retriesEnded is the limit that ends the retries of an entry, as the line logged
+// shows it, or "" while neither limit has passed. failed is how long the entry has
+// failed without the time that counts as down, and since how long ago it first failed
+// without the time the feed could not be read, see [feed.feedUp].
+// The limits are stuckFor+more of failed and 2*stuckFor+more of since. The second ends
+// the retries of entries that fail while nothing applies, as when 2 issues always
+// fail, and passes none in an outage of GitHub shorter than 2*stuckFor.
+func retriesEnded(failed, since, more time.Duration) string {
+	switch {
+	case failed >= stuckFor+more:
+		return fmt.Sprintf("%s of failures, outages left out", hoursOf(stuckFor+more))
+	case since >= 2*stuckFor+more:
+		return fmt.Sprintf("%s since the first failure, feed read outages left out", hoursOf(2*stuckFor+more))
+	}
+	return ""
+}
+
+// hoursOf is d in whole hours, as "48 hours".
+func hoursOf(d time.Duration) string {
+	return strconv.Itoa(int(d/time.Hour)) + " hours"
 }
 
 func (f *feed) clock() time.Time {
@@ -319,30 +512,41 @@ func (f *feed) feedDown() {
 	}
 }
 
-// feedUp notes that the page after the cursor after was read: the entries' first
-// failures are moved later by as long as the feed could not be read, and forgotten,
-// with the entries passed, when the page is another cursor's.
+// feedUp notes that the page after the cursor after was read, and forgets the
+// entries' states when the page is another cursor's. The entries' first failures, both
+// first and since, are moved later by as long as the feed could not be read; since is
+// moved later by as long as the feed could not be read or every entry tried failed,
+// the two times counted once where they overlap, see [retriesEnded].
 func (f *feed) feedUp(after string) {
-	if f.failing.after != after || f.failing.since == nil {
-		f.failing.after, f.failing.since, f.failing.passed = after, map[int]time.Time{}, map[int]bool{}
+	if f.failing.after != after || f.failing.entries == nil {
+		f.failing.after, f.failing.entries = after, map[int]*entryState{}
 	}
+	now := f.clock()
+	var unread, failed time.Duration
 	if !f.failing.down.IsZero() {
-		d := f.clock().Sub(f.failing.down)
-		for i, t := range f.failing.since {
-			f.failing.since[i] = t.Add(d)
-		}
-		f.failing.down = time.Time{}
+		unread = now.Sub(f.failing.down)
 	}
+	if !f.failing.allFailed.IsZero() {
+		failed = now.Sub(f.failing.allFailed)
+	}
+	for _, s := range f.failing.entries {
+		if !s.since.IsZero() {
+			s.since = s.since.Add(max(unread, failed))
+			s.first = s.first.Add(unread)
+		}
+	}
+	f.failing.down, f.failing.allFailed = time.Time{}, time.Time{}
 }
 
-// failedFor is how long the entry at index of the page read has failed, from its first
-// failure, not counting the time the feed could not be read.
-func (f *feed) failedFor(index int) time.Duration {
+// failedFor is how long the entry whose state is state has failed, from its first
+// failure: without the time that counts as down, and without the time the feed could
+// not be read alone, see [feed.feedUp].
+func (f *feed) failedFor(state *entryState) (failed, since time.Duration) {
 	now := f.clock()
-	if _, ok := f.failing.since[index]; !ok {
-		f.failing.since[index] = now
+	if state.since.IsZero() {
+		state.since, state.first = now, now
 	}
-	return now.Sub(f.failing.since[index])
+	return now.Sub(state.since), now.Sub(state.first)
 }
 
 // apply applies one entry of the feed, one [known] says serve knows; another fails for
@@ -391,6 +595,9 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 		if ch.Interval != nil {
 			interval = min(max(*ch.Interval, minimumSyncInterval), maximumSyncInterval)
 		}
+		if f.keepInterval != nil {
+			return f.keepInterval(interval)
+		}
 		return f.store.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(interval)), 0)
 	}
 	return Permanent(errors.New("the change is not one serve knows"))
@@ -413,8 +620,8 @@ func (f *feed) comment(ctx context.Context, ch contracts.Change) error {
 // reason, after cause, the post's failure, see [Apiary.ChangesFailed]. Sent, or failed
 // permanently, as with Qory Apiary's 400 or 403, it is a [Permanent] error, so the feed
 // logs the entry and passes it. A report that fails otherwise is a [*reportPending],
-// which may pass, so the page stays and the entry is posted again, until the entry has
-// failed for 2*stuckFor, see [feed.step].
+// which may pass, so the page stays and the entry is posted again, until each limit of
+// its retries has passed by one more stuckFor, see [feed.step].
 func (f *feed) report(ctx context.Context, commentID, reason string, cause error) error {
 	err := f.apiary.ChangesFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, CommentID: commentID, Reason: reason})
 	switch {

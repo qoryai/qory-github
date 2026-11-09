@@ -142,6 +142,8 @@ type fakeApiary struct {
 	// grant_ref, which GET /v1/grants returns, each report it takes adds to, and each
 	// grant end it takes drops from.
 	grants map[string]string
+	// grantsDown makes each GET /v1/grants return 503.
+	grantsDown bool
 
 	mu       sync.Mutex
 	requests []apiaryRequest
@@ -382,7 +384,7 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		body = f.page(r.URL.Query().Get("after"))
 	}
-	refuse, refuseGet, unsigned := f.refuse, f.refuseGet, f.unsigned
+	refuse, refuseGet, unsigned, grantsDown := f.refuse, f.refuseGet, f.unsigned, f.grantsDown
 	f.mu.Unlock()
 	// A start-up body's description counts once the body arrives, as Qory Apiary keeps
 	// it before it answers; a refusal puts the one before back.
@@ -406,6 +408,8 @@ func (f *fakeApiary) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if code := f.openUpload(b, req.AccessKeyID); code != "" {
 			status, body = http.StatusBadRequest, `{"error":"`+code+`"}`
 		}
+	case r.URL.Path == routeGrants && r.Method == http.MethodGet && grantsDown:
+		status, body = http.StatusServiceUnavailable, `{"error":"unavailable"}`
 	case r.URL.Path == routeGrants && r.Method == http.MethodGet:
 		body = f.grantsAnswer()
 	case r.URL.Path == routeGrants && !refused:
@@ -858,6 +862,9 @@ type fakeGitHub struct {
 	// /repositories/, and GraphQL's, 502.
 	unauthorized, issuesDown, reposDown bool
 	goneComments                        int
+	// commentsDown makes the read of the comments of each issue of acme/widgets it
+	// contains, by number, return 502.
+	commentsDown map[int]bool
 	// repoPageSize, when set, lists the installation's repositories that many on a
 	// page, each page's Link header naming the next; repoPageDown answers that page,
 	// counted from 1, 502. repoAfter, when set, is called with each page's number once
@@ -1099,6 +1106,11 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, widgets+"/issues/") && strings.HasSuffix(r.URL.Path, "/comments"):
 		n, _ := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, widgets+"/issues/"), "/comments"))
+		if f.commentsDown[n] {
+			w.WriteHeader(502)
+			io.WriteString(w, `{"message":"Bad Gateway"}`)
+			return
+		}
 		json.NewEncoder(w).Encode(append([]map[string]any{}, f.comments[n]...))
 	case r.Method == "POST" && r.URL.Path == widgets+"/labels" && f.labelStatus != 0:
 		w.WriteHeader(f.labelStatus)
