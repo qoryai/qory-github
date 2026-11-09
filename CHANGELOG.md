@@ -36,8 +36,11 @@ change what the program does, and notes it under Upgrading.
   `too_long`, or `unreachable`. The description has `comments: true` in
   `roles.source`.
 - The name in the first line shows as plain text. The adapter puts a backslash before
-  each Markdown character and a zero-width space after each `@`, `#`, and `:`, so
-  GitHub makes no mention, issue link, emoji, or web link from the name.
+  each Markdown character, a zero-width space after each `@`, `#`, `:`, `-`, `.`, `_`,
+  `+`, and `/`, and a zero-width space after every sixth digit of a run of more than six
+  hex digits, so GitHub makes no mention, issue link such as `GH-123`, emoji, web link
+  such as `www.example.com`, or commit link from the name. A repository's autolink whose
+  prefix ends in a letter or a digit, such as `TICKET123`, is still a link.
 - The adapter reports a comment as `unreachable` at once when GitHub returns 400 for
   it, or 422 for any cause other than a body too long, or when the issue has more than
   100 pages of comments. If the failure report still fails two days after the
@@ -46,6 +49,18 @@ change what the program does, and notes it under Upgrading.
 
 ### Changed
 
+- The adapter applies the entries of Qory Apiary's change feed that come after a failing
+  entry while it retries that entry. The adapter applies an entry for the same issue
+  only after it. A collection entry and the entries of its repository apply in the
+  feed's order. A grant entry applies only after every entry before it, and every later
+  entry but a sync entry applies only after the grant entry. Sync entries apply in the
+  feed's order. Before, every later entry waited until the failing entry passed: up to a
+  day, or two days for a comment whose failure report also failed. A time in which 2 or
+  more entries fail and none applies, as in an outage of GitHub, does not count toward
+  that day, and the adapter stops retrying a failing entry at most 2 days after its
+  first failure, not counting the time the feed cannot be read, or 3 days for a comment
+  whose failure report also fails. The line logged for an entry passed has
+  `retries_ended`, the limit that ended its retries.
 - On the set-up pages, the optional field GitHub organisation replaces the field for the
   GitHub account. With an organisation, GitHub creates the App under it; with the field
   empty, under the GitHub user signed in on github.com. A login of a GitHub user, which

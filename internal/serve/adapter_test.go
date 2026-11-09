@@ -1764,8 +1764,9 @@ func TestACommentThatFailsForADayIsReportedUnreachable(t *testing.T) {
 		t.Errorf("the cursor %q", c)
 	}
 	const fix = "post the comment again from Qory Apiary later, or post it on GitHub by hand"
-	if logged := w.log.String(); !strings.Contains(logged, `"msg":"a change of the feed has failed for a day, and is passed","kind":"comment","error":"`+fix+`: `) ||
-		strings.Count(logged, fix) != 1 || !strings.Contains(logged, "with the reason unreachable") {
+	if logged := w.log.String(); !strings.Contains(logged, `"msg":"a change of the feed kept failing until its retries ended, and is passed","kind":"comment","error":"`+fix+`: `) ||
+		strings.Count(logged, fix) != 1 || !strings.Contains(logged, "with the reason unreachable") ||
+		!strings.Contains(logged, `"retries_ended":"24 hours of failures, outages left out"`) {
 		t.Errorf("the log %s", logged)
 	}
 }
@@ -1859,11 +1860,11 @@ func TestAReportThatFailsForADayMorePassesTheEntry(t *testing.T) {
 		t.Errorf("the cursor %q", c)
 	}
 	logged := w.log.String()
-	const line = `"msg":"check that Qory Apiary returns 204 for failure reports: one failed for a day; the entry is passed","comment_id":"` + testCommentID + `","reason":"item_gone"`
+	const line = `"msg":"check that Qory Apiary returns 204 for failure reports: one failed for a day or more; the entry is passed","comment_id":"` + testCommentID + `","reason":"item_gone"`
 	if n := strings.Count(logged, line); n != 1 {
 		t.Errorf("the line is logged %d times: %s", n, logged)
 	}
-	if strings.Contains(logged, "a change of the feed has failed for a day") {
+	if strings.Contains(logged, "a change of the feed kept failing") {
 		t.Errorf("a second line is logged: %s", logged)
 	}
 	if strings.Contains(logged, "Dana") || strings.Contains(logged, "steps") {
@@ -1872,6 +1873,546 @@ func TestAReportThatFailsForADayMorePassesTheEntry(t *testing.T) {
 	for _, r := range w.apiary.reports() {
 		if r != testCommentID+" item_gone" {
 			t.Errorf("a report is %q, want item_gone", r)
+		}
+	}
+}
+
+// commentOn is a comment entry of the feed with the comment_id id, for the issue n of
+// acme/widgets.
+func commentOn(id string, n int) contracts.Change {
+	c := commentEntry("acme/widgets", n)
+	c.CommentID = id
+	return c
+}
+
+// requestsFor is how many requests the fake GitHub received whose method and URI
+// contain s.
+func (f *fakeGitHub) requestsFor(s string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.requests {
+		if strings.Contains(r, s) {
+			n++
+		}
+	}
+	return n
+}
+
+// The comment_ids of the entries the tests of a failing entry read.
+const (
+	firstOn9  = "sc_0123456789abcdeg"
+	secondOn9 = "sc_0123456789abcdeh"
+	onTen     = "sc_0123456789abcdej"
+	onSeven   = "sc_0123456789abcdek"
+)
+
+// TestALaterEntryAppliesWhileAnEarlierOneFails has the fake GitHub return 502 for the
+// comments of issue 9, which the post of a comment on issue 9 reads first. The comment
+// on issue 7 after it is posted once, and the sync entry applies, which waits for
+// nothing; the second comment on issue 9 waits, and the cursor stays where the page
+// starts. Once issue 9 reads again, both comments on issue 9 apply, in order, and the
+// cursor moves to the page's end.
+func TestALaterEntryAppliesWhileAnEarlierOneFails(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeSync})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	sixty := 60
+	w.apiary.add(commentOn(firstOn9, 9), commentOn(secondOn9, 9), commentEntry("acme/widgets", 7), contracts.Change{Kind: contracts.ChangeSync, Interval: &sixty})
+	for try := 1; try <= 2; try++ {
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("try %d: err %v", try, err)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_1" {
+			t.Errorf("try %d: the cursor %q", try, c)
+		}
+		if n := w.gh.requestsFor("/issues/9/comments"); n != try {
+			t.Errorf("try %d: issue 9's comments read %d times; the second comment on 9 does not wait", try, n)
+		}
+		if n := w.gh.requestsFor("GET /repositories/" + widgetsRef + "/issues/7/comments"); n != 1 {
+			t.Errorf("try %d: issue 7's comments read %d times", try, n)
+		}
+		if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+			t.Errorf("try %d: the interval %s; the sync entry waits", try, v)
+		}
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 || !strings.Contains(posted[0], testCommentID) {
+		t.Errorf("posted %q", posted)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = nil })
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_5" {
+		t.Errorf("the cursor %q", c)
+	}
+	if r := w.apiary.reports(); !slices.Equal(r, []string{firstOn9 + " item_gone", secondOn9 + " item_gone"}) {
+		t.Errorf("reports %v", r)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+		t.Errorf("the interval %s", v)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// TestARestartAppliesTheFailedEntryAgain has the fake GitHub return 502 for the
+// comments of issue 9, so the comment on issue 9 fails and the comment on issue 7 after
+// it is posted. A new feed on the same store, as after a restart, reads the page from
+// the cursor kept: it posts the comment on issue 9 again and finds the comment on
+// issue 7 posted, so it posts no second one.
+func TestARestartAppliesTheFailedEntryAgain(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	w.apiary.add(commentOn(firstOn9, 9), commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 {
+		t.Fatalf("posted %q", posted)
+	}
+	f := &feed{apiary: w.client, adapter: w.adapter, store: w.st, log: slog.New(slog.DiscardHandler)}
+	if err := f.step(context.Background()); err == nil {
+		t.Fatal("the step after the restart passed the failing entry")
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+	if n := w.gh.requestsFor("/issues/9/comments"); n != 2 {
+		t.Errorf("issue 9's comments read %d times", n)
+	}
+	if n := w.gh.requestsFor("GET /repositories/" + widgetsRef + "/issues/7/comments"); n != 2 {
+		t.Errorf("issue 7's comments read %d times", n)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = nil })
+	if err := f.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 {
+		t.Errorf("posted %q", posted)
+	}
+	if r := w.apiary.reports(); !slices.Equal(r, []string{firstOn9 + " item_gone"}) {
+		t.Errorf("reports %v", r)
+	}
+}
+
+// TestAnotherEntryAtAPlaceDoneIsApplied has the comment on issue 9 fail, so the page
+// stays, and the comment on issue 7 after it posted. The page read again has another
+// comment on issue 7 at that place: the feed applies it, since its comment_id is not
+// the one of the entry done there.
+func TestAnotherEntryAtAPlaceDoneIsApplied(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	w.apiary.add(commentOn(firstOn9, 9), commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	w.apiary.mu.Lock()
+	w.apiary.changes[1] = commentOn(onSeven, 7)
+	w.apiary.mu.Unlock()
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	posted := w.gh.postedComments()
+	if len(posted) != 2 || !strings.Contains(posted[0], testCommentID) || !strings.Contains(posted[1], onSeven) {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// TestAnOutageOfGitHubPassesNoEntry has the fake GitHub return 502 for the comments of
+// issues 9 and 10 for 30 hours, while the feed's reads succeed: each step fails both
+// comment entries and applies none, so neither is reported or passed, and the cursor
+// stays.
+func TestAnOutageOfGitHubPassesNoEntry(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true, 10: true} })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentOn(firstOn9, 9), commentOn(onTen, 10))
+	for range 16 {
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("err %v", err)
+		}
+		now = now.Add(2 * time.Hour)
+	}
+	if r := w.apiary.reports(); len(r) != 0 {
+		t.Errorf("reports %v", r)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+	if logged := w.log.String(); strings.Contains(logged, "is passed") {
+		t.Errorf("an entry is passed: %s", logged)
+	}
+}
+
+// TestAStepsErrorIsItsFirstWithACount checks that the error of a step whose entries
+// failed is the first entry's error, which it wraps, with the count of the others, and
+// that a step of the outage of GitHub returns it.
+func TestAStepsErrorIsItsFirstWithACount(t *testing.T) {
+	first, other := errors.New("first"), errors.New("other")
+	for errs, want := range map[int]string{1: "first", 2: "first; and 1 more entry failed", 3: "first; and 2 more entries failed"} {
+		list := []error{first}
+		for range errs - 1 {
+			list = append(list, other)
+		}
+		if err := failures(list); err.Error() != want || !errors.Is(err, first) || errors.Is(err, other) {
+			t.Errorf("%d errors: %v, want %s", errs, err, want)
+		}
+	}
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true, 10: true} })
+	w.apiary.add(commentOn(firstOn9, 9), commentOn(onTen, 10))
+	if err := w.feed.step(context.Background()); err == nil || !strings.HasSuffix(err.Error(), "(comment "+firstOn9+"); and 1 more entry failed") {
+		t.Errorf("err %v", err)
+	}
+}
+
+// grantOf42 is a grant entry of the feed, for the installation 42.
+func grantOf42() contracts.Change {
+	return contracts.Change{Kind: contracts.ChangeGrant, ConnectionID: testConnection, GrantRef: "42", Status: "linked"}
+}
+
+// TestAGrantEntryWaitsForEveryEntryBeforeIt has the comment on issue 9 fail: the grant
+// entry after it waits, so Qory Apiary's copy of the grants is not read, and so does
+// the comment on issue 7 after the grant entry.
+func TestAGrantEntryWaitsForEveryEntryBeforeIt(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	w.apiary.add(commentOn(firstOn9, 9), grantOf42(), commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	if n := len(w.apiary.sent("GET " + routeGrants)); n != 0 {
+		t.Errorf("the grants are read %d times", n)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 0 {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// TestEveryEntryButASyncWaitsForAGrantEntry has the fake Qory Apiary return 503 for its
+// copy of the grants, so the grant entry fails: the comment on issue 7 after it waits,
+// and the sync entry after that applies, since it waits for nothing.
+func TestEveryEntryButASyncWaitsForAGrantEntry(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	w.apiary.mu.Lock()
+	w.apiary.grantsDown = true
+	w.apiary.mu.Unlock()
+	sixty := 60
+	w.apiary.add(grantOf42(), commentEntry("acme/widgets", 7), contracts.Change{Kind: contracts.ChangeSync, Interval: &sixty})
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing grant entry")
+	}
+	if n := len(w.apiary.sent("GET " + routeGrants)); n != 1 {
+		t.Errorf("the grants are read %d times", n)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 0 {
+		t.Errorf("posted %q", posted)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+		t.Errorf("the interval %s; the sync entry waits", v)
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+}
+
+// TestACollectionEntryWaitsOnlyForItsRepository has the comment on acme/widgets's issue
+// 9 fail: the unlink of acme/gadgets after it applies, the unlink of acme/widgets
+// waits, and the comment on acme/widgets's issue 7 waits for that unlink.
+func TestACollectionEntryWaitsOnlyForItsRepository(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	linkCollection(w.st, refOf("acme/widgets"))
+	linkCollection(w.st, refOf("acme/gadgets"))
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	w.apiary.add(
+		commentOn(firstOn9, 9),
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/gadgets"), Status: "unlinked"},
+		contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "unlinked"},
+		commentEntry("acme/widgets", 7),
+	)
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/gadgets")); ok {
+		t.Error("acme/gadgets is linked; its entry waits")
+	}
+	if ok, _ := collectionLinked(w.st, refOf("acme/widgets")); !ok {
+		t.Error("acme/widgets is not linked; its entry does not wait")
+	}
+	if posted := w.gh.postedComments(); len(posted) != 0 {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// TestAnEntryPassedAfterADayLetsTheLaterOnesApplyFirst has the comment on issue 9 fail:
+// the comment on issue 7 after it is posted in the first step, and a day later the
+// comment on issue 9 is reported unreachable and passed, and the cursor moves past
+// both.
+func TestAnEntryPassedAfterADayLetsTheLaterOnesApplyFirst(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentOn(firstOn9, 9), commentEntry("acme/widgets", 7))
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing entry")
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 {
+		t.Fatalf("posted %q", posted)
+	}
+	if r := w.apiary.reports(); len(r) != 0 {
+		t.Fatalf("reports %v", r)
+	}
+	now = now.Add(stuckFor)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := w.apiary.reports(); !slices.Equal(r, []string{firstOn9 + " unreachable"}) {
+		t.Errorf("reports %v", r)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 {
+		t.Errorf("posted %q", posted)
+	}
+}
+
+// TestEntriesAddedToAPageReadAgainApply has the comment on issue 9 fail, then adds a
+// comment on issue 7 to the feed, then another: each step reads the page after the
+// same cursor, and posts the comment added before it, once.
+func TestEntriesAddedToAPageReadAgainApply(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	w.apiary.add(commentOn(firstOn9, 9))
+	for n, id := range []string{"", testCommentID, onSeven} {
+		if id != "" {
+			w.apiary.add(commentOn(id, 7))
+		}
+		if err := w.feed.step(context.Background()); err == nil {
+			t.Fatalf("step %d passed the failing entry", n+1)
+		}
+		if posted := w.gh.postedComments(); len(posted) != n {
+			t.Errorf("step %d: posted %q", n+1, posted)
+		}
+	}
+	for _, get := range w.apiary.sent("GET " + routeChanges) {
+		if get.target != routeChanges {
+			t.Errorf("read %s", get.target)
+		}
+	}
+	if _, err := w.st.Get(nsAdapter, keyCursor); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the cursor is kept: %v", err)
+	}
+}
+
+// TestEntriesThatAlwaysFailArePassedAfterTwoDays has the fake GitHub return 502 for
+// the comments of issues 9 and 10, while nothing else applies: neither entry is passed
+// a second before 2*stuckFor since their first failure, and both are reported
+// unreachable and passed at 2*stuckFor, each line with the limit that ended its
+// retries.
+func TestEntriesThatAlwaysFailArePassedAfterTwoDays(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true, 10: true} })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentOn(firstOn9, 9), commentOn(onTen, 10))
+	for _, after := range []time.Duration{0, stuckFor, stuckFor - time.Second} {
+		now = now.Add(after)
+		if err := w.feed.step(context.Background()); err == nil {
+			t.Fatalf("after %v more: the step passed the failing entries", after)
+		}
+	}
+	if r := w.apiary.reports(); len(r) != 0 {
+		t.Fatalf("reports %v", r)
+	}
+	now = now.Add(time.Second)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r := w.apiary.reports(); !slices.Equal(r, []string{firstOn9 + " unreachable", onTen + " unreachable"}) {
+		t.Errorf("reports %v", r)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	if n := strings.Count(w.log.String(), `"retries_ended":"48 hours since the first failure, feed read outages left out"`); n != 2 {
+		t.Errorf("%d lines have the limit: %s", n, w.log.String())
+	}
+}
+
+// TestAnOutageOfTheFeedCountsTowardNoLimit has the comment on issue 9 fail once, then
+// the feed's reads fail for 49 hours, then the comment fail again: it is not passed,
+// since the outage counts toward neither stuckFor of failures nor 2*stuckFor since
+// the first failure.
+func TestAnOutageOfTheFeedCountsTowardNoLimit(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentOn(firstOn9, 9))
+	if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+		t.Fatalf("err %v", err)
+	}
+	down := true
+	w.apiary.mu.Lock()
+	w.apiary.refuseGet = func(int) (int, string) {
+		if down {
+			return 503, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	w.apiary.mu.Unlock()
+	for range 49 {
+		now = now.Add(time.Hour)
+		if err := w.feed.step(context.Background()); !IsOutage(err) {
+			t.Fatalf("err %v", err)
+		}
+	}
+	w.apiary.mu.Lock()
+	down = false
+	w.apiary.mu.Unlock()
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the entry is passed after the feed's outage")
+	}
+	if r := w.apiary.reports(); len(r) != 0 {
+		t.Errorf("reports %v", r)
+	}
+}
+
+// TestASyncEntryWaitsForAnEarlierOne has the interval of the first of two sync entries
+// fail to be kept: the second waits, and once the first applies, the second applies
+// after it, so the interval is the second's.
+func TestASyncEntryWaitsForAnEarlierOne(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	failing := true
+	var kept []int
+	w.feed.keepInterval = func(seconds int) error {
+		kept = append(kept, seconds)
+		if failing && seconds == 1000 {
+			return errors.New("the store is full")
+		}
+		return w.st.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(seconds)), 0)
+	}
+	first, second := 1000, 2000
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeSync, Interval: &first}, contracts.Change{Kind: contracts.ChangeSync, Interval: &second})
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the step passed the failing sync entry")
+	}
+	if _, err := w.st.Get(nsAdapter, keySyncInterval); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("an interval is kept: %v", err)
+	}
+	failing = false
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "2000" {
+		t.Errorf("the interval %s, want 2000", v)
+	}
+	if !slices.Equal(kept, []int{1000, 1000, 2000}) {
+		t.Errorf("kept %v", kept)
+	}
+}
+
+// TestTheTwoKindsOfDownTimeOverlapOnce has the comments on issues 9 and 10 fail in one
+// step at 0 h, so the time after it counts as all failed, then the feed's reads fail
+// from 2 h to 12 h. At 12 h the first failures move later: since by the 12 h of the
+// two kinds together, counted once, and first by the 10 h of failed reads alone.
+//   - With issue 10 passed at 12 h, the comment on issue 9 fails alone after it, so its
+//     failures count: it is passed at 36 h, stuckFor after since, and not a second
+//     before.
+//   - With both failing after 12 h, the time keeps counting as all failed: both are
+//     passed at 58 h, 2*stuckFor after first, and not a second before.
+func TestTheTwoKindsOfDownTimeOverlapOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		alone    bool
+		passedAt time.Duration
+		reports  []string
+		limit    string
+	}{
+		{"one entry fails after the outage", true, 36 * time.Hour, []string{onTen + " item_gone", firstOn9 + " unreachable"}, "24 hours of failures, outages left out"},
+		{"both entries fail after the outage", false, 58 * time.Hour, []string{firstOn9 + " unreachable", onTen + " unreachable"}, "48 hours since the first failure, feed read outages left out"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setReach(w.st, widgetsRef, 42)
+		setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true, 10: true} })
+		start := time.Now()
+		now := start
+		w.feed.now = func() time.Time { return now }
+		w.apiary.add(commentOn(firstOn9, 9), commentOn(onTen, 10))
+		if err := w.feed.step(context.Background()); err == nil || IsOutage(err) {
+			t.Fatalf("%s: at 0 h: err %v", tc.name, err)
+		}
+		down := true
+		w.apiary.mu.Lock()
+		w.apiary.refuseGet = func(int) (int, string) {
+			if down {
+				return 503, `{"error":"unavailable"}`
+			}
+			return 0, ""
+		}
+		w.apiary.mu.Unlock()
+		for _, at := range []time.Duration{2 * time.Hour, 7 * time.Hour} {
+			now = start.Add(at)
+			if err := w.feed.step(context.Background()); !IsOutage(err) {
+				t.Fatalf("%s: at %v: err %v", tc.name, at, err)
+			}
+		}
+		w.apiary.mu.Lock()
+		down = false
+		w.apiary.mu.Unlock()
+		if tc.alone {
+			setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true} })
+		}
+		for _, at := range []time.Duration{12 * time.Hour, tc.passedAt - time.Second} {
+			now = start.Add(at)
+			if err := w.feed.step(context.Background()); err == nil {
+				t.Fatalf("%s: at %v: the step passed the failing entries", tc.name, at)
+			}
+		}
+		// Before the limit, the one report is for issue 10, passed at 12 h when issue 9
+		// fails alone.
+		var before []string
+		if tc.alone {
+			before = tc.reports[:1]
+		}
+		if r := w.apiary.reports(); !slices.Equal(r, before) {
+			t.Errorf("%s: reports before %v: %v", tc.name, tc.passedAt, r)
+		}
+		now = start.Add(tc.passedAt)
+		if err := w.feed.step(context.Background()); err != nil {
+			t.Fatalf("%s: at %v: %v", tc.name, tc.passedAt, err)
+		}
+		if r := w.apiary.reports(); !slices.Equal(r, tc.reports) {
+			t.Errorf("%s: reports %v", tc.name, r)
+		}
+		if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+			t.Errorf("%s: the cursor %q", tc.name, c)
+		}
+		if !strings.Contains(w.log.String(), `"retries_ended":"`+tc.limit+`"`) {
+			t.Errorf("%s: the log %s", tc.name, w.log.String())
 		}
 	}
 }
@@ -2373,7 +2914,7 @@ func TestAnEntryIsPassedOnceItHasFailedForADay(t *testing.T) {
 	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "3600" {
 		t.Errorf("the entry after it is not applied: %q", v)
 	}
-	if !strings.Contains(w.log.String(), `"level":"ERROR","msg":"a change of the feed has failed for a day, and is passed","kind":"collection"`) {
+	if !strings.Contains(w.log.String(), `"level":"ERROR","msg":"a change of the feed kept failing until its retries ended, and is passed","kind":"collection"`) {
 		t.Errorf("the log %s", w.log.String())
 	}
 }
@@ -2415,7 +2956,7 @@ func TestTwoEntriesThatFailOnOnePageArePassedEachAfterADay(t *testing.T) {
 		t.Errorf("the sync is not applied: %q", v)
 	}
 	logged := w.log.String()
-	if strings.Count(logged, "a change of the feed has failed for a day, and is passed") != 2 || !strings.Contains(logged, `"kind":"collection"`) || !strings.Contains(logged, `"kind":"work_item"`) {
+	if strings.Count(logged, "a change of the feed kept failing until its retries ended, and is passed") != 2 || !strings.Contains(logged, `"kind":"collection"`) || !strings.Contains(logged, `"kind":"work_item"`) {
 		t.Errorf("the log %s", logged)
 	}
 }
@@ -4027,9 +4568,10 @@ func TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept(t *testi
 	}
 }
 
-// suspendedError is the end of the error of a request whose installation GitHub
-// answers as suspended.
-const suspendedError = `GitHub answers that the installation is suspended, so no installation token is minted for it"`
+// suspendedError is the text of the error of a request whose installation GitHub
+// answers as suspended: the end of a fill's error, and the start of a take in's, which
+// the repository's id follows.
+const suspendedError = `GitHub answers that the installation is suspended, so no installation token is minted for it`
 
 // TestAnEntryOfASuspendedInstallationIsPassedAtOnce has GitHub answer the installation
 // 42 as suspended, and reads a page of the feed: a take in of acme/widgets#7, a link of

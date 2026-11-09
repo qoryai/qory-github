@@ -200,20 +200,14 @@ func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug
 		return err
 	}
 	if !slugShape.MatchString(slug) {
-		return errors.New("the App's slug is not one, 1 to 100 letters, digits, dots, underscores or hyphens")
+		return errSlug
 	}
 	if err := CheckAPIURL(c.base()); err != nil {
 		return err
 	}
-	if token == nil {
-		return errors.New("no token function")
-	}
-	tok, err := token(ctx, issue.repository)
+	tok, err := installationToken(ctx, token, "ApplyChange", issue.repository)
 	if err != nil {
-		return fmt.Errorf("the installation token for the repository %d: %w", issue.repository, err)
-	}
-	if tok == "" {
-		return fmt.Errorf("the installation token for the repository %d is empty", issue.repository)
+		return err
 	}
 	if p == nil {
 		p = &Pacer{}
@@ -222,6 +216,27 @@ func (c Client) ApplyChange(ctx context.Context, p *Pacer, token TokenFunc, slug
 		return c.undo(ctx, p, tok, issue)
 	}
 	return c.takeIn(ctx, p, tok, slug, issue, e)
+}
+
+// errSlug is the error of [Client.ApplyChange] and [Client.PostComment] for a slug that
+// is not an App's, see slugShape.
+var errSlug = errors.New("set the App's slug to 1 to 100 letters, digits, dots, underscores, or hyphens, letter or digit first")
+
+// installationToken is the token that token returns for the repository, for caller,
+// [Client.ApplyChange] or [Client.PostComment], whose name the error for a nil token
+// contains. An error of token comes first in the error, with the repository after it.
+func installationToken(ctx context.Context, token TokenFunc, caller string, repository int64) (string, error) {
+	if token == nil {
+		return "", errors.New("pass a token function to " + caller + ": token is nil")
+	}
+	tok, err := token(ctx, repository)
+	if err != nil {
+		return "", fmt.Errorf("%w (installation token for the repository %d)", err, repository)
+	}
+	if tok == "" {
+		return "", fmt.Errorf("check the App's installation: GitHub returned an empty token for the repository %d", repository)
+	}
+	return tok, nil
 }
 
 // takeIn creates the label when the repository has none, adds it to the issue, and posts
@@ -387,12 +402,25 @@ func markedID(body string) string {
 const nameEscapes = "\\`*_{}[]()+-.!|<>~&$"
 
 // nameBreakers are the characters a zero-width space follows in the author's name, see
-// [escapeName]: @ for a mention, # for an issue link, and : for an emoji such as :tada:
-// and a link such as https://example.com.
-const nameBreakers = "@#:"
+// [escapeName]: @ for a mention, # for an issue link, : for an emoji such as :tada:
+// and a link such as https://example.com, . for a link such as www.example.com, and -,
+// _, + and / for a reference such as GH-123 and a repository's autolinks such as
+// ABC-123, ABC_123, ABC+1 and ABC/1. An autolink whose prefix ends in a letter or a
+// digit, such as TICKET123 for the prefix TICKET, is still made.
+const nameBreakers = "@#:-._+/"
 
 // zeroWidthSpace follows each character of nameBreakers in the author's name.
 const zeroWidthSpace = "\u200b"
+
+// maxHexRun is the most hex digits that stand together in the escaped name: a
+// zero-width space follows every 6th digit of a longer run, since GitHub links a
+// commit by 7 or more hex digits.
+const maxHexRun = 6
+
+// isHex is whether r is a hex digit: 0 to 9, a to f, or A to F.
+func isHex(r rune) bool {
+	return '0' <= r && r <= '9' || 'a' <= r && r <= 'f' || 'A' <= r && r <= 'F'
+}
 
 // cleanName is the author's name as the first line contains it, before it is escaped:
 // each line or paragraph separator a space, see nameBreaks, without the characters
@@ -404,19 +432,30 @@ func cleanName(name string) string {
 
 // escapeName is the author's name as the first line contains it, shown as plain text:
 // each character of nameEscapes after a backslash, so the name changes no formatting,
-// and a zero-width space after each character of nameBreakers, as Dependabot writes an
-// @. GitHub matches mentions, issue links, emoji and links in the rendered text, after
-// Markdown removes a backslash, so a backslash or a character reference such as &#64;
-// still makes a mention; the zero-width space breaks the pattern, so @octocat sends no
-// notification, #123 links to nothing, :tada: stays text, and https://example.com is
-// no link. Each character becomes at most 2 characters, so a name of 100 characters,
-// the contract's limit, becomes at most 200, and the first line with its marker and the
-// empty line fit the 536 characters the contract leaves them. Each < and ! follows a
-// backslash, so the name contains no <!: it starts no HTML comment, which could hide
-// the marker, and no marker.
+// a zero-width space after each character of nameBreakers, as Dependabot writes an @,
+// and a zero-width space after every 6th digit of a run of more than 6 hex digits, see
+// maxHexRun. GitHub matches mentions, issue links, emoji, links and commit ids in the
+// rendered text, after Markdown removes a backslash, so a backslash or a character
+// reference such as &#64; still makes a mention; the zero-width space breaks the
+// pattern, so @octocat sends no notification, #123 and GH-123 link to nothing, :tada:
+// stays text, https://example.com and www.example.com are no links, and neither is a
+// commit id such as 0123456789abcdef or org/repo@0123456789abcdef. Each character
+// becomes at most 3 characters, as a -, ., _ or + does, a backslash before it and a
+// zero-width space after it, so a name of 100 characters, the contract's limit, becomes
+// at most 300, and the first line with its marker and the empty line fit the 536
+// characters the contract leaves them. Each < and ! follows a backslash, so the name
+// contains no <!: it starts no HTML comment, which could hide the marker, and no
+// marker.
 func escapeName(name string) string {
 	var b strings.Builder
+	run := 0
 	for _, r := range name {
+		if !isHex(r) {
+			run = 0
+		} else if run++; run > maxHexRun {
+			b.WriteString(zeroWidthSpace)
+			run = 1
+		}
 		if strings.ContainsRune(nameEscapes, r) {
 			b.WriteByte('\\')
 		}
@@ -486,7 +525,7 @@ func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug
 		return err
 	}
 	if !slugShape.MatchString(slug) {
-		return errors.New("set the App's slug to 1 to 100 letters, digits, dots, underscores, or hyphens, letter or digit first")
+		return errSlug
 	}
 	body := commentBody(e)
 	if n := utf8.RuneCountInString(body); n > maxCommentBody {
@@ -495,15 +534,9 @@ func (c Client) PostComment(ctx context.Context, p *Pacer, token TokenFunc, slug
 	if err := CheckAPIURL(c.base()); err != nil {
 		return err
 	}
-	if token == nil {
-		return errors.New("pass a token function to PostComment: token is nil")
-	}
-	tok, err := token(ctx, issue.repository)
+	tok, err := installationToken(ctx, token, "PostComment", issue.repository)
 	if err != nil {
-		return fmt.Errorf("%w (installation token for the repository %d)", err, issue.repository)
-	}
-	if tok == "" {
-		return fmt.Errorf("check the App's installation: GitHub returned an empty token for the repository %d", issue.repository)
+		return err
 	}
 	if p == nil {
 		p = &Pacer{}

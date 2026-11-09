@@ -458,22 +458,44 @@ func TestAnUnknownStatusIsLeftAlone(t *testing.T) {
 	}
 }
 
-// TestATokenThatCannotBeHadSendsNothing has the token function fail, and checks that
-// nothing is sent and the error says for which repository.
+// TestATokenThatCannotBeHadSendsNothing has the take in and the post of a comment each
+// get a slug that is not one, no token function, a token function that fails, and one
+// that returns an empty token, and checks that nothing is sent and that both return
+// the same errors, each starting with its fix; the nil token's error contains the name
+// of the function called.
 func TestATokenThatCannotBeHadSendsNothing(t *testing.T) {
-	tr := &sentTransport{}
-	token := func(context.Context, int64) (string, error) { return "", errors.New("no installation") }
-	err := Client{HTTP: &http.Client{Transport: tr}}.ApplyChange(context.Background(), nil, token, takeInSlug, takenIn)
-	if want := "the installation token for the repository 1296269: no installation"; err == nil || err.Error() != want || tr.sent {
-		t.Errorf("err %v, want %s; sent %v", err, want, tr.sent)
-	}
-	empty := func(context.Context, int64) (string, error) { return "", nil }
-	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, empty, takeInSlug, takenIn); err == nil || tr.sent {
-		t.Errorf("an empty token: err %v, sent %v", err, tr.sent)
-	}
 	working := func(context.Context, int64) (string, error) { return takeInToken, nil }
-	if err := (Client{HTTP: &http.Client{Transport: tr}}).ApplyChange(context.Background(), nil, working, takeInSlug+"]", takenIn); err == nil || !strings.HasPrefix(err.Error(), "the App's slug is not one") || tr.sent {
-		t.Errorf("a slug that is not one: err %v, sent %v", err, tr.sent)
+	failing := func(context.Context, int64) (string, error) { return "", errors.New("check the installation") }
+	empty := func(context.Context, int64) (string, error) { return "", nil }
+	const slugFix = "set the App's slug to 1 to 100 letters, digits, dots, underscores, or hyphens, letter or digit first"
+	for _, path := range []struct {
+		name string
+		call func(c Client, token TokenFunc, slug string) error
+	}{
+		{"ApplyChange", func(c Client, token TokenFunc, slug string) error {
+			return c.ApplyChange(context.Background(), nil, token, slug, takenIn)
+		}},
+		{"PostComment", func(c Client, token TokenFunc, slug string) error {
+			return c.PostComment(context.Background(), nil, token, slug, testComment)
+		}},
+	} {
+		for _, tc := range []struct {
+			name  string
+			token TokenFunc
+			slug  string
+			want  string
+		}{
+			{"a slug that is not one", working, takeInSlug + "]", slugFix},
+			{"no token function", nil, takeInSlug, "pass a token function to " + path.name + ": token is nil"},
+			{"a token function that fails", failing, takeInSlug, "check the installation (installation token for the repository 1296269)"},
+			{"an empty token", empty, takeInSlug, "check the App's installation: GitHub returned an empty token for the repository 1296269"},
+		} {
+			tr := &sentTransport{}
+			err := path.call(Client{HTTP: &http.Client{Transport: tr}}, tc.token, tc.slug)
+			if err == nil || err.Error() != tc.want || tr.sent {
+				t.Errorf("%s, %s: err %v, want %s; sent %v", path.name, tc.name, err, tc.want, tr.sent)
+			}
+		}
 	}
 }
 
@@ -901,36 +923,52 @@ func TestOnlyTheBotsFirstLineMarkerCounts(t *testing.T) {
 }
 
 // TestTheNameLineCleansAndEscapesTheName posts comments whose author's name would
-// mention a user, link an issue, show an emoji, make a link, change the formatting or
-// reorder the line, and checks the exact first line: a zero-width space after each @,
-// # and :, each other Markdown character, & and $ after a backslash, the bidirectional
-// controls and invisible characters removed, and the leading and trailing spaces
-// trimmed. The person's text is posted unchanged.
+// mention a user, link an issue or a commit, show an emoji, make a link, change the
+// formatting or reorder the line, and checks the exact first line: a zero-width space
+// after each @, #, :, -, ., _, + and /, and after every 6th digit of a longer run of
+// hex digits;
+// each other Markdown character, & and $ after a backslash; the bidirectional controls
+// and invisible characters removed; and the leading and trailing spaces trimmed. An
+// autolink whose prefix ends in a letter, TICKET123, stays as it is. The person's text
+// is posted unchanged.
 func TestTheNameLineCleansAndEscapesTheName(t *testing.T) {
 	for name, want := range map[string]string{
 		"@octocat":                       "@\u200boctocat",
 		"**x**":                          `\*\*x\*\*`,
 		"#123":                           "#\u200b123",
 		"# Dana":                         "#\u200b Dana",
-		"acme/widgets#123":               "acme/widgets#\u200b123",
+		"acme/widgets#123":               "acme/\u200bwidgets#\u200b123",
 		"&#8238;x":                       "\\&#\u200b8238;x",
 		"$x$":                            `\$x\$`,
 		"Dana \u202eelpmaxE":             "Dana elpmaxE",
 		"\u200bDana\u2066 Example\ufeff": "Dana Example",
 		"Dana\u2028Example":              "Dana Example",
 		"\u2029Dana Example\u2028":       "Dana Example",
-		"Dana @octo-org/team **x**":      "Dana @\u200bocto\\-org/team \\*\\*x\\*\\*",
-		"\\`*_{}[]()#+-.!|<>~&$:@":       "\\\\\\`\\*\\_\\{\\}\\[\\]\\(\\)#\u200b\\+\\-\\.\\!\\|\\<\\>\\~\\&\\$:\u200b@\u200b",
+		"Dana @octo-org/team **x**":      "Dana @\u200bocto\\-\u200borg/\u200bteam \\*\\*x\\*\\*",
+		"\\`*_{}[]()#+-.!|<>~&$:@":       "\\\\\\`\\*\\_\u200b\\{\\}\\[\\]\\(\\)#\u200b\\+\u200b\\-\u200b\\.\u200b\\!\\|\\<\\>\\~\\&\\$:\u200b@\u200b",
 		"    Dana Example ":              "Dana Example",
 		"    code":                       "code",
 		"\u00a0\u3000Dana Example\u2009": "Dana Example",
 		"José Ñandú :tada:":              "José Ñandú :\u200btada:\u200b",
-		"https://example.com/x":          "https:\u200b//example\\.com/x",
+		"https://example.com/x":          "https:\u200b/\u200b/\u200bexample\\.\u200bcom/\u200bx",
 		"```go":                          "\\`\\`\\`go",
 		"~~~":                            "\\~\\~\\~",
-		"1. Dana":                        "1\\. Dana",
-		"<!-- Dana":                      "\\<\\!\\-\\- Dana",
-		"<!-- qory:work-item wi_1 -->":   "\\<\\!\\-\\- qory:\u200bwork\\-item wi\\_1 \\-\\-\\>",
+		"1. Dana":                        "1\\.\u200b Dana",
+		"<!-- Dana":                      "\\<\\!\\-\u200b\\-\u200b Dana",
+		"<!-- qory:work-item wi_1 -->":   "\\<\\!\\-\u200b\\-\u200b qory:\u200bwork\\-\u200bitem wi\\_\u200b1 \\-\u200b\\-\u200b\\>",
+		"GH-123":                         "GH\\-\u200b123",
+		"ABC-42":                         "ABC\\-\u200b42",
+		"Dana 0123abc":                   "Dana 0123ab\u200bc",
+		"0123456789abcdef0123456789abcdef01234567": "012345\u200b6789ab\u200bcdef01\u200b234567\u200b89abcd\u200bef0123\u200b4567",
+		"org/repo@0123456789abcdef":                "org/\u200brepo@\u200b012345\u200b6789ab\u200bcdef",
+		"www.example.com":                          "www\\.\u200bexample\\.\u200bcom",
+		"ABC_123":                                  "ABC\\_\u200b123",
+		"ABC+1":                                    "ABC\\+\u200b1",
+		"ABC/1":                                    "ABC/\u200b1",
+		"TICKET123":                                "TICKET123",
+		"Dana c0ffee":                              "Dana c0ffee",
+		"Dana 2026":                                "Dana 2026",
+		"1234567 and 123456789012":                 "123456\u200b7 and 123456\u200b789012",
 	} {
 		f := &fakeTakeIn{}
 		c, token, _ := serveTakeIn(t, f)
@@ -956,7 +994,7 @@ func TestTheNameLineCleansAndEscapesTheName(t *testing.T) {
 
 // TestAnEscapedNameFitsTheContractsRoom builds the comment for names of 100 copies of
 // one character, for every printable ASCII character and a few others, and checks that
-// each character of the name becomes at most 2 characters, that the escaped name, "
+// each character of the name becomes at most 3 characters, that the escaped name, "
 // wrote in Qory Apiary:", the space and marker after it and the line breaks are at most
 // 536 characters together, as the contract has it, and that the comment_id is read back
 // from the end of the first line, with no <! in the escaped name and no work item's
@@ -972,8 +1010,8 @@ func TestAnEscapedNameFitsTheContractsRoom(t *testing.T) {
 		e := testComment
 		e.AuthorName = strings.Repeat(string(r), maxAuthorName)
 		escaped := escapeName(cleanName(e.AuthorName))
-		if n := utf8.RuneCountInString(escaped); n > 2*maxAuthorName {
-			t.Errorf("%q: the escaped name is %d characters, over %d", r, n, 2*maxAuthorName)
+		if n := utf8.RuneCountInString(escaped); n > 3*maxAuthorName {
+			t.Errorf("%q: the escaped name is %d characters, over %d", r, n, 3*maxAuthorName)
 		}
 		e.Body = body
 		posted := commentBody(e)
@@ -987,11 +1025,12 @@ func TestAnEscapedNameFitsTheContractsRoom(t *testing.T) {
 			t.Errorf("%q: the marker's id is %q", r, id)
 		}
 	}
-	// A name of 100 characters that each become 2: the longest escaped name.
+	// A name of 100 characters that each become 3: the longest escaped name.
 	e := testComment
-	e.AuthorName = strings.Repeat("@", maxAuthorName)
+	e.AuthorName = strings.Repeat("-", maxAuthorName)
 	e.Body = body
-	if n := utf8.RuneCountInString(commentBody(e)) - len(body); n != 200+len(" wrote in Qory Apiary: "+commentMark(testCommentID)+"\n\n") {
+	n := utf8.RuneCountInString(commentBody(e)) - len(body)
+	if n != 300+len(" wrote in Qory Apiary: "+commentMark(testCommentID)+"\n\n") || n > 536 {
 		t.Errorf("the longest name line with its marker and the line breaks are %d characters", n)
 	}
 }
