@@ -174,7 +174,7 @@ func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return map[string]any{
 			"number": p.Number, "html_url": u, "title": p.Title, "body": p.Body,
-			"draft": p.Draft, "head": map[string]any{"ref": p.Head}, "base": map[string]any{"ref": p.Base},
+			"draft": p.Draft, "state": "open", "head": map[string]any{"ref": p.Head}, "base": map[string]any{"ref": p.Base},
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -228,9 +228,13 @@ type env struct {
 	caFile string
 	mu     sync.Mutex
 	// tunnels counts the connections the proxy accepted; connectStatus, when set, is
-	// the status the proxy returns to every CONNECT.
+	// the status the proxy returns to every CONNECT. connectReply, when set, is written
+	// in one write in place of the proxy's response; with closeAfter, the proxy then
+	// closes the connection, and without it, waits for the program to close it.
 	tunnels       int
 	connectStatus int
+	connectReply  string
+	closeAfter    bool
 }
 
 func (e *env) tunnelCount() int {
@@ -311,8 +315,15 @@ func (e *env) proxy(c net.Conn, upstream, auth string) {
 		return
 	}
 	e.mu.Lock()
-	status := e.connectStatus
+	status, reply, closeAfter := e.connectStatus, e.connectReply, e.closeAfter
 	e.mu.Unlock()
+	if reply != "" {
+		_, _ = io.WriteString(c, reply)
+		if !closeAfter {
+			_, _ = io.Copy(io.Discard, br)
+		}
+		return
+	}
 	if status != 0 {
 		_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
 		return
@@ -401,7 +412,7 @@ func (e *env) runRaw(t *testing.T, file string, vars []string) (result, map[stri
 	if raw, err := os.ReadFile(file); err == nil {
 		_ = json.Unmarshal(raw, &got)
 	}
-	if _, err := os.Stat(file + ".tmp"); err == nil {
+	if _, err := os.Lstat(file + ".tmp"); err == nil {
 		t.Errorf("%s.tmp is left behind", file)
 	}
 	return r, got
@@ -594,7 +605,7 @@ func TestSeveralOpenPullRequests(t *testing.T) {
 
 func TestLinkInAnotherCase(t *testing.T) {
 	e := newEnv(t)
-	e.gh.fix("POST "+repoA, 201, `{"number":34,"html_url":"https://github.com/ACME-Corp/Widgets-App/pull/34","title":"Add the widget","draft":true}`)
+	e.gh.fix("POST "+repoA, 201, `{"number":34,"html_url":"https://github.com/ACME-Corp/Widgets-App/pull/34","title":"Add the widget","draft":true,"state":"open"}`)
 	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
 	url := "https://github.com/" + repoA + "/pull/34"
 	if r.code != 0 || r.stdout != url+" opened\n" {
@@ -620,13 +631,14 @@ func TestTitleOf256CodePoints(t *testing.T) {
 func TestFailedWriteLeavesNoTmp(t *testing.T) {
 	e := newEnv(t)
 	file := filepath.Join(e.dir, "submission.json")
-	// A read-only submission.json.tmp makes the write fail; the program removes it.
-	if err := os.WriteFile(file+".tmp", nil, 0o400); err != nil {
+	// A submission.json.tmp that links to a missing folder makes the write fail, also for
+	// root; the program removes the link.
+	if err := os.Symlink(filepath.Join(e.dir, "missing", "x"), file+".tmp"); err != nil {
 		t.Fatal(err)
 	}
 	s := submission("changes-requested", "Add the widget", repo(repoA, "github.com"))
 	r, _ := e.run(t, s, nil)
-	want := "Make the folder of QORY_SUBMISSION_FILE writable: writing " + file + " failed (EACCES)\n"
+	want := "Make the folder of QORY_SUBMISSION_FILE writable: writing " + file + " failed (ENOENT)\n"
 	if r.code != 2 || r.stderr != want {
 		t.Errorf("exit %d, stderr %q; want 2 and %q", r.code, r.stderr, want)
 	}
@@ -763,6 +775,14 @@ func TestFailedCalls(t *testing.T) {
 		{"unusable title", func(e *env) {
 			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add\u0007the widget","draft":true}`)
 		}, nil, "Check the proxy for " + r + ": POST pulls returned an unusable title"},
+		{"closed pull request", func(e *env) {
+			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add the widget","draft":true,"state":"closed"}`)
+		}, nil, "Check the proxy for " + r + ": POST pulls returned a closed pull request"},
+		{"proxy closes after 200", func(e *env) { e.connectReply, e.closeAfter = "HTTP/1.1 200 OK\r\n\r\n", true }, nil,
+			"Retry with a later passed round for " + r + ": GET pulls failed (ECONNRESET)"},
+		// The alert reaches TLS only through the bytes the program keeps after the head.
+		{"TLS alert after 200", func(e *env) { e.connectReply = "HTTP/1.1 200 OK\r\n\r\n\x15\x03\x03\x00\x02\x02\x28" }, nil,
+			"Check the proxy's tunnel to api.github.com: TLS failed (ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE)"},
 		{"another link", func(e *env) { e.gh.badURL = true }, nil,
 			"Check that " + r + " is the repository's current name: pulls returned another link"},
 	}
@@ -772,7 +792,12 @@ func TestFailedCalls(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup(e)
 			}
+			start := time.Now()
 			r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA), tc.extra...)
+			// A failed call ends at once, not at the 30 s time-out.
+			if d := time.Since(start); d > 10*time.Second {
+				t.Errorf("the run took %v", d)
+			}
 			if r.code != 1 || r.stderr != tc.wantErr+"\n" || r.stdout != "" {
 				t.Fatalf("exit %d, stdout %q, stderr %q; want 1 and %q", r.code, r.stdout, r.stderr, tc.wantErr)
 			}

@@ -6,8 +6,10 @@
 // opens or updates the draft pull request of each such repository. It reaches
 // api.github.com only through the CONNECT proxy on a unix socket, and sends no token.
 //
-// Exit 0: done. Exit 1: a call to GitHub failed; the file has every commit link and each
-// draft that went through. Exit 2: the input is wrong; the file is unchanged.
+// Exit 0: done. Exit 1: a call to GitHub failed, and the file has every commit link and
+// each draft that went through; or writing the file failed after a draft, and the
+// program stopped. Exit 2: the input is wrong, or the first write of the file failed;
+// the file is unchanged.
 'use strict';
 
 const fs = require('node:fs');
@@ -44,8 +46,11 @@ const MAX_REPOSITORIES = 20;
 const MAX_TITLE = 256;
 const MAX_DESCRIPTION = 16384;
 const DRAFT_TITLE_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/u;
-// A path segment that the harness type submission refuses: ., .. or .git in any case.
+// A path segment that the schema of the harness type submission does not allow: ., ..
+// or .git in any case.
 const DOT_SEGMENT_PATTERN = /(^|\/)(\.\.?|\.git)(\/|$)/i;
+// The codes of a TLS error about the server's certificate, which the CA bundle can fix.
+const CERT_ERROR_PATTERN = /^(UNABLE_TO_|SELF_SIGNED_|DEPTH_ZERO_|CERT_|ERR_TLS_CERT_)/;
 // The most characters of a first stderr line, and of GitHub's message quoted in one.
 const MAX_LINE = 100;
 const BASE_BRANCH_PATTERN = /^[^\x00-\x20\x7f~^:?*[\\]{1,255}$/;
@@ -209,8 +214,9 @@ function tunnel(cfg, signal) {
     let buf = Buffer.alloc(0);
     const onError = (error) => reject(Object.assign(new Error('proxy'), { kind: 'proxy', code: error.code }));
     sock.on('error', onError);
-    // A close before the proxy's response ends the call at once; after it, reject is a no-op.
-    sock.on('close', () => reject(Object.assign(new Error('connect'), { kind: 'connect', status: 0 })));
+    // A close before the proxy's response ends the call at once.
+    const onClose = () => reject(Object.assign(new Error('connect'), { kind: 'connect', status: 0 }));
+    sock.on('close', onClose);
     sock.on('connect', () => {
       const auth = Buffer.from(`${PROXY_USER}:${cfg.password}`).toString('base64');
       sock.write(`CONNECT ${API_HOST}:${API_PORT} HTTP/1.1\r\nHost: ${API_HOST}:${API_PORT}\r\n` +
@@ -225,6 +231,7 @@ function tunnel(cfg, signal) {
       }
       sock.removeListener('data', onData);
       sock.removeListener('error', onError);
+      sock.removeListener('close', onClose);
       // Bytes after the proxy's response head belong to the TLS handshake. The paused
       // socket keeps them in its buffer until the TLS socket reads the buffer.
       sock.pause();
@@ -240,7 +247,14 @@ function tunnel(cfg, signal) {
       }
       const t = tls.connect({ socket: sock, servername: API_HOST, ca: cfg.ca });
       signal.sockets.push(t);
-      t.on('error', (error) => reject(Object.assign(new Error('tls'), { kind: 'tls', code: error.code })));
+      t.on('error', (error) => {
+        let kind = 'net';
+        if (CERT_ERROR_PATTERN.test(error.code || '')) kind = 'tls';
+        else if (/^ERR_SSL_/.test(error.code || '')) kind = 'handshake';
+        reject(Object.assign(new Error(kind), { kind, code: error.code }));
+      });
+      // A close before the handshake ends the call at once; after it, reject is a no-op.
+      t.on('close', () => reject(Object.assign(new Error('net'), { kind: 'net', code: 'ECONNRESET' })));
       t.on('secureConnect', () => resolve(t));
     };
     sock.on('data', onData);
@@ -352,6 +366,8 @@ function callMessage(error, repo, method, label) {
     case 'tls':
       if (!process.env[ENV_CA]) return `Set ${ENV_CA} to the run's CA bundle: TLS failed (${error.code})`;
       return `Check the CA bundle in ${ENV_CA}: TLS failed (${error.code})`;
+    case 'handshake':
+      return `Check the proxy's tunnel to ${API_HOST}: TLS failed (${error.code})`;
     case 'timeout':
       return `Retry with a later passed round for ${repo}: ${what} timed out after ${CALL_TIMEOUT_MS / 1000} s`;
     case 'json':
@@ -394,6 +410,7 @@ function draftFrom(pr, repo, action) {
     throw Object.assign(new Error('moved'), { kind: 'moved' });
   }
   if (typeof pr.title !== 'string' || !DRAFT_TITLE_PATTERN.test(pr.title)) throw bad('an unusable title');
+  if (pr.state !== 'open') throw bad('a closed pull request');
   return { number: pr.number, url, title: pr.title, state: pr.draft === true ? 'draft' : 'open', action };
 }
 
