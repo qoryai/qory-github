@@ -36,10 +36,11 @@ nothing but the socket in `QORY_PROXY_SOCKET`. The proxy adds the credential.
      `text.description`, the head `ref` and the base branch from `QORY_SUBMIT_BASES`.
    - With one, `PATCH /repos/<path>/pulls/<number>` sets its title and description only.
      With several, the program updates the one into the base branch, else the oldest.
-   - The program sets the entry's `draft` to `{number, url, title, state, action}`. `url`
-     is `https://github.com/<path>/pull/<number>`; a reply with another link counts as a
-     failed call. `title` is the title GitHub returned. `state` is `draft`, or `open` when
-     the pull request is no longer a draft. `action` is `opened` or `updated`.
+   - The program sets the entry's `draft` to `{number, url, title, state, action}` and
+     writes the file. `url` is `https://github.com/<path>/pull/<number>`; a response with
+     another link, compared without regard to case, counts as a failed call. `title` is
+     the title GitHub returned. `state` is `draft`, or `open` when the pull request is no
+     longer a draft. `action` is `opened` or `updated`.
 
    Otherwise, `draft` stays as it is, and the program makes no call.
 
@@ -50,7 +51,7 @@ Each call ends after 30 seconds, with no retry.
 | Exit | Meaning | The submission file |
 |---|---|---|
 | 0 | Done. | Every commit link, and each draft. |
-| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 400 or more, a reply that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. | Every commit link, and the drafts of the repositories whose calls went through. |
+| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. | Every commit link, and the drafts of the repositories whose calls went through. |
 | 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. | Unchanged. |
 
 stdout has one line per repository whose draft the program opened or updated:
@@ -60,11 +61,14 @@ https://github.com/owner/name/pull/34 opened
 https://github.com/owner/name/pull/34 updated
 ```
 
-stderr has one line per error. The line starts with the fix:
+stderr has one line per error, and the line starts with the fix. For a repository path
+of up to 21 characters, a line with no file path in it has at most 100 characters. After
+a 422 or another 4xx status that has no fix of its own, the line ends with GitHub's error
+message in parentheses, cut to fit:
 
 ```text
-Give the GitHub App pull_requests: write on owner/name: GitHub returned 403 for POST pulls
-Add owner/name to the run documents' targets: QORY_SUBMIT_BASES has no base branch for it
+Give the GitHub App pull_requests: write on owner/name: POST pulls returned 403
+Add owner/name to the run documents' targets: no base branch for it in QORY_SUBMIT_BASES
 ```
 
 The program writes neither the proxy password nor a token to its output.

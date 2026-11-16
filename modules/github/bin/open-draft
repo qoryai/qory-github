@@ -43,7 +43,11 @@ const OWNER_NAME_PATTERN = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
 const MAX_REPOSITORIES = 20;
 const MAX_TITLE = 256;
 const MAX_DESCRIPTION = 16384;
-const DRAFT_TITLE_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/;
+const DRAFT_TITLE_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/u;
+// A path segment that the harness type submission refuses: ., .. or .git in any case.
+const DOT_SEGMENT_PATTERN = /(^|\/)(\.\.?|\.git)(\/|$)/i;
+// The most characters of a first stderr line, and of GitHub's message quoted in one.
+const MAX_LINE = 100;
 const BASE_BRANCH_PATTERN = /^[^\x00-\x20\x7f~^:?*[\\]{1,255}$/;
 const BASES_MEMBER = 'base';
 
@@ -52,6 +56,11 @@ class InputError extends Error {}
 
 // CallError is a failed call to GitHub; its message is one stderr line.
 class CallError extends Error {}
+
+// chars is the length of s in code points, as JSON Schema counts it.
+function chars(s) {
+  return [...s].length;
+}
 
 function isObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -98,6 +107,7 @@ function checkSubmission(s) {
     if (!isObject(r)) fix(at, 'it is not a JSON object');
     if (typeof r.system !== 'string' || !SYSTEM_PATTERN.test(r.system)) fix(`${at}.system`, 'it is not a host name');
     if (typeof r.path !== 'string' || r.path === '') fix(`${at}.path`, 'it is not a path');
+    if (DOT_SEGMENT_PATTERN.test(r.path)) fix(`${at}.path`, 'it has a ., .. or .git segment');
     checkCommit(r.commit, `${at}.commit`);
     if (!isObject(r.draft)) fix(`${at}.draft`, 'it is missing or not a JSON object');
     if (r.commit_url !== undefined && typeof r.commit_url !== 'string') fix(`${at}.commit_url`, 'it is not a string');
@@ -113,22 +123,19 @@ function checkSubmission(s) {
         if (typeof c.step !== 'string') fix(`${at}.commits[${j}].step`, 'it is not a string');
       });
     }
-    if (r.system === SYSTEM) {
-      const parts = r.path.split('/');
-      if (!OWNER_NAME_PATTERN.test(r.path) || parts[1] === '.' || parts[1] === '..') {
-        fix(`${at}.path`, `${SYSTEM} needs owner/name, not ${r.path}`);
-      }
+    if (r.system === SYSTEM && !OWNER_NAME_PATTERN.test(r.path)) {
+      fix(`${at}.path`, `it is not owner/name for ${SYSTEM}`);
     }
   });
   if (s.text !== undefined) {
     const t = s.text;
     if (!isObject(t)) fix('text', 'it is not a JSON object');
-    if (typeof t.title !== 'string' || t.title.length < 1 || t.title.length > MAX_TITLE ||
-        t.title.includes('\n')) {
-      fix('text.title', `it is not one line of 1 to ${MAX_TITLE} characters`);
+    // GitHub returns the title as sent, and draft.title takes no control character.
+    if (typeof t.title !== 'string' || chars(t.title) > MAX_TITLE || !DRAFT_TITLE_PATTERN.test(t.title)) {
+      fix('text.title', `it is not 1 to ${MAX_TITLE} characters with no control character`);
     }
-    if (typeof t.description !== 'string' || t.description.length < 1 ||
-        t.description.length > MAX_DESCRIPTION) {
+    if (typeof t.description !== 'string' || chars(t.description) < 1 ||
+        chars(t.description) > MAX_DESCRIPTION) {
       fix('text.description', `it is not 1 to ${MAX_DESCRIPTION} characters`);
     }
   }
@@ -143,7 +150,8 @@ function readBases(path) {
   list.forEach((b, i) => {
     if (!isObject(b) || typeof b.system !== 'string' || typeof b.path !== 'string' ||
         typeof b[BASES_MEMBER] !== 'string' || !BASE_BRANCH_PATTERN.test(b[BASES_MEMBER])) {
-      fail(fix, `entry ${i} is not one`);
+      fail(`Fix entry ${i} of the file in ${ENV_BASES}`,
+        `it is not {system, path, ${BASES_MEMBER}} with a valid branch`);
     }
     if (b.system === SYSTEM) bases.set(b.path, b[BASES_MEMBER]);
   });
@@ -175,8 +183,22 @@ function addLinks(s) {
 // writeFile replaces the file at path through path.tmp and a rename.
 function writeFile(path, s) {
   const tmp = `${path}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(s, null, 2)}\n`);
-  fs.renameSync(tmp, path);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(s, null, 2)}\n`);
+    fs.renameSync(tmp, path);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // No path.tmp is left, or it cannot be removed; the first error is the one to print.
+    }
+    throw error;
+  }
+}
+
+// writeMessage is the stderr line for a failed write of the file.
+function writeMessage(file, error) {
+  return `Make the folder of ${ENV_SUBMISSION} writable: writing ${file} failed (${error.code})`;
 }
 
 // tunnel opens a TLS connection to api.github.com through the CONNECT proxy.
@@ -187,7 +209,7 @@ function tunnel(cfg, signal) {
     let buf = Buffer.alloc(0);
     const onError = (error) => reject(Object.assign(new Error('proxy'), { kind: 'proxy', code: error.code }));
     sock.on('error', onError);
-    // A close before the proxy's reply ends the call at once; after it, reject is a no-op.
+    // A close before the proxy's response ends the call at once; after it, reject is a no-op.
     sock.on('close', () => reject(Object.assign(new Error('connect'), { kind: 'connect', status: 0 })));
     sock.on('connect', () => {
       const auth = Buffer.from(`${PROXY_USER}:${cfg.password}`).toString('base64');
@@ -203,7 +225,12 @@ function tunnel(cfg, signal) {
       }
       sock.removeListener('data', onData);
       sock.removeListener('error', onError);
-      sock.on('error', () => {}); // The TLS socket reports errors from here on.
+      // Bytes after the proxy's response head belong to the TLS handshake. The paused
+      // socket keeps them in its buffer until the TLS socket reads the buffer.
+      sock.pause();
+      const rest = buf.subarray(end + 4);
+      if (rest.length > 0) sock.unshift(rest);
+      sock.on('error', () => {}); // From here on, errors reach the TLS socket.
       const m = /^HTTP\/1\.[01] (\d{3})/.exec(buf.subarray(0, end).toString('latin1'));
       const status = m ? Number(m[1]) : 0;
       if (status !== 200) {
@@ -272,7 +299,9 @@ async function call(cfg, repo, method, apiPath, body, label) {
       tunnel(cfg, signal).then((t) => request(t, method, apiPath, body)),
       timeout,
     ]);
-    if (res.status >= 400) throw Object.assign(new Error('status'), { kind: 'status', status: res.status });
+    if (res.status < 200 || res.status >= 300) {
+      throw Object.assign(new Error('status'), { kind: 'status', status: res.status, detail: githubMessage(res.text) });
+    }
     try {
       return JSON.parse(res.text);
     } catch {
@@ -286,6 +315,31 @@ async function call(cfg, repo, method, apiPath, body, label) {
   }
 }
 
+// githubMessage is GitHub's error text from a response body: the first entry of errors
+// when it has a message, else message, with control characters replaced by spaces.
+function githubMessage(text) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return '';
+  }
+  if (!isObject(doc)) return '';
+  const first = Array.isArray(doc.errors) ? doc.errors[0] : undefined;
+  const msg = isObject(first) && typeof first.message === 'string' ? first.message : doc.message;
+  if (typeof msg !== 'string') return '';
+  return msg.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, ' ').trim();
+}
+
+// withDetail adds GitHub's message to line, in parentheses, cut so the line has at most
+// MAX_LINE characters.
+function withDetail(line, detail) {
+  const room = MAX_LINE - chars(line) - 3;
+  if (!detail || room < 8) return line;
+  const cut = [...detail];
+  return `${line} (${cut.length > room ? `${cut.slice(0, room - 3).join('')}...` : detail})`;
+}
+
 // callMessage is the stderr line for a failed call: the fix, then the cause.
 function callMessage(error, repo, method, label) {
   const what = `${method} ${label}`;
@@ -296,35 +350,51 @@ function callMessage(error, repo, method, label) {
       if (error.status === 407) return `Set ${ENV_PASSWORD} to the proxy password: the proxy returned 407 for ${repo}`;
       return `Check the proxy at ${ENV_SOCKET}: CONNECT returned ${error.status || 'no status'} for ${repo}`;
     case 'tls':
-      return `Check the CA bundle in ${ENV_CA} for ${repo}: TLS failed (${error.code})`;
+      if (!process.env[ENV_CA]) return `Set ${ENV_CA} to the run's CA bundle: TLS failed (${error.code})`;
+      return `Check the CA bundle in ${ENV_CA}: TLS failed (${error.code})`;
     case 'timeout':
       return `Retry with a later passed round for ${repo}: ${what} timed out after ${CALL_TIMEOUT_MS / 1000} s`;
     case 'json':
-      return `Check the proxy for ${repo}: GitHub returned no valid JSON for ${what}`;
-    case 'reply':
-      return `Check the proxy for ${repo}: GitHub returned ${error.detail} for ${what}`;
+      return `Check the proxy for ${repo}: ${what} returned no valid JSON`;
+    case 'response':
+      return `Check the proxy for ${repo}: ${what} returned ${error.detail}`;
+    case 'moved':
+      return `Check that ${repo} is the repository's current name: ${label} returned another link`;
     case 'status': {
-      const cause = `GitHub returned ${error.status} for ${what}`;
-      if (error.status === 401) return `Check the token the proxy adds for ${repo}: ${cause}`;
-      if (error.status === 403) return `Give the GitHub App pull_requests: write on ${repo}: ${cause}`;
-      if (error.status === 404) return `Install the GitHub App on ${repo}: ${cause}`;
-      if (error.status === 422 && method === 'POST') return `Check the head and base branches on ${repo}: ${cause}`;
-      if (error.status === 422) return `Check the title and description for ${repo}: ${cause}`;
-      if (error.status >= 500) return `Retry with a later passed round for ${repo}: ${cause}`;
-      return `Check the request to ${repo}: ${cause}`;
+      const cause = `${what} returned ${error.status}`;
+      const s = error.status;
+      if (s >= 300 && s < 400) return `Set the targets to the current name of ${repo}: ${cause}`;
+      if (s === 401) return `Check the token the proxy adds for ${repo}: ${cause}`;
+      if (s === 403 && method === 'GET') return `Give the GitHub App pull_requests: read on ${repo}: ${cause}`;
+      if (s === 403) return `Give the GitHub App pull_requests: write on ${repo}: ${cause}`;
+      if (s === 404) return `Install the GitHub App on ${repo}: ${cause}`;
+      if (s === 422) {
+        let fix = `Check the title and description for ${repo}`;
+        if (/draft/i.test(error.detail)) fix = `Use a GitHub plan with draft pull requests for ${repo}`;
+        else if (/no commits between/i.test(error.detail)) fix = `Push the run's commits to ${repo}`;
+        else if (method === 'POST') fix = `Check the head and base branches on ${repo}`;
+        return withDetail(`${fix}: ${cause}`, error.detail);
+      }
+      if (s >= 500) return `Retry with a later passed round for ${repo}: ${cause}`;
+      return withDetail(`Check the request to ${repo}: ${cause}`, error.detail);
     }
     default:
       return `Retry with a later passed round for ${repo}: ${what} failed (${error.code || error.message})`;
   }
 }
 
-// draftFrom checks GitHub's pull request and returns the submission's draft.
+// draftFrom checks GitHub's pull request and returns the submission's draft. GitHub
+// may return the link with the owner and name in another case; the draft's url is the
+// link formed from the submission's path.
 function draftFrom(pr, repo, action) {
-  const bad = (detail) => Object.assign(new Error('reply'), { kind: 'reply', detail });
+  const bad = (detail) => Object.assign(new Error('response'), { kind: 'response', detail });
   if (!isObject(pr) || !Number.isInteger(pr.number) || pr.number < 1) throw bad('no pull request number');
-  if (pr.html_url !== `${WEB_ORIGIN}/${repo}/pull/${pr.number}`) throw bad('an unexpected link');
+  const url = `${WEB_ORIGIN}/${repo}/pull/${pr.number}`;
+  if (typeof pr.html_url !== 'string' || pr.html_url.toLowerCase() !== url.toLowerCase()) {
+    throw Object.assign(new Error('moved'), { kind: 'moved' });
+  }
   if (typeof pr.title !== 'string' || !DRAFT_TITLE_PATTERN.test(pr.title)) throw bad('an unusable title');
-  return { number: pr.number, url: pr.html_url, title: pr.title, state: pr.draft === true ? 'draft' : 'open', action };
+  return { number: pr.number, url, title: pr.title, state: pr.draft === true ? 'draft' : 'open', action };
 }
 
 // openOrUpdate opens the draft pull request of one repository, or updates the open one.
@@ -334,7 +404,7 @@ async function openOrUpdate(cfg, s, r, base) {
   const head = encodeURIComponent(`${owner}:${s.ref}`);
   const list = await call(cfg, r.path, 'GET', `${pulls}?head=${head}&state=open`, undefined, 'pulls');
   if (!Array.isArray(list) || list.some((p) => !isObject(p) || !Number.isInteger(p.number))) {
-    throw new CallError(callMessage({ kind: 'reply', detail: 'no list of pull requests' }, r.path, 'GET', 'pulls'));
+    throw new CallError(callMessage({ kind: 'response', detail: 'no list of pull requests' }, r.path, 'GET', 'pulls'));
   }
   // Several open pull requests from one head: the one into the base branch, else the oldest.
   const open = list.find((p) => isObject(p.base) && p.base.ref === base) ||
@@ -372,7 +442,7 @@ async function main() {
       bases = readBases(env(ENV_BASES));
       for (const r of repos) {
         if (!bases.has(r.path)) {
-          fail(`Add ${r.path} to the run documents' targets`, `${ENV_BASES} has no base branch for it`);
+          fail(`Add ${r.path} to the run documents' targets`, `no base branch for it in ${ENV_BASES}`);
         }
       }
       cfg = { socket: env(ENV_SOCKET), password: env(ENV_PASSWORD) };
@@ -391,7 +461,7 @@ async function main() {
       try {
         writeFile(file, s);
       } catch (error) {
-        fail(`Make the folder of ${ENV_SUBMISSION} writable`, `writing ${file} failed (${error.code})`);
+        throw new InputError(writeMessage(file, error));
       }
     }
     if (!drafts) return 0;
@@ -401,27 +471,27 @@ async function main() {
     return 2;
   }
 
-  // 3. Open or update each draft; a failed call does not stop the others.
+  // 3. Open or update each draft; a failed call does not stop the others. The file is
+  // written after each draft, so a stop from outside keeps the drafts that went through.
   let failed = false;
-  const lines = [];
   for (const r of repos) {
+    let draft;
     try {
-      r.draft = await openOrUpdate(cfg, s, r, bases.get(r.path));
-      lines.push(`${r.draft.url} ${r.draft.action}`);
+      draft = await openOrUpdate(cfg, s, r, bases.get(r.path));
     } catch (error) {
       if (!(error instanceof CallError)) throw error;
       failed = true;
       process.stderr.write(`${error.message}\n`);
+      continue;
     }
-  }
-  if (lines.length > 0) {
+    r.draft = draft;
     try {
       writeFile(file, s);
     } catch (error) {
-      process.stderr.write(`Make the folder of ${ENV_SUBMISSION} writable: writing ${file} failed (${error.code})\n`);
+      process.stderr.write(`${writeMessage(file, error)}\n`);
       return 1;
     }
-    process.stdout.write(lines.map((l) => `${l}\n`).join(''));
+    process.stdout.write(`${draft.url} ${draft.action}\n`);
   }
   return failed ? 1 : 0;
 }
