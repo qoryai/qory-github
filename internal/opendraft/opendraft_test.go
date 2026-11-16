@@ -30,6 +30,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -37,8 +38,9 @@ import (
 const (
 	password = "pw-7f3a9c-never-printed"
 	ref      = "qory/wi_01HZX"
-	repoA    = "acme/widgets"
-	repoB    = "acme/gadgets"
+	// repoA has 21 characters, the length the stderr lines are kept within 100 for.
+	repoA = "acme-corp/widgets-app"
+	repoB = "acme-corp/gadgets"
 )
 
 // Commit ids of the submissions: the base, two commits in between, and the head.
@@ -77,14 +79,51 @@ type pull struct {
 	Draft  bool
 }
 
-// github is a stand-in for api.github.com: pull requests per repository, and a status
-// to return for a method on a repository.
+// response is a status and a body that the stand-in GitHub returns as they are.
+type response struct {
+	status int
+	body   string
+}
+
+// github is a stand-in for api.github.com: pull requests per repository, and responses
+// to return for a method on a repository in place of the stand-in's.
 type github struct {
-	mu     sync.Mutex
-	calls  []call
-	pulls  map[string][]*pull
-	fail   map[string]int // "POST acme/widgets" → status
+	mu    sync.Mutex
+	calls []call
+	pulls map[string][]*pull
+	// fixed are the responses by "METHOD owner/name", such as "POST acme-corp/gadgets".
+	fixed  map[string]response
 	badURL bool
+}
+
+func (g *github) setPulls(repo string, pulls ...*pull) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pulls[repo] = pulls
+}
+
+func (g *github) pullsOf(repo string) []pull {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []pull
+	for _, p := range g.pulls[repo] {
+		out = append(out, *p)
+	}
+	return out
+}
+
+func (g *github) markReady(repo string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, p := range g.pulls[repo] {
+		p.Draft = false
+	}
+}
+
+func (g *github) fix(key string, status int, body string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fixed[key] = response{status, body}
 }
 
 var pullsPath = regexp.MustCompile(`^/repos/([^/]+/[^/]+)/pulls(?:/(\d+))?$`)
@@ -122,8 +161,10 @@ func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := m[1]
-	if s, ok := g.fail[r.Method+" "+repo]; ok {
-		http.Error(w, `{"message":"no"}`, s)
+	if f, ok := g.fixed[r.Method+" "+repo]; ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(f.status)
+		_, _ = io.WriteString(w, f.body)
 		return
 	}
 	render := func(p *pull) map[string]any {
@@ -148,7 +189,11 @@ func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	case r.Method == http.MethodPost && m[2] == "":
-		p := &pull{Number: 33 + len(g.pulls[repo]) + 1, Title: c.Body["title"].(string),
+		n := 34
+		for _, p := range g.pulls[repo] {
+			n = max(n, p.Number+1)
+		}
+		p := &pull{Number: n, Title: c.Body["title"].(string),
 			Body: c.Body["body"].(string), Head: c.Body["head"].(string), Base: c.Body["base"].(string),
 			Draft: c.Body["draft"] == true}
 		g.pulls[repo] = append(g.pulls[repo], p)
@@ -177,12 +222,15 @@ func (g *github) recorded() []call {
 
 // env is a stand-in GitHub behind a stand-in proxy, and the files of one run.
 type env struct {
-	gh      *github
-	dir     string
-	socket  string
-	caFile  string
-	tunnels int
-	mu      sync.Mutex
+	gh     *github
+	dir    string
+	socket string
+	caFile string
+	mu     sync.Mutex
+	// tunnels counts the connections the proxy accepted; connectStatus, when set, is
+	// the status the proxy returns to every CONNECT.
+	tunnels       int
+	connectStatus int
 }
 
 func (e *env) tunnelCount() int {
@@ -200,7 +248,7 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	e := &env{gh: &github{pulls: map[string][]*pull{}, fail: map[string]int{}}, dir: dir,
+	e := &env{gh: &github{pulls: map[string][]*pull{}, fixed: map[string]response{}}, dir: dir,
 		socket: filepath.Join(dir, "p.sock"), caFile: filepath.Join(dir, "ca.pem")}
 
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -242,6 +290,9 @@ func newEnv(t *testing.T) *env {
 			if err != nil {
 				return
 			}
+			e.mu.Lock()
+			e.tunnels++
+			e.mu.Unlock()
 			go e.proxy(c, upstream, auth)
 		}
 	}()
@@ -259,6 +310,13 @@ func (e *env) proxy(c net.Conn, upstream, auth string) {
 		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
+	e.mu.Lock()
+	status := e.connectStatus
+	e.mu.Unlock()
+	if status != 0 {
+		_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
+		return
+	}
 	if req.Header.Get("Proxy-Authorization") != auth {
 		_, _ = io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
 		return
@@ -269,14 +327,27 @@ func (e *env) proxy(c net.Conn, upstream, auth string) {
 		return
 	}
 	defer func() { _ = up.Close() }()
-	e.mu.Lock()
-	e.tunnels++
-	e.mu.Unlock()
 	_, _ = io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n")
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(up, br); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(c, up); done <- struct{}{} }()
 	<-done
+}
+
+// otherCA is the PEM of a CA that did not sign the stand-in's certificate.
+func otherCA() []byte {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "other CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 // result is one run of the program.
@@ -322,7 +393,7 @@ func (e *env) runRaw(t *testing.T, file string, vars []string) (result, map[stri
 	}
 	for _, line := range strings.Split(strings.TrimSpace(r.stderr), "\n") {
 		// A line with a file path may pass 100 characters; the fix stays at the front.
-		if len(line) > 100 && !strings.Contains(line, e.dir) {
+		if utf8.RuneCountInString(line) > 100 && !strings.Contains(line, e.dir) {
 			t.Errorf("stderr line is %d characters, over 100: %s", len(line), line)
 		}
 	}
@@ -442,7 +513,7 @@ func TestFirstPassedRunOpensDraft(t *testing.T) {
 	if len(calls) != 2 || calls[0].Method != "GET" || calls[1].Method != "POST" {
 		t.Fatalf("calls = %+v", calls)
 	}
-	if calls[0].Path != "/repos/"+repoA+"/pulls" || calls[0].Query != "head=acme%3Aqory%2Fwi_01HZX&state=open" {
+	if calls[0].Path != "/repos/"+repoA+"/pulls" || calls[0].Query != "head=acme-corp%3Aqory%2Fwi_01HZX&state=open" {
 		t.Errorf("GET = %+v", calls[0])
 	}
 	want := map[string]any{"title": "Add the widget", "body": "What changed and why.", "head": ref, "base": "main", "draft": true}
@@ -466,7 +537,7 @@ func TestLaterPassedRunUpdatesSameDraft(t *testing.T) {
 		t.Fatalf("first run: exit %d, stderr %q", r.code, r.stderr)
 	}
 	// A member marks the draft ready for review between the runs.
-	e.gh.pulls[repoA][0].Draft = false
+	e.gh.markReady(repoA)
 	r, got := e.run(t, submission("passed", "Second title", repo(repoA, "github.com")), bases(repoA))
 	if r.code != 0 {
 		t.Fatalf("second run: exit %d, stderr %q", r.code, r.stderr)
@@ -483,11 +554,85 @@ func TestLaterPassedRunUpdatesSameDraft(t *testing.T) {
 	if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, wantDraft) {
 		t.Errorf("draft = %v, want %v", d, wantDraft)
 	}
-	if len(e.gh.pulls[repoA]) != 1 {
-		t.Errorf("%d pull requests, want 1", len(e.gh.pulls[repoA]))
+	if n := len(e.gh.pullsOf(repoA)); n != 1 {
+		t.Errorf("%d pull requests, want 1", n)
 	}
 	if r.stdout != url+" updated\n" {
 		t.Errorf("stdout = %q", r.stdout)
+	}
+}
+
+func TestSeveralOpenPullRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pulls []*pull
+		want  int
+	}{
+		{"one into the base branch", []*pull{{Number: 41, Base: "dev"}, {Number: 42, Base: "main"}, {Number: 40, Base: "release"}}, 42},
+		{"none into the base branch", []*pull{{Number: 45, Base: "dev"}, {Number: 43, Base: "release"}}, 43},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			for _, p := range tc.pulls {
+				p.Head, p.Title, p.Body, p.Draft = ref, "Old", "Old", true
+			}
+			e.gh.setPulls(repoA, tc.pulls...)
+			r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
+			if r.code != 0 {
+				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+			}
+			calls := e.gh.recorded()
+			if len(calls) != 2 || calls[1].Method != "PATCH" || calls[1].Path != "/repos/"+repoA+"/pulls/"+strconv.Itoa(tc.want) {
+				t.Fatalf("calls = %+v, want PATCH pulls/%d", calls, tc.want)
+			}
+			if d := entry(got, 0)["draft"].(map[string]any); d["number"] != float64(tc.want) || d["action"] != "updated" {
+				t.Errorf("draft = %v", d)
+			}
+		})
+	}
+}
+
+func TestLinkInAnotherCase(t *testing.T) {
+	e := newEnv(t)
+	e.gh.fix("POST "+repoA, 201, `{"number":34,"html_url":"https://github.com/ACME-Corp/Widgets-App/pull/34","title":"Add the widget","draft":true}`)
+	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
+	url := "https://github.com/" + repoA + "/pull/34"
+	if r.code != 0 || r.stdout != url+" opened\n" {
+		t.Fatalf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+	}
+	if d := entry(got, 0)["draft"].(map[string]any); d["url"] != url {
+		t.Errorf("draft url = %v, want %s", d["url"], url)
+	}
+}
+
+func TestTitleOf256CodePoints(t *testing.T) {
+	e := newEnv(t)
+	title := strings.Repeat("\U0001F600", 256)
+	r, got := e.run(t, submission("passed", title, repo(repoA, "github.com")), bases(repoA))
+	if r.code != 0 {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	if d := entry(got, 0)["draft"].(map[string]any); d["title"] != title {
+		t.Errorf("draft title = %v", d["title"])
+	}
+}
+
+func TestFailedWriteLeavesNoTmp(t *testing.T) {
+	e := newEnv(t)
+	file := filepath.Join(e.dir, "submission.json")
+	// A read-only submission.json.tmp makes the write fail; the program removes it.
+	if err := os.WriteFile(file+".tmp", nil, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	s := submission("changes-requested", "Add the widget", repo(repoA, "github.com"))
+	r, _ := e.run(t, s, nil)
+	want := "Make the folder of QORY_SUBMISSION_FILE writable: writing " + file + " failed (EACCES)\n"
+	if r.code != 2 || r.stderr != want {
+		t.Errorf("exit %d, stderr %q; want 2 and %q", r.code, r.stderr, want)
+	}
+	before, _ := json.MarshalIndent(s, "", "  ")
+	if after, _ := os.ReadFile(file); !bytes.Equal(before, after) {
+		t.Errorf("the file changed:\n%s", after)
 	}
 }
 
@@ -548,12 +693,12 @@ func TestOtherSystemsUntouched(t *testing.T) {
 
 func TestForbiddenRepositoryKeepsOthers(t *testing.T) {
 	e := newEnv(t)
-	e.gh.fail["POST "+repoA] = http.StatusForbidden
+	e.gh.fix("POST "+repoA, http.StatusForbidden, `{"message":"Resource not accessible by integration"}`)
 	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com"), repo(repoB, "github.com")), bases(repoA, repoB))
 	if r.code != 1 {
 		t.Fatalf("exit %d, want 1; stderr %q", r.code, r.stderr)
 	}
-	wantErr := "Give the GitHub App pull_requests: write on acme/widgets: GitHub returned 403 for POST pulls\n"
+	wantErr := "Give the GitHub App pull_requests: write on acme-corp/widgets-app: POST pulls returned 403\n"
 	if r.stderr != wantErr {
 		t.Errorf("stderr = %q, want %q", r.stderr, wantErr)
 	}
@@ -571,6 +716,8 @@ func TestForbiddenRepositoryKeepsOthers(t *testing.T) {
 }
 
 func TestFailedCalls(t *testing.T) {
+	const r = repoA
+	link := "https://github.com/" + r + "/pull/34"
 	cases := []struct {
 		name    string
 		setup   func(e *env)
@@ -578,17 +725,46 @@ func TestFailedCalls(t *testing.T) {
 		wantErr string
 	}{
 		{"wrong proxy password", nil, []string{"QORY_PROXY_PASSWORD=wrong"},
-			"Set QORY_PROXY_PASSWORD to the proxy password: the proxy returned 407 for acme/widgets"},
+			"Set QORY_PROXY_PASSWORD to the proxy password: the proxy returned 407 for " + r},
+		{"proxy status 502", func(e *env) { e.connectStatus = 502 }, nil,
+			"Check the proxy at QORY_PROXY_SOCKET: CONNECT returned 502 for " + r},
 		{"no proxy", nil, []string{"QORY_PROXY_SOCKET=/nonexistent/p.sock"},
-			"Check the proxy at QORY_PROXY_SOCKET: connecting failed (ENOENT) for acme/widgets"},
+			"Check the proxy at QORY_PROXY_SOCKET: connecting failed (ENOENT) for " + r},
 		{"no CA", nil, []string{"SSL_CERT_FILE="},
-			"Check the CA bundle in SSL_CERT_FILE for acme/widgets: TLS failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"},
-		{"404", func(e *env) { e.gh.fail["GET "+repoA] = 404 }, nil,
-			"Install the GitHub App on acme/widgets: GitHub returned 404 for GET pulls"},
-		{"422", func(e *env) { e.gh.fail["POST "+repoA] = 422 }, nil,
-			"Check the head and base branches on acme/widgets: GitHub returned 422 for POST pulls"},
-		{"unexpected link", func(e *env) { e.gh.badURL = true }, nil,
-			"Check the proxy for acme/widgets: GitHub returned an unexpected link for POST pulls"},
+			"Set SSL_CERT_FILE to the run's CA bundle: TLS failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"},
+		{"other CA", func(e *env) { _ = os.WriteFile(e.caFile, otherCA(), 0o600) }, nil,
+			"Check the CA bundle in SSL_CERT_FILE: TLS failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"},
+		{"301", func(e *env) { e.gh.fix("GET "+r, 301, `{"message":"Moved Permanently"}`) }, nil,
+			"Set the targets to the current name of " + r + ": GET pulls returned 301"},
+		{"401", func(e *env) { e.gh.fix("GET "+r, 401, `{"message":"Bad credentials"}`) }, nil,
+			"Check the token the proxy adds for " + r + ": GET pulls returned 401"},
+		{"403 on GET", func(e *env) { e.gh.fix("GET "+r, 403, `{"message":"no"}`) }, nil,
+			"Give the GitHub App pull_requests: read on " + r + ": GET pulls returned 403"},
+		{"404", func(e *env) { e.gh.fix("GET "+r, 404, `{"message":"Not Found"}`) }, nil,
+			"Install the GitHub App on " + r + ": GET pulls returned 404"},
+		{"422", func(e *env) {
+			e.gh.fix("POST "+r, 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`)
+		}, nil, "Check the head and base branches on " + r + ": POST pulls returned 422 (head invalid)"},
+		{"422 no commits", func(e *env) {
+			e.gh.fix("POST "+r, 422, `{"message":"Validation Failed","errors":[{"message":"No commits between main and qory/wi_01HZX, as the branches are the same"}]}`)
+		}, nil, "Push the run's commits to " + r + ": POST pulls returned 422 (No commits between mai...)"},
+		{"422 drafts", func(e *env) {
+			e.gh.fix("POST "+r, 422, `{"message":"Draft pull requests are not supported in this repository."}`)
+		}, nil, "Use a GitHub plan with draft pull requests for " + r + ": POST pulls returned 422"},
+		{"503", func(e *env) { e.gh.fix("POST "+r, 503, `{"message":"unavailable"}`) }, nil,
+			"Retry with a later passed round for " + r + ": POST pulls returned 503"},
+		{"not JSON", func(e *env) { e.gh.fix("POST "+r, 201, `<html>`) }, nil,
+			"Check the proxy for " + r + ": POST pulls returned no valid JSON"},
+		{"GET returns no list", func(e *env) { e.gh.fix("GET "+r, 200, `{"message":"x"}`) }, nil,
+			"Check the proxy for " + r + ": GET pulls returned no list of pull requests"},
+		{"no pull request number", func(e *env) {
+			e.gh.fix("POST "+r, 201, `{"html_url":"`+link+`","title":"Add the widget","draft":true}`)
+		}, nil, "Check the proxy for " + r + ": POST pulls returned no pull request number"},
+		{"unusable title", func(e *env) {
+			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add\u0007the widget","draft":true}`)
+		}, nil, "Check the proxy for " + r + ": POST pulls returned an unusable title"},
+		{"another link", func(e *env) { e.gh.badURL = true }, nil,
+			"Check that " + r + " is the repository's current name: pulls returned another link"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -625,9 +801,19 @@ func TestBadInputLeavesFileUnchanged(t *testing.T) {
 		{"no draft", with(func(s map[string]any) { delete(entry(s, 0), "draft") }), bases(repoA),
 			"Fix repositories[0].draft in the submission: it is missing or not a JSON object"},
 		{"path not owner/name", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/team/widgets" }), bases(repoA),
-			"Fix repositories[0].path in the submission: github.com needs owner/name, not acme/team/widgets"},
+			"Fix repositories[0].path in the submission: it is not owner/name for github.com"},
+		{"dot-dot path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.." }), bases(repoA),
+			"Fix repositories[0].path in the submission: it has a ., .. or .git segment"},
+		{".git path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.GIT" }), bases(repoA),
+			"Fix repositories[0].path in the submission: it has a ., .. or .git segment"},
+		{"title with a control character", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = "Add\tthe widget" }), bases(repoA),
+			"Fix text.title in the submission: it is not 1 to 256 characters with no control character"},
+		{"title of 257 code points", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = strings.Repeat("\U0001F600", 257) }), bases(repoA),
+			"Fix text.title in the submission: it is not 1 to 256 characters with no control character"},
 		{"missing base", good(), bases(repoB),
-			"Add acme/widgets to the run documents' targets: QORY_SUBMIT_BASES has no base branch for it"},
+			"Add acme-corp/widgets-app to the run documents' targets: no base branch for it in QORY_SUBMIT_BASES"},
+		{"bases entry without base", good(), []any{map[string]any{"system": "github.com", "path": repoA}},
+			"Fix entry 0 of the file in QORY_SUBMIT_BASES: it is not {system, path, base} with a valid branch"},
 		{"no bases file", good(), nil, "Set QORY_SUBMIT_BASES: the variable is unset or empty"},
 		{"bases not a list", good(), map[string]any{"x": 1},
 			"Write a list of {system, path, base} to the file in QORY_SUBMIT_BASES: it is not a list"},
