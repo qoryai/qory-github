@@ -1,6 +1,6 @@
 module github.com/qoryai/qory-github
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/qoryai/forager v0.7.1-0.20261023001330-b6ac9f060456

@@ -236,7 +236,7 @@ hosts and paths stay the same; only the token changes.
 ## Development
 
 ```sh
-mise install                    # Go 1.27.1
+mise install                    # Go 1.27.4
 go build ./cmd/qory-github
 go test ./...
 ```
