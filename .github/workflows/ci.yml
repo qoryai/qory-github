@@ -17,6 +17,7 @@ jobs:
     # shows, so that pull request's run is skipped. Every push, and any other pull
     # request, a fork's next among them, runs.
     if: github.event_name != 'pull_request' || github.head_ref != 'next' || github.event.pull_request.head.repo.full_name != github.repository
-    # A main commit of integrations, for Go 1.27.3, until its release; then the release
-    # tag.
+    # A main commit of integrations until its release; then the release tag.
+    # That commit sets GOTOOLCHAIN=go1.27.3+auto, so Go switches to the go1.27.4 that
+    # go.mod requires.
     uses: qoryai/integrations/.github/workflows/go.yml@5f92b11673052874cd1e2f9fbf246a230d50dd16
