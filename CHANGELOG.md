@@ -9,6 +9,14 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
+- The harness module `modules/github`, with the program `bin/open-draft`, declared as the
+  module's `submit_program`. The program sets a GitHub commit link for each commit of a
+  run's submission file. After a passed round with a title and a description, it opens a
+  draft pull request from the branch in `ref` into the base branch listed in
+  `QORY_SUBMIT_BASES`, or updates the title and description of the open one, and writes
+  its number and link into the file. It reaches `api.github.com` only through the proxy
+  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. Exit 1 means a call to
+  GitHub failed; exit 2 means wrong input, with the file unchanged.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens
