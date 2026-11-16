@@ -22,20 +22,22 @@ nothing but the socket in `QORY_PROXY_SOCKET`. The proxy adds the credential.
 
 ## What the program does
 
-1. It reads and checks the submission file, and, when it will open or update drafts, the
-   bases file, the socket, the password and the CA bundle.
-2. In each entry of `repositories` whose `system` is `github.com`, it sets `commit_url`,
-   `base.commit_url` and each `commits[].commit_url` to
-   `https://github.com/<path>/commit/<commit>`. It changes no entry of another system. It
-   writes the file before any call to GitHub.
-3. If `verdict` is `passed` and the submission has `text`, then for each `github.com`
-   repository:
-   - `GET /repos/<path>/pulls?head=<owner>:<ref>&state=open` finds the open pull request
-     from the branch in `ref`.
+1. It reads the submission file and checks its structure: `ref`, `verdict`, and in each
+   entry of `repositories`, `system`, `path`, `commit`, `draft`, `base` and `commits`.
+2. In each entry whose `system` is `github.com`, it sets `commit_url`, `base.commit_url`
+   and each `commits[].commit_url` to `https://github.com/<path>/commit/<commit>`, and
+   writes the file. It changes no entry of another system.
+3. If `verdict` is `passed` and the submission has `text`, it checks what the drafts
+   need: `text`, the bases file, the socket, the password and the CA bundle. Then, for
+   each `github.com` repository:
+   - `GET /repos/<path>/pulls?head=<owner>:<ref>&state=open&per_page=100` lists open
+     pull requests. The program uses only those whose head branch is `ref`, whose head
+     repository is `<path>` in any case, and whose base branch is the one in
+     `QORY_SUBMIT_BASES`.
    - With none, `POST /repos/<path>/pulls` opens a draft with `text.title`,
-     `text.description`, the head `ref` and the base branch from `QORY_SUBMIT_BASES`.
+     `text.description`, the head `ref` and the base branch.
    - With one, `PATCH /repos/<path>/pulls/<number>` sets its title and description only.
-     With several, the program updates the one into the base branch, else the oldest.
+     With more than one, the call counts as failed.
    - The program sets the entry's `draft` to `{number, url, title, state, action}` and
      writes the file. `url` is `https://github.com/<path>/pull/<number>`; a response with
      another link, compared without regard to case, counts as a failed call. `title` is
@@ -44,15 +46,15 @@ nothing but the socket in `QORY_PROXY_SOCKET`. The proxy adds the credential.
 
    Otherwise, `draft` stays as it is, and the program makes no call.
 
-Each call ends after 30 seconds, with no retry.
+Every call to GitHub ends by 100 seconds after the program starts, and has no retry.
 
 ## Exit status and output
 
 | Exit | Meaning | The submission file |
 |---|---|---|
 | 0 | Done. | Every commit link, and each draft. |
-| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. Or writing the file failed after a draft; the program then stops. | Every commit link, and each draft written before the program ended. |
-| 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. Or writing the commit links failed. | Unchanged. |
+| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, more than one matching pull request, or the 100 s limit. The program still calls GitHub for the other repositories. Or a write of the file failed; the program then stops. | Every commit link and each draft written before the program ended. Unchanged when writing the commit links failed. |
+| 2 | The input is wrong. | Unchanged when the structure is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, or a `github.com` path that is not `owner/name`. Only the commit links written when an input of the drafts is wrong: `text`, the bases file or a repository with no base branch in it, the socket, the password or the CA bundle. |
 
 stdout has one line per repository whose draft the program opened or updated:
 
@@ -64,7 +66,9 @@ https://github.com/owner/name/pull/34 updated
 stderr has one line per error, and the line starts with the fix. For a repository path
 of up to 21 characters, a line with no file path in it has at most 100 characters. After
 a 422 or another 4xx status without a specific fix, the line ends with GitHub's error
-message in parentheses, cut to fit:
+message in parentheses, cut to fit. A 429, or a 403 with no requests left or with a
+message about the rate limit, gets the line that starts `Wait for GitHub's rate limit to
+reset`:
 
 ```text
 Give the GitHub App pull_requests: write on owner/name: POST pulls returned 403

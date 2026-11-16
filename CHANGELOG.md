@@ -23,9 +23,12 @@ change what the program does, and notes it under Upgrading.
   draft pull request from the branch in `ref` into the base branch listed in
   `QORY_SUBMIT_BASES`, or updates the title and description of the open one, and writes
   its number and link into the file. It reaches `api.github.com` only through the proxy
-  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. Exit 1 means a call to
-  GitHub failed, or writing the file failed after a draft and the program stopped. Exit
-  2 means wrong input, or a failed write of the commit links, with the file unchanged.
+  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. The program updates
+  only an open pull request from that branch of that repository into that base branch.
+  Every call to GitHub ends by 100 seconds after the program starts. Exit 1 means a call
+  to GitHub failed or a write of the file failed. Exit 2 means wrong input: with a wrong
+  structure, the file is unchanged; with a wrong input of the drafts, such as a missing
+  base branch, the file has only the commit links.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

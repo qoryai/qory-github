@@ -7,9 +7,9 @@
 // api.github.com only through the CONNECT proxy on a unix socket, and sends no token.
 //
 // Exit 0: done. Exit 1: a call to GitHub failed, and the file has every commit link and
-// each draft that went through; or writing the file failed after a draft, and the
-// program stopped. Exit 2: the input is wrong, or writing the commit links failed; the
-// file is unchanged.
+// each draft that went through; or a write of the file failed, and the program stopped.
+// Exit 2: the input is wrong. When the submission's structure is wrong, the file is
+// unchanged; when an input of the drafts is wrong, the file has only the commit links.
 'use strict';
 
 const fs = require('node:fs');
@@ -32,8 +32,11 @@ const API_HOST = 'api.github.com';
 const API_PORT = 443;
 const API_VERSION = '2022-11-28';
 const USER_AGENT = 'qory-github-open-draft';
-const CALL_TIMEOUT_MS = 30000;
+// All calls to GitHub end by this time after the program starts.
+const DEADLINE_MS = 100000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+// The most pull requests that one GET lists, GitHub's largest page.
+const MAX_LIST = 100;
 
 // Members of the submission file (the harness type submission) and of the bases file.
 const VERDICT_PASSED = 'passed';
@@ -54,7 +57,7 @@ const MAX_LINE = 100;
 const BASE_BRANCH_PATTERN = /^[^\x00-\x20\x7f~^:?*[\\]{1,255}$/;
 const BASES_MEMBER = 'base';
 
-// InputError marks wrong input: the program exits 2 and leaves the file unchanged.
+// InputError marks wrong input: the program exits 2.
 class InputError extends Error {}
 
 // CallError is a failed call to GitHub; its message is one stderr line.
@@ -95,7 +98,8 @@ function checkCommit(value, where) {
   }
 }
 
-// checkSubmission checks the members the program reads and writes.
+// checkSubmission checks the structure the commit links need: ref, verdict and the
+// repositories. checkText checks text, which only a draft needs.
 function checkSubmission(s) {
   const fix = (where, cause) => fail(`Fix ${where} in the submission`, cause);
   if (!isObject(s)) fix('the top level', 'it is not a JSON object');
@@ -130,17 +134,19 @@ function checkSubmission(s) {
       fix(`${at}.path`, `it is not owner/name for ${SYSTEM}`);
     }
   });
-  if (s.text !== undefined) {
-    const t = s.text;
-    if (!isObject(t)) fix('text', 'it is not a JSON object');
-    // GitHub returns the title as sent, and draft.title takes no control character.
-    if (typeof t.title !== 'string' || chars(t.title) > MAX_TITLE || !DRAFT_TITLE_PATTERN.test(t.title)) {
-      fix('text.title', `it is not 1 to ${MAX_TITLE} characters with no control character`);
-    }
-    if (typeof t.description !== 'string' || chars(t.description) < 1 ||
-        chars(t.description) > MAX_DESCRIPTION) {
-      fix('text.description', `it is not 1 to ${MAX_DESCRIPTION} characters`);
-    }
+}
+
+// checkText checks the title and description that a draft gets.
+function checkText(t) {
+  const fix = (where, cause) => fail(`Fix ${where} in the submission`, cause);
+  if (!isObject(t)) fix('text', 'it is not a JSON object');
+  // GitHub returns the title as sent, and draft.title takes no control character.
+  if (typeof t.title !== 'string' || chars(t.title) > MAX_TITLE || !DRAFT_TITLE_PATTERN.test(t.title)) {
+    fix('text.title', `it is not 1 to ${MAX_TITLE} characters with no control character`);
+  }
+  if (typeof t.description !== 'string' || chars(t.description) < 1 ||
+      chars(t.description) > MAX_DESCRIPTION) {
+    fix('text.description', `it is not 1 to ${MAX_DESCRIPTION} characters`);
   }
 }
 
@@ -294,7 +300,9 @@ function request(t, method, path, body) {
         chunks.push(c);
       });
       res.on('error', (error) => reject(Object.assign(new Error('net'), { kind: 'net', code: error.code })));
-      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () => resolve({
+        status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8'),
+      }));
     });
     req.end(payload);
   });
@@ -305,7 +313,8 @@ async function call(cfg, repo, method, apiPath, body, label) {
   const signal = { sockets: [] };
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { kind: 'timeout' })), CALL_TIMEOUT_MS);
+    const left = Math.max(0, cfg.deadline - Date.now());
+    timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { kind: 'timeout' })), left);
   });
   try {
     const res = await Promise.race([
@@ -313,7 +322,10 @@ async function call(cfg, repo, method, apiPath, body, label) {
       timeout,
     ]);
     if (res.status < 200 || res.status >= 300) {
-      throw Object.assign(new Error('status'), { kind: 'status', status: res.status, detail: githubMessage(res.text) });
+      throw Object.assign(new Error('status'), {
+        kind: 'status', status: res.status, detail: githubMessage(res.text),
+        rateLimited: rateLimited(res),
+      });
     }
     try {
       return JSON.parse(res.text);
@@ -325,6 +337,20 @@ async function call(cfg, repo, method, apiPath, body, label) {
   } finally {
     clearTimeout(timer);
     for (const s of signal.sockets) s.destroy();
+  }
+}
+
+// rateLimited is whether a response is GitHub's rate limit: a 429, or a 403 with no
+// requests left or with a message about the rate limit.
+function rateLimited(res) {
+  if (res.status === 429) return true;
+  if (res.status !== 403) return false;
+  if (res.headers['x-ratelimit-remaining'] === '0') return true;
+  try {
+    const doc = JSON.parse(res.text);
+    return isObject(doc) && typeof doc.message === 'string' && /rate limit/i.test(doc.message);
+  } catch {
+    return false;
   }
 }
 
@@ -368,7 +394,7 @@ function callMessage(error, repo, method, label) {
     case 'handshake':
       return `Check the proxy's tunnel to GitHub: TLS failed (${error.code})`;
     case 'timeout':
-      return `Retry with a later passed round for ${repo}: ${what} timed out after ${CALL_TIMEOUT_MS / 1000} s`;
+      return `Retry with a later passed round for ${repo}: ${what} timed out at ${DEADLINE_MS / 1000} s`;
     case 'json':
       return `Check the proxy for ${repo}: ${what} returned no valid JSON`;
     case 'response':
@@ -377,9 +403,15 @@ function callMessage(error, repo, method, label) {
       return `Retry with a later passed round for ${repo}: ${what} returned state closed`;
     case 'moved':
       return `Check that ${repo} is the repository's current name: ${label} returned another link`;
+    case 'several':
+      return `Close all but one of the run's open pull requests on ${repo}: GET pulls listed ${error.count}`;
     case 'status': {
       const cause = `${what} returned ${error.status}`;
       const s = error.status;
+      if (error.rateLimited) {
+        const line = `Wait for GitHub's rate limit to reset, then run again: ${cause}`;
+        return chars(`${line} for ${repo}`) <= MAX_LINE ? `${line} for ${repo}` : line;
+      }
       if (s >= 300 && s < 400) return `Set the targets to the current name of ${repo}: ${cause}`;
       if (s === 401) return `Check the token the proxy adds for ${repo}: ${cause}`;
       if (s === 403 && method === 'GET') return `Give the GitHub App pull_requests: read on ${repo}: ${cause}`;
@@ -422,13 +454,21 @@ async function openOrUpdate(cfg, s, r, base) {
   const owner = r.path.split('/')[0];
   const pulls = `/repos/${r.path}/pulls`;
   const head = encodeURIComponent(`${owner}:${s.ref}`);
-  const list = await call(cfg, r.path, 'GET', `${pulls}?head=${head}&state=open`, undefined, 'pulls');
+  const query = `head=${head}&state=open&per_page=${MAX_LIST}`;
+  const list = await call(cfg, r.path, 'GET', `${pulls}?${query}`, undefined, 'pulls');
   if (!Array.isArray(list) || list.some((p) => !isObject(p) || !Number.isInteger(p.number))) {
     throw new CallError(callMessage({ kind: 'response', detail: 'no list of pull requests' }, r.path, 'GET', 'pulls'));
   }
-  // Several open pull requests from one head: the one into the base branch, else the oldest.
-  const open = list.find((p) => isObject(p.base) && p.base.ref === base) ||
-    list.slice().sort((a, b) => a.number - b.number)[0];
+  // The program uses only a pull request from the run's branch in this repository into
+  // the base branch, whatever else the list contains. A head.repo of null is a deleted fork.
+  const matching = list.filter((p) => isObject(p.head) && p.head.ref === s.ref &&
+    isObject(p.head.repo) && typeof p.head.repo.full_name === 'string' &&
+    p.head.repo.full_name.toLowerCase() === r.path.toLowerCase() &&
+    isObject(p.base) && p.base.ref === base);
+  if (matching.length > 1) {
+    throw new CallError(callMessage({ kind: 'several', count: matching.length }, r.path, 'GET', 'pulls'));
+  }
+  const open = matching[0];
   const text = { title: s.text.title, body: s.text.description };
   const step = open === undefined
     ? { action: 'opened', method: 'POST', path: pulls, label: 'pulls',
@@ -444,47 +484,54 @@ async function openOrUpdate(cfg, s, r, base) {
 }
 
 async function main() {
-  // 1. Read and check everything before the file changes.
+  const started = Date.now();
+  // 1. Read the file and check its structure; on an error, the file stays unchanged.
   let file;
   let s;
-  let original;
-  let cfg;
-  let repos;
-  let bases;
   try {
     file = env(ENV_SUBMISSION);
     s = readJSON(file, ENV_SUBMISSION);
     checkSubmission(s);
-    original = JSON.stringify(s);
-    repos = s.repositories.filter((r) => r.system === SYSTEM);
-    const drafts = s.verdict === VERDICT_PASSED && s.text !== undefined && repos.length > 0;
-    if (drafts) {
-      bases = readBases(env(ENV_BASES));
-      for (const r of repos) {
-        if (!bases.has(r.path)) {
-          fail(`Add ${r.path} to the run documents' targets`, `no base branch for it in ${ENV_BASES}`);
-        }
-      }
-      cfg = { socket: env(ENV_SOCKET), password: env(ENV_PASSWORD) };
-      const caFile = process.env[ENV_CA];
-      if (caFile) {
-        try {
-          cfg.ca = fs.readFileSync(caFile);
-        } catch (error) {
-          fail(`Set ${ENV_CA} to a readable CA bundle`, `reading ${caFile} failed (${error.code})`);
-        }
+  } catch (error) {
+    if (!(error instanceof InputError)) throw error;
+    process.stderr.write(`${error.message}\n`);
+    return 2;
+  }
+
+  // 2. Write the commit links before anything else can fail.
+  const original = JSON.stringify(s);
+  addLinks(s);
+  if (JSON.stringify(s) !== original) {
+    try {
+      writeFile(file, s);
+    } catch (error) {
+      process.stderr.write(`${writeMessage(file, error)}\n`);
+      return 1;
+    }
+  }
+  const repos = s.repositories.filter((r) => r.system === SYSTEM);
+  if (s.verdict !== VERDICT_PASSED || s.text === undefined || repos.length === 0) return 0;
+
+  // Check what the drafts need; on an error, the file has only the commit links.
+  let cfg;
+  let bases;
+  try {
+    checkText(s.text);
+    bases = readBases(env(ENV_BASES));
+    for (const r of repos) {
+      if (!bases.has(r.path)) {
+        fail(`Add ${r.path} to the run documents' targets`, `no base branch for it in ${ENV_BASES}`);
       }
     }
-    // 2. Write the commit links before any call.
-    addLinks(s);
-    if (JSON.stringify(s) !== original) {
+    cfg = { socket: env(ENV_SOCKET), password: env(ENV_PASSWORD), deadline: started + DEADLINE_MS };
+    const caFile = process.env[ENV_CA];
+    if (caFile) {
       try {
-        writeFile(file, s);
+        cfg.ca = fs.readFileSync(caFile);
       } catch (error) {
-        throw new InputError(writeMessage(file, error));
+        fail(`Set ${ENV_CA} to a readable CA bundle`, `reading ${caFile} failed (${error.code})`);
       }
     }
-    if (!drafts) return 0;
   } catch (error) {
     if (!(error instanceof InputError)) throw error;
     process.stderr.write(`${error.message}\n`);

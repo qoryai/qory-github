@@ -43,10 +43,11 @@ const (
 	repoB = "acme-corp/gadgets"
 )
 
-// Commit ids of the submissions: the base, two commits in between, and the head.
+// Commit ids of the submissions: the base, the two commits in commits[], and the head.
 var (
 	baseCommit = strings.Repeat("a", 40)
 	midCommit  = strings.Repeat("b", 40)
+	fixCommit  = strings.Repeat("d", 40)
 	headCommit = strings.Repeat("c", 40)
 )
 
@@ -70,19 +71,24 @@ type call struct {
 	Body   map[string]any
 }
 
+// pull is an open pull request of the stand-in GitHub. HeadRepo is the full name of the
+// head's repository: empty is the pull request's repository, and "-" is null, a
+// deleted fork.
 type pull struct {
-	Number int
-	Title  string
-	Body   string
-	Head   string
-	Base   string
-	Draft  bool
+	Number   int
+	Title    string
+	Body     string
+	Head     string
+	HeadRepo string
+	Base     string
+	Draft    bool
 }
 
-// response is a status and a body that the stand-in GitHub returns as they are.
+// response is a status, headers and a body that the stand-in GitHub returns as they are.
 type response struct {
 	status int
 	body   string
+	header map[string]string
 }
 
 // github is a stand-in for api.github.com: pull requests per repository, and responses
@@ -121,9 +127,13 @@ func (g *github) markReady(repo string) {
 }
 
 func (g *github) fix(key string, status int, body string) {
+	g.fixHeader(key, status, body, nil)
+}
+
+func (g *github) fixHeader(key string, status int, body string, header map[string]string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.fixed[key] = response{status, body}
+	g.fixed[key] = response{status, body, header}
 }
 
 var pullsPath = regexp.MustCompile(`^/repos/([^/]+/[^/]+)/pulls(?:/(\d+))?$`)
@@ -163,6 +173,9 @@ func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	repo := m[1]
 	if f, ok := g.fixed[r.Method+" "+repo]; ok {
 		w.Header().Set("Content-Type", "application/json")
+		for k, v := range f.header {
+			w.Header().Set(k, v)
+		}
 		w.WriteHeader(f.status)
 		_, _ = io.WriteString(w, f.body)
 		return
@@ -172,20 +185,26 @@ func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if g.badURL {
 			u = "https://github.com/someone/else/pull/" + strconv.Itoa(p.Number)
 		}
+		var headRepo any = map[string]any{"full_name": repo}
+		switch p.HeadRepo {
+		case "":
+		case "-":
+			headRepo = nil
+		default:
+			headRepo = map[string]any{"full_name": p.HeadRepo}
+		}
 		return map[string]any{
-			"number": p.Number, "html_url": u, "title": p.Title, "body": p.Body,
-			"draft": p.Draft, "state": "open", "head": map[string]any{"ref": p.Head}, "base": map[string]any{"ref": p.Base},
+			"number": p.Number, "html_url": u, "title": p.Title, "body": p.Body, "draft": p.Draft, "state": "open",
+			"head": map[string]any{"ref": p.Head, "repo": headRepo}, "base": map[string]any{"ref": p.Base},
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodGet && m[2] == "":
-		owner := strings.Split(repo, "/")[0]
+		// Every open pull request, whatever the head parameter: the program filters.
 		out := []map[string]any{}
 		for _, p := range g.pulls[repo] {
-			if r.URL.Query().Get("state") == "open" && r.URL.Query().Get("head") == owner+":"+p.Head {
-				out = append(out, render(p))
-			}
+			out = append(out, render(p))
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	case r.Method == http.MethodPost && m[2] == "":
@@ -462,7 +481,7 @@ func writeJSON(t *testing.T, path string, v any) {
 func repo(path, system string) map[string]any {
 	return map[string]any{"system": system, "path": path, "commit": headCommit,
 		"base":    map[string]any{"commit": baseCommit},
-		"commits": []any{map[string]any{"commit": midCommit, "step": "deliverable:d-1"}, map[string]any{"commit": headCommit, "step": "fix:f1"}},
+		"commits": []any{map[string]any{"commit": midCommit, "step": "deliverable:d-1"}, map[string]any{"commit": fixCommit, "step": "fix:f1"}},
 		"draft":   map[string]any{"none": "not-passed"}}
 }
 
@@ -503,7 +522,7 @@ func checkLinks(t *testing.T, r map[string]any, path string) {
 	if b := r["base"].(map[string]any); b["commit_url"] != link(path, baseCommit) {
 		t.Errorf("base.commit_url = %v", b["commit_url"])
 	}
-	for i, want := range []string{midCommit, headCommit} {
+	for i, want := range []string{midCommit, fixCommit} {
 		c := r["commits"].([]any)[i].(map[string]any)
 		if c["commit_url"] != link(path, want) {
 			t.Errorf("commits[%d].commit_url = %v", i, c["commit_url"])
@@ -549,7 +568,7 @@ func TestFirstPassedRunOpensDraft(t *testing.T) {
 	if len(calls) != 2 || calls[0].Method != "GET" || calls[1].Method != "POST" {
 		t.Fatalf("calls = %+v", calls)
 	}
-	if calls[0].Path != "/repos/"+repoA+"/pulls" || calls[0].Query != "head=acme-corp%3Aqory%2Fwi_01HZX&state=open" {
+	if calls[0].Path != "/repos/"+repoA+"/pulls" || calls[0].Query != "head=acme-corp%3Aqory%2Fwi_01HZX&state=open&per_page=100" {
 		t.Errorf("GET = %+v", calls[0])
 	}
 	want := map[string]any{"title": "Add the widget", "body": "What changed and why.", "head": ref, "base": "main", "draft": true}
@@ -598,34 +617,61 @@ func TestLaterPassedRunUpdatesSameDraft(t *testing.T) {
 	}
 }
 
-func TestSeveralOpenPullRequests(t *testing.T) {
+// others are open pull requests that the program must not update: another branch's,
+// one into another base, one from a fork with the same branch name, and one from a
+// deleted fork.
+func others() []*pull {
+	return []*pull{
+		{Number: 41, Head: "qory/wi_OTHER", Base: "main"},
+		{Number: 43, Head: ref, Base: "dev"},
+		{Number: 44, Head: ref, HeadRepo: "fork-owner/widgets-app", Base: "main"},
+		{Number: 45, Head: ref, HeadRepo: "-", Base: "main"},
+	}
+}
+
+func TestOnlyTheRunsPullRequestIsUpdated(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		pulls []*pull
-		want  int
+		name   string
+		pulls  []*pull
+		method string
+		path   string
 	}{
-		{"one into the base branch", []*pull{{Number: 41, Base: "dev"}, {Number: 42, Base: "main"}, {Number: 40, Base: "release"}}, 42},
-		{"none into the base branch", []*pull{{Number: 45, Base: "dev"}, {Number: 43, Base: "release"}}, 43},
+		{"the run's among others", append(others(), &pull{Number: 42, Head: ref, HeadRepo: "ACME-Corp/Widgets-App", Base: "main"}),
+			"PATCH", "/repos/" + repoA + "/pulls/42"},
+		{"only others", others(), "POST", "/repos/" + repoA + "/pulls"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
 			for _, p := range tc.pulls {
-				p.Head, p.Title, p.Body, p.Draft = ref, "Old", "Old", true
+				p.Title, p.Body, p.Draft = "Old", "Old", true
 			}
 			e.gh.setPulls(repoA, tc.pulls...)
-			r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
+			r, _ := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
 			if r.code != 0 {
 				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
 			}
 			calls := e.gh.recorded()
-			if len(calls) != 2 || calls[1].Method != "PATCH" || calls[1].Path != "/repos/"+repoA+"/pulls/"+strconv.Itoa(tc.want) {
-				t.Fatalf("calls = %+v, want PATCH pulls/%d", calls, tc.want)
-			}
-			if d := entry(got, 0)["draft"].(map[string]any); d["number"] != float64(tc.want) || d["action"] != "updated" {
-				t.Errorf("draft = %v", d)
+			if len(calls) != 2 || calls[1].Method != tc.method || calls[1].Path != tc.path {
+				t.Fatalf("calls = %+v, want %s %s", calls, tc.method, tc.path)
 			}
 		})
 	}
+}
+
+func TestTwoOfTheRunsPullRequests(t *testing.T) {
+	e := newEnv(t)
+	e.gh.setPulls(repoA, append(others(),
+		&pull{Number: 42, Head: ref, Base: "main", Title: "Old", Body: "Old"},
+		&pull{Number: 47, Head: ref, Base: "main", Title: "Old", Body: "Old"})...)
+	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
+	want := "Close all but one of the run's open pull requests on " + repoA + ": GET pulls listed 2\n"
+	if r.code != 1 || r.stderr != want {
+		t.Fatalf("exit %d, stderr %q; want 1 and %q", r.code, r.stderr, want)
+	}
+	if calls := e.gh.recorded(); len(calls) != 1 {
+		t.Errorf("calls = %+v, want the GET alone", calls)
+	}
+	checkLinks(t, entry(got, 0), repoA)
 }
 
 func TestLinkInAnotherCase(t *testing.T) {
@@ -664,8 +710,8 @@ func TestFailedWriteLeavesNoTmp(t *testing.T) {
 	s := submission("changes-requested", "Add the widget", repo(repoA, "github.com"))
 	r, _ := e.run(t, s, nil)
 	want := "Make the folder of QORY_SUBMISSION_FILE writable: writing " + file + " failed (ENOENT)\n"
-	if r.code != 2 || r.stderr != want {
-		t.Errorf("exit %d, stderr %q; want 2 and %q", r.code, r.stderr, want)
+	if r.code != 1 || r.stderr != want {
+		t.Errorf("exit %d, stderr %q; want 1 and %q", r.code, r.stderr, want)
 	}
 	before, _ := json.MarshalIndent(s, "", "  ")
 	if after, _ := os.ReadFile(file); !bytes.Equal(before, after) {
@@ -673,8 +719,11 @@ func TestFailedWriteLeavesNoTmp(t *testing.T) {
 	}
 }
 
+// TestFourCommitsGetLinks runs a submission with four commits, the base, two in commits[]
+// and the head, for every verdict: each commit gets its link, and only the passed round
+// calls GitHub.
 func TestFourCommitsGetLinks(t *testing.T) {
-	for _, verdict := range []string{"passed", "changes-requested"} {
+	for _, verdict := range []string{"passed", "changes-requested", "escalate", "none"} {
 		t.Run(verdict, func(t *testing.T) {
 			e := newEnv(t)
 			r, got := e.run(t, submission(verdict, "Add the widget", repo(repoA, "github.com")), bases(repoA))
@@ -683,6 +732,9 @@ func TestFourCommitsGetLinks(t *testing.T) {
 			}
 			checkLinks(t, entry(got, 0), repoA)
 			if verdict == "passed" {
+				if e.tunnelCount() == 0 || len(e.gh.recorded()) != 2 {
+					t.Errorf("%d tunnels and %d calls after a passed round, want the GET and the POST", e.tunnelCount(), len(e.gh.recorded()))
+				}
 				return
 			}
 			if n := e.tunnelCount(); n != 0 || len(e.gh.recorded()) != 0 {
@@ -788,6 +840,14 @@ func TestFailedCalls(t *testing.T) {
 		{"422 drafts", func(e *env) {
 			e.gh.fix("POST "+r, 422, `{"message":"Draft pull requests are not supported in this repository."}`)
 		}, nil, "Use a GitHub plan with draft pull requests for " + r + ": POST pulls returned 422"},
+		{"429", func(e *env) { e.gh.fix("GET "+r, 429, `{"message":"Too many requests"}`) }, nil,
+			"Wait for GitHub's rate limit to reset, then run again: GET pulls returned 429"},
+		{"403 with no requests left", func(e *env) {
+			e.gh.fixHeader("POST "+r, 403, `{"message":"Forbidden"}`, map[string]string{"X-RateLimit-Remaining": "0"})
+		}, nil, "Wait for GitHub's rate limit to reset, then run again: POST pulls returned 403"},
+		{"403 about the rate limit", func(e *env) {
+			e.gh.fix("POST "+r, 403, `{"message":"You have exceeded a secondary rate limit."}`)
+		}, nil, "Wait for GitHub's rate limit to reset, then run again: POST pulls returned 403"},
 		{"503", func(e *env) { e.gh.fix("POST "+r, 503, `{"message":"unavailable"}`) }, nil,
 			"Retry with a later passed round for " + r + ": POST pulls returned 503"},
 		{"not JSON", func(e *env) { e.gh.fix("POST "+r, 201, `<html>`) }, nil,
@@ -840,7 +900,35 @@ func TestFailedCalls(t *testing.T) {
 	}
 }
 
-func TestBadInputLeavesFileUnchanged(t *testing.T) {
+// withLinks is submission s with the commit links of its github.com entries, as the
+// program writes them.
+func withLinks(t *testing.T, s any) any {
+	t.Helper()
+	raw, _ := json.Marshal(s)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range out["repositories"].([]any) {
+		r := r.(map[string]any)
+		if r["system"] != "github.com" {
+			continue
+		}
+		path := r["path"].(string)
+		r["commit_url"] = link(path, r["commit"].(string))
+		b := r["base"].(map[string]any)
+		b["commit_url"] = link(path, b["commit"].(string))
+		for _, c := range r["commits"].([]any) {
+			c := c.(map[string]any)
+			c["commit_url"] = link(path, c["commit"].(string))
+		}
+	}
+	return out
+}
+
+// TestBadInputExits2 runs wrong input. A wrong structure leaves the file unchanged; a
+// wrong input of the drafts leaves only the commit links written.
+func TestBadInputExits2(t *testing.T) {
 	good := func() map[string]any { return submission("passed", "Add the widget", repo(repoA, "github.com")) }
 	with := func(f func(s map[string]any)) map[string]any { s := good(); f(s); return s }
 	cases := []struct {
@@ -848,31 +936,32 @@ func TestBadInputLeavesFileUnchanged(t *testing.T) {
 		submission any
 		bases      any
 		wantErr    string
+		links      bool
 	}{
-		{"not JSON", "{", bases(repoA), "Write valid JSON to the file in QORY_SUBMISSION_FILE: %s does not parse"},
+		{"not JSON", "{", bases(repoA), "Write valid JSON to the file in QORY_SUBMISSION_FILE: %s does not parse", false},
 		{"no ref", with(func(s map[string]any) { delete(s, "ref") }), bases(repoA),
-			"Fix ref in the submission: it is not qory/wi_<id>"},
+			"Fix ref in the submission: it is not qory/wi_<id>", false},
 		{"short commit", with(func(s map[string]any) { entry(s, 0)["commit"] = "abc" }), bases(repoA),
-			"Fix repositories[0].commit in the submission: it is not a 40 or 64 hex commit id"},
+			"Fix repositories[0].commit in the submission: it is not a 40 or 64 hex commit id", false},
 		{"no draft", with(func(s map[string]any) { delete(entry(s, 0), "draft") }), bases(repoA),
-			"Fix repositories[0].draft in the submission: it is missing or not a JSON object"},
+			"Fix repositories[0].draft in the submission: it is missing or not a JSON object", false},
 		{"path not owner/name", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/team/widgets" }), bases(repoA),
-			"Fix repositories[0].path in the submission: it is not owner/name for github.com"},
+			"Fix repositories[0].path in the submission: it is not owner/name for github.com", false},
 		{"dot-dot path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.." }), bases(repoA),
-			"Fix repositories[0].path in the submission: it has a ., .. or .git segment"},
+			"Fix repositories[0].path in the submission: it has a ., .. or .git segment", false},
 		{".git path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.GIT" }), bases(repoA),
-			"Fix repositories[0].path in the submission: it has a ., .. or .git segment"},
+			"Fix repositories[0].path in the submission: it has a ., .. or .git segment", false},
 		{"title with a control character", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = "Add\tthe widget" }), bases(repoA),
-			"Fix text.title in the submission: it is not 1 to 256 characters with no control character"},
+			"Fix text.title in the submission: it is not 1 to 256 characters with no control character", true},
 		{"title of 257 code points", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = strings.Repeat("\U0001F600", 257) }), bases(repoA),
-			"Fix text.title in the submission: it is not 1 to 256 characters with no control character"},
+			"Fix text.title in the submission: it is not 1 to 256 characters with no control character", true},
 		{"missing base", good(), bases(repoB),
-			"Add acme-corp/widgets-app to the run documents' targets: no base branch for it in QORY_SUBMIT_BASES"},
+			"Add acme-corp/widgets-app to the run documents' targets: no base branch for it in QORY_SUBMIT_BASES", true},
 		{"bases entry without base", good(), []any{map[string]any{"system": "github.com", "path": repoA}},
-			"Fix entry 0 of the file in QORY_SUBMIT_BASES: it is not {system, path, base} with a valid branch"},
-		{"no bases file", good(), nil, "Set QORY_SUBMIT_BASES: the variable is unset or empty"},
+			"Fix entry 0 of the file in QORY_SUBMIT_BASES: it is not {system, path, base} with a valid branch", true},
+		{"no bases file", good(), nil, "Set QORY_SUBMIT_BASES: the variable is unset or empty", true},
 		{"bases not a list", good(), map[string]any{"x": 1},
-			"Write a list of {system, path, base} to the file in QORY_SUBMIT_BASES: it is not a list"},
+			"Write a list of {system, path, base} to the file in QORY_SUBMIT_BASES: it is not a list", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -886,7 +975,13 @@ func TestBadInputLeavesFileUnchanged(t *testing.T) {
 			} else {
 				before, _ = json.MarshalIndent(tc.submission, "", "  ")
 			}
-			if !bytes.Equal(before, after) {
+			if tc.links {
+				var got any
+				_ = json.Unmarshal(after, &got)
+				if want := withLinks(t, tc.submission); !reflect.DeepEqual(got, want) {
+					t.Errorf("the file is\n%s\nwant the submission with its commit links alone", after)
+				}
+			} else if !bytes.Equal(before, after) {
 				t.Errorf("the file changed:\n%s", after)
 			}
 			wantErr := tc.wantErr
