@@ -233,8 +233,10 @@ type env struct {
 	// closes the connection, and without it, waits for the program to close it.
 	tunnels       int
 	connectStatus int
-	connectReply  string
-	closeAfter    bool
+	// cert is the stand-in GitHub's certificate, see [env.issue].
+	cert         *tls.Certificate
+	connectReply string
+	closeAfter   bool
 }
 
 func (e *env) tunnelCount() int {
@@ -255,29 +257,14 @@ func newEnv(t *testing.T) *env {
 	e := &env{gh: &github{pulls: map[string][]*pull{}, fixed: map[string]response{}}, dir: dir,
 		socket: filepath.Join(dir, "p.sock"), caFile: filepath.Join(dir, "ca.pem")}
 
-	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "stand-in CA"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
-		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	caCert, _ := x509.ParseCertificate(caDER)
-	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "api.github.com"},
-		DNSNames: []string{"api.github.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(e.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	e.issue(x509.KeyUsageCertSign)
 	srv := httptest.NewUnstartedServer(e.gh)
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
-	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}}}
+	srv.TLS = &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.cert, nil
+	}}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
@@ -343,6 +330,43 @@ func (e *env) proxy(c net.Conn, upstream, auth string) {
 	go func() { _, _ = io.Copy(up, br); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(c, up); done <- struct{}{} }()
 	<-done
+}
+
+// issue makes a CA whose certificate has the key usage caUsage, writes it to caFile,
+// and gives the stand-in GitHub a certificate for api.github.com that the CA signed.
+func (e *env) issue(caUsage x509.KeyUsage) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "stand-in CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: caUsage}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		panic(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		panic(err)
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "api.github.com"},
+		DNSNames: []string{"api.github.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(e.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		panic(err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cert = &tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
 }
 
 // otherCA is the PEM of a CA that did not sign the stand-in's certificate.
@@ -777,12 +801,18 @@ func TestFailedCalls(t *testing.T) {
 		}, nil, "Check the proxy for " + r + ": POST pulls returned an unusable title"},
 		{"closed pull request", func(e *env) {
 			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add the widget","draft":true,"state":"closed"}`)
-		}, nil, "Check the proxy for " + r + ": POST pulls returned a closed pull request"},
+		}, nil, "Check the proxy for " + r + ": POST pulls returned no open pull request"},
+		{"pull request closed before the PATCH", func(e *env) {
+			e.gh.setPulls(r, &pull{Number: 12345, Head: ref, Base: "main", Title: "Old", Body: "Old", Draft: true})
+			e.gh.fix("PATCH "+r, 200, `{"number":12345,"html_url":"https://github.com/`+r+`/pull/12345","title":"Add the widget","draft":true,"state":"closed"}`)
+		}, nil, "Retry with a later passed round for " + r + ": PATCH pulls/12345 returned state closed"},
+		{"CA without keyCertSign", func(e *env) { e.issue(x509.KeyUsageDigitalSignature) }, nil,
+			"Check the CA bundle in SSL_CERT_FILE: TLS failed (UNSPECIFIED)"},
 		{"proxy closes after 200", func(e *env) { e.connectReply, e.closeAfter = "HTTP/1.1 200 OK\r\n\r\n", true }, nil,
 			"Retry with a later passed round for " + r + ": GET pulls failed (ECONNRESET)"},
 		// The alert reaches TLS only through the bytes the program keeps after the head.
 		{"TLS alert after 200", func(e *env) { e.connectReply = "HTTP/1.1 200 OK\r\n\r\n\x15\x03\x03\x00\x02\x02\x28" }, nil,
-			"Check the proxy's tunnel to api.github.com: TLS failed (ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE)"},
+			"Check the proxy's tunnel to GitHub: TLS failed (ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE)"},
 		{"another link", func(e *env) { e.gh.badURL = true }, nil,
 			"Check that " + r + " is the repository's current name: pulls returned another link"},
 	}

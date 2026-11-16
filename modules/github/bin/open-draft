@@ -8,8 +8,8 @@
 //
 // Exit 0: done. Exit 1: a call to GitHub failed, and the file has every commit link and
 // each draft that went through; or writing the file failed after a draft, and the
-// program stopped. Exit 2: the input is wrong, or the first write of the file failed;
-// the file is unchanged.
+// program stopped. Exit 2: the input is wrong, or writing the commit links failed; the
+// file is unchanged.
 'use strict';
 
 const fs = require('node:fs');
@@ -49,8 +49,6 @@ const DRAFT_TITLE_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/u;
 // A path segment that the schema of the harness type submission does not allow: ., ..
 // or .git in any case.
 const DOT_SEGMENT_PATTERN = /(^|\/)(\.\.?|\.git)(\/|$)/i;
-// The codes of a TLS error about the server's certificate, which the CA bundle can fix.
-const CERT_ERROR_PATTERN = /^(UNABLE_TO_|SELF_SIGNED_|DEPTH_ZERO_|CERT_|ERR_TLS_CERT_)/;
 // The most characters of a first stderr line, and of GitHub's message quoted in one.
 const MAX_LINE = 100;
 const BASE_BRANCH_PATTERN = /^[^\x00-\x20\x7f~^:?*[\\]{1,255}$/;
@@ -248,8 +246,9 @@ function tunnel(cfg, signal) {
       const t = tls.connect({ socket: sock, servername: API_HOST, ca: cfg.ca });
       signal.sockets.push(t);
       t.on('error', (error) => {
+        // Node sets authorizationError when the server's certificate fails verification.
         let kind = 'net';
-        if (CERT_ERROR_PATTERN.test(error.code || '')) kind = 'tls';
+        if (t.authorizationError) kind = 'tls';
         else if (/^ERR_SSL_/.test(error.code || '')) kind = 'handshake';
         reject(Object.assign(new Error(kind), { kind, code: error.code }));
       });
@@ -367,13 +366,15 @@ function callMessage(error, repo, method, label) {
       if (!process.env[ENV_CA]) return `Set ${ENV_CA} to the run's CA bundle: TLS failed (${error.code})`;
       return `Check the CA bundle in ${ENV_CA}: TLS failed (${error.code})`;
     case 'handshake':
-      return `Check the proxy's tunnel to ${API_HOST}: TLS failed (${error.code})`;
+      return `Check the proxy's tunnel to GitHub: TLS failed (${error.code})`;
     case 'timeout':
       return `Retry with a later passed round for ${repo}: ${what} timed out after ${CALL_TIMEOUT_MS / 1000} s`;
     case 'json':
       return `Check the proxy for ${repo}: ${what} returned no valid JSON`;
     case 'response':
       return `Check the proxy for ${repo}: ${what} returned ${error.detail}`;
+    case 'closed':
+      return `Retry with a later passed round for ${repo}: ${what} returned state closed`;
     case 'moved':
       return `Check that ${repo} is the repository's current name: ${label} returned another link`;
     case 'status': {
@@ -410,7 +411,9 @@ function draftFrom(pr, repo, action) {
     throw Object.assign(new Error('moved'), { kind: 'moved' });
   }
   if (typeof pr.title !== 'string' || !DRAFT_TITLE_PATTERN.test(pr.title)) throw bad('an unusable title');
-  if (pr.state !== 'open') throw bad('a closed pull request');
+  // A person may close the pull request between the GET and the PATCH.
+  if (pr.state === 'closed' && action === 'updated') throw Object.assign(new Error('closed'), { kind: 'closed' });
+  if (pr.state !== 'open') throw bad('no open pull request');
   return { number: pr.number, url, title: pr.title, state: pr.draft === true ? 'draft' : 'open', action };
 }
 
