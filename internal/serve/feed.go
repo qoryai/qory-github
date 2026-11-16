@@ -216,7 +216,7 @@ func known(ch contracts.Change) bool {
 		return true
 	case contracts.ChangeCollection, contracts.ChangeGrant:
 		return ch.Status == "linked" || ch.Status == "unlinked"
-	case contracts.ChangeSync:
+	case contracts.ChangeSync, contracts.ChangeWatch:
 		return true
 	}
 	return false
@@ -264,6 +264,9 @@ func known(ch contracts.Change) bool {
 // Qory Apiary sends only the kinds and statuses of the contract's revision, which serve
 // implements, so such an entry is Qory Apiary's defect, and passing it could lose what
 // it says.
+//
+// watch entries are dropped: a watch entry changes nothing, waits for no entry, and no
+// entry waits for it. The cursor moves past it as past an applied entry.
 func (f *feed) step(ctx context.Context) error {
 	cursor, err := f.store.Get(nsAdapter, keyCursor)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -286,6 +289,9 @@ func (f *feed) step(ctx context.Context) error {
 	open := newNotDone()
 	applied := false
 	for i, ch := range page.Changes {
+		if ch.Kind == contracts.ChangeWatch {
+			continue
+		}
 		state := f.state(i, ch)
 		if state.done {
 			continue
@@ -405,6 +411,8 @@ func itemRepository(ref string) string {
 //   - A sync entry writes the sync interval alone, which only the pulls read, see
 //     [syncInterval]. It waits for an earlier sync entry, so the last one sets the
 //     interval, and only a later sync entry waits for it.
+//
+// A watch entry never reaches waits or add: [feed.step] drops it first.
 func (p *notDone) waits(ch contracts.Change) bool {
 	switch ch.Kind {
 	case contracts.ChangeSync:
@@ -555,7 +563,7 @@ func (f *feed) failedFor(state *entryState) (failed, since time.Duration) {
 // grant's entry, linked or unlinked, reads Qory Apiary's copy of the grants again, once
 // for each page, see [Adapter.syncGrants]: the copy wins, so the entries after the
 // first of a page find it read; one whose grant_ref is not an installation's id, or
-// whose connection_id is not a connection's, fails for good.
+// whose connection_id is not a connection's, fails for good. watch entries are dropped.
 func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
@@ -599,6 +607,8 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 			return f.keepInterval(interval)
 		}
 		return f.store.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(interval)), 0)
+	case contracts.ChangeWatch:
+		return nil
 	}
 	return Permanent(errors.New("the change is not one serve knows"))
 }
