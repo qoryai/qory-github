@@ -8,7 +8,7 @@
 # Build from the repository's root. The server's image is the default target, the last
 # stage below:
 #
-#   docker build --build-arg VERSION=dev -t qory-github-server .
+#   docker build --build-arg VERSION=dev --build-arg COMMIT="$(git rev-parse HEAD)" -t qory-github-server .
 #
 # Build both platforms at once with docker buildx build --platform
 # linux/amd64,linux/arm64. The build stage runs on the building machine's platform, and
@@ -73,13 +73,17 @@ COPY . .
 # The version the program reports: sha-<the commit's first 7 characters> for a
 # pre-release image, and dev when none is given.
 ARG VERSION=dev
+# The full commit id the image is built from, which serve declares to Qory Apiary as the
+# ref of its submit module, modules/github. Empty, as when none is given, serve logs a
+# line at start and declares no submit module.
+ARG COMMIT=
 # The platform of the image, which docker buildx sets from --platform, or to the platform
 # of the machine that builds when no --platform is given.
 ARG TARGETOS
 ARG TARGETARCH
 # The same build flags as the release's archives of qory-github, for the image's
-# platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+# platform, and the commit.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/qory-github-server ./cmd/qory-github-server
 
 # The state directory, 0700 as serve makes it; it is given to the nonroot user below.

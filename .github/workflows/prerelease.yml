@@ -79,7 +79,8 @@ jobs:
           driver-opts: image=ghcr.io/qoryai/ci-images:buildkit-buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       # Both platforms in one image index, pushed by digest alone: no tag names the image
-      # until both are built. The program reports sha-<7> as its version. The labels give
+      # until both are built. The program reports sha-<7> as its version, and declares
+      # modules/github at the full commit as its submit module. The labels give
       # the image's revision, source and licenses, and no version, as no release names the
       # image; the build uses the GitHub Actions cache in the scope server-image.
       - name: Build and push by digest
@@ -92,6 +93,7 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=sha-${{ steps.commit.outputs.short }}
+            COMMIT=${{ steps.commit.outputs.sha }}
           labels: |
             org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
