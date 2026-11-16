@@ -25,7 +25,7 @@ change what the program does, and notes it under Upgrading.
   its number and link into the file. It reaches `api.github.com` only through the proxy
   on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. Exit 1 means a call to
   GitHub failed, or writing the file failed after a draft and the program stopped. Exit
-  2 means wrong input, or a failed first write of the file, with the file unchanged.
+  2 means wrong input, or a failed write of the commit links, with the file unchanged.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

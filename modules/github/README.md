@@ -52,7 +52,7 @@ Each call ends after 30 seconds, with no retry.
 |---|---|---|
 | 0 | Done. | Every commit link, and each draft. |
 | 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. Or writing the file failed after a draft; the program then stops. | Every commit link, and each draft written before the program ended. |
-| 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. Or the first write of the file failed. | Unchanged. |
+| 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. Or writing the commit links failed. | Unchanged. |
 
 stdout has one line per repository whose draft the program opened or updated:
 
