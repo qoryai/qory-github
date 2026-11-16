@@ -333,7 +333,8 @@ func (e *env) proxy(c net.Conn, upstream, auth string) {
 }
 
 // issue makes a CA whose certificate has the key usage caUsage, writes it to caFile,
-// and gives the stand-in GitHub a certificate for api.github.com that the CA signed.
+// and sets the stand-in GitHub's certificate to one for api.github.com that the CA
+// signed.
 func (e *env) issue(caUsage x509.KeyUsage) {
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
