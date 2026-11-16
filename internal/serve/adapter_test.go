@@ -2660,7 +2660,8 @@ func TestAPageOfWatchEntriesMovesTheCursorAlone(t *testing.T) {
 
 // TestAWatchEntryDoesNotCountAsApplied has the comments on issues 9 and 10 fail
 // around a watch entry for a day: each step applies no entry, so the day counts
-// toward neither entry's limit, and neither entry is reported or passed.
+// toward 2*stuckFor since the first failure alone, and neither entry is reported
+// or passed.
 func TestAWatchEntryDoesNotCountAsApplied(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setReach(w.st, widgetsRef, 42)
