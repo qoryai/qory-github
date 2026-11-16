@@ -2551,6 +2551,113 @@ func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	}
 }
 
+// watchEntry is a watch entry of the feed for the work item id.
+func watchEntry(id string) contracts.Change {
+	return contracts.Change{Kind: contracts.ChangeWatch, WorkItemID: id, URL: "https://apiary.example.com/work-items/" + id}
+}
+
+// checkPageSchema checks that the fake's feed page from the start passes the
+// contract's changes.schema.json.
+func checkPageSchema(t *testing.T, f *fakeApiary) {
+	t.Helper()
+	f.mu.Lock()
+	body := f.page("")
+	f.mu.Unlock()
+	schema, err := contracts.Compile("changes.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(strings.NewReader(body))
+	if err == nil {
+		err = schema.Validate(doc)
+	}
+	if err != nil {
+		t.Errorf("the page breaks the contract: %v", err)
+	}
+}
+
+// TestTheFeedDropsAWatchEntryAndGoesOn reads a work_item entry, a watch entry and a
+// sync entry: the work item is taken in, the interval is kept, and the cursor is
+// stored after the sync entry. The next read starts there and applies the entry after.
+func TestTheFeedDropsAWatchEntryAndGoesOn(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, refOf("acme/widgets"), 42)
+	sixty := 60
+	w.apiary.add(
+		contracts.Change{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "taken_in", URL: "https://apiary.example.com/work-items/wi_42"},
+		watchEntry("wi_42"),
+		contracts.Change{Kind: contracts.ChangeSync, Interval: &sixty},
+	)
+	checkPageSchema(t, w.apiary)
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if posted := w.gh.postedComments(); len(posted) != 1 || !strings.HasPrefix(posted[0], "<!-- qory:work-item wi_42 -->") {
+		t.Errorf("posted %q", posted)
+	}
+	if v, _ := w.st.Get(nsAdapter, keySyncInterval); string(v) != "900" {
+		t.Errorf("the interval %s", v)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_3" {
+		t.Errorf("the cursor %q", c)
+	}
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/gadgets"), Status: "unlinked"})
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gets := w.apiary.sent("GET " + routeChanges)
+	if len(gets) != 2 || gets[1].target != routeChanges+"?after=c_3" {
+		t.Errorf("read %v", gets)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_4" {
+		t.Errorf("the cursor %q", c)
+	}
+	if strings.Contains(w.log.String(), `"level":"ERROR"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+}
+
+// TestAPageOfWatchEntriesMovesTheCursorAlone reads a page of two watch entries: the
+// cursor is stored after them, and nothing else changes in the store, on GitHub or in
+// Qory Apiary.
+func TestAPageOfWatchEntriesMovesTheCursorAlone(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(watchEntry("wi_42"), watchEntry("wi_43"))
+	checkPageSchema(t, w.apiary)
+	before := map[string]int{}
+	for _, ns := range []string{nsAdapter, nsCollections} {
+		w.st.Each(ns, func(string, []byte) error { before[ns]++; return nil })
+	}
+	if err := w.feed.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := w.st.Get(nsAdapter, keyCursor); string(c) != "c_2" {
+		t.Errorf("the cursor %q", c)
+	}
+	after := map[string]int{}
+	for _, ns := range []string{nsAdapter, nsCollections} {
+		w.st.Each(ns, func(string, []byte) error { after[ns]++; return nil })
+	}
+	if after[nsAdapter] != before[nsAdapter]+1 || after[nsCollections] != before[nsCollections] {
+		t.Errorf("the store keys before %v, after %v", before, after)
+	}
+	if _, err := w.st.Get(nsAdapter, keySyncInterval); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("an interval is kept: %v", err)
+	}
+	w.gh.mu.Lock()
+	asked := slices.Clone(w.gh.requests)
+	w.gh.mu.Unlock()
+	if r := w.apiary.reports(); len(r) != 0 || len(asked) != 0 {
+		t.Errorf("reports %v, GitHub was asked %v", r, asked)
+	}
+	if strings.Contains(w.log.String(), `"level":"ERROR"`) {
+		t.Errorf("the log %s", w.log.String())
+	}
+	if err := w.feed.apply(context.Background(), watchEntry("wi_42")); err != nil {
+		t.Errorf("apply: %v", err)
+	}
+}
+
 // TestAFeedEntryThatFailsForGoodIsPassed reads a work item of a repository no listing
 // named and a collection whose ref is not a repository's id, both logged and passed, so the
 // cursor moves, and the store holds no link for the bad ref.

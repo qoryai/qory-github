@@ -67,6 +67,9 @@ change what the program does, and notes it under Upgrading.
   100 pages of comments. If the failure report still fails two days after the
   comment's first failure, the adapter logs one line with the `comment_id` and moves
   past the comment.
+- The adapter reads the change feed entry kind `watch`, which Qory Apiary writes when a
+  run stores a submission version, and drops it. A `watch` entry changes nothing, and
+  the adapter moves its cursor past it, so the feed goes on to the entries after it.
 
 ### Changed
 
