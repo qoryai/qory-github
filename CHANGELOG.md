@@ -13,7 +13,8 @@ change what the program does, and notes it under Upgrading.
   the module `modules/github` of `https://github.com/qoryai/qory-github` at the commit
   the program was built from. The build sets that commit with
   `-ldflags "-X main.commit=<full commit>"`; the Dockerfile takes it as the build
-  argument `COMMIT`, and the pre-release image workflow passes the commit it builds.
+  argument `COMMIT`, and the pre-release image workflow passes the commit it builds. That
+  workflow now builds only a commit on main, and stops with an error for any other.
   A build without a full commit id of 40 or 64 lower-case hex digits sends no
   `submit_module`, and serve logs at start:
   `Build with -X main.commit=<full commit> to declare the submit module: this build sends none`.

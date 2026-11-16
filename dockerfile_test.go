@@ -104,9 +104,10 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	}
 }
 
-// TestPrereleaseBuildsWithTheCommit pins that the pre-release workflow builds the image
-// with the build argument COMMIT set to the full commit it checked out, which the
-// Dockerfile passes to -X main.commit, so the image declares its submit module.
+// TestPrereleaseBuildsWithTheCommit pins that the pre-release workflow builds only a
+// commit on main, which every run can fetch modules/github at, and builds the image with
+// the build argument COMMIT set to the full commit it checked out, which the Dockerfile
+// passes to -X main.commit, so the image declares its submit module.
 func TestPrereleaseBuildsWithTheCommit(t *testing.T) {
 	b, err := os.ReadFile(".github/workflows/prerelease.yml")
 	if err != nil {
@@ -125,18 +126,24 @@ func TestPrereleaseBuildsWithTheCommit(t *testing.T) {
 	if err := yaml.Unmarshal(b, &wf); err != nil {
 		t.Fatal(err)
 	}
-	var named, built bool
+	var fullHistory, named, onMain, built bool
 	for _, step := range wf.Jobs["image"].Steps {
-		if step.ID == "commit" && strings.Contains(step.Run, `sha="$(git rev-parse HEAD)"`) &&
-			strings.Contains(step.Run, `echo "sha=$sha" >> "$GITHUB_OUTPUT"`) {
-			named = true
-		}
-		if strings.HasPrefix(step.Uses, "docker/build-push-action@") {
+		switch {
+		case strings.HasPrefix(step.Uses, "actions/checkout@"):
+			fullHistory = step.With["fetch-depth"] == "0"
+		case step.ID == "commit":
+			named = strings.Contains(step.Run, `sha="$(git rev-parse HEAD)"`) &&
+				strings.Contains(step.Run, `echo "sha=$sha" >> "$GITHUB_OUTPUT"`)
+		case strings.Contains(step.Run, "git merge-base --is-ancestor HEAD origin/main || {"):
+			onMain = strings.Contains(step.Run, "exit 1")
+		case strings.HasPrefix(step.Uses, "docker/build-push-action@"):
 			args := strings.Split(strings.TrimSpace(step.With["build-args"]), "\n")
-			built = slices.Contains(args, "COMMIT=${{ steps.commit.outputs.sha }}")
+			// The build comes after the check, so a commit off main is never built.
+			built = onMain && slices.Contains(args, "COMMIT=${{ steps.commit.outputs.sha }}")
 		}
 	}
-	if !named || !built {
-		t.Errorf("prerelease.yml: the step commit writes the full commit %v; the build passes it as COMMIT %v", named, built)
+	if !fullHistory || !named || !onMain || !built {
+		t.Errorf("prerelease.yml: full history %v; the step commit writes the full commit %v; "+
+			"a commit off main stops the run %v; the build after the check passes COMMIT %v", fullHistory, named, onMain, built)
 	}
 }
