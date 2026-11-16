@@ -852,6 +852,73 @@ func TestTheDeclarationHasCallURLOnlyWithoutSetupURL(t *testing.T) {
 	}
 }
 
+// TestTheDeclarationHasSubmitModuleOnlyWithFullCommit pins that Declare sends
+// submit_module, the module github of qory-github at Commit, when Commit is a full commit
+// id of 40 or 64 lower-case hex digits, and leaves the member out otherwise. The fake
+// checks each body against the contract's adapter.schema.json.
+func TestTheDeclarationHasSubmitModuleOnlyWithFullCommit(t *testing.T) {
+	sha1 := strings.Repeat("0123456789", 4)
+	sha256 := strings.Repeat("abcdef0123456789", 4)
+	for _, c := range []struct {
+		commit string
+		want   bool
+	}{
+		{sha1, true}, {sha256, true}, {"", false}, {"a0cb297", false}, {"main", false},
+		{"v0.3.0", false}, {strings.ToUpper(sha256), false}, {sha1 + "\n", false}, {sha1[:39] + "g", false},
+	} {
+		access := newKey(t)
+		apiary := newFakeApiary(t, access)
+		client := apiary.client(access)
+		client.Commit = c.commit
+		if err := client.Declare(context.Background(), "https://qory-github.example.com", ""); err != nil {
+			t.Fatal(err)
+		}
+		declared := apiary.sent(routeAdapter)
+		if len(declared) != 1 {
+			t.Fatalf("declared %d times", len(declared))
+		}
+		checkBody(t, routeAdapter, declared[0].raw)
+		got, ok := declared[0].body["submit_module"]
+		if ok != c.want {
+			t.Errorf("commit %q: declared %s", c.commit, declared[0].raw)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		// Both sides go through a map, so json.Marshal writes their keys in one order.
+		var want any
+		if err := json.Unmarshal([]byte(`{"source":{"git":"https://github.com/qoryai/qory-github","ref":"`+c.commit+`","path":"modules/github"}}`), &want); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(got)
+		if w, _ := json.Marshal(want); string(raw) != string(w) {
+			t.Errorf("commit %q: submit_module %s, want %v", c.commit, raw, want)
+		}
+	}
+}
+
+// TestTheContractRefusesASubmitModuleAtAShortRef pins why Declare leaves submit_module
+// out for a commit that is not a full id: a body with that ref fails validation against
+// adapter.schema.json.
+func TestTheContractRefusesASubmitModuleAtAShortRef(t *testing.T) {
+	access := newKey(t)
+	apiary := newFakeApiary(t, access)
+	client := apiary.client(access)
+	client.Commit = strings.Repeat("a", 40)
+	if err := client.Declare(context.Background(), "https://qory-github.example.com", ""); err != nil {
+		t.Fatal(err)
+	}
+	var doc any
+	short := strings.Replace(string(apiary.sent(routeAdapter)[0].raw), strings.Repeat("a", 40), "a0cb297", 1)
+	if err := json.Unmarshal([]byte(short), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := bodySchemas()[routeAdapter].Validate(doc); err == nil {
+		t.Errorf("adapter.schema.json takes submit_module with the ref a0cb297: %s", short)
+	}
+}
+
 // TestRunServesCallsOnlyWithCallURL runs serve with an App and call_url set: it declares
 // call_url, and its listener answers a call at /v1/calls/; without call_url, it declares
 // none, and the path is answered 404.

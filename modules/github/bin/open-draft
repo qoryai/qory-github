@@ -1,0 +1,573 @@
+#!/usr/bin/env node
+// open-draft: the submit program of the module github.
+//
+// It reads the submission file, writes a GitHub commit link for every commit of each
+// github.com repository, and, when the verdict is passed and the submission has text,
+// opens or updates the draft pull request of each such repository. It reaches
+// api.github.com only through the CONNECT proxy on a unix socket, and sends no token.
+//
+// Exit 0: done. Exit 1: a call to GitHub failed, and the file has every commit link and
+// each draft that went through; or a write of the file failed, and the program stopped.
+// Exit 2: the input is wrong. When QORY_SUBMISSION_FILE, the file or its structure is
+// wrong, the file is unchanged; when an input of the drafts is wrong, the file has only
+// the commit links.
+'use strict';
+
+const fs = require('node:fs');
+const http = require('node:http');
+const net = require('node:net');
+const tls = require('node:tls');
+
+// The environment variables the program reads.
+const ENV_SUBMISSION = 'QORY_SUBMISSION_FILE';
+const ENV_BASES = 'QORY_SUBMIT_BASES';
+const ENV_SOCKET = 'QORY_PROXY_SOCKET';
+const ENV_PASSWORD = 'QORY_PROXY_PASSWORD';
+const ENV_CA = 'SSL_CERT_FILE';
+
+// The proxy and GitHub.
+const PROXY_USER = 'qory';
+const SYSTEM = 'github.com';
+const WEB_ORIGIN = 'https://github.com';
+const API_HOST = 'api.github.com';
+const API_PORT = 443;
+const API_VERSION = '2022-11-28';
+const USER_AGENT = 'qory-github-open-draft';
+// All calls to GitHub end by this time after the program starts.
+const DEADLINE_MS = 100000;
+const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+// The most pull requests that one GET lists, GitHub's largest page.
+const MAX_LIST = 100;
+
+// Members of the submission file (the harness type submission) and of the bases file.
+const VERDICT_PASSED = 'passed';
+const VERDICTS = ['passed', 'changes-requested', 'escalate', 'none'];
+const REF_PATTERN = /^qory\/wi_[A-Za-z0-9_-]{1,64}$/;
+const COMMIT_PATTERN = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+const SYSTEM_PATTERN = /^[a-z0-9.-]{0,252}[a-z0-9-]$/;
+const OWNER_NAME_PATTERN = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+const MAX_REPOSITORIES = 20;
+const MAX_TITLE = 256;
+const MAX_DESCRIPTION = 16384;
+const DRAFT_TITLE_PATTERN = /^[^\x00-\x1f\x7f]{1,256}$/u;
+// A path segment that the schema of the harness type submission does not allow: ., ..
+// or .git in any case.
+const DOT_SEGMENT_PATTERN = /(^|\/)(\.\.?|\.git)(\/|$)/i;
+// The most characters of a first stderr line, and of GitHub's message quoted in one.
+const MAX_LINE = 100;
+const BASE_BRANCH_PATTERN = /^[^\x00-\x20\x7f~^:?*[\\]{1,255}$/;
+const BASES_MEMBER = 'base';
+
+// InputError marks wrong input: the program exits 2.
+class InputError extends Error {}
+
+// CallError is a failed call to GitHub; its message is one stderr line.
+class CallError extends Error {}
+
+// chars is the length of s in code points, as JSON Schema counts it.
+function chars(s) {
+  return [...s].length;
+}
+
+function isObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function fail(fix, cause) {
+  throw new InputError(`${fix}: ${cause}`);
+}
+
+// readJSON reads and parses the file at path; envName is the variable with the path.
+function readJSON(path, envName) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path, 'utf8');
+  } catch (error) {
+    fail(`Set ${envName} to a readable file`, `reading ${path} failed (${error.code || error.message})`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    fail(`Write valid JSON to the file in ${envName}`, `${path} does not parse`);
+  }
+  return undefined;
+}
+
+function checkCommit(value, where) {
+  if (typeof value !== 'string' || !COMMIT_PATTERN.test(value)) {
+    fail(`Fix ${where} in the submission`, 'it is not a 40 or 64 hex commit id');
+  }
+}
+
+// checkSubmission checks the structure the commit links need: ref, verdict and the
+// repositories. checkText checks text, which only a draft needs.
+function checkSubmission(s) {
+  const fix = (where, cause) => fail(`Fix ${where} in the submission`, cause);
+  if (!isObject(s)) fix('the top level', 'it is not a JSON object');
+  if (typeof s.ref !== 'string' || !REF_PATTERN.test(s.ref)) fix('ref', 'it is not qory/wi_<id>');
+  if (!VERDICTS.includes(s.verdict)) fix('verdict', `it is not one of ${VERDICTS.join(', ')}`);
+  if (!Array.isArray(s.repositories) || s.repositories.length < 1 ||
+      s.repositories.length > MAX_REPOSITORIES) {
+    fix('repositories', `it is not a list of 1 to ${MAX_REPOSITORIES} entries`);
+  }
+  s.repositories.forEach((r, i) => {
+    const at = `repositories[${i}]`;
+    if (!isObject(r)) fix(at, 'it is not a JSON object');
+    if (typeof r.system !== 'string' || !SYSTEM_PATTERN.test(r.system)) fix(`${at}.system`, 'it is not a host name');
+    if (typeof r.path !== 'string' || r.path === '') fix(`${at}.path`, 'it is not a path');
+    if (DOT_SEGMENT_PATTERN.test(r.path)) fix(`${at}.path`, 'it has a ., .. or .git segment');
+    checkCommit(r.commit, `${at}.commit`);
+    if (!isObject(r.draft)) fix(`${at}.draft`, 'it is missing or not a JSON object');
+    if (r.commit_url !== undefined && typeof r.commit_url !== 'string') fix(`${at}.commit_url`, 'it is not a string');
+    if (r.base !== undefined) {
+      if (!isObject(r.base)) fix(`${at}.base`, 'it is not a JSON object');
+      checkCommit(r.base.commit, `${at}.base.commit`);
+    }
+    if (r.commits !== undefined) {
+      if (!Array.isArray(r.commits)) fix(`${at}.commits`, 'it is not a list');
+      r.commits.forEach((c, j) => {
+        if (!isObject(c)) fix(`${at}.commits[${j}]`, 'it is not a JSON object');
+        checkCommit(c.commit, `${at}.commits[${j}].commit`);
+        if (typeof c.step !== 'string') fix(`${at}.commits[${j}].step`, 'it is not a string');
+      });
+    }
+    if (r.system === SYSTEM && !OWNER_NAME_PATTERN.test(r.path)) {
+      fix(`${at}.path`, `it is not owner/name for ${SYSTEM}`);
+    }
+  });
+}
+
+// checkText checks the title and description that a draft gets.
+function checkText(t) {
+  const fix = (where, cause) => fail(`Fix ${where} in the submission`, cause);
+  if (!isObject(t)) fix('text', 'it is not a JSON object');
+  // GitHub returns the title as sent, and draft.title takes no control character.
+  if (typeof t.title !== 'string' || chars(t.title) > MAX_TITLE || !DRAFT_TITLE_PATTERN.test(t.title)) {
+    fix('text.title', `it is not 1 to ${MAX_TITLE} characters with no control character`);
+  }
+  if (typeof t.description !== 'string' || chars(t.description) < 1 ||
+      chars(t.description) > MAX_DESCRIPTION) {
+    fix('text.description', `it is not 1 to ${MAX_DESCRIPTION} characters`);
+  }
+}
+
+// readBases returns a map from owner/name to the base branch of its pull request.
+function readBases(path) {
+  const list = readJSON(path, ENV_BASES);
+  const fix = `Write a list of {system, path, ${BASES_MEMBER}} to the file in ${ENV_BASES}`;
+  if (!Array.isArray(list)) fail(fix, 'it is not a list');
+  const bases = new Map();
+  list.forEach((b, i) => {
+    if (!isObject(b) || typeof b.system !== 'string' || typeof b.path !== 'string' ||
+        typeof b[BASES_MEMBER] !== 'string' || !BASE_BRANCH_PATTERN.test(b[BASES_MEMBER])) {
+      fail(`Fix entry ${i} of the file in ${ENV_BASES}`,
+        `it is not {system, path, ${BASES_MEMBER}} with a valid branch`);
+    }
+    if (b.system === SYSTEM) bases.set(b.path, b[BASES_MEMBER]);
+  });
+  return bases;
+}
+
+function env(name) {
+  const value = process.env[name];
+  if (value === undefined || value === '') fail(`Set ${name}`, 'the variable is unset or empty');
+  return value;
+}
+
+function commitURL(path, commit) {
+  return `${WEB_ORIGIN}/${path}/commit/${commit}`;
+}
+
+// addLinks sets every commit link of the github.com repositories.
+function addLinks(s) {
+  for (const r of s.repositories) {
+    if (r.system !== SYSTEM) continue;
+    r.commit_url = commitURL(r.path, r.commit);
+    if (r.base !== undefined) r.base.commit_url = commitURL(r.path, r.base.commit);
+    if (r.commits !== undefined) {
+      for (const c of r.commits) c.commit_url = commitURL(r.path, c.commit);
+    }
+  }
+}
+
+// writeFile replaces the file at path through path.tmp and a rename.
+function writeFile(path, s) {
+  const tmp = `${path}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(s, null, 2)}\n`);
+    fs.renameSync(tmp, path);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // No path.tmp is left, or it cannot be removed; the first error is the one to print.
+    }
+    throw error;
+  }
+}
+
+// writeMessage is the stderr line for a failed write of the file.
+function writeMessage(file, error) {
+  return `Make the folder of ${ENV_SUBMISSION} writable: writing ${file} failed (${error.code})`;
+}
+
+// tunnel opens a TLS connection to api.github.com through the CONNECT proxy.
+function tunnel(cfg, signal) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ path: cfg.socket });
+    signal.sockets.push(sock);
+    let buf = Buffer.alloc(0);
+    const onError = (error) => reject(Object.assign(new Error('proxy'), { kind: 'proxy', code: error.code }));
+    sock.on('error', onError);
+    // A close before the proxy's response ends the call at once.
+    const onClose = () => reject(Object.assign(new Error('connect'), { kind: 'connect', status: 0 }));
+    sock.on('close', onClose);
+    sock.on('connect', () => {
+      const auth = Buffer.from(`${PROXY_USER}:${cfg.password}`).toString('base64');
+      sock.write(`CONNECT ${API_HOST}:${API_PORT} HTTP/1.1\r\nHost: ${API_HOST}:${API_PORT}\r\n` +
+        `Proxy-Authorization: Basic ${auth}\r\n\r\n`);
+    });
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) {
+        if (buf.length > 65536) reject(Object.assign(new Error('proxy'), { kind: 'connect', status: 0 }));
+        return;
+      }
+      sock.removeListener('data', onData);
+      sock.removeListener('error', onError);
+      sock.removeListener('close', onClose);
+      // Bytes after the proxy's response head belong to the TLS handshake. The paused
+      // socket keeps them in its buffer until the TLS socket reads the buffer.
+      sock.pause();
+      const rest = buf.subarray(end + 4);
+      if (rest.length > 0) sock.unshift(rest);
+      sock.on('error', () => {}); // From here on, errors reach the TLS socket.
+      const m = /^HTTP\/1\.[01] (\d{3})/.exec(buf.subarray(0, end).toString('latin1'));
+      const status = m ? Number(m[1]) : 0;
+      if (status !== 200) {
+        sock.destroy();
+        reject(Object.assign(new Error('connect'), { kind: 'connect', status }));
+        return;
+      }
+      const t = tls.connect({ socket: sock, servername: API_HOST, ca: cfg.ca });
+      signal.sockets.push(t);
+      t.on('error', (error) => {
+        // Node sets authorizationError when the server's certificate fails verification.
+        let kind = 'net';
+        if (t.authorizationError) kind = 'tls';
+        else if (/^ERR_SSL_/.test(error.code || '')) kind = 'handshake';
+        reject(Object.assign(new Error(kind), { kind, code: error.code }));
+      });
+      // A close before the handshake ends the call at once; after it, reject is a no-op.
+      t.on('close', () => reject(Object.assign(new Error('net'), { kind: 'net', code: 'ECONNRESET' })));
+      t.on('secureConnect', () => resolve(t));
+    };
+    sock.on('data', onData);
+  });
+}
+
+// request sends one HTTP/1.1 request over the TLS connection and returns status and body.
+function request(t, method, path, body) {
+  return new Promise((resolve, reject) => {
+    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+    const headers = {
+      Host: API_HOST,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': API_VERSION,
+      'User-Agent': USER_AGENT,
+      Connection: 'close',
+    };
+    if (payload !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = String(payload.length);
+    }
+    // The agent passes the tunnel to the request. With agent: false, Node 24 ignores a
+    // createConnection option and connects to the host option.
+    const agent = new http.Agent({ keepAlive: false });
+    agent.createConnection = () => t;
+    const req = http.request({ method, host: API_HOST, port: API_PORT, path, headers, agent });
+    req.on('error', (error) => reject(Object.assign(new Error('net'), { kind: 'net', code: error.code })));
+    req.on('response', (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_RESPONSE_BYTES) {
+          req.destroy();
+          reject(Object.assign(new Error('large'), { kind: 'json' }));
+          return;
+        }
+        chunks.push(c);
+      });
+      res.on('error', (error) => reject(Object.assign(new Error('net'), { kind: 'net', code: error.code })));
+      res.on('end', () => resolve({
+        status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.end(payload);
+  });
+}
+
+// call makes one API call through the proxy and returns the parsed JSON body.
+async function call(cfg, repo, method, apiPath, body, label) {
+  // Past the deadline, the call fails before it opens the tunnel.
+  const left = cfg.deadline - Date.now();
+  if (left <= 0) throw new CallError(callMessage({ kind: 'timeout' }, repo, method, label));
+  const signal = { sockets: [] };
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { kind: 'timeout' })), left);
+  });
+  try {
+    const res = await Promise.race([
+      tunnel(cfg, signal).then((t) => request(t, method, apiPath, body)),
+      timeout,
+    ]);
+    if (res.status < 200 || res.status >= 300) {
+      throw Object.assign(new Error('status'), {
+        kind: 'status', status: res.status, detail: githubMessage(res.text),
+        rateLimited: rateLimited(res),
+      });
+    }
+    try {
+      return JSON.parse(res.text);
+    } catch {
+      throw Object.assign(new Error('json'), { kind: 'json' });
+    }
+  } catch (error) {
+    throw new CallError(callMessage(error, repo, method, label));
+  } finally {
+    clearTimeout(timer);
+    for (const s of signal.sockets) s.destroy();
+  }
+}
+
+// rateLimited is whether a response is GitHub's rate limit: a 429, or a 403 with no
+// requests left or with a message about the rate limit.
+function rateLimited(res) {
+  if (res.status === 429) return true;
+  if (res.status !== 403) return false;
+  if (res.headers['x-ratelimit-remaining'] === '0') return true;
+  try {
+    const doc = JSON.parse(res.text);
+    return isObject(doc) && typeof doc.message === 'string' && /rate limit/i.test(doc.message);
+  } catch {
+    return false;
+  }
+}
+
+// githubMessage is GitHub's error text from a response body: the first entry of errors
+// when it has a message, else message, with control characters replaced by spaces.
+function githubMessage(text) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return '';
+  }
+  if (!isObject(doc)) return '';
+  const first = Array.isArray(doc.errors) ? doc.errors[0] : undefined;
+  const msg = isObject(first) && typeof first.message === 'string' ? first.message : doc.message;
+  if (typeof msg !== 'string') return '';
+  return msg.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, ' ').trim();
+}
+
+// withDetail adds GitHub's message to line, in parentheses, cut so the line has at most
+// MAX_LINE characters.
+function withDetail(line, detail) {
+  const room = MAX_LINE - chars(line) - 3;
+  if (!detail || room < 8) return line;
+  const cut = [...detail];
+  return `${line} (${cut.length > room ? `${cut.slice(0, room - 3).join('')}...` : detail})`;
+}
+
+// callMessage is the stderr line for a failed call: the fix, then the cause.
+function callMessage(error, repo, method, label) {
+  const what = `${method} ${label}`;
+  switch (error.kind) {
+    case 'proxy':
+      return `Check the proxy at ${ENV_SOCKET}: connecting failed (${error.code}) for ${repo}`;
+    case 'connect':
+      if (error.status === 407) return `Set ${ENV_PASSWORD} to the proxy password: the proxy returned 407 for ${repo}`;
+      return `Check the proxy at ${ENV_SOCKET}: CONNECT returned ${error.status || 'no status'} for ${repo}`;
+    case 'tls':
+      if (!process.env[ENV_CA]) return `Set ${ENV_CA} to the run's CA bundle: TLS failed (${error.code})`;
+      return `Check the CA bundle in ${ENV_CA}: TLS failed (${error.code})`;
+    case 'handshake':
+      return `Check the proxy's tunnel to GitHub: TLS failed (${error.code})`;
+    case 'timeout':
+      return `Retry with a later passed round for ${repo}: ${what} timed out at ${DEADLINE_MS / 1000} s`;
+    case 'json':
+      return `Check the proxy for ${repo}: ${what} returned no valid JSON`;
+    case 'response':
+      return `Check the proxy for ${repo}: ${what} returned ${error.detail}`;
+    case 'closed':
+      return `Retry with a later passed round for ${repo}: ${what} returned state closed`;
+    case 'moved':
+      return `Check that ${repo} is the repository's current name: ${label} returned another link`;
+    case 'several':
+      return `Close all but one of the run's open pull requests on ${repo}: GET pulls listed ${error.count}`;
+    case 'status': {
+      const cause = `${what} returned ${error.status}`;
+      const s = error.status;
+      if (error.rateLimited) return `Wait for GitHub's rate limit to reset for ${repo}: ${cause}`;
+      if (s >= 300 && s < 400) return `Set the targets to the current name of ${repo}: ${cause}`;
+      if (s === 401) return `Check the token the proxy adds for ${repo}: ${cause}`;
+      if (s === 403 && method === 'GET') return `Give the GitHub App pull_requests: read on ${repo}: ${cause}`;
+      if (s === 403) return `Give the GitHub App pull_requests: write on ${repo}: ${cause}`;
+      if (s === 404) return `Install the GitHub App on ${repo}: ${cause}`;
+      if (s === 422) {
+        let fix = `Check the title and description for ${repo}`;
+        if (/draft/i.test(error.detail)) fix = `Use a GitHub plan with draft pull requests for ${repo}`;
+        else if (/no commits between/i.test(error.detail)) fix = `Push the run's commits to ${repo}`;
+        else if (method === 'POST') fix = `Check the head and base branches on ${repo}`;
+        return withDetail(`${fix}: ${cause}`, error.detail);
+      }
+      if (s >= 500) return `Retry with a later passed round for ${repo}: ${cause}`;
+      return withDetail(`Check the request to ${repo}: ${cause}`, error.detail);
+    }
+    default:
+      return `Retry with a later passed round for ${repo}: ${what} failed (${error.code || error.message})`;
+  }
+}
+
+// draftFrom checks GitHub's pull request and returns the submission's draft. GitHub
+// may return the link with the owner and name in another case; the draft's url is the
+// link formed from the submission's path.
+function draftFrom(pr, repo, action) {
+  const bad = (detail) => Object.assign(new Error('response'), { kind: 'response', detail });
+  if (!isObject(pr) || !Number.isInteger(pr.number) || pr.number < 1) throw bad('no pull request number');
+  const url = `${WEB_ORIGIN}/${repo}/pull/${pr.number}`;
+  if (typeof pr.html_url !== 'string' || pr.html_url.toLowerCase() !== url.toLowerCase()) {
+    throw Object.assign(new Error('moved'), { kind: 'moved' });
+  }
+  if (typeof pr.title !== 'string' || !DRAFT_TITLE_PATTERN.test(pr.title)) throw bad('an unusable title');
+  // A person may close the pull request between the GET and the PATCH.
+  if (pr.state === 'closed' && action === 'updated') throw Object.assign(new Error('closed'), { kind: 'closed' });
+  if (pr.state !== 'open') throw bad('no open pull request');
+  return { number: pr.number, url, title: pr.title, state: pr.draft === true ? 'draft' : 'open', action };
+}
+
+// openOrUpdate opens the draft pull request of one repository, or updates the open one.
+async function openOrUpdate(cfg, s, r, base) {
+  const owner = r.path.split('/')[0];
+  const pulls = `/repos/${r.path}/pulls`;
+  const head = encodeURIComponent(`${owner}:${s.ref}`);
+  const query = `head=${head}&state=open&per_page=${MAX_LIST}`;
+  const list = await call(cfg, r.path, 'GET', `${pulls}?${query}`, undefined, 'pulls');
+  if (!Array.isArray(list) || list.some((p) => !isObject(p) || !Number.isInteger(p.number))) {
+    throw new CallError(callMessage({ kind: 'response', detail: 'no list of pull requests' }, r.path, 'GET', 'pulls'));
+  }
+  // The program uses only a pull request from the run's branch in this repository into
+  // the base branch, whatever else the list contains. A head.repo of null is a deleted fork.
+  const matching = list.filter((p) => isObject(p.head) && p.head.ref === s.ref &&
+    isObject(p.head.repo) && typeof p.head.repo.full_name === 'string' &&
+    p.head.repo.full_name.toLowerCase() === r.path.toLowerCase() &&
+    isObject(p.base) && p.base.ref === base);
+  if (matching.length > 1) {
+    throw new CallError(callMessage({ kind: 'several', count: matching.length }, r.path, 'GET', 'pulls'));
+  }
+  const open = matching[0];
+  const text = { title: s.text.title, body: s.text.description };
+  const step = open === undefined
+    ? { action: 'opened', method: 'POST', path: pulls, label: 'pulls',
+      body: { ...text, head: s.ref, base, draft: true } }
+    : { action: 'updated', method: 'PATCH', path: `${pulls}/${open.number}`,
+      label: `pulls/${open.number}`, body: text };
+  const pr = await call(cfg, r.path, step.method, step.path, step.body, step.label);
+  try {
+    return draftFrom(pr, r.path, step.action);
+  } catch (error) {
+    throw new CallError(callMessage(error, r.path, step.method, step.label));
+  }
+}
+
+async function main() {
+  const started = Date.now();
+  // 1. Read the file and check its structure; on an error, the file stays unchanged.
+  let file;
+  let s;
+  try {
+    file = env(ENV_SUBMISSION);
+    s = readJSON(file, ENV_SUBMISSION);
+    checkSubmission(s);
+  } catch (error) {
+    if (!(error instanceof InputError)) throw error;
+    process.stderr.write(`${error.message}\n`);
+    return 2;
+  }
+
+  // 2. Write the commit links before anything else can fail.
+  const original = JSON.stringify(s);
+  addLinks(s);
+  if (JSON.stringify(s) !== original) {
+    try {
+      writeFile(file, s);
+    } catch (error) {
+      process.stderr.write(`${writeMessage(file, error)}\n`);
+      return 1;
+    }
+  }
+  const repos = s.repositories.filter((r) => r.system === SYSTEM);
+  if (s.verdict !== VERDICT_PASSED || s.text === undefined || repos.length === 0) return 0;
+
+  // Check what the drafts need; on an error, the file has only the commit links.
+  let cfg;
+  let bases;
+  try {
+    checkText(s.text);
+    bases = readBases(env(ENV_BASES));
+    for (const r of repos) {
+      if (!bases.has(r.path)) {
+        fail(`Add ${r.path} to the run documents' targets`, `no base branch for it in ${ENV_BASES}`);
+      }
+    }
+    cfg = { socket: env(ENV_SOCKET), password: env(ENV_PASSWORD), deadline: started + DEADLINE_MS };
+    const caFile = process.env[ENV_CA];
+    if (caFile) {
+      try {
+        cfg.ca = fs.readFileSync(caFile);
+      } catch (error) {
+        fail(`Set ${ENV_CA} to a readable CA bundle`, `reading ${caFile} failed (${error.code})`);
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof InputError)) throw error;
+    process.stderr.write(`${error.message}\n`);
+    return 2;
+  }
+
+  // 3. Open or update each draft; a failed call does not stop the others. The file is
+  // written after each draft, so a stop from outside keeps the drafts that went through.
+  let failed = false;
+  for (const r of repos) {
+    let draft;
+    try {
+      draft = await openOrUpdate(cfg, s, r, bases.get(r.path));
+    } catch (error) {
+      if (!(error instanceof CallError)) throw error;
+      failed = true;
+      process.stderr.write(`${error.message}\n`);
+      continue;
+    }
+    r.draft = draft;
+    try {
+      writeFile(file, s);
+    } catch (error) {
+      process.stderr.write(`${writeMessage(file, error)}\n`);
+      return 1;
+    }
+    process.stdout.write(`${draft.url} ${draft.action}\n`);
+  }
+  return failed ? 1 : 0;
+}
+
+if (require.main === module) {
+  main().then((code) => {
+    process.exitCode = code;
+  }, (error) => {
+    process.stderr.write(`Report this defect in modules/github/bin/open-draft: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}

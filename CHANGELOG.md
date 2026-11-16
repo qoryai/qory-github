@@ -9,6 +9,27 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
+- `qory-github-server serve` sends `submit_module` in its start-up body to Qory Apiary:
+  the module `modules/github` of `https://github.com/qoryai/qory-github` at the commit
+  the program was built from. The build sets that commit with
+  `-ldflags "-X main.commit=<full commit>"`; the Dockerfile takes it as the build
+  argument `COMMIT`, and the pre-release image workflow passes the commit it builds. That
+  workflow builds only a commit on main, and stops with an error for any other.
+  A build without a full commit id of 40 or 64 lower-case hex digits sends no
+  `submit_module`, and serve logs at start:
+  `Build with -X main.commit=<full commit> to declare the submit module: this build sends none`.
+- The harness module `modules/github`, with the program `bin/open-draft`, declared as the
+  module's `submit_program`. The program sets a GitHub commit link for each commit of a
+  run's submission file. After a passed round with a title and a description, it opens a
+  draft pull request from the branch in `ref` into the base branch listed in
+  `QORY_SUBMIT_BASES`, or updates the title and description of the open one, and writes
+  its number and link into the file. It reaches `api.github.com` only through the proxy
+  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. The program updates
+  only an open pull request from that branch of that repository into that base branch.
+  Every call to GitHub ends by 100 seconds after the program starts. Exit 1 means a call
+  to GitHub failed or a write of the file failed. Exit 2 means wrong input: with a wrong
+  structure, the file is unchanged; with a wrong input of the drafts, such as a missing
+  base branch, the file has only the commit links.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

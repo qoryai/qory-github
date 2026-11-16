@@ -199,8 +199,11 @@ permissions on GitHub and accept the change on the installation.
 
 ### Push and pull requests
 
-The agent pushes and opens pull requests itself with `git` and `gh`; the default
-permissions allow it. Tested with git 2.39 and gh 2.100:
+qory pushes the commits a run leaves, in its push step after the session: it runs `git
+push` over HTTPS through the run's host proxy and the gateway behind it, which sets the
+token on `github.com`. Inside the container, `git` and `gh` reach GitHub through the
+gateway, which sets the token on the calls below; the default permissions allow them.
+Tested with git 2.39 and gh 2.100:
 
 | Command | Calls | Needs |
 |---|---|---|
@@ -211,6 +214,12 @@ permissions allow it. Tested with git 2.39 and gh 2.100:
 - The remote must be HTTPS. A remote over SSH gets no token.
 - The pull request must be in a repository the policy lists. A pull request from a fork
   into another owner's repository needs two owners; a run has one.
+
+The harness module in [`modules/github`](modules/github/README.md) contains
+`bin/open-draft`, a program that adds a GitHub link to each commit of a run's submission
+and, after a passed round, opens or updates the draft pull request through the GitHub REST
+API. It reaches GitHub through a proxy on a unix socket and sends no token. As of
+2026-11-17, `qory` does not run the program.
 
 ### Token expiry
 

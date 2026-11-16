@@ -38,6 +38,11 @@ func main() {
 // built from, see [cli.ProgramVersion].
 var version string
 
+// commit is the commit the program was built from, set when it is built with
+// -ldflags "-X main.commit=...". serve declares the module github at a full commit id
+// as the adapter's submit_module, see [serve.Options].
+var commit string
+
 // init sets the program's version, and its name in the errors of [ownerfile].
 func init() {
 	version = cli.ProgramVersion(version, debug.ReadBuildInfo)
@@ -199,5 +204,5 @@ func runServe(ctx context.Context, args []string, stderr io.Writer, lookup func(
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	return serve.Run(ctx, s, serve.Options{ProgramVersion: version, Log: log})
+	return serve.Run(ctx, s, serve.Options{ProgramVersion: version, Commit: commit, Log: log})
 }

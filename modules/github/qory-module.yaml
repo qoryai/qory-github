@@ -1,0 +1,5 @@
+apiVersion: qory.dev/v1alpha1
+name: github
+description: The program that adds GitHub links to a submission and opens its draft pull request
+submit_program:
+  command: [bin/open-draft]

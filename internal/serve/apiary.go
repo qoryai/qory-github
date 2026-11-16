@@ -54,6 +54,29 @@ const (
 	minimumSyncInterval = 900
 )
 
+// The harness module that contains GitHub's submit program, bin/open-draft, which
+// [Apiary.Declare] sends as submit_module at [Apiary.Commit].
+const (
+	submitModuleGit  = "https://github.com/qoryai/qory-github"
+	submitModulePath = "modules/github"
+)
+
+// fullCommit matches a full commit id, as submit_module's ref must be.
+var fullCommit = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// noSubmitModule is the line serve logs at start when [Options.Commit] is not a full
+// commit id, so its declarations send no submit_module.
+const noSubmitModule = "Build with -X main.commit=<full commit> to declare the submit module: this build sends none"
+
+// submitModule is the submit_module of a build from commit, or nil when commit is not
+// a full commit id, as in a build with no -X main.commit.
+func submitModule(commit string) *contracts.SubmitModule {
+	if !fullCommit.MatchString(commit) {
+		return nil
+	}
+	return &contracts.SubmitModule{Source: contracts.HarnessSource{Git: submitModuleGit, Ref: commit, Path: submitModulePath}}
+}
+
 // maximumSyncInterval is the longest interval the contract allows, a day: a longer one
 // in the change feed is taken as a day.
 const maximumSyncInterval = 86400
@@ -140,6 +163,9 @@ type Apiary struct {
 	// ProgramVersion is the program's version, which the description that
 	// [Apiary.Declare] sends carries as its program_version.
 	ProgramVersion string
+	// Commit is the commit the program was built from. When it is a full commit id,
+	// [Apiary.Declare] sends submit_module, the module github of qory-github at Commit.
+	Commit string
 	// HTTP is the client; nil is one with no other setting. Whichever it is, its
 	// timeout is the request's, and no redirect is followed.
 	HTTP *http.Client
@@ -414,7 +440,8 @@ func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.Connect
 // is once an App is kept or the settings give one; where Qory Apiary calls serve,
 // [Apiary.CallURL], declared only with no setupURL; how often serve pulls from GitHub,
 // and whether it sends changes as they happen, which it does unless
-// [Apiary.PullsAlone]; and the integration's description. The description is
+// [Apiary.PullsAlone]; the integration's description; and submit_module, the module
+// github at [Apiary.Commit], when Commit is a full commit id. The description is
 // [github.Describe] with [Apiary.ProgramVersion], the source role among its roles: the
 // document qory-github describe prints where QORY_FEATURES names factory, as
 // json.Marshal writes it. Every declaration carries it. A description that cannot be
@@ -430,12 +457,13 @@ func (a *Apiary) Declare(ctx context.Context, publicURL, setupURL string) error 
 		callURL = a.CallURL
 	}
 	req := contracts.Adapter{
-		Version:     contracts.Version,
-		ConnectURL:  publicURL + connectPath,
-		SetupURL:    setupURL,
-		CallURL:     callURL,
-		Sync:        contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: !a.PullsAlone},
-		Description: description,
+		Version:      contracts.Version,
+		ConnectURL:   publicURL + connectPath,
+		SetupURL:     setupURL,
+		CallURL:      callURL,
+		Sync:         contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: !a.PullsAlone},
+		Description:  description,
+		SubmitModule: submitModule(a.Commit),
 	}
 	return a.post(ctx, what, routeAdapter, "", "", func(t string) any { req.Time = t; return req })
 }

@@ -1191,6 +1191,40 @@ func TestRunDeclaresTheAdapterAtStart(t *testing.T) {
 	}
 }
 
+// TestRunLogsWhenItDeclaresNoSubmitModule runs serve with a full commit and with none:
+// with the commit, it declares submit_module and logs nothing of it; with none, it
+// declares no submit_module and logs noSubmitModule once at start.
+func TestRunLogsWhenItDeclaresNoSubmitModule(t *testing.T) {
+	full := strings.Repeat("c", 40)
+	for _, commit := range []string{full, ""} {
+		dir := t.TempDir()
+		access := newKey(t)
+		apiary := newFakeApiary(t, access)
+		s := settingsFiles(t, dir, access, apiary.srv.URL, pinOf(apiary.server))
+		var logs syncBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- Run(ctx, s, Options{ProgramVersion: testVersion, Commit: commit, Log: slog.New(slog.NewJSONHandler(&logs, nil))})
+		}()
+		eventually(t, "declared", func() bool { return len(apiary.sent(routeAdapter)) > 0 })
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		declared := apiary.sent(routeAdapter)[0]
+		checkBody(t, routeAdapter, declared.raw)
+		_, has := declared.body["submit_module"]
+		lines := strings.Count(logs.String(), `"msg":"`+noSubmitModule+`"`)
+		if commit == full && (!has || lines != 0) || commit == "" && (has || lines != 1) {
+			t.Errorf("commit %q: declared %s; logged %d lines of %q:\n%s", commit, declared.raw, lines, noSubmitModule, logs.String())
+		}
+	}
+	if len(noSubmitModule) > 100 {
+		t.Errorf("noSubmitModule is %d characters, over 100", len(noSubmitModule))
+	}
+}
+
 // declaredDescription is the description member of the body of POST /v1/adapter, the
 // bytes as the body carries them.
 func declaredDescription(t *testing.T, body []byte) []byte {
