@@ -200,10 +200,10 @@ permissions on GitHub and accept the change on the installation.
 ### Push and pull requests
 
 qory pushes the commits a run leaves, in its push step after the session: it runs `git
-push` over HTTPS through the run's host proxy, which sets the token on `github.com`.
-Inside the container, `git` and `gh` reach GitHub through the gateway, which sets the
-token on the calls below; the default permissions allow them. Tested with git 2.39 and
-gh 2.100:
+push` over HTTPS through the run's host proxy and the gateway behind it, which sets the
+token on `github.com`. Inside the container, `git` and `gh` reach GitHub through the
+gateway, which sets the token on the calls below; the default permissions allow them.
+Tested with git 2.39 and gh 2.100:
 
 | Command | Calls | Needs |
 |---|---|---|
