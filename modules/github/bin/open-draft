@@ -8,8 +8,9 @@
 //
 // Exit 0: done. Exit 1: a call to GitHub failed, and the file has every commit link and
 // each draft that went through; or a write of the file failed, and the program stopped.
-// Exit 2: the input is wrong. When the submission's structure is wrong, the file is
-// unchanged; when an input of the drafts is wrong, the file has only the commit links.
+// Exit 2: the input is wrong. When QORY_SUBMISSION_FILE, the file or its structure is
+// wrong, the file is unchanged; when an input of the drafts is wrong, the file has only
+// the commit links.
 'use strict';
 
 const fs = require('node:fs');
@@ -310,10 +311,12 @@ function request(t, method, path, body) {
 
 // call makes one API call through the proxy and returns the parsed JSON body.
 async function call(cfg, repo, method, apiPath, body, label) {
+  // Past the deadline, the call fails before it opens the tunnel.
+  const left = cfg.deadline - Date.now();
+  if (left <= 0) throw new CallError(callMessage({ kind: 'timeout' }, repo, method, label));
   const signal = { sockets: [] };
   let timer;
   const timeout = new Promise((_, reject) => {
-    const left = Math.max(0, cfg.deadline - Date.now());
     timer = setTimeout(() => reject(Object.assign(new Error('timeout'), { kind: 'timeout' })), left);
   });
   try {
@@ -408,10 +411,7 @@ function callMessage(error, repo, method, label) {
     case 'status': {
       const cause = `${what} returned ${error.status}`;
       const s = error.status;
-      if (error.rateLimited) {
-        const line = `Wait for GitHub's rate limit to reset, then run again: ${cause}`;
-        return chars(`${line} for ${repo}`) <= MAX_LINE ? `${line} for ${repo}` : line;
-      }
+      if (error.rateLimited) return `Wait for GitHub's rate limit to reset for ${repo}: ${cause}`;
       if (s >= 300 && s < 400) return `Set the targets to the current name of ${repo}: ${cause}`;
       if (s === 401) return `Check the token the proxy adds for ${repo}: ${cause}`;
       if (s === 403 && method === 'GET') return `Give the GitHub App pull_requests: read on ${repo}: ${cause}`;

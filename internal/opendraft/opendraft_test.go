@@ -256,6 +256,8 @@ type env struct {
 	cert         *tls.Certificate
 	connectReply string
 	closeAfter   bool
+	// vars are environment variables that run adds after the others.
+	vars []string
 }
 
 func (e *env) tunnelCount() int {
@@ -424,7 +426,7 @@ func (e *env) run(t *testing.T, submission any, bases any, extra ...string) (res
 		writeJSON(t, bf, bases)
 		vars = append(vars, "QORY_SUBMIT_BASES="+bf)
 	}
-	return e.runRaw(t, file, append(vars, extra...))
+	return e.runRaw(t, file, append(append(vars, extra...), e.vars...))
 }
 
 func (e *env) runRaw(t *testing.T, file string, vars []string) (result, map[string]any) {
@@ -841,13 +843,19 @@ func TestFailedCalls(t *testing.T) {
 			e.gh.fix("POST "+r, 422, `{"message":"Draft pull requests are not supported in this repository."}`)
 		}, nil, "Use a GitHub plan with draft pull requests for " + r + ": POST pulls returned 422"},
 		{"429", func(e *env) { e.gh.fix("GET "+r, 429, `{"message":"Too many requests"}`) }, nil,
-			"Wait for GitHub's rate limit to reset, then run again: GET pulls returned 429"},
+			"Wait for GitHub's rate limit to reset for " + r + ": GET pulls returned 429"},
 		{"403 with no requests left", func(e *env) {
 			e.gh.fixHeader("POST "+r, 403, `{"message":"Forbidden"}`, map[string]string{"X-RateLimit-Remaining": "0"})
-		}, nil, "Wait for GitHub's rate limit to reset, then run again: POST pulls returned 403"},
+		}, nil, "Wait for GitHub's rate limit to reset for " + r + ": POST pulls returned 403"},
 		{"403 about the rate limit", func(e *env) {
 			e.gh.fix("POST "+r, 403, `{"message":"You have exceeded a secondary rate limit."}`)
-		}, nil, "Wait for GitHub's rate limit to reset, then run again: POST pulls returned 403"},
+		}, nil, "Wait for GitHub's rate limit to reset for " + r + ": POST pulls returned 403"},
+		{"past the deadline", func(e *env) {
+			// Every Date.now after the first, the program's start, is 100 s later.
+			late := filepath.Join(e.dir, "late.js")
+			_ = os.WriteFile(late, []byte("const now = Date.now; let n = 0; Date.now = () => now() + (n++ ? 100000 : 0);\n"), 0o600)
+			e.vars = append(e.vars, "NODE_OPTIONS=--require="+late)
+		}, nil, "Retry with a later passed round for " + r + ": GET pulls timed out at 100 s"},
 		{"503", func(e *env) { e.gh.fix("POST "+r, 503, `{"message":"unavailable"}`) }, nil,
 			"Retry with a later passed round for " + r + ": POST pulls returned 503"},
 		{"not JSON", func(e *env) { e.gh.fix("POST "+r, 201, `<html>`) }, nil,
@@ -895,6 +903,10 @@ func TestFailedCalls(t *testing.T) {
 			checkLinks(t, entry(got, 0), repoA)
 			if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, map[string]any{"none": "not-passed"}) {
 				t.Errorf("draft = %v, want it unchanged", d)
+			}
+			// Past the deadline, no call leaves the program.
+			if tc.name == "past the deadline" && (e.tunnelCount() != 0 || len(e.gh.recorded()) != 0) {
+				t.Errorf("%d tunnels and %d calls past the deadline, want none", e.tunnelCount(), len(e.gh.recorded()))
 			}
 		})
 	}

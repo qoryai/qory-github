@@ -54,7 +54,7 @@ Every call to GitHub ends by 100 seconds after the program starts, and has no re
 |---|---|---|
 | 0 | Done. | Every commit link, and each draft. |
 | 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, more than one matching pull request, or the 100 s limit. The program still calls GitHub for the other repositories. Or a write of the file failed; the program then stops. | Every commit link and each draft written before the program ended. Unchanged when writing the commit links failed. |
-| 2 | The input is wrong. | Unchanged when the structure is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, or a `github.com` path that is not `owner/name`. Only the commit links written when an input of the drafts is wrong: `text`, the bases file or a repository with no base branch in it, the socket, the password or the CA bundle. |
+| 2 | The input is wrong. | Unchanged when the structure is wrong: a missing `QORY_SUBMISSION_FILE`, a file that is missing or does not parse, a member of the wrong shape, or a `github.com` path that is not `owner/name`. Only the commit links written when an input of the drafts is wrong: `text`, the bases file or a repository with no base branch in it, the socket, the password or the CA bundle. |
 
 stdout has one line per repository whose draft the program opened or updated:
 
@@ -68,7 +68,7 @@ of up to 21 characters, a line with no file path in it has at most 100 character
 a 422 or another 4xx status without a specific fix, the line ends with GitHub's error
 message in parentheses, cut to fit. A 429, or a 403 with no requests left or with a
 message about the rate limit, gets the line that starts `Wait for GitHub's rate limit to
-reset`:
+reset for`:
 
 ```text
 Give the GitHub App pull_requests: write on owner/name: POST pulls returned 403
