@@ -899,7 +899,8 @@ func TestTheDeclarationHasSubmitModuleOnlyWithFullCommit(t *testing.T) {
 }
 
 // TestTheContractRefusesASubmitModuleAtAShortRef pins why Declare leaves submit_module
-// out for a commit that is not a full id: adapter.schema.json refuses the body.
+// out for a commit that is not a full id: a body with that ref fails validation against
+// adapter.schema.json.
 func TestTheContractRefusesASubmitModuleAtAShortRef(t *testing.T) {
 	access := newKey(t)
 	apiary := newFakeApiary(t, access)

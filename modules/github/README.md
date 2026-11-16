@@ -51,8 +51,8 @@ Each call ends after 30 seconds, with no retry.
 | Exit | Meaning | The submission file |
 |---|---|---|
 | 0 | Done. | Every commit link, and each draft. |
-| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. | Every commit link, and the drafts of the repositories whose calls went through. |
-| 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. | Unchanged. |
+| 1 | A call to GitHub failed: a refused connection, a proxy status other than 200, an HTTP status of 300 or more, a response that is not the expected JSON, or a time-out. The program still calls GitHub for the other repositories. Or writing the file failed after a draft; the program then stops. | Every commit link, and each draft written before the program ended. |
+| 2 | The input is wrong: a missing variable, a file that is missing or does not parse, a member of the wrong shape, a `github.com` path that is not `owner/name`, or a repository with no base branch in `QORY_SUBMIT_BASES`. Or the first write of the file failed. | Unchanged. |
 
 stdout has one line per repository whose draft the program opened or updated:
 
@@ -63,7 +63,7 @@ https://github.com/owner/name/pull/34 updated
 
 stderr has one line per error, and the line starts with the fix. For a repository path
 of up to 21 characters, a line with no file path in it has at most 100 characters. After
-a 422 or another 4xx status that has no fix of its own, the line ends with GitHub's error
+a 422 or another 4xx status without a specific fix, the line ends with GitHub's error
 message in parentheses, cut to fit:
 
 ```text

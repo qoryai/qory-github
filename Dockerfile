@@ -74,8 +74,8 @@ COPY . .
 # pre-release image, and dev when none is given.
 ARG VERSION=dev
 # The full commit id the image is built from, which serve declares to Qory Apiary as the
-# ref of its submit module, modules/github. Empty, as when none is given, serve logs a
-# line at start and declares no submit module.
+# ref of its submit module, modules/github. When COMMIT is empty, as when no value is
+# given, serve logs a line at start and declares no submit module.
 ARG COMMIT=
 # The platform of the image, which docker buildx sets from --platform, or to the platform
 # of the machine that builds when no --platform is given.
