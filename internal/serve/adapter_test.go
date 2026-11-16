@@ -2618,8 +2618,8 @@ func TestTheFeedDropsAWatchEntryAndGoesOn(t *testing.T) {
 }
 
 // TestAPageOfWatchEntriesMovesTheCursorAlone reads a page of two watch entries: the
-// cursor is stored after them, and nothing else changes in the store, on GitHub or in
-// Qory Apiary.
+// cursor is the one key added to the adapter and collections namespaces, no request
+// reaches GitHub, and Qory Apiary receives no failure report.
 func TestAPageOfWatchEntriesMovesTheCursorAlone(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	w.apiary.add(watchEntry("wi_42"), watchEntry("wi_43"))
@@ -2655,6 +2655,27 @@ func TestAPageOfWatchEntriesMovesTheCursorAlone(t *testing.T) {
 	}
 	if err := w.feed.apply(context.Background(), watchEntry("wi_42")); err != nil {
 		t.Errorf("apply: %v", err)
+	}
+}
+
+// TestAWatchEntryDoesNotCountAsApplied has the comments on issues 9 and 10 fail
+// around a watch entry for a day: each step applies no entry, so the day counts
+// toward neither entry's limit, and neither entry is reported or passed.
+func TestAWatchEntryDoesNotCountAsApplied(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setReach(w.st, widgetsRef, 42)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.commentsDown = map[int]bool{9: true, 10: true} })
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(commentOn(firstOn9, 9), watchEntry("wi_42"), commentOn(onTen, 10))
+	for range 2 {
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) {
+			t.Fatalf("err %v", err)
+		}
+		now = now.Add(stuckFor)
+	}
+	if r := w.apiary.reports(); len(r) != 0 || strings.Contains(w.log.String(), "is passed") {
+		t.Errorf("reports %v, the log %s", r, w.log.String())
 	}
 }
 
