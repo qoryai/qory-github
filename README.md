@@ -170,6 +170,10 @@ permissions on GitHub and accept the change on the installation.
 
 ## What the token reaches
 
+This section describes the token that the command `qory-github credential` returns. For
+the token of a Qory Apiary run, see
+[The token of a Qory Apiary run](#the-token-of-a-qory-apiary-run).
+
 | Host | Auth | Paths, per repository |
 |---|---|---|
 | `github.com` | basic, username `x-access-token` | `/owner/name.git/*`, `/owner/name/*` (clone, fetch, push, Git LFS batch) |
@@ -187,31 +191,35 @@ permissions on GitHub and accept the change on the installation.
 
 ### The token of a Qory Apiary run
 
-The table above lists the paths of the token that `qory-github credential` returns. The
-run credential that `qory-github-server` returns to Qory Apiary has a list for each purpose and access:
+The table in What the token reaches lists the paths of the token that
+`qory-github credential` returns. The run credential that `qory-github-server` returns to
+Qory Apiary has a list of paths for each purpose and access:
 
 | Purpose and access | Host | Paths, per repository |
 |---|---|---|
 | `work`, `write` | `github.com` | `/owner/name.git/info/refs`, `/owner/name.git/git-receive-pack` |
 | `work`, `write` | `api.github.com` | `/repos/owner/name/pulls`, `/repos/owner/name/pulls/{}` |
-| `work`, `read` | `github.com`, `api.github.com` | the paths in the table above |
-| `harness` | `github.com` | the `github.com` paths in the table above |
+| `work`, `read` | `github.com`, `api.github.com` | the paths of the table in What the token reaches |
+| `harness` | `github.com` | the `github.com` paths of the table in What the token reaches |
 
 - `{}` matches one path segment that is not empty: `/repos/owner/name/pulls/12` matches,
   and `/repos/owner/name/pulls/12/merge` and `/repos/owner/name/pulls/` do not.
-- The `write` token is for the push and its pull request. A call to any other path, such
-  as `/graphql`, `/owner/name.git/git-upload-pack` or `/repos/owner/name/issues`, gets no
-  token. A query string is not part of a path, so `/owner/name.git/info/refs` is covered
-  for both services, `git-receive-pack` and `git-upload-pack`. Under this credential,
-  `gh pr create` gets no token, because it calls `/graphql`.
-- A run whose documents have the access `write-no-push` gets the `read` list.
+- The `write` credential covers the push and its pull request. A request to any other
+  path, such as `/graphql`, `/owner/name.git/git-upload-pack` or
+  `/repos/owner/name/issues`, gets no token. A query string is not part of a path, so
+  `/owner/name.git/info/refs` is covered for both services, `git-receive-pack` and
+  `git-upload-pack`. `gh pr create` calls `/graphql`, which the `write` token does not
+  cover.
+- A run with the access `write-no-push` (a checkout that is writable but cannot push)
+  gets the `read` credential: Qory Apiary sends the call with access `read` for it.
 
 ### What the agent sees
 
 - `GH_TOKEN` and `GITHUB_TOKEN` hold `qory-sets-the-credential-outside-the-enclosure`, a
   placeholder so `gh` starts.
 - The gateway terminates TLS for `github.com` and `api.github.com` with a
-  certificate the container trusts, and sets the token on requests to the paths above.
+  certificate the container trusts, and sets the token on requests to the paths in the
+  table in What the token reaches.
 - Under `enforce`, a request to another path gets `403` and a line such as:
 
   ```text
