@@ -187,8 +187,8 @@ permissions on GitHub and accept the change on the installation.
 
 ### The token of a Qory Apiary run
 
-The table above is the token that `qory-github credential` returns. The run credential
-that `qory-github-server` returns to Qory Apiary has a list for each purpose and access:
+The table above lists the paths of the token that `qory-github credential` returns. The
+run credential that `qory-github-server` returns to Qory Apiary has a list for each purpose and access:
 
 | Purpose and access | Host | Paths, per repository |
 |---|---|---|
@@ -197,13 +197,14 @@ that `qory-github-server` returns to Qory Apiary has a list for each purpose and
 | `work`, `read` | `github.com`, `api.github.com` | the paths in the table above |
 | `harness` | `github.com` | the `github.com` paths in the table above |
 
-- `{}` matches one path segment: `/repos/owner/name/pulls/12` matches, and
-  `/repos/owner/name/pulls/12/merge` does not.
+- `{}` matches one path segment that is not empty: `/repos/owner/name/pulls/12` matches,
+  and `/repos/owner/name/pulls/12/merge` and `/repos/owner/name/pulls/` do not.
 - The `write` token is for the push and its pull request. A call to any other path, such
-  as `/graphql`, `git-upload-pack` or `/repos/owner/name/issues`, gets no token. Under
-  this credential, `gh pr create` gets no token, because it calls `/graphql`.
-- The `read` token of purpose `work` includes the access `write-no-push`, which reaches
-  the adapter as `read`.
+  as `/graphql`, `/owner/name.git/git-upload-pack` or `/repos/owner/name/issues`, gets no
+  token. A query string is not part of a path, so `/owner/name.git/info/refs` is covered
+  for both services, `git-receive-pack` and `git-upload-pack`. Under this credential,
+  `gh pr create` gets no token, because it calls `/graphql`.
+- A run whose documents have the access `write-no-push` gets the `read` list.
 
 ### What the agent sees
 
