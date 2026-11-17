@@ -525,10 +525,8 @@ func runPermissions(purpose, access string) map[string]string {
 // repositories, as for an installation that does not grant them, or the installation
 // is suspended; when the mint fails for good, as for an installation GitHub has no
 // more, 409 grant_unknown for a harness and 403 resource_not_covered for work; and 503
-// source_unavailable when GitHub fails otherwise. The answer's apply has, for work,
-// github.com with basic and the username x-access-token on the repository's git paths
-// and api.github.com with bearer on its API paths, as [github.Uses] returns them; for a
-// harness, the github.com item alone.
+// source_unavailable when GitHub fails otherwise. The answer's apply is the list that
+// [runCredentialUses] returns.
 func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (int, any) {
 	var req contracts.RunCredential
 	if !decodeCall("run-credential.schema.json", body, &req) {
@@ -589,10 +587,7 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		}
 		repos = append(repos, name)
 	}
-	uses := github.Uses(repos)
-	if req.Purpose == "harness" {
-		uses = uses[:1]
-	}
+	uses := runCredentialUses(req.Purpose, req.Access, repos)
 	apply := make([]contracts.CredentialApply, len(uses))
 	for i, u := range uses {
 		apply[i] = contracts.CredentialApply{Hosts: u.Hosts, Scheme: u.Scheme, Username: u.Username, Paths: u.Paths}
@@ -605,6 +600,24 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		return http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 	}
 	return http.StatusOK, answer
+}
+
+// runCredentialUses is the apply of a run credential for purpose and access:
+//
+//   - for work with access write, [github.PushUses]: the push calls on github.com and
+//     the pull request calls on api.github.com, so the token that can write reaches no
+//     other path;
+//   - for work with access read, which includes a run whose documents have the access
+//     write-no-push, [github.Uses];
+//   - for a harness, the github.com item of [github.Uses] alone.
+func runCredentialUses(purpose, access string, repos []github.Repository) []github.Apply {
+	switch {
+	case purpose == "harness":
+		return github.Uses(repos)[:1]
+	case access == "write":
+		return github.PushUses(repos)
+	}
+	return github.Uses(repos)
 }
 
 // harnessGrant is the installation of grant and the repositories of resources for a
