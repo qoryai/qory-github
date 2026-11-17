@@ -539,6 +539,122 @@ func TestTheSourceApplyIsUsesForTheTarget(t *testing.T) {
 	}
 }
 
+// TestPushUsesAreThePullRequestAndPushCalls pins PushUses with literal paths, in order:
+// for one repository and for two, the push calls on github.com and the pull request
+// calls on api.github.com, and nothing else.
+func TestPushUsesAreThePullRequestAndPushCalls(t *testing.T) {
+	for _, tc := range []struct {
+		repos string
+		want  string
+	}{
+		{"acme/widgets", `[` +
+			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/widgets.git/info/refs","/acme/widgets.git/git-receive-pack"]},` +
+			`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/widgets/pulls","/repos/acme/widgets/pulls/{}"]}]`},
+		{"acme/shop,acme/lib", `[` +
+			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/info/refs","/acme/shop.git/git-receive-pack","/acme/lib.git/info/refs","/acme/lib.git/git-receive-pack"]},` +
+			`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/shop/pulls","/repos/acme/shop/pulls/{}","/repos/acme/lib/pulls","/repos/acme/lib/pulls/{}"]}]`},
+	} {
+		repos, err := ParseRepositories(tc.repos)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := json.Marshal(PushUses(repos))
+		if string(got) != tc.want {
+			t.Errorf("PushUses for %s is\n%s\nwant\n%s", tc.repos, got, tc.want)
+		}
+		again, _ := json.Marshal(PushUses(repos))
+		if string(again) != string(got) {
+			t.Errorf("PushUses for %s differs between two calls:\n%s\n%s", tc.repos, got, again)
+		}
+		for _, a := range PushUses(repos) {
+			for _, p := range a.Paths {
+				if strings.Contains(p, "*") || strings.Contains(p, "graphql") {
+					t.Errorf("PushUses for %s has the path %q", tc.repos, p)
+				}
+			}
+		}
+	}
+}
+
+// TestPushUsesShareTheItemsOfUses pins that PushUses has the hosts, schemes and
+// username of Uses, in the same order, so the two cannot drift.
+func TestPushUsesShareTheItemsOfUses(t *testing.T) {
+	repos, err := ParseRepositories("acme/shop,acme/lib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uses, push := Uses(repos), PushUses(repos)
+	if len(uses) != len(push) {
+		t.Fatalf("Uses has %d items, PushUses %d", len(uses), len(push))
+	}
+	for i := range uses {
+		u, p := uses[i], push[i]
+		u.Paths, p.Paths = nil, nil
+		if a, b := fmtApply(u), fmtApply(p); a != b {
+			t.Errorf("item %d of PushUses is %s, Uses has %s", i, b, a)
+		}
+	}
+}
+
+func fmtApply(a Apply) string {
+	b, _ := json.Marshal(a)
+	return string(b)
+}
+
+// coveredBySource reports whether path on the host of item a is covered by an item of
+// the source apply as the control plane checks it: the same hosts, scheme and username,
+// and the path equal to a path of the item, or, for a path ending in *, with the path
+// before the * as its start, compared as strings.
+func coveredBySource(source []Apply, a Apply, path string) bool {
+	for _, s := range source {
+		if !slices.Equal(s.Hosts, a.Hosts) || s.Scheme != a.Scheme || s.Username != a.Username {
+			continue
+		}
+		for _, sp := range s.Paths {
+			if sp == path || strings.HasSuffix(sp, "*") && strings.HasPrefix(path, strings.TrimSuffix(sp, "*")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestPushUsesAreInsideTheSourceApply pins that each path of PushUses, for one
+// repository and for several, is covered by the source role's apply filled with that
+// repository, so the control plane accepts the answer as narrower than the description.
+func TestPushUsesAreInsideTheSourceApply(t *testing.T) {
+	for _, target := range []string{"acme/widgets", "a-b/c_d.e", "ACME/.github"} {
+		repos, err := ParseRepositories(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var source []Apply
+		for _, a := range Describe("").Roles.Source.Apply {
+			var paths []string
+			for _, p := range a.Paths {
+				paths = append(paths, strings.Replace(p, "{target.path}", target, 1))
+			}
+			a.Paths = paths
+			source = append(source, a)
+		}
+		for _, a := range PushUses(repos) {
+			for _, p := range a.Paths {
+				if !coveredBySource(source, a, p) {
+					t.Errorf("the path %q of %v is not inside the source apply for %s", p, a.Hosts, target)
+				}
+			}
+		}
+	}
+	// The check refuses a path outside the source apply, so a pass above has meaning.
+	source := []Apply{{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets/*"}}}
+	api := Apply{Hosts: []string{"api.github.com"}, Scheme: "bearer"}
+	for path, want := range map[string]bool{"/repos/acme/widgets/pulls": true, "/repos/acme/other/pulls": false, "/graphql": false} {
+		if got := coveredBySource(source, api, path); got != want {
+			t.Errorf("coveredBySource(%q) is %v, want %v", path, got, want)
+		}
+	}
+}
+
 func TestOneRunsRepositoriesShareAnOwner(t *testing.T) {
 	for _, arg := range []string{"acme/shop,other/lib", "acme/shop,acme/shop", "acme", "acme/", "/shop", "acme/..", "acme/shop.git", "ac me/shop", "-acme/shop", "acme/shop/x"} {
 		if _, err := ParseRepositories(arg); err == nil {
