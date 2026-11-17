@@ -185,6 +185,26 @@ permissions on GitHub and accept the change on the installation.
   host to the fetch paths in the policy
   ([Forager contract](https://github.com/qoryai/forager/tree/v0.7.0/contracts/forager/v1#the-policy)).
 
+### The token of a Qory Apiary run
+
+The table above is the token that `qory-github credential` returns. The run credential
+that `qory-github-server` returns to Qory Apiary has a list for each purpose and access:
+
+| Purpose and access | Host | Paths, per repository |
+|---|---|---|
+| `work`, `write` | `github.com` | `/owner/name.git/info/refs`, `/owner/name.git/git-receive-pack` |
+| `work`, `write` | `api.github.com` | `/repos/owner/name/pulls`, `/repos/owner/name/pulls/{}` |
+| `work`, `read` | `github.com`, `api.github.com` | the paths in the table above |
+| `harness` | `github.com` | the `github.com` paths in the table above |
+
+- `{}` matches one path segment: `/repos/owner/name/pulls/12` matches, and
+  `/repos/owner/name/pulls/12/merge` does not.
+- The `write` token is for the push and its pull request. A call to any other path, such
+  as `/graphql`, `git-upload-pack` or `/repos/owner/name/issues`, gets no token. Under
+  this credential, `gh pr create` gets no token, because it calls `/graphql`.
+- The `read` token of purpose `work` includes the access `write-no-push`, which reaches
+  the adapter as `read`.
+
 ### What the agent sees
 
 - `GH_TOKEN` and `GITHUB_TOKEN` hold `qory-sets-the-credential-outside-the-enclosure`, a
@@ -203,6 +223,8 @@ qory pushes the commits a run leaves, in its push step after the session: it run
 push` over HTTPS through the run's host proxy and the gateway behind it, which sets the
 token on `github.com`. Inside the container, `git` and `gh` reach GitHub through the
 gateway, which sets the token on the calls below; the default permissions allow them.
+The table is for the token of `qory-github credential`; the token of a Qory Apiary run has
+the paths in [The token of a Qory Apiary run](#the-token-of-a-qory-apiary-run).
 Tested with git 2.39 and gh 2.100:
 
 | Command | Calls | Needs |
