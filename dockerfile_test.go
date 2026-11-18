@@ -44,7 +44,7 @@ func stages(t *testing.T) []stage {
 // directory and the address serve reads from the environment, and exposes that port.
 // The program is cross-compiled on the platform of the machine that builds for the
 // image's platform, so one build makes the images of linux/amd64 and linux/arm64. The
-// build sets main.version and main.commit from the build arguments VERSION and COMMIT.
+// build sets main.version from the build argument VERSION.
 func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	all := stages(t)
 	const base = "FROM gcr.io/distroless/static-debian13:nonroot@sha256:"
@@ -82,7 +82,7 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	}
 	// The program is built with the release's flags, for the image's platform, which
 	// the build stage declares.
-	const flags = `RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \`
+	const flags = `RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \`
 	var builds int
 	for _, s := range all {
 		for _, line := range s.lines {
@@ -91,7 +91,7 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 				if line != flags {
 					t.Errorf("%s builds with %q, not %q", s.from, line, flags)
 				}
-				for _, arg := range []string{"ARG VERSION=dev", "ARG COMMIT=", "ARG TARGETOS", "ARG TARGETARCH"} {
+				for _, arg := range []string{"ARG VERSION=dev", "ARG TARGETOS", "ARG TARGETARCH"} {
 					if !slices.Contains(s.lines, arg) {
 						t.Errorf("%s builds without %s", s.from, arg)
 					}
@@ -104,11 +104,10 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	}
 }
 
-// TestPrereleaseBuildsWithTheCommit pins that the pre-release workflow builds only a
-// commit on main, which every run can fetch modules/github at, and builds the image with
-// the build argument COMMIT set to the full commit it checked out, which the Dockerfile
-// passes to -X main.commit, so the image declares its submit module.
-func TestPrereleaseBuildsWithTheCommit(t *testing.T) {
+// TestPrereleaseBuildsOnlyACommitOnMain pins that the pre-release workflow checks out the
+// full history, names the full commit it builds, stops for a commit that is not on main,
+// and builds the image only after that check.
+func TestPrereleaseBuildsOnlyACommitOnMain(t *testing.T) {
 	b, err := os.ReadFile(".github/workflows/prerelease.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -139,11 +138,11 @@ func TestPrereleaseBuildsWithTheCommit(t *testing.T) {
 		case strings.HasPrefix(step.Uses, "docker/build-push-action@"):
 			args := strings.Split(strings.TrimSpace(step.With["build-args"]), "\n")
 			// The build comes after the check, so a commit off main is never built.
-			built = onMain && slices.Contains(args, "COMMIT=${{ steps.commit.outputs.sha }}")
+			built = onMain && slices.Contains(args, "VERSION=sha-${{ steps.commit.outputs.short }}")
 		}
 	}
 	if !fullHistory || !named || !onMain || !built {
 		t.Errorf("prerelease.yml: full history %v; the step commit writes the full commit %v; "+
-			"a commit off main stops the run %v; the build after the check passes COMMIT %v", fullHistory, named, onMain, built)
+			"a commit off main stops the run %v; the build comes after the check %v", fullHistory, named, onMain, built)
 	}
 }

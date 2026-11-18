@@ -3,9 +3,7 @@ name: Pre-release image
 # Run by hand only: from the Actions tab, once this file is on the default branch, or by
 # pushing a commit to the branch prerelease, which nothing else pushes to. Never on a push
 # to any other branch, a pull request or a schedule. Each run costs Actions minutes and
-# package storage. The run builds only a commit on main: the image declares
-# modules/github at its commit, and every run of Qory fetches the module at that commit,
-# so the commit must stay on GitHub.
+# package storage. The run builds only a commit on main.
 on:
   push:
     branches: [prerelease]
@@ -75,7 +73,7 @@ jobs:
       - name: Check that the commit is on main
         run: |
           git merge-base --is-ancestor HEAD origin/main || {
-            echo "::error::Build a commit on main: $(git rev-parse --short HEAD) is not on main, and runs fetch modules/github at it"
+            echo "::error::Build a commit on main: $(git rev-parse --short HEAD) is not on main"
             exit 1
           }
 
@@ -90,8 +88,7 @@ jobs:
           driver-opts: image=ghcr.io/qoryai/ci-images:buildkit-buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       # Both platforms in one image index, pushed by digest alone: no tag names the image
-      # until both are built. The program reports sha-<7> as its version, and declares
-      # modules/github at the full commit as its submit module. The labels give
+      # until both are built. The program reports sha-<7> as its version. The labels give
       # the image's revision, source and licenses, and no version, as no release names the
       # image; the build uses the GitHub Actions cache in the scope server-image.
       - name: Build and push by digest
@@ -104,7 +101,6 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=sha-${{ steps.commit.outputs.short }}
-            COMMIT=${{ steps.commit.outputs.sha }}
           labels: |
             org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
