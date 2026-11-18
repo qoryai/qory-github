@@ -539,20 +539,18 @@ func TestTheSourceApplyIsUsesForTheTarget(t *testing.T) {
 	}
 }
 
-// TestPushUsesAreThePullRequestAndPushCalls pins PushUses with literal paths, in order:
-// for one repository and for two, the push calls on github.com and the pull request
-// calls on api.github.com, and nothing else.
-func TestPushUsesAreThePullRequestAndPushCalls(t *testing.T) {
+// TestPushUsesAreTheReceivePackCalls pins PushUses with literal paths, in order: for one
+// repository and for two, the git-receive-pack calls on github.com, one item, and no
+// api.github.com item.
+func TestPushUsesAreTheReceivePackCalls(t *testing.T) {
 	for _, tc := range []struct {
 		repos string
 		want  string
 	}{
 		{"acme/widgets", `[` +
-			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/widgets.git/info/refs","/acme/widgets.git/git-receive-pack"]},` +
-			`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/widgets/pulls","/repos/acme/widgets/pulls/{}"]}]`},
+			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/widgets.git/info/refs","/acme/widgets.git/git-receive-pack"]}]`},
 		{"acme/shop,acme/lib", `[` +
-			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/info/refs","/acme/shop.git/git-receive-pack","/acme/lib.git/info/refs","/acme/lib.git/git-receive-pack"]},` +
-			`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/shop/pulls","/repos/acme/shop/pulls/{}","/repos/acme/lib/pulls","/repos/acme/lib/pulls/{}"]}]`},
+			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/info/refs","/acme/shop.git/git-receive-pack","/acme/lib.git/info/refs","/acme/lib.git/git-receive-pack"]}]`},
 	} {
 		repos, err := ParseRepositories(tc.repos)
 		if err != nil {
@@ -567,8 +565,11 @@ func TestPushUsesAreThePullRequestAndPushCalls(t *testing.T) {
 			t.Errorf("PushUses for %s differs between two calls:\n%s\n%s", tc.repos, got, again)
 		}
 		for _, a := range PushUses(repos) {
+			if slices.Contains(a.Hosts, APIHost) {
+				t.Errorf("PushUses for %s has the item for %v", tc.repos, a.Hosts)
+			}
 			for _, p := range a.Paths {
-				if strings.Contains(p, "*") || strings.Contains(p, "graphql") {
+				if strings.Contains(p, "*") || strings.Contains(p, "graphql") || strings.Contains(p, "/repos/") {
 					t.Errorf("PushUses for %s has the path %q", tc.repos, p)
 				}
 			}
@@ -576,23 +577,21 @@ func TestPushUsesAreThePullRequestAndPushCalls(t *testing.T) {
 	}
 }
 
-// TestPushUsesShareTheItemsOfUses pins that PushUses has the hosts, schemes and
-// username of Uses, in the same order, so the two cannot drift.
-func TestPushUsesShareTheItemsOfUses(t *testing.T) {
+// TestPushUsesShareTheGitItemOfUses pins that PushUses has the one item of github.com
+// of Uses, with its hosts, scheme and username, so the two cannot drift.
+func TestPushUsesShareTheGitItemOfUses(t *testing.T) {
 	repos, err := ParseRepositories("acme/shop,acme/lib")
 	if err != nil {
 		t.Fatal(err)
 	}
 	uses, push := Uses(repos), PushUses(repos)
-	if len(uses) != len(push) {
-		t.Fatalf("Uses has %d items, PushUses %d", len(uses), len(push))
+	if len(push) != 1 || len(uses) != 2 {
+		t.Fatalf("Uses has %d items, PushUses %d, want 2 and 1", len(uses), len(push))
 	}
-	for i := range uses {
-		u, p := uses[i], push[i]
-		u.Paths, p.Paths = nil, nil
-		if a, b := fmtApply(u), fmtApply(p); a != b {
-			t.Errorf("item %d of PushUses is %s, Uses has %s", i, b, a)
-		}
+	u, p := uses[0], push[0]
+	u.Paths, p.Paths = nil, nil
+	if a, b := fmtApply(u), fmtApply(p); a != b {
+		t.Errorf("the item of PushUses is %s, the first of Uses has %s", b, a)
 	}
 }
 

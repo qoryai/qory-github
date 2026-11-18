@@ -504,14 +504,15 @@ func repositoryOf(ref string) (int64, bool) { return installationOf(ref) }
 
 // runPermissions are the permissions of a run's token for purpose and access. A token
 // for work reads the repositories' contents and pull requests with access read, and
-// writes both with access write; GitHub adds metadata read to every token. A token for
-// a harness reads the contents alone, whatever the access. No token has workflows.
+// writes the contents alone with access write, since the token reaches only git's push;
+// GitHub adds metadata read to every token. A token for a harness reads the contents
+// alone, whatever the access. No token has workflows.
 func runPermissions(purpose, access string) map[string]string {
 	switch {
 	case purpose == "harness":
 		return map[string]string{"contents": "read"}
 	case access == "write":
-		return map[string]string{"contents": "write", "pull_requests": "write"}
+		return map[string]string{"contents": "write"}
 	}
 	return map[string]string{"contents": "read", "metadata": "read", "pull_requests": "read"}
 }
@@ -605,8 +606,8 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 // runCredentialUses is the apply of a run credential for purpose and access:
 //
 //   - for work with access write, [github.PushUses]: the push calls on github.com and
-//     the pull request calls on api.github.com, so the token that can write reaches no
-//     other path;
+//     nothing on api.github.com, so the token that can write reaches GitHub only for
+//     git's push;
 //   - for work with access read, which includes a run whose documents have the access
 //     write-no-push, [github.Uses];
 //   - for a harness, the github.com item of [github.Uses] alone.

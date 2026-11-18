@@ -18,7 +18,10 @@ GitHub repository in it.
 | `SSL_CERT_FILE` | Optional. A PEM bundle of the certificate authorities that the program trusts for `api.github.com`. Without it, the program trusts Node's default store. |
 
 The program sends no token and no `Authorization` header, runs no `git`, and connects to
-nothing but the socket in `QORY_PROXY_SOCKET`. The proxy adds the credential.
+nothing but the socket in `QORY_PROXY_SOCKET`. The proxy of a push allows only the hosts
+of the push credential's items. The run credential for work with access `write` has no
+item for `api.github.com`, so the program cannot reach `api.github.com` through that
+proxy: the proxy refuses the `CONNECT`.
 
 ## What the program does
 

@@ -440,12 +440,12 @@ func workCall(connection, ref, access string) string {
 }
 
 // TestARunCredentialForWorkMapsTheAccess pins a run credential for work: access read
-// mints contents, metadata and pull_requests read, access write contents and
-// pull_requests write, never workflows, for the one repository alone, by id. The answer
+// mints contents, metadata and pull_requests read, access write contents write alone,
+// never pull_requests or workflows, for the one repository alone, by id. The answer
 // for read is [github.Uses] for that repository: the token on github.com with basic and
 // x-access-token on its git paths, and on api.github.com with bearer on its API paths.
-// The answer for write is [github.PushUses]: the push calls and the pull request calls,
-// and no other path. Both have GitHub's expiry.
+// The answer for write is [github.PushUses]: one apply item, github.com with the
+// git-receive-pack paths, and none for api.github.com. Both have GitHub's expiry.
 func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 	for _, tc := range []struct {
 		access string
@@ -457,9 +457,8 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 			{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*"}},
 			{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets", "/repos/acme/widgets/*", "/graphql"}},
 		}, github.Uses},
-		{"write", `{"contents":"write","pull_requests":"write"}`, []contracts.CredentialApply{
+		{"write", `{"contents":"write"}`, []contracts.CredentialApply{
 			{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/info/refs", "/acme/widgets.git/git-receive-pack"}},
-			{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets/pulls", "/repos/acme/widgets/pulls/{}"}},
 		}, github.PushUses},
 	} {
 		t.Run(tc.access, func(t *testing.T) {
@@ -499,8 +498,9 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 }
 
 // TestTheRunCredentialUsesFollowThePurposeAndTheAccess pins runCredentialUses with
-// literal paths for several repositories: work with write has the push paths of every
-// repository, in the order of the repositories; work with read and a harness keep the
+// literal paths for several repositories: work with write has the one github.com item
+// with the git-receive-pack paths of every repository, in the order of the
+// repositories, and no api.github.com item; work with read and a harness keep the
 // paths of [github.Uses]; the same repositories give the same list every time.
 func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 	repos := []github.Repository{{Owner: "acme", Name: "shop"}, {Owner: "acme", Name: "lib"}}
@@ -514,8 +514,7 @@ func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 	for _, tc := range []struct {
 		purpose, access, want string
 	}{
-		{"work", "write", "github.com basic x-access-token: /acme/shop.git/info/refs /acme/shop.git/git-receive-pack /acme/lib.git/info/refs /acme/lib.git/git-receive-pack\n" +
-			"api.github.com bearer : /repos/acme/shop/pulls /repos/acme/shop/pulls/{} /repos/acme/lib/pulls /repos/acme/lib/pulls/{}\n"},
+		{"work", "write", "github.com basic x-access-token: /acme/shop.git/info/refs /acme/shop.git/git-receive-pack /acme/lib.git/info/refs /acme/lib.git/git-receive-pack\n"},
 		{"work", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/shop/* /acme/lib.git/* /acme/lib/*\n" +
 			"api.github.com bearer : /repos/acme/shop /repos/acme/shop/* /repos/acme/lib /repos/acme/lib/* /graphql\n"},
 		{"harness", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/shop/* /acme/lib.git/* /acme/lib/*\n"},
@@ -528,11 +527,34 @@ func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 			t.Errorf("%s with %s differs between two calls:\n%s\n%s", tc.purpose, tc.access, got, again)
 		}
 	}
-	for _, a := range runCredentialUses("work", "write", repos) {
+	push := runCredentialUses("work", "write", repos)
+	if len(push) != 1 || !slices.Equal(push[0].Hosts, []string{"github.com"}) {
+		t.Errorf("the push list is %v, want the one item of github.com", push)
+	}
+	for _, a := range push {
 		for _, p := range a.Paths {
-			if strings.Contains(p, "*") || strings.Contains(p, "graphql") {
+			if strings.Contains(p, "*") || strings.Contains(p, "graphql") || strings.Contains(p, "/repos/") {
 				t.Errorf("the push list has the path %q", p)
 			}
+		}
+	}
+}
+
+// TestTheRunPermissionsFollowThePurposeAndTheAccess pins runPermissions: work with write
+// has contents write and nothing else, work with read keeps contents, metadata and
+// pull_requests read, and a harness has contents read, whatever the access.
+func TestTheRunPermissionsFollowThePurposeAndTheAccess(t *testing.T) {
+	for _, tc := range []struct {
+		purpose, access, want string
+	}{
+		{"work", "write", `{"contents":"write"}`},
+		{"work", "read", `{"contents":"read","metadata":"read","pull_requests":"read"}`},
+		{"harness", "read", `{"contents":"read"}`},
+		{"harness", "write", `{"contents":"read"}`},
+	} {
+		got, _ := json.Marshal(runPermissions(tc.purpose, tc.access))
+		if string(got) != tc.want {
+			t.Errorf("%s with %s gets %s, want %s", tc.purpose, tc.access, got, tc.want)
 		}
 	}
 }

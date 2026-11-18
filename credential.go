@@ -120,38 +120,32 @@ func Uses(repos []Repository) []Apply {
 		api = append(api, "/repos/"+r.String(), "/repos/"+r.String()+"/*")
 	}
 	api = append(api, "/graphql")
-	return applyItems(git, api)
+	return []Apply{gitItem(git), {Hosts: []string{APIHost}, Scheme: "bearer", Paths: api}}
 }
 
-// PushUses are where the token of a run that may push goes: the calls that push the
-// commits and open the pull request, and no other. Like [Uses], it returns the same
-// for the same repositories every time. Its items are those of [Uses], with these paths
-// for each repository, in this order:
+// PushUses are where the token of a run that may push goes: git's push and no other
+// call. Like [Uses], it returns the same for the same repositories every time. It has
+// one item, the github.com item of [Uses], with these paths for each repository, in
+// this order:
 //
-//   - github.com: /owner/name.git/info/refs, which a push calls with the query
-//     service=git-receive-pack, and /owner/name.git/git-receive-pack;
-//   - api.github.com: /repos/owner/name/pulls, to list and to open pull requests, and
-//     /repos/owner/name/pulls/{}, one pull request, where {} matches one path segment.
+//   - /owner/name.git/info/refs, which a push calls with the query
+//     service=git-receive-pack, and /owner/name.git/git-receive-pack.
 //
-// No path ends in *, and none is /graphql or under /pulls/{}/.
+// It has no api.github.com item: no REST path and no /graphql. No path ends in *.
 //
 // Each path is inside a path of the source role's apply, in the description.
 func PushUses(repos []Repository) []Apply {
-	var git, api []string
+	var git []string
 	for _, r := range repos {
 		git = append(git, "/"+r.String()+".git/info/refs", "/"+r.String()+".git/git-receive-pack")
-		api = append(api, "/repos/"+r.String()+"/pulls", "/repos/"+r.String()+"/pulls/{}")
 	}
-	return applyItems(git, api)
+	return []Apply{gitItem(git)}
 }
 
-// applyItems are the two items of a token's uses, with the paths of github.com and of
-// api.github.com, shared by [Uses] and [PushUses] so that their hosts and schemes agree.
-func applyItems(git, api []string) []Apply {
-	return []Apply{
-		{Hosts: []string{GitHost}, Scheme: "basic", Username: "x-access-token", Paths: git},
-		{Hosts: []string{APIHost}, Scheme: "bearer", Paths: api},
-	}
+// gitItem is the github.com item of a token's uses, with paths, shared by [Uses] and
+// [PushUses] so that their host and scheme agree.
+func gitItem(paths []string) Apply {
+	return Apply{Hosts: []string{GitHost}, Scheme: "basic", Username: "x-access-token", Paths: paths}
 }
 
 // Client is how the package reaches GitHub's API.
