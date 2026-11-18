@@ -118,7 +118,10 @@ Check your gh login and its access to owner/name, then run `qory run` again: the
 ```
 
 qory stops the program after 120 seconds and then reads no line. The program ends itself
-after 110 seconds when `gh` has not finished: it ends the `gh` call, prints ``Run `qory run`
-again; `gh` did not answer within 110 seconds.`` on standard error, and exits with status 1,
-so the commit lines that it printed are read. The tests set `OPEN_DRAFT_WATCHDOG_SECONDS`, from 1 to 110, to shorten the limit; the
-program takes no larger value.
+after 110 seconds when `gh` has not finished: it ends the `gh` call, prints
+``Run `qory run` again; `gh` did not answer within 110 seconds.`` on standard error, and
+exits with status 1, so the commit lines that it printed are read. SIGHUP, SIGINT and SIGTERM end the
+timer, the work and `gh` the same way, with status 1. A SIGKILL of the program leaves its
+timer, a `sleep`, running for up to 110 seconds. The tests set
+`OPEN_DRAFT_WATCHDOG_SECONDS`, from 1 to 110, to shorten the limit; the program takes no
+larger value.

@@ -575,6 +575,8 @@ func TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing.T)
 		{"the installation lookup is 301", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 301, `{"message":"Moved Permanently"}`), "forge_refused", github.FixMoved, "GitHub answered 301: Moved Permanently", false},
 		{"the installation lookup is 308", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 308, `{"message":"Permanent Redirect"}`), "forge_refused", github.FixMoved, "GitHub answered 308: Permanent Redirect", false},
 		{"the installation lookup is 404", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 404, `{"message":"Not Found"}`), "not_permitted", fixNotInstalled, "", false},
+		{"the installation lookup is 302", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 302, `{"message":"Found"}`), "not_permitted", fixNotInstalled, "", false},
+		{"the installation lookup is 307", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 307, `{"message":"Temporary Redirect"}`), "not_permitted", fixNotInstalled, "", false},
 		{"a suspended installation", "Text.", func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", "Unsuspend the App's installation on GitHub.", "", false},
 		{"the create is 403", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub answered 403: Resource not accessible by integration", false},
 		{"the repository moved", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 301, `{"message":"Moved Permanently"}`), "forge_refused", "Link the repository by its new name: GitHub moved it.", "GitHub answered 301: Moved Permanently", false},

@@ -437,3 +437,17 @@ func TestARedirectOnTheInstallationLookupSaysTheRepositoryMovedOnlyFor301And308(
 		}
 	}
 }
+
+// TestAMovedPullRequestRepositoryIsForgeRefusedWithTheMovedFix: GitHub's 301 and 308 to a
+// request of a submission are [ReasonForgeRefused] with [FixMoved], with the answer's
+// status and message in the detail, and never [ReasonNotPermitted].
+func TestAMovedPullRequestRepositoryIsForgeRefusedWithTheMovedFix(t *testing.T) {
+	for _, status := range []int{301, 308} {
+		a := &apiReply{status: status, body: []byte(`{"message":"Moved Permanently"}`)}
+		err := submitFailed(a, "listing the pull requests", false)
+		var refused *SubmitRefused
+		if !errors.As(err, &refused) || refused.Reason != ReasonForgeRefused || refused.Fix != FixMoved || refused.Status != status {
+			t.Errorf("%d: %v", status, err)
+		}
+	}
+}

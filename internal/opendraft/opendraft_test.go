@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,7 +78,11 @@ case "$1 $2" in
 	esac
 	;;
 esac
-if [ -f "$d/hang.$key" ]; then exec sleep 31337; fi
+if [ -f "$d/hang.$key" ]; then
+	# A hang file with text makes a gh that ignores TERM; exec keeps the ignoring.
+	if [ -s "$d/hang.$key" ]; then trap '' TERM; fi
+	exec sleep 31337
+fi
 k=$(cat "$d/k.$key" 2>/dev/null || echo 0)
 k=$((k + 1))
 echo "$k" >"$d/k.$key"
@@ -299,6 +304,16 @@ func (f *fake) run(env ...string) result {
 
 func (f *fake) runProgram(prog string, shell []string, env ...string) result {
 	f.t.Helper()
+	cmd := f.command(prog, shell, env...)
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	return f.finish(err, out.String(), errb.String())
+}
+
+// command is the program with the inputs of the fake and env, not started.
+func (f *fake) command(prog string, shell []string, env ...string) *exec.Cmd {
+	f.t.Helper()
 	vars := map[string]string{}
 	for k, v := range f.input {
 		vars[k] = v
@@ -323,16 +338,19 @@ func (f *fake) runProgram(prog string, shell []string, env ...string) result {
 	for k, v := range vars {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	var out, errb strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	err := cmd.Run()
+	return cmd
+}
+
+// finish is the result of a run that ended with err, after the checks that every run has.
+func (f *fake) finish(err error, stdout, stderr string) result {
+	f.t.Helper()
 	code := 0
 	if ee, ok := err.(*exec.ExitError); ok {
 		code = ee.ExitCode()
 	} else if err != nil {
 		f.t.Fatal(err)
 	}
-	r := result{out.String(), errb.String(), code}
+	r := result{stdout, stderr, code}
 	if left, _ := filepath.Glob(filepath.Join(f.tmp, "*")); len(left) > 0 {
 		f.t.Errorf("the program left %v in TMPDIR", left)
 	}
@@ -1230,4 +1248,108 @@ func TestTheWatchdogLimitIsAtMost110Seconds(t *testing.T) {
 			t.Errorf("%q: the timer slept %q, want %s", c.value, got, c.want)
 		}
 	}
+}
+
+// started runs the program and waits until its hung gh, the second call, is running; it
+// returns the command, which the test signals, and a function that waits for its result.
+func (f *fake) started(env ...string) (*exec.Cmd, func() result) {
+	f.t.Helper()
+	var shell []string
+	if sh := os.Getenv("OPEN_DRAFT_TEST_SHELL"); sh != "" {
+		shell = []string{sh}
+	}
+	cmd := f.command(program(f.t), shell, env...)
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Start(); err != nil {
+		f.t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if b, err := os.ReadFile(filepath.Join(f.dir, "pid.2")); err == nil && len(b) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cmd.Process.Kill()
+			f.t.Fatal("the hung gh did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cmd, func() result {
+		select {
+		case err := <-done:
+			return f.finish(err, out.String(), errb.String())
+		case <-time.After(30 * time.Second):
+			cmd.Process.Kill()
+			f.t.Fatal("the program did not end")
+			return result{}
+		}
+	}
+}
+
+// allStopped checks that every sleep that the program started, the timer and the hung gh,
+// is gone, and the temporary directory too, which finish checks.
+func (f *fake) allStopped() {
+	f.t.Helper()
+	var pids []string
+	for _, s := range f.sleeps() {
+		pids = append(pids, s[0])
+	}
+	if b, err := os.ReadFile(filepath.Join(f.dir, "pid.2")); err == nil {
+		pids = append(pids, strings.TrimSpace(string(b)))
+	}
+	if len(pids) < 2 {
+		f.t.Fatalf("the program started %d processes to check: %v", len(pids), pids)
+	}
+	if left := alive(pids...); len(left) != 0 {
+		f.t.Errorf("processes %v are still running", left)
+	}
+}
+
+// TestASignalEndsTheProgramWithStatus1AndLeavesNothing: HUP, INT and TERM, sent to the
+// program while gh hangs, end it with status 1, the commit lines printed, no timer, no gh,
+// and no file in the temporary directory.
+func TestASignalEndsTheProgramWithStatus1AndLeavesNothing(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM} {
+		t.Run(sig.String(), func(t *testing.T) {
+			f := newFake(t, "text")
+			f.have(pull{Number: 8, Draft: true, Body: block("Old.")})
+			f.set("hang.list", "")
+			cmd, wait := f.started()
+			if err := cmd.Process.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
+			began := time.Now()
+			r := wait()
+			wantResult(t, r, 1, commitLines())
+			if took := time.Since(began); took > 10*time.Second {
+				t.Errorf("the program took %v to end", took)
+			}
+			f.allStopped()
+		})
+	}
+}
+
+// TestAGhThatIgnoresTermIsKilled: gh ignores SIGTERM, and the watchdog, or a signal to
+// the program, ends it after a second with SIGKILL: status 1, and no gh left.
+func TestAGhThatIgnoresTermIsKilled(t *testing.T) {
+	t.Run("the watchdog", func(t *testing.T) {
+		f := newFake(t, "text")
+		f.have(pull{Number: 8, Draft: true, Body: block("Old.")})
+		f.set("hang.list", "ignore TERM")
+		r := f.run("OPEN_DRAFT_WATCHDOG_SECONDS=2")
+		wantResult(t, r, 1, commitLines())
+		f.allStopped()
+	})
+	t.Run("a signal", func(t *testing.T) {
+		f := newFake(t, "text")
+		f.have(pull{Number: 8, Draft: true, Body: block("Old.")})
+		f.set("hang.list", "ignore TERM")
+		cmd, wait := f.started()
+		cmd.Process.Signal(syscall.SIGTERM)
+		wantResult(t, wait(), 1, commitLines())
+		f.allStopped()
+	})
 }

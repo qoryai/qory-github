@@ -45,11 +45,27 @@ cleanup() {
 	# A signal or the watchdog stopped the program before the work ended: end what it
 	# started. After a normal end the pids are gone, and nothing is signalled.
 	if [ -n "$stopped" ]; then
-		for _p in "$timer" "$worker" "$(cat "$tmp/gh.pid" 2>/dev/null || :)"; do
+		# The worker and the timer first, so the worker starts no other gh; they end at
+		# TERM, and wait reaps them. Then the gh that the worker left: TERM, and KILL
+		# after 1 second for a gh that ignores TERM.
+		for _p in "$worker" "$timer"; do
 			if [ -n "$_p" ]; then
 				kill "$_p" 2>/dev/null || :
+				wait "$_p" 2>/dev/null || :
 			fi
 		done
+		_gh=$(cat "$tmp/gh.pid" 2>/dev/null || :)
+		if [ -n "$_gh" ] && kill -0 "$_gh" 2>/dev/null; then
+			kill "$_gh" 2>/dev/null || :
+			_n=0
+			while [ "$_n" -lt 2000 ] && kill -0 "$_gh" 2>/dev/null; do
+				_n=$((_n + 1))
+			done
+			if kill -0 "$_gh" 2>/dev/null; then
+				sleep 1
+				kill -9 "$_gh" 2>/dev/null || :
+			fi
+		fi
 	fi
 	if [ -n "$tmp" ]; then
 		rm -rf "$tmp"
@@ -447,15 +463,13 @@ print_draft() {
 	case $_state in
 	closed | merged) _action=kept ;;
 	esac
-	printf 'draft_number %s\n' "$(sed -n 1p "$tmp/pull")"
-	printf 'draft_url %s\n' "$(sed -n 8p "$tmp/pull")"
 	_title=$(sed -n 7p "$tmp/pull")
 	if [ -z "$_title" ]; then
 		_title=$fallback_title
 	fi
-	printf 'draft_title %s\n' "$_title"
-	printf 'draft_state %s\n' "$_state"
-	printf 'draft_action %s\n' "$_action"
+	# One printf, so one write: a signal cannot leave some of the five lines.
+	printf 'draft_number %s\ndraft_url %s\ndraft_title %s\ndraft_state %s\ndraft_action %s\n' \
+		"$(sed -n 1p "$tmp/pull")" "$(sed -n 8p "$tmp/pull")" "$_title" "$_state" "$_action"
 }
 
 # ---------------------------------------------------------------- the work
@@ -522,7 +536,11 @@ publish() {
 run_gh() {
 	command gh "$@" &
 	echo "$!" >"$tmp/gh.pid"
-	wait "$!"
+	_s=0
+	wait "$!" || _s=$?
+	# The pid is free for another process now, so the cleanup must not find it.
+	rm -f "$tmp/gh.pid"
+	return "$_s"
 }
 
 # ------------------------------------------------------------------ the watchdog
