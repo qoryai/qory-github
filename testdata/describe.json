@@ -115,6 +115,7 @@
         "other": "repositories"
       },
       "comments": true,
+      "submissions": true,
       "targets": true,
       "program": "qory-github-server",
       "setup": {

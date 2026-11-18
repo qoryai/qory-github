@@ -34,8 +34,11 @@ const (
 	routeChanges     = "/v1/work-items/changes"
 	changesAfter     = "after"
 	// routeChangesFailed is the route of the failure report for a comment entry of the
-	// feed whose comment was not posted.
-	routeChangesFailed = "/v1/work-items/changes/failed"
+	// feed whose comment was not posted, or a repository of a submission entry that was
+	// not put on GitHub; routeChangesSubmitted is the route of the reply for a
+	// repository of a submission entry that was.
+	routeChangesFailed    = "/v1/work-items/changes/failed"
+	routeChangesSubmitted = "/v1/work-items/changes/submitted"
 	// routeConnectionsDisconnect ends a connection the source no longer grants access.
 	routeConnectionsDisconnect = "/v1/connections/disconnect"
 	// headerContractVersion carries contracts.Revision on every request. It is not
@@ -53,29 +56,6 @@ const (
 	defaultSyncInterval = 3600
 	minimumSyncInterval = 900
 )
-
-// The harness module that contains GitHub's submit program, bin/open-draft, which
-// [Apiary.Declare] sends as submit_module at [Apiary.Commit].
-const (
-	submitModuleGit  = "https://github.com/qoryai/qory-github"
-	submitModulePath = "modules/github"
-)
-
-// fullCommit matches a full commit id, as submit_module's ref must be.
-var fullCommit = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
-
-// noSubmitModule is the line serve logs at start when [Options.Commit] is not a full
-// commit id, so its declarations send no submit_module.
-const noSubmitModule = "Build with -X main.commit=<full commit> to declare the submit module: this build sends none"
-
-// submitModule is the submit_module of a build from commit, or nil when commit is not
-// a full commit id, as in a build with no -X main.commit.
-func submitModule(commit string) *contracts.SubmitModule {
-	if !fullCommit.MatchString(commit) {
-		return nil
-	}
-	return &contracts.SubmitModule{Source: contracts.HarnessSource{Git: submitModuleGit, Ref: commit, Path: submitModulePath}}
-}
 
 // maximumSyncInterval is the longest interval the contract allows, a day: a longer one
 // in the change feed is taken as a day.
@@ -163,9 +143,6 @@ type Apiary struct {
 	// ProgramVersion is the program's version, which the description that
 	// [Apiary.Declare] sends carries as its program_version.
 	ProgramVersion string
-	// Commit is the commit the program was built from. When it is a full commit id,
-	// [Apiary.Declare] sends submit_module, the module github of qory-github at Commit.
-	Commit string
 	// HTTP is the client; nil is one with no other setting. Whichever it is, its
 	// timeout is the request's, and no redirect is followed.
 	HTTP *http.Client
@@ -381,13 +358,37 @@ func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments)
 }
 
 // ChangesFailed sends POST /v1/work-items/changes/failed: the adapter stopped trying to
-// post the comment of the comment entry with the comment_id in req, for req's reason.
-// Qory Apiary returns the signed 204 for a comment_id that has no comment entry, and
-// for one whose comment it matched to a posted comment already, so a repeated
-// report is no error. Its 400 and 403 are [Permanent], as every request's are: the
-// report is not sent again.
+// post the comment of the comment entry with the comment_id in req, or to put the
+// repository of the submission entry with the submission_id, system and path in req on
+// GitHub, for req's reason. Qory Apiary returns the signed 204 for a comment_id that has
+// no comment entry, and for one whose comment it matched to a posted comment already, so
+// a repeated report is no error. Its 400 and 403 are [Permanent], as every request's
+// are: the report is not sent again.
 func (a *Apiary) ChangesFailed(ctx context.Context, req contracts.ChangesFailed) error {
-	return a.post(ctx, "sending the failure report of the comment "+req.CommentID, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+	what := "sending the failure report of the comment " + req.CommentID
+	if req.SubmissionID != "" {
+		what = "sending the failure report of the submission " + req.SubmissionID
+	}
+	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+}
+
+// SubmissionFailed sends POST /v1/work-items/changes/failed for a repository of a
+// submission entry: the adapter stopped trying to put the repository with the
+// submission_id, system and path in req on GitHub, for req's reason, with detail, see
+// [github.SubmitRefused.Detail]. Qory Apiary answers as for [Apiary.ChangesFailed].
+func (a *Apiary) SubmissionFailed(ctx context.Context, req contracts.ChangesFailed, detail string) error {
+	what := "sending the failure report of the submission " + req.SubmissionID
+	req.Detail = detail
+	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+}
+
+// ChangesSubmitted sends POST /v1/work-items/changes/submitted: what the adapter put on
+// GitHub for the repositories of the submission entry with the submission_id in req, one
+// reply for the entry. Qory Apiary keeps the first reply for a repository and answers
+// the signed 204 to a later one, so a repeated reply is no error. Its 400 and 403 are [Permanent], as every
+// request's are: the reply is not sent again.
+func (a *Apiary) ChangesSubmitted(ctx context.Context, req contracts.ChangesSubmitted) error {
+	return a.post(ctx, "sending the reply for the submission "+req.SubmissionID, routeChangesSubmitted, "", "", func(t string) any { req.Time = t; return req })
 }
 
 // Disconnect sends POST /v1/sources/disconnect, which names the collection's ref and the
@@ -440,8 +441,7 @@ func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.Connect
 // is once an App is kept or the settings give one; where Qory Apiary calls serve,
 // [Apiary.CallURL], declared only with no setupURL; how often serve pulls from GitHub,
 // and whether it sends changes as they happen, which it does unless
-// [Apiary.PullsAlone]; the integration's description; and submit_module, the module
-// github at [Apiary.Commit], when Commit is a full commit id. The description is
+// [Apiary.PullsAlone]; and the integration's description. The description is
 // [github.Describe] with [Apiary.ProgramVersion], the source role among its roles: the
 // document qory-github describe prints where QORY_FEATURES names factory, as
 // json.Marshal writes it. Every declaration carries it. A description that cannot be
@@ -457,13 +457,12 @@ func (a *Apiary) Declare(ctx context.Context, publicURL, setupURL string) error 
 		callURL = a.CallURL
 	}
 	req := contracts.Adapter{
-		Version:      contracts.Version,
-		ConnectURL:   publicURL + connectPath,
-		SetupURL:     setupURL,
-		CallURL:      callURL,
-		Sync:         contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: !a.PullsAlone},
-		Description:  description,
-		SubmitModule: submitModule(a.Commit),
+		Version:     contracts.Version,
+		ConnectURL:  publicURL + connectPath,
+		SetupURL:    setupURL,
+		CallURL:     callURL,
+		Sync:        contracts.Sync{DefaultInterval: defaultSyncInterval, MinimumInterval: minimumSyncInterval, SendsChanges: !a.PullsAlone},
+		Description: description,
 	}
 	return a.post(ctx, what, routeAdapter, "", "", func(t string) any { req.Time = t; return req })
 }

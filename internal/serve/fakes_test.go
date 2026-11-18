@@ -207,6 +207,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 
 		routeConnectionsDisconnect: "connections-disconnect.schema.json",
 		routeChangesFailed:         "changes-failed.schema.json",
+		routeChangesSubmitted:      "changes-submitted.schema.json",
 		routeSecrets:               "adapter-secrets.schema.json",
 		routeGrants:                "grant.schema.json",
 		routeGrantsEnd:             "grant-end.schema.json",
@@ -801,6 +802,9 @@ func (f *fakeApiary) client(key *accesskey.Key) *Apiary {
 // an undo's removal of the label, each by the repository's id, /repositories/{id}.
 type fakeGitHub struct {
 	srv *httptest.Server
+	// The pull requests of the repositories, and what a test may change of how the
+	// stand-in answers for them, see [pullStore].
+	pullStore
 
 	mu       sync.Mutex
 	repos    []string
@@ -996,6 +1000,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer f.answered(f, r.Method+" "+r.URL.RequestURI(), b)
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if repo, rest, ok := pullsRoute(r.URL.Path); ok {
+		f.pullsAPI(w, r, b, repo, rest)
+		return
+	}
 	const widgets = "/repositories/" + widgetsRef
 	moved := "/repositories/" + strconv.Itoa(movedID)
 	switch {
@@ -1040,6 +1048,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.oldRead != nil {
 			f.oldRead()
 		}
+	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && f.pullMint != nil && strings.Contains(string(b), "pull_requests"):
+		status, body := f.pullMint()
+		w.WriteHeader(status)
+		io.WriteString(w, body)
 	case r.Method == "POST" && (r.URL.Path == "/app/installations/42/access_tokens" || r.URL.Path == "/app/installations/9/access_tokens"):
 		f.mints = append(f.mints, string(b))
 		w.WriteHeader(201)

@@ -9,27 +9,46 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` sends `submit_module` in its start-up body to Qory Apiary:
-  the module `modules/github` of `https://github.com/qoryai/qory-github` at the commit
-  the program was built from. The build sets that commit with
-  `-ldflags "-X main.commit=<full commit>"`; the Dockerfile takes it as the build
-  argument `COMMIT`, and the pre-release image workflow passes the commit it builds. That
-  workflow builds only a commit on main, and stops with an error for any other.
-  A build without a full commit id of 40 or 64 lower-case hex digits sends no
-  `submit_module`, and serve logs at start:
-  `Build with -X main.commit=<full commit> to declare the submit module: this build sends none`.
+- `qory-github-server serve` opens or updates the draft pull request for each `submission`
+  entry of Qory Apiary's change feed, in Go, over GitHub's REST API, with an installation
+  token of the App for that one repository with `pull_requests: write` and no other
+  permission. For each repository of the entry it sends Qory Apiary the address of the
+  base commit and of each commit, with or without a draft, and, when the entry asks for a
+  draft, the pull request's number, address, title, state and action, in one reply for the
+  entry. It finds the pull request by its head branch and repository, of any state, and
+  never by its base branch, opens a draft when there is none, and changes only the text
+  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and
+  the title only while it equals the previous version's title. A closed or merged pull
+  request is not changed. One repository that fails does not stop the others. A repository
+  that GitHub refuses for good is reported to Qory Apiary with the reason `not_permitted`,
+  `branch_gone`, `too_long` or `forge_refused`, and a `detail` with the fix and GitHub's
+  status and message; one that still fails when the retries end, after a day, is reported
+  with the reason of the last error of its tries: `unreachable` for a failure to reach
+  GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such
+  as a 404 or a 401 that kept coming. A 301 or 308, also on the lookup of the
+  installation, is `forge_refused`, and its fix says GitHub moved the repository; a 302,
+  307, 404 or 403 on the lookup stays `not_permitted`. The App needs the permission Pull
+  requests: read and write. The title in the reply has none of the control, bidirectional
+  or invisible characters that Qory Apiary refuses.
+- The description of the adapter has `submissions: true` in `roles.source`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
-  module's `submit_program`. The program sets a GitHub commit link for each commit of a
-  run's submission file. After a passed round with a title and a description, it opens a
-  draft pull request from the branch in `ref` into the base branch listed in
-  `QORY_SUBMIT_BASES`, or updates the title and description of the open one, and writes
-  its number and link into the file. It reaches `api.github.com` only through the proxy
-  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. The program updates
-  only an open pull request from that branch of that repository into that base branch.
-  Every call to GitHub ends by 100 seconds after the program starts. Exit 1 means a call
-  to GitHub failed or a write of the file failed. Exit 2 means wrong input: with a wrong
-  structure, the file is unchanged; with a wrong input of the drafts, such as a missing
-  base branch, the file has only the commit links.
+  module's `submit_program`. It is a POSIX `sh` script that uses `gh`. qory runs it on
+  your machine, outside the sandbox that a run uses, once for each repository of a run
+  that has no run code, after it pushed the branch. A run that has a run code runs no
+  program: `qory-github-server serve` opens its draft pull request from the change feed.
+  The program prints the GitHub address of each commit and, for a run with hand-off text,
+  opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the one that exists,
+  with the login of `gh`. The title it prints has none of the characters that the contract
+  refuses; when nothing is left, it prints `QORY_SUBMIT_TITLE`, cleaned the same way. It
+  finds the pull request by its head branch and repository alone, in any state. Of several
+  it takes the highest number that is not closed and not merged, otherwise the highest
+  number. It replaces only the text between the lines `<!-- qory:start -->` and
+  `<!-- qory:end -->` of the description, keeps the title, and changes nothing in a closed or
+  merged pull request. It prints the result as lines (`draft_number`, `draft_url`,
+  `draft_title`, `draft_state`, `draft_action`, `commit_url`). Exit 1 means a call to `gh`
+  failed or did not finish within 110 seconds, exit 2 an input it cannot use, and exit 3 a
+  missing login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first
+  line on standard error. The program pushes nothing.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

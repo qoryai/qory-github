@@ -275,11 +275,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	if got.Token == "" {
-		return nil, errors.New(minting + ": GitHub answered without a token")
+		return nil, unreadableAt(http.StatusCreated, minting+": GitHub answered without a token", nil)
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
+		return nil, unreadableAt(http.StatusCreated, fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
@@ -440,10 +440,10 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
+		return fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != want {
 		var e struct {
 			Message string `json:"message"`
@@ -452,13 +452,17 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
+		limited := (&apiReply{status: resp.StatusCode, header: resp.Header, body: b}).rateLimited()
+		return &answerError{what: what, status: resp.StatusCode, message: e.Message, limited: limited && resp.StatusCode == http.StatusForbidden}
 	}
 	if out == nil {
 		return nil
 	}
+	if readErr != nil {
+		return connectionFailed(what, path, readErr)
+	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
+		return unreadableAt(resp.StatusCode, fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	return nil
 }
@@ -469,6 +473,8 @@ type answerError struct {
 	what    string
 	status  int
 	message string
+	// limited is whether the answer is a 403 for GitHub's rate limit, not a refusal.
+	limited bool
 }
 
 func (e *answerError) Error() string {
@@ -482,6 +488,13 @@ func (e *answerError) Error() string {
 func Forbidden(err error) bool {
 	var e *answerError
 	return errors.As(err, &e) && e.status == http.StatusForbidden
+}
+
+// RateLimited is whether err, or an error it wraps, is GitHub's 403 for its rate limit, as
+// its headers or its message say, which passes rather than refuses: a retry can succeed.
+func RateLimited(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.limited
 }
 
 // Unauthorized is whether err, or an error it wraps, is GitHub's 401 to a request

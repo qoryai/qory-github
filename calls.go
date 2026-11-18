@@ -22,6 +22,22 @@ import (
 // owner/name, or the name moved.
 var ErrNotInstalled = errors.New("GitHub has no installation of the App on the repository")
 
+// ErrRepositoryMoved is also in the error of [Client.RepositoryInstallation] when GitHub
+// returns 301 or 308: the repository moved or was renamed. Such an error is
+// [ErrNotInstalled] too, and has GitHub's answer for [AnswerOf].
+var ErrRepositoryMoved = errors.New("GitHub moved the repository")
+
+// movedError is the answer 301 or 308 to the lookup of a repository's installation.
+type movedError struct{ answer *answerError }
+
+func (e *movedError) Error() string { return e.answer.Error() }
+func (e *movedError) Unwrap() error { return e.answer }
+
+// Is makes the error [ErrNotInstalled] and [ErrRepositoryMoved] for errors.Is.
+func (e *movedError) Is(target error) bool {
+	return target == ErrNotInstalled || target == ErrRepositoryMoved
+}
+
 // ErrVersionNotFound is the error of [Client.CommitAt] when GitHub returns 404, 409 for
 // an empty repository, or 422: the repository has no commit, branch or tag by the name
 // asked for.
@@ -42,7 +58,8 @@ const maxDocumentAnswer = 2 << 20
 // RepositoryInstallation reads from GitHub, with the App's token, the installation of
 // the App that reaches the repository by owner/name, GET
 // /repos/{owner}/{repo}/installation, and returns its id and its account's login. A
-// 404 or a redirect is [ErrNotInstalled]. The redirect is never followed.
+// 404 or a redirect is [ErrNotInstalled], and a 301 or 308 is [ErrRepositoryMoved] too.
+// The redirect is never followed.
 func (c Client) RepositoryInstallation(ctx context.Context, appID string, key *rsa.PrivateKey, repo Repository) (int64, string, error) {
 	const what = "finding the App's installation on a repository"
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
@@ -68,12 +85,14 @@ func (c Client) RepositoryInstallation(ctx context.Context, appID string, key *r
 	err = c.call(ctx, what, http.MethodGet, "/repos/"+repo.String()+"/installation", jwt, nil, http.StatusOK, &got)
 	var answered *answerError
 	switch {
+	case errors.As(err, &answered) && (answered.status == http.StatusMovedPermanently || answered.status == http.StatusPermanentRedirect):
+		return 0, "", &movedError{answered}
 	case errors.As(err, &answered) && (answered.redirect() || answered.status == http.StatusNotFound):
 		return 0, "", ErrNotInstalled
 	case err != nil:
 		return 0, "", err
 	case got.ID <= 0 || !ownerShape.MatchString(got.Account.Login):
-		return 0, "", errors.New(what + ": GitHub's answer has no installation id or no account login")
+		return 0, "", unreadableAt(http.StatusOK, what+": GitHub's answer has no installation id or no account login", nil)
 	}
 	return got.ID, got.Account.Login, nil
 }
@@ -93,7 +112,7 @@ func (c Client) RepositoryID(ctx context.Context, token string, repo Repository)
 	}
 	name, ok := nameOf(r)
 	if r.ID <= 0 || !ok {
-		return 0, Repository{}, errors.New(what + ": GitHub's answer has no id or no owner/name")
+		return 0, Repository{}, unreadableAt(http.StatusOK, what+": GitHub's answer has no id or no owner/name", nil)
 	}
 	return r.ID, name, nil
 }
@@ -121,7 +140,7 @@ func (c Client) CommitAt(ctx context.Context, token string, repository int64, at
 	case len(got) == 0:
 		return "", ErrVersionNotFound
 	case !shaShape.MatchString(got[0].SHA):
-		return "", errors.New(what + ": GitHub's answer has no commit id")
+		return "", unreadableAt(http.StatusOK, what+": GitHub's answer has no commit id", nil)
 	}
 	return got[0].SHA, nil
 }

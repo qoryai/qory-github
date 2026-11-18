@@ -281,7 +281,7 @@ func (a *apiReply) err(what string) error {
 	if e.Message == "" {
 		e.Message = http.StatusText(a.status)
 	}
-	return &answerError{what: what, status: a.status, message: e.Message}
+	return &answerError{what: what, status: a.status, message: e.Message, limited: a.status == http.StatusForbidden && a.rateLimited()}
 }
 
 // send makes one request to the API with an installation token, paced by p, or by a new
@@ -336,7 +336,7 @@ func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, m
 		hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		resp, err := hc.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
+			return nil, fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))
 		}
 		return resp, nil
 	}
@@ -350,10 +350,10 @@ func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, m
 	defer resp.Body.Close()
 	a, err := io.ReadAll(io.LimitReader(resp.Body, int64(largest)+1))
 	if err != nil {
-		return nil, &unreadAnswer{status: resp.StatusCode, err: fmt.Errorf("%s: GitHub's answer could not be read: %w", what, unsent(err, path))}
+		return nil, &unreadAnswer{status: resp.StatusCode, err: connectionFailed(what, path, err)}
 	}
 	if len(a) > largest {
-		return nil, &unreadAnswer{status: resp.StatusCode, err: fmt.Errorf("%s: GitHub's answer is larger than %d bytes", what, largest)}
+		return nil, &unreadAnswer{status: resp.StatusCode, err: unreadableAt(resp.StatusCode, fmt.Sprintf("%s: GitHub's answer is larger than %d bytes", what, largest), nil)}
 	}
 	return &apiReply{status: resp.StatusCode, header: resp.Header, body: a}, nil
 }
@@ -371,7 +371,7 @@ func (c Client) get(ctx context.Context, p *Pacer, listing bool, what, path, tok
 		return "", a.err(what)
 	}
 	if err := json.Unmarshal(a.body, out); err != nil {
-		return "", fmt.Errorf("%s: GitHub's answer: %w", what, err)
+		return "", unreadableAt(a.status, fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	next, err := nextPage(a.header.Values("Link"), c.base())
 	if err != nil {

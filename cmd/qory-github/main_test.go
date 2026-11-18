@@ -456,7 +456,7 @@ func TestDescribeLeavesTheSourceRoleOutWithoutFactory(t *testing.T) {
 // TestDescribeHasASourceRoleTheContractAccepts pins that describe, where QORY_FEATURES
 // names factory, names the source role, qory-github-server, with every member the
 // integration contract requires, item_noun, issue and issues, collection_noun,
-// repository and repositories, comments, true, targets, true, secrets, the four the
+// repository and repositories, comments, true, submissions, true, targets, true, secrets, the four the
 // adapter stores in Qory Apiary, credential_scope, apply, and guide, with steps for setup
 // and for connect in plain text, and that the contract's schema, as conformance compiles
 // it, checks that role:
@@ -486,8 +486,8 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 			t.Errorf("the source role has no %s", m)
 		}
 	}
-	if len(source) != len(members)+8 {
-		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+8, source)
+	if len(source) != len(members)+9 {
+		t.Errorf("the source role has %d members, want %d: %v", len(source), len(members)+9, source)
 	}
 	guide, _ := source["guide"].(map[string]any)
 	for _, part := range []string{"setup", "connect"} {
@@ -514,6 +514,9 @@ func TestDescribeHasASourceRoleTheContractAccepts(t *testing.T) {
 	}
 	if noun, _ := source["collection_noun"].(map[string]any); len(noun) != 2 || noun["one"] != "repository" || noun["other"] != "repositories" {
 		t.Errorf("the source role's collection_noun is %v, want repository and repositories", source["collection_noun"])
+	}
+	if source["submissions"] != true {
+		t.Errorf("the source role's submissions is %v, want true: Qory Apiary writes a submission entry for each submission version a run stores", source["submissions"])
 	}
 	if source["comments"] != true {
 		t.Errorf("the source role's comments is %v, want true: Qory Apiary writes a comment entry for each comment a person writes on a work item taken in from an issue", source["comments"])
