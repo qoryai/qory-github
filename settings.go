@@ -77,6 +77,10 @@ type SourceRole struct {
 	// Qory Apiary on a work item taken in from it, so Qory Apiary writes a comment entry
 	// to the change feed for each.
 	Comments bool `json:"comments,omitempty"`
+	// Submissions is true: the adapter opens or updates the draft pull request of each
+	// submission a run stores and gives each commit of it its address, so Qory Apiary
+	// writes a submission entry to the change feed for each stored submission version.
+	Submissions bool `json:"submissions,omitempty"`
 	// Targets is true: a repository can be the target of a run, the place where the
 	// run's changes go, so Qory Apiary offers the repositories as targets.
 	Targets    bool       `json:"targets,omitempty"`

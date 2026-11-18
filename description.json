@@ -69,6 +69,7 @@
       "item_noun": {"one": "issue", "other": "issues"},
       "collection_noun": {"one": "repository", "other": "repositories"},
       "comments": true,
+      "submissions": true,
       "targets": true,
       "program": "qory-github-server",
       "setup": {
