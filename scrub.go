@@ -81,7 +81,8 @@ var (
 	secretShape = regexp.MustCompile(`(?i)(?-i:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)` + tokenChars(`[A-Za-z0-9_]`, 8) +
 		`|` + spread("eyJ") + tokenChars(`[A-Za-z0-9_-]`, 8) + `(?:` + between + `\.` + tokenChars(`[A-Za-z0-9_-]`, 1) + `){1,2}` +
 		`|\b` + spread("bearer") + space + valueShape(valueChars, 8, `[0-9]`) +
-		`|\b` + spread("basic") + space + valueShape(base64Chars, 8, `[0-9+/=]`) +
+		// A basic value of letters only and under 20 characters is not removed: GitHub never echoes one.
+		`|\b` + spread("basic") + space + valueShape(base64Chars, 12, `[0-9+/=]`) +
 		`|(?s:-----BEGIN[^-]*KEY-----.*?(?:-----END[^-]*KEY-----|$))` +
 		`|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
 )
