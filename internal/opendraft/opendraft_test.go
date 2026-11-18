@@ -1151,6 +1151,19 @@ func (f *fake) sleeps() [][]string {
 	return out
 }
 
+// graceSleeps are the sleeps of 1 second that the program started: the wait of the
+// cleanup for a gh that still runs after TERM. No other sleep of these tests lasts 1
+// second: the timer is 3 seconds or more, and the hung gh is 31337.
+func (f *fake) graceSleeps() [][]string {
+	var out [][]string
+	for _, s := range f.sleeps() {
+		if len(s) > 1 && s[1] == "1" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // running is whether the process pid runs. A process that ended and was not waited for
 // is a zombie: signal 0 reaches it, and it is not running. A container whose first
 // process does not wait for orphans, such as the CI image, keeps them as zombies.
@@ -1211,17 +1224,17 @@ func TestAHungGhEndsTheProgramWithStatus1AndTheAddressesPrinted(t *testing.T) {
 	if want := "Run `qory run` again: the `gh` call did not finish within 3 seconds.\n"; r.stderr != want {
 		t.Errorf("stderr %q, want %q", r.stderr, want)
 	}
-	// The sleeps are the timer and the hung gh, which the fake makes a sleep. The sleep of
-	// 1 second is the wait of the cleanup for a gh that does not end at TERM, which this
-	// run needs only when gh ends late.
+	// The sleeps are the timer and the hung gh, which the fake makes a sleep. A third, of
+	// 1 second, is the wait of the cleanup for a gh that still runs after TERM: this gh
+	// ends at TERM, so the program must not wait. Every sleep is checked for a leftover.
 	var pids []string
 	for _, s := range f.sleeps() {
-		if len(s) > 1 && s[1] == "1" {
-			continue
-		}
 		pids = append(pids, s[0])
 	}
-	if len(pids) != 2 {
+	if grace := f.graceSleeps(); len(grace) != 0 {
+		t.Errorf("the cleanup waited for a gh that ended at TERM: %v", grace)
+	}
+	if want := 2 + len(f.graceSleeps()); len(pids) != want {
 		t.Fatalf("the program started %d sleeps, want the timer and the hung gh: %v", len(pids), f.sleeps())
 	}
 	if left := alive(pids...); len(left) != 0 {
@@ -1359,6 +1372,10 @@ func TestASignalEndsTheProgramWithStatus1AndLeavesNothing(t *testing.T) {
 			if took := time.Since(began); took > 10*time.Second {
 				t.Errorf("the program took %v to end", took)
 			}
+			// This gh ends at TERM, so the cleanup does not wait for it.
+			if grace := f.graceSleeps(); len(grace) != 0 {
+				t.Errorf("the cleanup waited for a gh that ended at TERM: %v", grace)
+			}
 			f.allStopped()
 		})
 	}
@@ -1373,6 +1390,9 @@ func TestAGhThatIgnoresTermIsKilled(t *testing.T) {
 		f.set("hang.list", "ignore TERM")
 		r := f.run("OPEN_DRAFT_WATCHDOG_SECONDS=2")
 		wantResult(t, r, 1, commitLines())
+		if grace := f.graceSleeps(); len(grace) != 1 {
+			t.Errorf("the cleanup waited %d times for a gh that ignores TERM, want 1: %v", len(grace), grace)
+		}
 		f.allStopped()
 	})
 	t.Run("a signal", func(t *testing.T) {
@@ -1382,6 +1402,9 @@ func TestAGhThatIgnoresTermIsKilled(t *testing.T) {
 		cmd, wait := f.started()
 		cmd.Process.Signal(syscall.SIGTERM)
 		wantResult(t, wait(), 1, commitLines())
+		if grace := f.graceSleeps(); len(grace) != 1 {
+			t.Errorf("the cleanup waited %d times for a gh that ignores TERM, want 1: %v", len(grace), grace)
+		}
 		f.allStopped()
 	})
 }
