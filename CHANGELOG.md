@@ -9,15 +9,6 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` sends `submit_module` in its start-up body to Qory Apiary:
-  the module `modules/github` of `https://github.com/qoryai/qory-github` at the commit
-  the program was built from. The build sets that commit with
-  `-ldflags "-X main.commit=<full commit>"`; the Dockerfile takes it as the build
-  argument `COMMIT`, and the pre-release image workflow passes the commit it builds. That
-  workflow builds only a commit on main, and stops with an error for any other.
-  A build without a full commit id of 40 or 64 lower-case hex digits sends no
-  `submit_module`, and serve logs at start:
-  `Build with -X main.commit=<full commit> to declare the submit module: this build sends none`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. The program sets a GitHub commit link for each commit of a
   run's submission file. After a passed round with a title and a description, it opens a

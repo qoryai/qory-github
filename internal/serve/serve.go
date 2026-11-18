@@ -64,11 +64,6 @@ type Options struct {
 	// ProgramVersion is the program's version, which the description serve declares
 	// at each start carries, see [Apiary.Declare]. It is required.
 	ProgramVersion string
-	// Commit is the commit the program was built from, which a build sets with
-	// -ldflags "-X main.commit=...". When it is a full commit id, serve declares the
-	// module github at it as submit_module; otherwise serve logs [noSubmitModule] at
-	// start and declares none.
-	Commit string
 	// Handlers are the handlers by event name; nil is the [Adapter]'s.
 	Handlers *Handlers
 	// Log takes serve's lines; nil logs nothing.
@@ -200,9 +195,6 @@ func Run(ctx context.Context, s Settings, opts Options) error {
 	}
 	if err := s.check(); err != nil {
 		return err
-	}
-	if submitModule(opts.Commit) == nil {
-		log.Warn(noSubmitModule)
 	}
 	if err := s.checkEnrolmentSource(); err != nil {
 		return err
@@ -375,7 +367,7 @@ func (r *runner) run(ctx context.Context, ln net.Listener) error {
 	}
 	in := r.creds.get()
 	r.apiary = &Apiary{
-		URL: s.ApiaryURL, KeyID: in.keyID, Key: in.key, Pin: in.pin, InstanceID: r.instance, ProgramVersion: r.opts.ProgramVersion, Commit: r.opts.Commit, Log: log,
+		URL: s.ApiaryURL, KeyID: in.keyID, Key: in.key, Pin: in.pin, InstanceID: r.instance, ProgramVersion: r.opts.ProgramVersion, Log: log,
 		Unlinked: func(ref string, began uint64) {
 			if _, err := unlinkSince(st, ref, began); err != nil {
 				log.Error("marking a collection not linked", slog.String("error", err.Error()))
