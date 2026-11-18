@@ -492,8 +492,8 @@ func TestAClosedOrMergedPullRequestIsNotEdited(t *testing.T) {
 	})
 }
 
-// The draft among several: the number in QORY_SUBMIT_DRAFT_NUMBER when it is one of them,
-// else the highest number that is not closed and not merged, else the highest number.
+// The draft among several: the highest number that is not closed and not merged, else
+// the highest number.
 func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		closed := pull{Number: 5, State: "closed", Title: "Five"}
@@ -507,32 +507,23 @@ func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 		upper := pull{Number: 23, Repo: "Acme-Corp/Widgets-App", Title: "Upper case", Draft: true, Body: "Text."}
 		for _, c := range []struct {
 			name   string
-			number string
 			ps     []pull
 			want   pull
 			state  string
 			action string
 		}{
-			{"the entry's number is among them", "7", []pull{closed, open7, open9, merged11}, open7, "draft", "updated"},
-			{"the entry's number is a closed one", "5", []pull{closed, open7, open9}, closed, "closed", "kept"},
-			{"the entry's number is not among them", "99", []pull{closed, open7, open9, merged11}, open9, "draft", "updated"},
-			{"the entry's number is a pull request of a fork", "20", []pull{open7, fork}, open7, "draft", "updated"},
-			{"no number: the highest that is not closed or merged", "", []pull{open7, closed, open9, merged11, closed12}, open9, "draft", "updated"},
-			{"no number: none is open, so the highest number", "", []pull{closed, merged11, closed12}, closed12, "closed", "kept"},
-			{"no number: none is open and the highest is merged", "", []pull{closed, closed12, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}}, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}, "merged", "kept"},
-			{"forks, deleted forks and other branches are not it", "", []pull{open7, fork, noRepo, otherBranch}, open7, "draft", "updated"},
-			{"the repository is compared without regard to case", "", []pull{open7, upper}, upper, "draft", "updated"},
+			{"the highest that is not closed or merged", []pull{open7, closed, open9, merged11, closed12}, open9, "draft", "updated"},
+			{"none is open, so the highest number", []pull{closed, merged11, closed12}, closed12, "closed", "kept"},
+			{"none is open and the highest is merged", []pull{closed, closed12, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}}, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}, "merged", "kept"},
+			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7, "draft", "updated"},
+			{"the repository is compared without regard to case", []pull{open7, upper}, upper, "draft", "updated"},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
 				f.setText("New text.")
 				f.have(c.ps...)
-				env := []string{}
-				if c.number != "" {
-					env = append(env, "QORY_SUBMIT_DRAFT_NUMBER="+c.number)
-				}
-				wantResult(t, f.run(env...), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, c.state, c.action))
+				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, c.state, c.action))
 				kinds := strings.Join(f.kinds(), " ")
 				if want := map[string]string{"updated": "auth list read patch", "kept": "auth list read"}[c.action]; kinds != want {
 					t.Errorf("calls %s, want %s", kinds, want)
@@ -540,17 +531,6 @@ func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 			})
 		}
 	})
-}
-
-func TestADraftNumberOfWrongShapeIsRefused(t *testing.T) {
-	for _, n := range []string{"0", "07", "abc", "1234567890", "-3", "1 2"} {
-		f := newFake(t, "text")
-		r := f.run("QORY_SUBMIT_DRAFT_NUMBER=" + n)
-		wantResult(t, r, 2, "")
-		if !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_DRAFT_NUMBER") || len(f.calls()) != 0 {
-			t.Errorf("number %q: stderr %q, calls %v", n, r.stderr, f.calls())
-		}
-	}
 }
 
 func TestADescriptionIsWrittenByTheRuleOfTheContract(t *testing.T) {

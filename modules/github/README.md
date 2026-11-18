@@ -41,7 +41,6 @@ empty.
 | `QORY_SUBMIT_DRAFT` | `open`, or `none` to print the addresses only. |
 | `QORY_SUBMIT_TITLE` | The title of a new draft, 1 to 256 characters on one line. |
 | `QORY_SUBMIT_DESCRIPTION_FILE` | The path of a file with the description text, at most 20000 characters. |
-| `QORY_SUBMIT_DRAFT_NUMBER` | Optional, 1 to 9 digits. Not in the contract's table, and qory sets it for no run today. Chooses the draft when several pull requests have the branch as their head. |
 
 `gh` reads `GH_TOKEN` and `GH_HOST` from the environment. The program prints neither.
 
@@ -57,8 +56,7 @@ empty.
    state (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and
    `state=all`). It ignores the base branch, the branch of a fork with the same name,
    and a pull request whose head repository is gone. Of several it takes the one
-   numbered `QORY_SUBMIT_DRAFT_NUMBER` when that is one of them, otherwise the one with
-   the highest number that is not closed and not merged, otherwise the one with the
+   with the highest number that is not closed and not merged, otherwise the one with the
    highest number.
 5. With none, it runs `gh pr create --draft` with the branch, the base branch, the title
    and the description. The description is the block alone.

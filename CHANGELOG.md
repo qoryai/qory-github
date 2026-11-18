@@ -30,9 +30,8 @@ change what the program does, and notes it under Upgrading.
   it pushed the branch. The program prints the GitHub address of each commit and, for a run
   with hand-off text, opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the
   one that exists, with the login of `gh`. It finds the pull request by its head branch and
-  repository alone, in any state. Of several it takes the number in
-  `QORY_SUBMIT_DRAFT_NUMBER` when that is one of them, otherwise the highest number that is
-  not closed and not merged. It replaces only the text between the lines
+  repository alone, in any state. Of several it takes the highest number
+  that is not closed and not merged, otherwise the highest number. It replaces only the text between the lines
   `<!-- qory:start -->` and `<!-- qory:end -->` of the description, keeps the title, and
   changes nothing in a closed or merged pull request. It prints the result as lines
   (`draft_number`, `draft_url`, `draft_title`, `draft_state`, `draft_action`, `commit_url`).

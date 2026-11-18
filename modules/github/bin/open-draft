@@ -188,12 +188,6 @@ if [ "$draft" = open ]; then
 	if [ "$title_len" -gt "$MAX_TITLE" ]; then
 		refuse "Shorten QORY_SUBMIT_TITLE to $MAX_TITLE characters: it has $title_len."
 	fi
-	case ${QORY_SUBMIT_DRAFT_NUMBER:-} in
-	"" | [1-9] | [1-9][0-9] | [1-9][0-9][0-9] | [1-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9] | [1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
-	*)
-		refuse 'Set QORY_SUBMIT_DRAFT_NUMBER to a number of 1 to 9 digits with no leading zero, or leave it unset.'
-		;;
-	esac
 	base_branch=${QORY_SUBMIT_BASE_BRANCH:-}
 	if [ -z "$base_branch" ]; then
 		refuse 'Set QORY_SUBMIT_BASE_BRANCH to the base branch of the draft: qory did not read it, so the draft has no base.'
@@ -274,8 +268,7 @@ read_pull() {
 
 # find_pull sets number to the pull request from the branch, or to nothing. It looks
 # at the head branch and the repository alone, in any state. Of several it takes the
-# number in QORY_SUBMIT_DRAFT_NUMBER when it is one of them, else the highest number
-# that is not closed and not merged, else the highest number.
+# highest number that is not closed and not merged, else the highest number.
 find_pull() {
 	if ! gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
 		-f "head=$owner:$branch" -f state=all -f per_page=100 --jq "$LIST_JQ" \
@@ -288,14 +281,12 @@ find_pull() {
 			v[f] = $0
 			if (f == 8 && v[2] == ENVIRON["QORY_SUBMIT_BRANCH"] && tolower(v[3]) == tolower(want_repo)) {
 				n = v[1] + 0
-				if (ENVIRON["QORY_SUBMIT_DRAFT_NUMBER"] != "" && n == ENVIRON["QORY_SUBMIT_DRAFT_NUMBER"] + 0) wanted = n
 				if (v[4] == "open" && v[5] == "false" && n > best_open) best_open = n
 				if (n > best_any) best_any = n
 			}
 		}
 		END {
-			if (wanted > 0) print wanted
-			else if (best_open > 0) print best_open
+			if (best_open > 0) print best_open
 			else if (best_any > 0) print best_any
 		}
 	' "$tmp/list")
