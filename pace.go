@@ -350,10 +350,10 @@ func (c Client) sendBounded(ctx context.Context, p *Pacer, listing bool, what, m
 	defer resp.Body.Close()
 	a, err := io.ReadAll(io.LimitReader(resp.Body, int64(largest)+1))
 	if err != nil {
-		return nil, &unreadAnswer{status: resp.StatusCode, err: fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))}
+		return nil, &unreadAnswer{status: resp.StatusCode, err: connectionFailed(what, path, err)}
 	}
 	if len(a) > largest {
-		return nil, &unreadAnswer{status: resp.StatusCode, err: unreadableAt(fmt.Sprintf("%s: GitHub's answer is larger than %d bytes", what, largest), nil)}
+		return nil, &unreadAnswer{status: resp.StatusCode, err: unreadableAt(resp.StatusCode, fmt.Sprintf("%s: GitHub's answer is larger than %d bytes", what, largest), nil)}
 	}
 	return &apiReply{status: resp.StatusCode, header: resp.Header, body: a}, nil
 }
@@ -371,7 +371,7 @@ func (c Client) get(ctx context.Context, p *Pacer, listing bool, what, path, tok
 		return "", a.err(what)
 	}
 	if err := json.Unmarshal(a.body, out); err != nil {
-		return "", unreadableAt(fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
+		return "", unreadableAt(a.status, fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	next, err := nextPage(a.header.Values("Link"), c.base())
 	if err != nil {

@@ -275,11 +275,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	if got.Token == "" {
-		return nil, unreadableAt(minting+": GitHub answered without a token", nil)
+		return nil, unreadableAt(http.StatusCreated, minting+": GitHub answered without a token", nil)
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, unreadableAt(fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
+		return nil, unreadableAt(http.StatusCreated, fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
@@ -443,7 +443,7 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		return fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != want {
 		var e struct {
 			Message string `json:"message"`
@@ -458,8 +458,11 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	if out == nil {
 		return nil
 	}
+	if readErr != nil {
+		return connectionFailed(what, path, readErr)
+	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return unreadableAt(fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
+		return unreadableAt(resp.StatusCode, fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	return nil
 }

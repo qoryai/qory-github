@@ -93,7 +93,19 @@ func TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle(t *testing.T) {
 			t.Fatalf("U+%04X: the adapter takes it for a space: %v, the program: %v", r, !notSpace, spaces[r])
 		}
 	}
-	awkRemoved := awkRunes(t, text)
+	awkRemoved := awkRunes(t, text, "clean_title")
+	blank := awkRunes(t, text, "is_blank")
+	if len(blank) != 17 {
+		t.Fatalf("is_blank removes %d characters, the adapter has 17 spaces", len(blank))
+	}
+	for r := rune(0); r <= 0x10ffff; r++ {
+		if r >= 0xd800 && r <= 0xdfff {
+			continue
+		}
+		if _, notSpace := cleanTitle(string(r)); !github.LineForbidden.MatchString(string(r)) && blank[r] == notSpace {
+			t.Fatalf("U+%04X: the adapter takes it for a space: %v, is_blank: %v", r, !notSpace, blank[r])
+		}
+	}
 	for r := rune(0); r <= 0x10ffff; r++ {
 		if r >= 0xd800 && r <= 0xdfff {
 			continue
@@ -105,24 +117,30 @@ func TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle(t *testing.T) {
 	}
 }
 
-// awkRunes are the code points that the gsub calls of clean_title in the program remove,
-// written there as the octal bytes of their UTF-8 form, each byte a literal or a class.
-func awkRunes(t *testing.T, text string) runeSet {
+// awkRunes are the code points that the gsub calls of the function fn of the program
+// remove, written there as the octal bytes of their UTF-8 form, each byte a literal or a
+// class, or as a plain space.
+func awkRunes(t *testing.T, text, fn string) runeSet {
 	t.Helper()
-	start := strings.Index(text, "clean_title() {")
+	start := strings.Index(text, fn+"() {")
+	if start < 0 {
+		t.Fatalf("the program has no %s", fn)
+	}
 	end := strings.Index(text[start:], "\n}\n")
-	if start < 0 || end < 0 {
-		t.Fatal("the program has no clean_title")
+	if end < 0 {
+		t.Fatalf("%s has no end", fn)
 	}
 	body := text[start : start+end]
-	pattern := regexp.MustCompile(`gsub\(/((?:\\[0-7]{3}|\[[^\]]*\])+)/, ""\)`)
+	pattern := regexp.MustCompile(`gsub\(/((?:\\[0-7]{3}|\[[^\]]*\]| )+)/, ""\)`)
 	octal := regexp.MustCompile(`\\([0-7]{3})`)
 	out := runeSet{}
 	for _, m := range pattern.FindAllStringSubmatch(body, -1) {
 		var alternatives [][]byte
-		for _, el := range regexp.MustCompile(`\\[0-7]{3}|\[[^\]]*\]`).FindAllString(m[1], -1) {
+		for _, el := range regexp.MustCompile(`\\[0-7]{3}|\[[^\]]*\]| `).FindAllString(m[1], -1) {
 			var bytes []byte
-			if strings.HasPrefix(el, "[") {
+			if el == " " {
+				bytes = []byte{' '}
+			} else if strings.HasPrefix(el, "[") {
 				inner := el[1 : len(el)-1]
 				for inner != "" {
 					lo := octal.FindStringSubmatch(inner[:4])

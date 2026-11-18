@@ -159,12 +159,15 @@ func (e *SubmitRefused) Error() string {
 func (e *SubmitRefused) Unwrap() error { return e.Err }
 
 // Detail is the text of the failure report's detail: Fix, then GitHub's status and
-// message when the refusal comes from an answer, else Message when it has one. It is one
+// message when the refusal comes from an answer (the status alone when it has no message),
+// else Message when it has one. It is one
 // line of at most [MaxDetail] characters, with no control character, and no token: see
 // [OneLine].
 func (e *SubmitRefused) Detail() string {
 	d := e.Fix
 	switch {
+	case e.Status != 0 && e.Message == "":
+		d += " GitHub answered " + strconv.Itoa(e.Status) + "."
 	case e.Status != 0:
 		d += " GitHub answered " + strconv.Itoa(e.Status) + ": " + e.Message
 	case e.Message != "":
@@ -351,7 +354,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 		case a.status == http.StatusOK:
 			var got ghPull
 			if err := json.Unmarshal(a.body, &got); err != nil {
-				return nil, unreadable(reading, err)
+				return nil, unreadable(a.status, reading, err)
 			}
 			if got.Number == d.Number && got.isDraftOf(d) {
 				return &got, nil
@@ -371,7 +374,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var listed []ghPull
 	if err := json.Unmarshal(a.body, &listed); err != nil {
-		return nil, unreadable(listing, err)
+		return nil, unreadable(a.status, listing, err)
 	}
 	var ours []ghPull
 	for _, l := range listed {
@@ -392,7 +395,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var got ghPull
 	if err := json.Unmarshal(a.body, &got); err != nil {
-		return nil, unreadable(reading, err)
+		return nil, unreadable(a.status, reading, err)
 	}
 	return &got, nil
 }
@@ -452,10 +455,10 @@ func lineFeeds(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 func resultOf(a *apiReply, what, action string) (DraftResult, error) {
 	var got ghPull
 	if err := json.Unmarshal(a.body, &got); err != nil {
-		return DraftResult{}, unreadable(what, err)
+		return DraftResult{}, unreadable(a.status, what, err)
 	}
 	if got.Number <= 0 || got.HTMLURL == "" {
-		return DraftResult{}, unreadable(what, errors.New("it has no number or address"))
+		return DraftResult{}, unreadable(a.status, what, errors.New("it has no number or address"))
 	}
 	return DraftResult{Number: got.Number, URL: got.HTMLURL, Title: got.Title, State: got.state(), Action: action}, nil
 }
@@ -525,8 +528,8 @@ func AnswerRefused(err error) bool {
 var ErrUnreadableAnswer = errors.New("GitHub's answer could not be read")
 
 // unreadable is the error for GitHub's answer to what, which could not be read, for cause.
-func unreadable(what string, cause error) error {
-	return fmt.Errorf("%s: %w: %w", what, ErrUnreadableAnswer, cause)
+func unreadable(status int, what string, cause error) error {
+	return unreadableAt(status, fmt.Sprintf("%s: %v: %v", what, ErrUnreadableAnswer, cause), cause)
 }
 
 // fixUnclassified is the fix line for an error that is neither an answer of GitHub nor a
@@ -571,7 +574,13 @@ func EndedRefusal(cause error) *SubmitRefused {
 		return report(ReasonForgeRefused, FixForgeRefused)
 	case errors.Is(cause, ErrUnreadableAnswer):
 		r := report(ReasonForgeRefused, fixUnreadable)
-		r.Message = ErrUnreadableAnswer.Error() + "."
+		var unread *unreadableError
+		if errors.As(cause, &unread) {
+			r.Status = unread.status
+		}
+		if r.Status == 0 {
+			r.Message = "No answer status was read."
+		}
 		return r
 	case errors.Is(cause, errMintRedirected):
 		return report(ReasonForgeRefused, FixForgeRefused)

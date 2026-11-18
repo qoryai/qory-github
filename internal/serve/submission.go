@@ -354,6 +354,11 @@ func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, t contract
 // reason unreachable for each of its repositories. It returns whether the entry is done,
 // and the error that keeps it.
 func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contracts.Change, cause error, failed, since time.Duration, limit string) (bool, error) {
+	// A cancelled context ends the step, not the entry: no report is sent, and no
+	// repository is passed for a request that the cancellation made fail.
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	more := func(what string, t contracts.SubmissionTarget, rerr error) bool {
 		if retriesEnded(failed, since, stuckFor) == "" {
 			return false

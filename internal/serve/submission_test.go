@@ -1341,6 +1341,43 @@ func runPastRetries(t *testing.T, w *wired) {
 	}
 }
 
+// TestACancelledContextKeepsAnEntryWhoseRetriesEnded: the retries of an entry have ended,
+// and the step that would report it is cancelled. The step returns the cancellation, sends
+// no report, and keeps the entry and its cursor; the next step reports it once.
+func TestACancelledContextKeepsAnEntryWhoseRetriesEnded(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelling := false
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pullMint = func() (int, string) {
+			if cancelling {
+				cancel()
+			}
+			return 502, `{"message":"Bad Gateway"}`
+		}
+	})
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	if err := w.feed.step(context.Background()); err == nil {
+		t.Fatal("the first step did not fail")
+	}
+	now = now.Add(3 * stuckFor)
+	cancelling = true
+	if err := w.feed.step(ctx); err == nil {
+		t.Error("the cancelled step did not fail")
+	}
+	if r := w.apiary.submissionReports(); len(r) != 0 || !cursorIs(w, "") {
+		t.Fatalf("reports %v, cursor moved: %v", r, !cursorIs(w, ""))
+	}
+	cancelling = false
+	w.stepOK(t)
+	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets unreachable"}) || !cursorIs(w, "c_1") {
+		t.Errorf("reports %v", r)
+	}
+}
+
 // detailOf is the detail of the failure report n of the submission entries.
 func detailOf(w *wired, n int) string {
 	d, _ := w.apiary.sent(routeChangesFailed)[n].body["detail"].(string)
@@ -1471,7 +1508,7 @@ func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
 	}{
 		{"401 on the pull requests", failAt("GET", "/repos/acme/widgets/pulls", 401, `{"message":"Bad credentials"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: Bad credentials"},
 		{"401 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 401, `{"message":"A JSON web token could not be decoded"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: A JSON web token could not be decoded"},
-		{"an answer that is no JSON", failAt("GET", "/repos/acme/widgets/pulls", 200, `<html>Unicorn</html>`), false, "forge_refused", "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub's answer could not be read."},
+		{"an answer that is no JSON", failAt("GET", "/repos/acme/widgets/pulls", 200, `<html>Unicorn</html>`), false, "forge_refused", "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub answered 200."},
 		{"400 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 400, `{"message":"Bad Request"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 400: Bad Request"},
 		{"422 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 422, `{"message":"Validation Failed"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 422: Validation Failed"},
 		{"502", failAt("GET", "/repos/acme/widgets/pulls", 502, `{"message":"Bad Gateway"}`), false, "unreachable", github.FixUnreachable + " GitHub answered 502: Bad Gateway"},
@@ -1495,10 +1532,10 @@ func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
 // on every try, so the entry is applied again until its retries end, then reported by the
 // last answer: a 403 that is no rate limit is not_permitted, a 403 that says rate limit,
 // a 429 and a 503 are unreachable, a redirect is forge_refused, and an answer with no
-// token or with an expiry that is no time is forge_refused with the detail that the answer
-// could not be read.
+// token or with an expiry that is no time is forge_refused with the detail that says the answer's
+// status.
 func TestAMintThatKeepsFailingEndsAsItsReason(t *testing.T) {
-	const unreadable = "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub's answer could not be read."
+	const unreadable = "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub answered 201."
 	for _, tc := range []struct {
 		name   string
 		status int

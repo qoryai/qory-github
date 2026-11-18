@@ -2,6 +2,7 @@ package github
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,7 +35,24 @@ func spread(lit string) string {
 
 // space matches white space, or a character of [between], between the words of a
 // credential.
-const space = `(?:\s|[` + lineForbiddenSet + `\p{Cf}])+`
+const space = `(?:[\s\p{Zs}]|[` + lineForbiddenSet + `\p{Cf}])+`
+
+// valueChars is the class of the characters of a bearer, basic or header value.
+const valueChars = `[A-Za-z0-9+/=_.~-]`
+
+// valueShape is the pattern for a value that looks like a credential, also when a
+// character of [between] splits it: a run of 20 or more characters of [valueChars], or a
+// run of at least n of them that has a character of marks. It has no word of prose: a word
+// of letters only and fewer than 20 characters is not a credential.
+func valueShape(n int, marks string) string {
+	one := between + valueChars
+	alternatives := []string{tokenChars(valueChars, 20)}
+	for before := 0; before < n; before++ {
+		alternatives = append(alternatives, `(?:`+one+`){`+strconv.Itoa(before)+`}`+between+marks+`(?:`+one+`){`+strconv.Itoa(n-1-before)+`}(?:`+one+`)*`)
+	}
+	alternatives = append(alternatives, `(?:`+one+`){`+strconv.Itoa(n)+`,}`+between+marks+`(?:`+one+`)*`)
+	return `(?:` + strings.Join(alternatives, `|`) + `)`
+}
 
 // tokenChars is the pattern for n or more characters of a token, each of which a
 // character of [between] may precede.
@@ -43,16 +61,23 @@ func tokenChars(class string, n int) string {
 }
 
 var (
-	// authorizationHeader matches a header value, with a scheme and a value, or a value
-	// alone, and the group is what stays: the name of the header.
-	authorizationHeader = regexp.MustCompile(`(?i)(` + spread("authorization") + `\s*[:=]\s*)(?:[a-z][a-z0-9_-]*\s+\S+|\S+)`)
+	// authorizationHeader matches a header value, and the group is what stays: the name
+	// of the header. The value is, after a known scheme, any word, and otherwise a value
+	// that looks like a credential, with or without a scheme word before it, so a sentence
+	// such as "Authorization: required for" stays.
+	authorizationHeader = regexp.MustCompile(`(?i)(\b` + spread("authorization") + `[\s\p{Zs}]*[:=][\s\p{Zs}]*)(?:` +
+		`(?:token|bearer|basic|digest|negotiate|ntlm|apikey)` + space + `\S+` +
+		`|(?:[a-z][a-z0-9_-]*` + space + `)?` + valueShape(8, `[0-9]`) + `)`)
 	// secretShape matches what looks like a credential, also when a line break or another
 	// character of [between] splits it: a GitHub token, a signed token of three parts, a
 	// bearer or basic value, a block of a PEM key, and the user information of an address.
-	secretShape = regexp.MustCompile(`(?i)(?:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)` + tokenChars(`[A-Za-z0-9_]`, 8) +
+	// The prefix of a GitHub token is lower case, so a constant such as HIGHS_AND_LOWS_FLAG
+	// stays. A bearer or basic value is removed only when it looks like a credential, so
+	// "the basic permissions" stays.
+	secretShape = regexp.MustCompile(`(?i)(?-i:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)` + tokenChars(`[A-Za-z0-9_]`, 8) +
 		`|` + spread("eyJ") + tokenChars(`[A-Za-z0-9_-]`, 8) + `(?:` + between + `\.` + tokenChars(`[A-Za-z0-9_-]`, 1) + `){1,2}` +
-		`|` + spread("bearer") + space + `(?:` + between + `\S)+` +
-		`|` + spread("basic") + space + tokenChars(`[A-Za-z0-9+/=_-]`, 8) +
+		`|\b` + spread("bearer") + space + valueShape(8, `[0-9]`) +
+		`|\b` + spread("basic") + space + valueShape(16, `[0-9+/=]`) +
 		`|(?s:-----BEGIN[^-]*KEY-----.*?(?:-----END[^-]*KEY-----|$))` +
 		`|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
 )
@@ -155,11 +180,33 @@ func Scrubbed(err error, secrets ...string) error {
 // can succeed.
 var ErrTransport = errors.New("GitHub's API could not be reached")
 
+// connectionError is the error of a connection that failed while GitHub's answer was
+// read. It is [ErrTransport] for errors.Is, and wraps the cause, so a timeout stays one.
+type connectionError struct {
+	text  string
+	cause error
+}
+
+func (e *connectionError) Error() string { return e.text }
+func (e *connectionError) Unwrap() error { return e.cause }
+
+// Is makes the error [ErrTransport] for errors.Is.
+func (e *connectionError) Is(target error) bool { return target == ErrTransport }
+
+// connectionFailed is the error for a read of GitHub's answer to the request what, to
+// path, that failed with err after the status was received.
+func connectionFailed(what, path string, err error) error {
+	cause := unsent(err, path)
+	return &connectionError{text: fmt.Sprintf("%s: the connection failed while GitHub's answer was read: %v", what, cause), cause: cause}
+}
+
 // unreadableError is the error for an answer of GitHub that does not have the shape the
 // adapter reads. It is [ErrUnreadableAnswer] for errors.Is, and says text.
 type unreadableError struct {
 	text  string
 	cause error
+	// status is the status of the answer, 0 when it is not known.
+	status int
 }
 
 func (e *unreadableError) Error() string { return e.text }
@@ -168,5 +215,8 @@ func (e *unreadableError) Unwrap() error { return e.cause }
 // Is makes the error [ErrUnreadableAnswer] for errors.Is.
 func (e *unreadableError) Is(target error) bool { return target == ErrUnreadableAnswer }
 
-// unreadableAt is the [unreadableError] that says text, for cause, which may be nil.
-func unreadableAt(text string, cause error) error { return &unreadableError{text: text, cause: cause} }
+// unreadableAt is the [unreadableError] that says text, for cause, which may be nil, of
+// an answer with status.
+func unreadableAt(status int, text string, cause error) error {
+	return &unreadableError{text: text, cause: cause, status: status}
+}

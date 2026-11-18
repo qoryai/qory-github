@@ -73,7 +73,7 @@ func (c Client) RepositoryInstallation(ctx context.Context, appID string, key *r
 	case err != nil:
 		return 0, "", err
 	case got.ID <= 0 || !ownerShape.MatchString(got.Account.Login):
-		return 0, "", unreadableAt(what+": GitHub's answer has no installation id or no account login", nil)
+		return 0, "", unreadableAt(http.StatusOK, what+": GitHub's answer has no installation id or no account login", nil)
 	}
 	return got.ID, got.Account.Login, nil
 }
@@ -93,7 +93,7 @@ func (c Client) RepositoryID(ctx context.Context, token string, repo Repository)
 	}
 	name, ok := nameOf(r)
 	if r.ID <= 0 || !ok {
-		return 0, Repository{}, unreadableAt(what+": GitHub's answer has no id or no owner/name", nil)
+		return 0, Repository{}, unreadableAt(http.StatusOK, what+": GitHub's answer has no id or no owner/name", nil)
 	}
 	return r.ID, name, nil
 }
@@ -121,7 +121,7 @@ func (c Client) CommitAt(ctx context.Context, token string, repository int64, at
 	case len(got) == 0:
 		return "", ErrVersionNotFound
 	case !shaShape.MatchString(got[0].SHA):
-		return "", unreadableAt(what+": GitHub's answer has no commit id", nil)
+		return "", unreadableAt(http.StatusOK, what+": GitHub's answer has no commit id", nil)
 	}
 	return got[0].SHA, nil
 }

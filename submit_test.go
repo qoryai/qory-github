@@ -27,7 +27,7 @@ func TestEveryFixLineIsOneSentenceOfAtMost100Characters(t *testing.T) {
 // space, a token, a bearer value and an address with a password are removed, and the line
 // is cut at the limit without a trailing space or a broken character.
 func TestOneLineCleansAndCuts(t *testing.T) {
-	got := OneLine("a\nb\r\n\tc\x00d e  ghp_abcdefgh12345678 Bearer xyz https://u:p@host/x ok", 1000)
+	got := OneLine("a\nb\r\n\tc\x00d e  ghp_abcdefgh12345678 Bearer xyz98765 https://u:p@host/x ok", 1000)
 	if want := "a b c d e [removed] [removed] [removed] ok"; got != want {
 		t.Errorf("%q, want %q", got, want)
 	}
@@ -159,14 +159,14 @@ func TestEndedRefusalByTheLastCause(t *testing.T) {
 		{"302, a redirect that is not followed", answer(302), ReasonForgeRefused},
 		{"307, a redirect that is not followed", answer(307), ReasonForgeRefused},
 		{"the redirect of a mint", errMintRedirected, ReasonForgeRefused},
-		{"an answer without a token", unreadableAt("minting: GitHub answered without a token", nil), ReasonForgeRefused},
-		{"an expiry that is no time", unreadableAt(`minting: the expiry "x" is not a time`, errors.New("x")), ReasonForgeRefused},
+		{"an answer without a token", unreadableAt(201, "minting: GitHub answered without a token", nil), ReasonForgeRefused},
+		{"an expiry that is no time", unreadableAt(201, `minting: the expiry "x" is not a time`, errors.New("x")), ReasonForgeRefused},
 		{"a canceled call", context.Canceled, ReasonUnreachable},
 		{"an error that is no answer and no failure to reach GitHub", errors.New("no private key"), ReasonForgeRefused},
 		{"400", answer(400), ReasonForgeRefused},
 		{"409", answer(409), ReasonForgeRefused},
 		{"422", answer(422), ReasonForgeRefused},
-		{"an unreadable answer", unreadable("reading", errors.New("invalid character")), ReasonForgeRefused},
+		{"an unreadable answer", unreadable(200, "reading", errors.New("invalid character")), ReasonForgeRefused},
 		{"a refusal", &SubmitRefused{Reason: ReasonBranchGone, Fix: fixHeadGone, Err: errors.New("x")}, ReasonBranchGone},
 	} {
 		got := EndedRefusal(fmt.Errorf("%w (entry)", tc.cause))
@@ -212,6 +212,13 @@ func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
 		{"an authorization header with a value", "authorization=abcdef12345", []string{"abcdef12345"}},
 		{"an authorization header split", "Authori\nzation: Custom abcdef12345", []string{"abcdef12345"}},
 		{"a basic value", "Basic dXNlcjpwYXNzd29yZA==", []string{"dXNlcjpw"}},
+		{"a bearer value after a no-break space", "Bearer\u00a0xyz98765", []string{"xyz98765"}},
+		{"a bearer value after an em space", "Bearer\u2003xyz98765", []string{"xyz98765"}},
+		{"a basic value after a no-break space", "Basic\u00a0dXNlcjpwYXNzd29yZA==", []string{"dXNlcjpw"}},
+		{"a bearer value of letters", "bearer abcdefghijklmnopqrstuvwxyz", []string{"abcdefgh"}},
+		{"an authorization header with a no-break space", "Authorization:\u00a0Bearer\u00a0abcdef", []string{"abcdef"}},
+		{"an authorization header with a known scheme", "authorization: basic secret", []string{"secret"}},
+		{"an authorization header with a long word", "authorization: abcdefghijklmnopqrstuvwxyz", []string{"abcdefgh"}},
 		{"a PEM block", "key -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcdefgh\n-----END RSA PRIVATE KEY----- after", []string{"MIIEow", "abcdefgh"}},
 		{"a PEM block with no end", "key -----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg\nrest", []string{"MIIEvg", "rest"}},
 		{"an address with a password", "see https://user:hunter2@example.com/x", []string{"hunter2"}},
@@ -224,6 +231,27 @@ func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
 		}
 		if !strings.Contains(got, "[removed]") || LineForbidden.MatchString(got) {
 			t.Errorf("%s: %q", tc.name, got)
+		}
+	}
+}
+
+// TestProseThatNamesACredentialSchemeStaysUnchanged: a text that only uses a word such as
+// basic, bearer or authorization, or a constant with a token prefix in capitals, has no
+// credential, and OneLine leaves it as it is.
+func TestProseThatNamesACredentialSchemeStaysUnchanged(t *testing.T) {
+	for _, in := range []string{
+		"Basic authentication using username and password is not supported",
+		"the basic permissions of the App",
+		"Authorization: required for this request",
+		"authorization is needed",
+		"HIGHS_AND_LOWS_FLAG",
+		"the bearer of this notice",
+		"Basic HTTP is not enough",
+		"Basic HTTP/1.1 is used",
+		"Bearer tokens are refused",
+	} {
+		if got := OneLine(in, 1000); got != in {
+			t.Errorf("%q became %q", in, got)
 		}
 	}
 }
@@ -269,3 +297,89 @@ func TestAnUnreadableAnswerOfACallIsUnreadable(t *testing.T) {
 		t.Errorf("%v", err)
 	}
 }
+
+// TestAnAnswerCutDuringItsBodyIsUnreachableAndACompleteOneThatIsNoJSONIsForgeRefused:
+// GitHub answers the installation lookup and the mint with the right status and starts
+// the body, but the connection closes before it ends, or stays silent until the client's
+// timeout. Each ends as [ReasonUnreachable] and wraps [ErrTransport]. A body that is
+// complete but no JSON ends as [ReasonForgeRefused].
+func TestAnAnswerCutDuringItsBodyIsUnreachableAndACompleteOneThatIsNoJSONIsForgeRefused(t *testing.T) {
+	repos, _ := ParseRepositories("acme/widgets")
+	lookup := func(c Client) error {
+		_, _, err := c.RepositoryInstallation(context.Background(), appID, key(t), Repository{Owner: "acme", Name: "widgets"})
+		return err
+	}
+	mint := func(c Client) error {
+		_, err := c.MintInstallationToken(context.Background(), Request{AppID: appID, Key: key(t), InstallationID: 7, Repositories: repos, Permissions: map[string]string{"pull_requests": "write"}})
+		return err
+	}
+	for _, tc := range []struct {
+		name string
+		// body writes the answer to the call under test, its status and body.
+		body   func(w http.ResponseWriter, r *http.Request)
+		reason string
+		cut    bool
+	}{
+		{"a body that ends early", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":4`))
+		}, ReasonUnreachable, true},
+		{"a body that stops until the timeout", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":4`))
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+		}, ReasonUnreachable, true},
+		{"a complete body that is no JSON", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`<html>Unicorn</html>`))
+		}, ReasonForgeRefused, false},
+	} {
+		for _, call := range []struct {
+			name string
+			run  func(Client) error
+			// status is the status the call under test wants.
+			status int
+			// path is the path of its request that the body is cut for.
+			path string
+		}{
+			{"the lookup", lookup, http.StatusOK, "/repos/acme/widgets/installation"},
+			{"the mint", mint, http.StatusCreated, "/app/installations/7/access_tokens"},
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/app/installations/7" && r.Method == http.MethodGet:
+					w.Write([]byte(`{"account":{"login":"acme"}}`))
+				case r.URL.Path == call.path:
+					tc.body(&statusWriter{ResponseWriter: w, status: call.status}, r)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			c := Client{API: srv.URL, HTTP: &http.Client{Timeout: 300 * time.Millisecond}}
+			err := call.run(c)
+			srv.Close()
+			ended := EndedRefusal(err)
+			if err == nil || errors.Is(err, ErrTransport) != tc.cut || errors.Is(err, ErrUnreadableAnswer) == tc.cut || ended.Reason != tc.reason {
+				t.Errorf("%s, %s: %v, %s", tc.name, call.name, err, ended.Reason)
+			}
+			if tc.cut && !strings.Contains(err.Error(), "the connection failed while GitHub's answer was read") {
+				t.Errorf("%s, %s: %v", tc.name, call.name, err)
+			}
+		}
+	}
+}
+
+// statusWriter writes status where the handler writes 200.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(int) { w.ResponseWriter.WriteHeader(w.status) }
+func (w *statusWriter) Flush()          { w.ResponseWriter.(http.Flusher).Flush() }
