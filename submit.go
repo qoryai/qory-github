@@ -159,10 +159,9 @@ func (e *SubmitRefused) Error() string {
 func (e *SubmitRefused) Unwrap() error { return e.Err }
 
 // Detail is the text of the failure report's detail: Fix, then GitHub's status and
-// message when the refusal comes from an answer (the status alone when it has no message),
-// else Message when it has one. It is one
-// line of at most [MaxDetail] characters, with no control character, and no token: see
-// [OneLine].
+// message when the refusal comes from an answer (the status alone when it has no
+// message), else Message when it has one. It is one line of at most [MaxDetail]
+// characters, with no control character, and no token: see [OneLine].
 func (e *SubmitRefused) Detail() string {
 	d := e.Fix
 	switch {

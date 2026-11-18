@@ -215,6 +215,9 @@ func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
 		{"a bearer value after a no-break space", "Bearer\u00a0xyz98765", []string{"xyz98765"}},
 		{"a bearer value after an em space", "Bearer\u2003xyz98765", []string{"xyz98765"}},
 		{"a basic value after a no-break space", "Basic\u00a0dXNlcjpwYXNzd29yZA==", []string{"dXNlcjpw"}},
+		{"a basic value of 12 characters with padding", "Basic dXNlcjpwYQ==", []string{"dXNlcjpw"}},
+		{"a basic value of 16 characters with a digit", "Basic dXNlcjpwYXNz12 ok", []string{"dXNlcjpw"}},
+		{"a bearer value of 8 characters with a digit", "Bearer abcdefg1 ok", []string{"abcdefg1"}},
 		{"a bearer value of letters", "bearer abcdefghijklmnopqrstuvwxyz", []string{"abcdefgh"}},
 		{"an authorization header with a no-break space", "Authorization:\u00a0Bearer\u00a0abcdef", []string{"abcdef"}},
 		{"an authorization header with a known scheme", "authorization: basic secret", []string{"secret"}},
@@ -248,6 +251,9 @@ func TestProseThatNamesACredentialSchemeStaysUnchanged(t *testing.T) {
 		"the bearer of this notice",
 		"Basic HTTP is not enough",
 		"Basic HTTP/1.1 is used",
+		"Bearer 2024 release notes",
+		"Basic 2024 pricing",
+		"Bearer 2 minutes ago",
 		"Bearer tokens are refused",
 	} {
 		if got := OneLine(in, 1000); got != in {
@@ -383,3 +389,22 @@ type statusWriter struct {
 
 func (w *statusWriter) WriteHeader(int) { w.ResponseWriter.WriteHeader(w.status) }
 func (w *statusWriter) Flush()          { w.ResponseWriter.(http.Flusher).Flush() }
+
+// TestAnAnswerCutDuringItsBodyOfAPagedReadIsATransportFailure: GitHub answers 200 to a
+// read of a page of the pull requests with a Content-Length that its body does not reach,
+// so the connection closes before the body ends. The read is [ErrTransport], and never an
+// unreadable answer.
+func TestAnAnswerCutDuringItsBodyOfAPagedReadIsATransportFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"number":4`))
+	}))
+	defer srv.Close()
+	var out any
+	_, err := Client{API: srv.URL}.get(context.Background(), (&fakeClock{}).pacer(), false, "reading", "/a", fakeToken, &out)
+	if !errors.Is(err, ErrTransport) || errors.Is(err, ErrUnreadableAnswer) || EndedRefusal(err).Reason != ReasonUnreachable ||
+		!strings.Contains(err.Error(), "the connection failed while GitHub's answer was read") {
+		t.Errorf("%v", err)
+	}
+}

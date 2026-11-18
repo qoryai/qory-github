@@ -37,16 +37,20 @@ func spread(lit string) string {
 // credential.
 const space = `(?:[\s\p{Zs}]|[` + lineForbiddenSet + `\p{Cf}])+`
 
-// valueChars is the class of the characters of a bearer, basic or header value.
-const valueChars = `[A-Za-z0-9+/=_.~-]`
+// valueChars is the class of the characters of a bearer or header value, and base64Chars
+// the class of those of a basic value, which is base64 and has no dot.
+const (
+	valueChars  = `[A-Za-z0-9+/=_.~-]`
+	base64Chars = `[A-Za-z0-9+/=_-]`
+)
 
 // valueShape is the pattern for a value that looks like a credential, also when a
-// character of [between] splits it: a run of 20 or more characters of [valueChars], or a
-// run of at least n of them that has a character of marks. It has no word of prose: a word
-// of letters only and fewer than 20 characters is not a credential.
-func valueShape(n int, marks string) string {
-	one := between + valueChars
-	alternatives := []string{tokenChars(valueChars, 20)}
+// character of [between] splits it: a run of 20 or more characters of class, or a run of
+// at least n of them that has a character of marks. It has no word of prose: a word of
+// letters only and fewer than 20 characters is not a credential.
+func valueShape(class string, n int, marks string) string {
+	one := between + class
+	alternatives := []string{tokenChars(class, 20)}
 	for before := 0; before < n; before++ {
 		alternatives = append(alternatives, `(?:`+one+`){`+strconv.Itoa(before)+`}`+between+marks+`(?:`+one+`){`+strconv.Itoa(n-1-before)+`}(?:`+one+`)*`)
 	}
@@ -67,7 +71,7 @@ var (
 	// such as "Authorization: required for" stays.
 	authorizationHeader = regexp.MustCompile(`(?i)(\b` + spread("authorization") + `[\s\p{Zs}]*[:=][\s\p{Zs}]*)(?:` +
 		`(?:token|bearer|basic|digest|negotiate|ntlm|apikey)` + space + `\S+` +
-		`|(?:[a-z][a-z0-9_-]*` + space + `)?` + valueShape(8, `[0-9]`) + `)`)
+		`|(?:[a-z][a-z0-9_-]*` + space + `)?` + valueShape(valueChars, 8, `[0-9]`) + `)`)
 	// secretShape matches what looks like a credential, also when a line break or another
 	// character of [between] splits it: a GitHub token, a signed token of three parts, a
 	// bearer or basic value, a block of a PEM key, and the user information of an address.
@@ -76,8 +80,8 @@ var (
 	// "the basic permissions" stays.
 	secretShape = regexp.MustCompile(`(?i)(?-i:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)` + tokenChars(`[A-Za-z0-9_]`, 8) +
 		`|` + spread("eyJ") + tokenChars(`[A-Za-z0-9_-]`, 8) + `(?:` + between + `\.` + tokenChars(`[A-Za-z0-9_-]`, 1) + `){1,2}` +
-		`|\b` + spread("bearer") + space + valueShape(8, `[0-9]`) +
-		`|\b` + spread("basic") + space + valueShape(16, `[0-9+/=]`) +
+		`|\b` + spread("bearer") + space + valueShape(valueChars, 8, `[0-9]`) +
+		`|\b` + spread("basic") + space + valueShape(base64Chars, 8, `[0-9+/=]`) +
 		`|(?s:-----BEGIN[^-]*KEY-----.*?(?:-----END[^-]*KEY-----|$))` +
 		`|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
 )
