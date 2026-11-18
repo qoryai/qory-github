@@ -504,14 +504,15 @@ func repositoryOf(ref string) (int64, bool) { return installationOf(ref) }
 
 // runPermissions are the permissions of a run's token for purpose and access. A token
 // for work reads the repositories' contents and pull requests with access read, and
-// writes both with access write; GitHub adds metadata read to every token. A token for
-// a harness reads the contents alone, whatever the access. No token has workflows.
+// writes the contents alone with access write, since the token reaches only git's push;
+// GitHub adds metadata read to every token. A token for a harness reads the contents
+// alone, whatever the access. No token has workflows.
 func runPermissions(purpose, access string) map[string]string {
 	switch {
 	case purpose == "harness":
 		return map[string]string{"contents": "read"}
 	case access == "write":
-		return map[string]string{"contents": "write", "pull_requests": "write"}
+		return map[string]string{"contents": "write"}
 	}
 	return map[string]string{"contents": "read", "metadata": "read", "pull_requests": "read"}
 }

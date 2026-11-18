@@ -80,8 +80,9 @@ change what the program does, and notes it under Upgrading.
   path, such as `/owner/name.git/git-upload-pack`, `/repos/owner/name/pulls` or
   `/graphql`, gets no token under it. A query string is not part of a path, so
   `/owner/name.git/info/refs` is covered for both services, `git-receive-pack` and
-  `git-upload-pack`. The run credential for work with access `read` and the one for a
-  harness are unchanged.
+  `git-upload-pack`. The token minted for it has the permission `contents: write` alone;
+  before, it also had `pull_requests: write`. The run credential for work with access
+  `read` and the one for a harness are unchanged, and so are the App's permissions.
 - The adapter applies the entries of Qory Apiary's change feed that come after a failing
   entry while it retries that entry. The adapter applies an entry for the same issue
   only after it. A collection entry and the entries of its repository apply in the

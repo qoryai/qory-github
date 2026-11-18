@@ -440,8 +440,8 @@ func workCall(connection, ref, access string) string {
 }
 
 // TestARunCredentialForWorkMapsTheAccess pins a run credential for work: access read
-// mints contents, metadata and pull_requests read, access write contents and
-// pull_requests write, never workflows, for the one repository alone, by id. The answer
+// mints contents, metadata and pull_requests read, access write contents write alone,
+// never pull_requests or workflows, for the one repository alone, by id. The answer
 // for read is [github.Uses] for that repository: the token on github.com with basic and
 // x-access-token on its git paths, and on api.github.com with bearer on its API paths.
 // The answer for write is [github.PushUses]: one apply item, github.com with the
@@ -457,7 +457,7 @@ func TestARunCredentialForWorkMapsTheAccess(t *testing.T) {
 			{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/*", "/acme/widgets/*"}},
 			{Hosts: []string{"api.github.com"}, Scheme: "bearer", Paths: []string{"/repos/acme/widgets", "/repos/acme/widgets/*", "/graphql"}},
 		}, github.Uses},
-		{"write", `{"contents":"write","pull_requests":"write"}`, []contracts.CredentialApply{
+		{"write", `{"contents":"write"}`, []contracts.CredentialApply{
 			{Hosts: []string{"github.com"}, Scheme: "basic", Username: "x-access-token", Paths: []string{"/acme/widgets.git/info/refs", "/acme/widgets.git/git-receive-pack"}},
 		}, github.PushUses},
 	} {
@@ -536,6 +536,25 @@ func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 			if strings.Contains(p, "*") || strings.Contains(p, "graphql") || strings.Contains(p, "/repos/") {
 				t.Errorf("the push list has the path %q", p)
 			}
+		}
+	}
+}
+
+// TestTheRunPermissionsFollowThePurposeAndTheAccess pins runPermissions: work with write
+// has contents write and nothing else, work with read keeps contents, metadata and
+// pull_requests read, and a harness has contents read, whatever the access.
+func TestTheRunPermissionsFollowThePurposeAndTheAccess(t *testing.T) {
+	for _, tc := range []struct {
+		purpose, access, want string
+	}{
+		{"work", "write", `{"contents":"write"}`},
+		{"work", "read", `{"contents":"read","metadata":"read","pull_requests":"read"}`},
+		{"harness", "read", `{"contents":"read"}`},
+		{"harness", "write", `{"contents":"read"}`},
+	} {
+		got, _ := json.Marshal(runPermissions(tc.purpose, tc.access))
+		if string(got) != tc.want {
+			t.Errorf("%s with %s gets %s, want %s", tc.purpose, tc.access, got, tc.want)
 		}
 	}
 }
