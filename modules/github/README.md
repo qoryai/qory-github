@@ -3,7 +3,7 @@
 A Qory harness module with one program, `bin/open-draft`, declared as the module's
 `submit_program` in `qory-module.yaml`. After `qory run` pushed the branch of a run that
 has no run code, qory runs the program once for each repository on your machine, outside
-the wall. The program prints the GitHub address of each commit and, when the run has
+the sandbox that a run uses. The program prints the GitHub address of each commit and, when the run has
 hand-off text, opens the draft pull request of the branch or edits the one that exists.
 It uses the login of `gh` that you made, pushes nothing, and gives no token to anything
 but `gh`. A run that starts from a run code runs no program: `qory-github-server serve`
@@ -11,15 +11,19 @@ opens its draft pull request.
 
 `bin/open-draft` is a POSIX `sh` script. It uses `gh`, and `sed`, `awk`, `grep`, `tr`,
 `head`, `tail`, `cut`, `wc`, `cat`, `cmp`, `mktemp` and `rm`. It needs no `jq`, Python or
-Node. As of 2026-11-18, `qory` does not run the program yet.
+Node.
+
+To try the program, set the variables under Inputs and run `bin/open-draft`.
 
 ## Requirements
 
-- `gh`, logged in to `github.com` (`gh auth login`), in a version that has
-  `gh auth status --active`.
+- `gh`, logged in to `github.com` (`gh auth login`). The program calls
+  `gh auth token --hostname`, `gh api --hostname ... --jq` and `gh pr create --repo --draft
+  --head --base --title --body-file`. The help of `gh` 2.102.0 lists each of them. The earliest
+  version that has each is not checked, so use a current `gh`.
 - A login that can open and edit pull requests in the repository.
 
-If `gh` has no login, the program exits with status 3 and prints as the first line on
+If `gh auth token` finds no login, the program exits with status 3 and prints as the first line on
 standard error: ``Run `gh auth login`, then `qory run` again.`` A `gh` call that GitHub
 answers with HTTP 401 gets the same exit status and line. Without `gh` on `PATH`, the
 program exits with status 1.
@@ -51,7 +55,8 @@ empty.
 2. It prints `commit_url <commit> https://github.com/<owner>/<name>/commit/<commit>` for
    the base commit and each commit. With `QORY_SUBMIT_DRAFT` `none`, it ends here and
    runs no `gh`.
-3. It runs `gh auth status --hostname github.com --active`.
+3. It runs `gh auth token --hostname github.com`, which reads the login from the credential
+   store of `gh` and calls no server. It discards the token.
 4. It searches for the pull requests of the repository with the head branch, in any
    state (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and
    `state=all`). It ignores the base branch, the branch of a fork with the same name,
@@ -90,7 +95,10 @@ draft_action opened
 ```
 
 `draft_state` is `draft`, `open`, `closed` or `merged`, and `draft_action` is `opened`,
-`updated` or `kept`. The title is the one that GitHub has after the call.
+`updated` or `kept`. The title is the one that GitHub has after the call, without the
+characters that the contract refuses for `draft_title`: control characters, line and
+paragraph separators, bidirectional and invisible format characters. When nothing but
+spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
 
 | Exit | Meaning |
 |---|---|

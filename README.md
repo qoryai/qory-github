@@ -251,8 +251,7 @@ The harness module in [`modules/github`](modules/github/README.md) contains
 of a run that has no run code, qory runs it on your machine with your `gh` login. It
 prints the GitHub address of each commit and opens or edits the draft pull request of the
 branch. It pushes nothing and needs `gh` logged in; without a login it exits with status 3
-and asks you to run `gh auth login`. As of 2026-11-18, `qory` does not run the program
-yet.
+and asks you to run `gh auth login`.
 
 ### Draft pull requests of a submission
 

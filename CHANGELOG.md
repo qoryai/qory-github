@@ -26,10 +26,10 @@ change what the program does, and notes it under Upgrading.
 - The description of the adapter has `submissions: true` in `roles.source`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. It is a POSIX `sh` script that uses `gh`. qory runs it on your
-  machine, outside the wall, once for each repository of a run that has no run code, after
+  machine, outside the sandbox that a run uses, once for each repository of a run that has no run code, after
   it pushed the branch. The program prints the GitHub address of each commit and, for a run
   with hand-off text, opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the
-  one that exists, with the login of `gh`. It finds the pull request by its head branch and
+  one that exists, with the login of `gh`. The title it prints has none of the characters that the contract refuses; when nothing is left, it prints `QORY_SUBMIT_TITLE`, cleaned the same way. It finds the pull request by its head branch and
   repository alone, in any state. Of several it takes the highest number
   that is not closed and not merged, otherwise the highest number. It replaces only the text between the lines
   `<!-- qory:start -->` and `<!-- qory:end -->` of the description, keeps the title, and
@@ -37,8 +37,7 @@ change what the program does, and notes it under Upgrading.
   (`draft_number`, `draft_url`, `draft_title`, `draft_state`, `draft_action`, `commit_url`).
   Exit 1 means a call to `gh` failed, exit 2 an input it cannot use, and exit 3 a missing
   login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first line on
-  standard error. The program pushes nothing and needs no Node, `jq` or proxy. As of 2026-11-18, `qory` does
-  not run it yet.
+  standard error. The program pushes nothing and needs no Node, `jq` or proxy.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

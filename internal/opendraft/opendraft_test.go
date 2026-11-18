@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -57,7 +58,7 @@ for a in "$@"; do
 	prev=$a
 done
 case "$1 $2" in
-"auth status") key=auth ;;
+"auth token") key=auth ;;
 "pr create") key=create ;;
 *)
 	case "$method $endpoint" in
@@ -122,7 +123,7 @@ func (p pull) url() string { return "https://github.com/" + repo + "/pull/" + st
 // description with the line feed that gh adds.
 func (p pull) text(read bool) string {
 	p = p.norm()
-	s := fmt.Sprintf("%d\n%s\n%s\n%s\n%t\n%t\n%s\n%s\n", p.Number, p.Ref, p.Repo, p.State, p.Merged, p.Draft, p.Title, p.url())
+	s := fmt.Sprintf("%d\n%s\n%s\n%s\n%t\n%t\n%s\n%s\n", p.Number, p.Ref, p.Repo, p.State, p.Merged, p.Draft, jqTitle(p.Title), p.url())
 	if read {
 		s += p.Body + "\n"
 	}
@@ -143,6 +144,20 @@ func (p pull) json() map[string]any {
 		m["head"].(map[string]any)["repo"] = map[string]any{"full_name": p.Repo}
 	}
 	return m
+}
+
+// forbidden is the set of characters that the contract's draft_title refuses, as the
+// adapter's cleanTitle removes them.
+var forbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+
+// jqTitle is what the --jq expression of the program prints for a title: the title
+// without the forbidden characters, or nothing when only spaces are left.
+func jqTitle(title string) string {
+	shown := forbidden.ReplaceAllString(title, "")
+	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
+		return ""
+	}
+	return shown
 }
 
 type fake struct {
@@ -336,7 +351,7 @@ func (f *fake) kinds() []string {
 	for _, c := range f.calls() {
 		line := strings.Join(c, " ")
 		switch {
-		case strings.HasPrefix(line, "auth status"):
+		case strings.HasPrefix(line, "auth token"):
 			ks = append(ks, "auth")
 		case strings.HasPrefix(line, "pr create"):
 			ks = append(ks, "create")
@@ -400,7 +415,7 @@ func TestAFirstRunOpensOneDraft(t *testing.T) {
 			t.Fatalf("calls %s, want %s", got, want)
 		}
 		calls := f.calls()
-		wantAuth := "auth status --hostname github.com --active"
+		wantAuth := "auth token --hostname github.com"
 		if got := strings.Join(calls[0], " "); got != wantAuth {
 			t.Errorf("auth call %q, want %q", got, wantAuth)
 		}
@@ -671,14 +686,45 @@ func TestEachCommitGetsAnAddress(t *testing.T) {
 
 func TestNoLoginIsExit3WithTheLoginCommandFirst(t *testing.T) {
 	f := newFake(t, "text")
-	f.set("auth.err", "You are not logged into any GitHub hosts. To log in, run: gh auth login\n")
+	f.set("auth.err", "no oauth token found for github.com\n")
 	f.set("auth.status", "1")
 	r := f.run()
 	if r.code != 3 || strings.SplitN(r.stderr, "\n", 2)[0] != loginLine || r.stderr != loginLine+"\n" {
 		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
 	}
-	if got := strings.Join(f.kinds(), " "); got != "auth" {
-		t.Errorf("calls %s", got)
+	// The login is read locally with gh auth token; gh auth status, which calls GitHub, is not run.
+	calls := f.calls()
+	if len(calls) != 1 || strings.Join(calls[0], " ") != "auth token --hostname github.com" {
+		t.Errorf("calls %q", calls)
+	}
+	if r.stdout != commitLines() {
+		t.Errorf("stdout %q", r.stdout)
+	}
+}
+
+func TestTheTokenIsNeverPrinted(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("auth.out", secret+"\n")
+	f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+	f.setRead(pull{Number: 12, Draft: true, Title: title})
+	r := f.run()
+	if r.code != 0 || strings.Contains(r.stdout+r.stderr, secret) {
+		t.Errorf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+	}
+}
+
+func TestANetworkFailureIsExit1NotALoginError(t *testing.T) {
+	for _, key := range []string{"list", "create", "read.8", "patch"} {
+		f := newFake(t, "text")
+		if key != "list" && key != "create" {
+			f.have(pull{Number: 8, Body: "old"})
+		}
+		f.set(key+".err", `Get "https://api.github.com/repos/acme-corp/widgets-app/pulls": dial tcp: lookup api.github.com: no such host`+"\n")
+		f.set(key+".status", "1")
+		r := f.run()
+		if r.code != 1 || strings.Contains(r.stderr, "gh auth login") || !strings.Contains(r.stderr, "no such host") || strings.Count(r.stderr, "\n") != 1 {
+			t.Errorf("%s: exit %d, stderr %q", key, r.code, r.stderr)
+		}
 	}
 }
 
@@ -906,5 +952,123 @@ func TestTheModuleDeclaresTheProgram(t *testing.T) {
 				t.Errorf("line %d has %q: %s", i+1, word, line)
 			}
 		}
+	}
+}
+
+// parsed checks that qory records the lines of a run: the five draft lines are valid
+// (contracts.ParseSubmitLines gives a draft and no line that it leaves out).
+func parsed(t *testing.T, stdout string) *contracts.SubmittedDraft {
+	t.Helper()
+	ids := []string{sha("a"), sha("b"), sha("c")}
+	res := contracts.ParseSubmitLines(stdout, "github.com", "open", ids)
+	if res.Draft == nil || len(res.Invalid) != 0 || len(res.CommitURLs) != 3 {
+		t.Fatalf("qory does not record %q: draft %+v, left out %v", stdout, res.Draft, res.Invalid)
+	}
+	return res.Draft
+}
+
+func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		classes := map[string]string{
+			"a C0 control":        "\x01",
+			"a delete":            "\x7f",
+			"a line feed":         "\n",
+			"a carriage return":   "\r",
+			"a tab":               "\t",
+			"a C1 control":        "\u0085",
+			"the highest C1":      "\u009f",
+			"a soft hyphen":       "\u00ad",
+			"an Arabic mark":      "\u061c",
+			"a Mongolian vowel":   "\u180e",
+			"a zero width space":  "\u200b",
+			"a left-to-right":     "\u200e",
+			"a right-to-left":     "\u200f",
+			"a line separator":    "\u2028",
+			"a paragraph sep":     "\u2029",
+			"a bidi embedding":    "\u202a",
+			"a bidi override":     "\u202e",
+			"a word joiner":       "\u2060",
+			"an invisible plus":   "\u2064",
+			"an isolate":          "\u2066",
+			"a pop isolate":       "\u2069",
+			"a byte order mark":   "\ufeff",
+			"an annotation start": "\ufff9",
+			"an annotation end":   "\ufffb",
+		}
+		for name, ch := range classes {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: "Show" + ch + " dates", Body: "x"})
+				r := f.run()
+				wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+				if d := parsed(t, r.stdout); d.Title != "Show dates" {
+					t.Errorf("recorded title %q", d.Title)
+				}
+			})
+		}
+		// A character next to the allowed ones stays: the neighbours of each range.
+		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u206a", "﻾", "￸", "￼", "é", "日本語"} {
+			t.Run("keeps "+keep, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: "Show" + keep, Body: "x"})
+				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Show"+keep, "draft", "updated"))
+			})
+		}
+		t.Run("nothing but forbidden characters and spaces uses the title of the run", func(t *testing.T) {
+			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   "} {
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: ghTitle, Body: "x"})
+				r := f.run("QORY_SUBMIT_TITLE=Show\u200b dates\u202e")
+				wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+				parsed(t, r.stdout)
+			}
+		})
+		t.Run("a closed pull request is cleaned too", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 4, State: "closed", Title: "Old\u200f\nname"})
+			wantResult(t, f.run(), 0, commitLines()+draftLines(4, "Oldname", "closed", "kept"))
+		})
+		t.Run("a new draft shows the title that GitHub has, cleaned", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+			f.setRead(pull{Number: 12, Draft: true, Title: "Show\u200b dates"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(12, "Show dates", "draft", "opened"))
+			parsed(t, r.stdout)
+		})
+	})
+}
+
+func TestATitleOfTheRunWithNothingToShowIsRefused(t *testing.T) {
+	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e "} {
+		f := newFake(t, "text")
+		r := f.run("QORY_SUBMIT_TITLE=" + bad)
+		if r.code != 2 || r.stdout != "" || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
+			t.Errorf("title %q: exit %d, stdout %q, stderr %q, calls %v", bad, r.code, r.stdout, r.stderr, f.calls())
+		}
+	}
+}
+
+func TestEveryRunOfTheProgramIsRecordedByQory(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(f *fake)
+	}{
+		{"opened", func(f *fake) {
+			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+			f.setRead(pull{Number: 12, Draft: true, Title: title})
+		}},
+		{"updated", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: "x"}) }},
+		{"kept merged", func(f *fake) { f.have(pull{Number: 8, State: "closed", Merged: true, Title: "Mine"}) }},
+	} {
+		f := newFake(t, "text")
+		c.set(f)
+		r := f.run()
+		if r.code != 0 {
+			t.Fatalf("%s: exit %d, stderr %q", c.name, r.code, r.stderr)
+		}
+		parsed(t, r.stdout)
 	}
 }
