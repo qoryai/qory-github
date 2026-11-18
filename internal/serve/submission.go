@@ -122,15 +122,19 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 		return contracts.SubmittedTarget{}, within(err, where)
 	}
 	installation, _, err := a.GitHub.RepositoryInstallation(ctx, a.AppID, a.Key, repo)
+	err = github.Scrubbed(err)
 	switch {
 	case errors.Is(err, github.ErrNotInstalled):
 		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixNotInstalled, err)
 	case github.Forbidden(err) && !github.RateLimited(err):
 		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixAppForbidden, err)
+	case github.AnswerRefused(err):
+		return contracts.SubmittedTarget{}, refuse(github.ReasonForgeRefused, github.FixForgeRefused, err)
 	case err != nil:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
 	tok, err := a.pullToken(ctx, installation, repo)
+	err = github.Scrubbed(err)
 	switch {
 	case errors.Is(err, github.ErrSuspended):
 		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixSuspended, err)
@@ -200,6 +204,8 @@ type targetState struct {
 	done    bool
 	reply   *contracts.SubmittedTarget
 	refused *github.SubmitRefused
+	// cause is the error of the last try that failed, not for good.
+	cause error
 }
 
 // target is the state of the repository with the system and path of t.
@@ -247,6 +253,7 @@ func (f *feed) submission(ctx context.Context, state *entryState, ch contracts.C
 		reply, err := f.target(ctx, ch, t, ts)
 		switch {
 		case err != nil:
+			ts.cause = err
 			errs = append(errs, err)
 		case reply != nil:
 			ts.reply = reply
@@ -354,10 +361,6 @@ func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contra
 		f.log.Error("check that Qory Apiary returns 204 for "+what+": one failed for a day or more; the repository is passed", slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("error", rerr.Error()), slog.String("retries_ended", limit))
 		return true
 	}
-	unreachable := func(cause error) *github.SubmitRefused {
-		status, message := github.AnswerOf(cause)
-		return &github.SubmitRefused{Reason: github.ReasonUnreachable, Fix: github.FixUnreachable, Err: cause, Status: status, Message: message}
-	}
 	for _, t := range ch.Targets {
 		ts := state.target(t)
 		if ts.done || ts.reply != nil {
@@ -365,7 +368,12 @@ func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contra
 		}
 		refused := ts.refused
 		if refused == nil {
-			refused = unreachable(cause)
+			// The error of this repository, not the entry's first, which may be another's.
+			last := ts.cause
+			if last == nil {
+				last = cause
+			}
+			refused = github.EndedRefusal(last)
 		}
 		if rerr := f.reportTarget(ctx, ch, t, refused, refused); rerr != nil && !more("failure reports", t, rerr) {
 			return false, rerr
@@ -381,7 +389,7 @@ func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contra
 	}
 	for _, t := range ch.Targets {
 		if ts := state.target(t); ts.reply != nil && !ts.done {
-			if err := f.reportTarget(ctx, ch, t, unreachable(rerr), rerr); err != nil {
+			if err := f.reportTarget(ctx, ch, t, github.EndedRefusal(rerr), rerr); err != nil {
 				more("failure reports", t, err)
 			}
 			ts.done = true

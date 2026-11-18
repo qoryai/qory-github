@@ -1304,3 +1304,184 @@ func TestTheRunsTitleInTheReplyIsCleanedToo(t *testing.T) {
 		t.Errorf("the log %s", w2.log.String())
 	}
 }
+
+// failAt makes the stand-in GitHub answer the request method path with status and body.
+func failAt(method, path string, status int, body string) func(f *fakeGitHub) {
+	return func(f *fakeGitHub) {
+		f.pullFail = func(m, p string) (int, string) {
+			if m == method && p == path {
+				return status, body
+			}
+			return 0, ""
+		}
+	}
+}
+
+// runPastRetries steps the feed once, moves the clock on by the limit of the entry's
+// retries and steps again, which must pass the entry.
+func runPastRetries(t *testing.T, w *wired) {
+	t.Helper()
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") {
+		t.Fatalf("the first step: err %v", err)
+	}
+	if len(w.apiary.submissionReports()) != 0 {
+		t.Fatalf("reported before the retries ended: %v", w.apiary.submissionReports())
+	}
+	now = now.Add(stuckFor)
+	w.stepOK(t)
+	if !cursorIs(w, "c_1") {
+		t.Fatal("the cursor did not move")
+	}
+}
+
+// detailOf is the detail of the failure report n of the submission entries.
+func detailOf(w *wired, n int) string {
+	d, _ := w.apiary.sent(routeChangesFailed)[n].body["detail"].(string)
+	return d
+}
+
+// TestADraftNumberOfAnotherBranchOrAForkIsNotTheDraft: the number of an update names a
+// pull request of another head branch, or one from a fork with the same branch name: it is
+// edited by neither, the branch's pull request is, and the reply has that one's number.
+func TestADraftNumberOfAnotherBranchOrAForkIsNotTheDraft(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		other *ghPullRec
+	}{
+		{"another head branch", &ghPullRec{repo: "acme/widgets", head: "feature/other", base: "main", number: 1, title: "Other", body: "Other text.", draft: true}},
+		{"a fork's branch of the same name", &ghPullRec{repo: "acme/widgets", headRepo: "acme/widgets-fork", head: testBranch, base: "main", number: 1, title: "Fork", body: "Fork text.", draft: true}},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, func(f *fakeGitHub) {
+			f.pulls = append(f.pulls, tc.other, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 2, title: testTitle, draft: true})
+		})
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, update(1))))
+		w.stepOK(t)
+		pulls := w.gh.pullRequests("acme/widgets")
+		if len(pulls) != 2 || pulls[0].title != tc.other.title || pulls[0].body != tc.other.body || pulls[1].body != blockOf("Text.") {
+			t.Errorf("%s: pull requests %+v", tc.name, pulls)
+		}
+		if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Number != 2 || d.Action != "updated" {
+			t.Errorf("%s: the draft is %+v", tc.name, d)
+		}
+	}
+}
+
+// TestNoTextOfAnErrorHasTheTokenOrALineBreak: GitHub answers with a message that has the
+// installation token, whole and split by a line break, and a line break: with a 400, which
+// is reported, and with a 502, which is tried again. The error's text, the log and the
+// failure report have no token and no line break.
+func TestNoTextOfAnErrorHasTheTokenOrALineBreak(t *testing.T) {
+	split := ghToken[:9] + "\r\n" + ghToken[9:]
+	message := "echo " + ghToken + " and\n" + split + "\nend"
+	body, err := json.Marshal(map[string]any{"message": message})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []int{400, 502} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, failAt("POST", "/repos/acme/widgets/pulls", status, string(body)))
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		stepErr := w.feed.step(context.Background())
+		texts := []string{w.log.String()}
+		if status == 400 {
+			texts = append(texts, detailOf(w, 0))
+			if stepErr != nil {
+				t.Errorf("%d: step %v", status, stepErr)
+			}
+		} else {
+			if stepErr == nil {
+				t.Fatalf("%d: no error", status)
+			}
+			texts = append(texts, stepErr.Error())
+		}
+		for _, text := range texts {
+			if strings.Contains(text, ghToken) || strings.Contains(text, ghToken[:9]) && strings.Contains(text, ghToken[9:]) {
+				t.Errorf("%d: a text has the token: %s", status, text)
+			}
+		}
+		if status == 502 && strings.ContainsAny(stepErr.Error(), "\r\n") {
+			t.Errorf("%d: the error has a line break: %q", status, stepErr.Error())
+		}
+	}
+}
+
+// TestTheErrorOfTheInstallationLookupHasNoCredentialOrLineBreak: GitHub's message to the
+// lookup of the installation has a signed token and a line break; the error of the step
+// has neither.
+func TestTheErrorOfTheInstallationLookupHasNoCredentialOrLineBreak(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, failAt("GET", "/repos/acme/widgets/installation", 502, `{"message":"jwt eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0In0.c2lnbmF0dXJl\nend"}`))
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	err := w.feed.step(context.Background())
+	if err == nil || strings.Contains(err.Error(), "eyJ") || strings.ContainsAny(err.Error(), "\r\n") || !strings.Contains(err.Error(), "jwt [removed] end") {
+		t.Errorf("err %v", err)
+	}
+}
+
+// TestWhenTheRetriesEndEachRepositoryIsReportedByItsLastCause: the first repository of
+// an entry fails with 502, the second with a 422 that says a pull request exists though
+// none is found, so each is tried again; at the end the first is unreachable and the second
+// forge_refused, with GitHub's message in its detail, not the first's.
+func TestWhenTheRetriesEndEachRepositoryIsReportedByItsLastCause(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pullFail = func(m, p string) (int, string) {
+			switch {
+			case m == "POST" && p == "/repos/acme/widgets/pulls":
+				return 502, `{"message":"Bad Gateway"}`
+			case m == "POST" && p == "/repos/acme/gadgets/pulls":
+				return 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"A pull request already exists for acme:qory/wi_42."}]}`
+			}
+			return 0, ""
+		}
+	})
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft), targetOf("acme/gadgets", 1, openDraft)))
+	runPastRetries(t, w)
+	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets unreachable", "acme/gadgets forge_refused"}) {
+		t.Fatalf("reports %v", r)
+	}
+	if d := detailOf(w, 0); !strings.HasSuffix(d, "GitHub answered 502: Bad Gateway") {
+		t.Errorf("the first detail is %q", d)
+	}
+	if d := detailOf(w, 1); !strings.Contains(d, "GitHub answered 422: Validation Failed; PullRequest custom A pull request already exists") || strings.Contains(d, "502") {
+		t.Errorf("the second detail is %q", d)
+	}
+}
+
+// TestACauseThatKeepsComingEndsAsItsReason: each case fails on every try, not for good, so
+// the entry is applied again until its retries end, then reported with the reason of its
+// last error: a 401 that never stops is not_permitted, an answer that is no JSON is
+// forge_refused with a detail that says so, a 4xx from the installation lookup is
+// forge_refused at once, and only 5xx, a rate limit and a timeout are unreachable.
+func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		set    func(f *fakeGitHub)
+		now    bool // reported at once, not after the retries
+		reason string
+		detail string
+	}{
+		{"401 on the pull requests", failAt("GET", "/repos/acme/widgets/pulls", 401, `{"message":"Bad credentials"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: Bad credentials"},
+		{"401 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 401, `{"message":"A JSON web token could not be decoded"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: A JSON web token could not be decoded"},
+		{"an answer that is no JSON", failAt("GET", "/repos/acme/widgets/pulls", 200, `<html>Unicorn</html>`), false, "forge_refused", "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub's answer could not be read."},
+		{"400 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 400, `{"message":"Bad Request"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 400: Bad Request"},
+		{"422 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 422, `{"message":"Validation Failed"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 422: Validation Failed"},
+		{"502", failAt("GET", "/repos/acme/widgets/pulls", 502, `{"message":"Bad Gateway"}`), false, "unreachable", github.FixUnreachable + " GitHub answered 502: Bad Gateway"},
+		{"408", failAt("GET", "/repos/acme/widgets/pulls", 408, `{"message":"Request Timeout"}`), false, "unreachable", github.FixUnreachable + " GitHub answered 408: Request Timeout"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, tc.set)
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		if tc.now {
+			w.stepOK(t)
+		} else {
+			runPastRetries(t, w)
+		}
+		if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets " + tc.reason}) || detailOf(w, 0) != tc.detail {
+			t.Errorf("%s: reports %v, detail %q", tc.name, r, detailOf(w, 0))
+		}
+	}
+}

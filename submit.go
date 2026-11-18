@@ -47,7 +47,9 @@ const (
 	// MaxDraftTitle is the most characters of a draft's title.
 	MaxDraftTitle = 256
 	// MaxPullBody is the most characters GitHub keeps in the description of a pull
-	// request, the person's text and the marked block together.
+	// request, the person's text and the marked block together. The check before an
+	// update counts code points; GitHub's 422 for a text too long, reported as too_long
+	// too, is the backstop for any other way it counts.
 	MaxPullBody = 65536
 	// MaxDetail is the most characters of the detail of a failure report.
 	MaxDetail = 1000
@@ -128,6 +130,7 @@ type SubmitRefused struct {
 const (
 	FixNotInstalled   = "Install the App on the repository with the permission Pull requests: write."
 	FixPermission     = "Give the App's installation the permission Pull requests: write on the repository."
+	FixTokenRefused   = "Check that the App's key and installation are valid on GitHub, then submit again."
 	FixSuspended      = "Unsuspend the App's installation on GitHub."
 	FixAppForbidden   = "Check on GitHub that the App is not suspended or blocked, then submit again."
 	FixUnreachable    = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
@@ -140,7 +143,8 @@ const (
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
 	fixPullTitle      = "Shorten the title of the pull request on GitHub to 256 characters or fewer."
 	fixPullText       = "Shorten the title or the description of the pull request on GitHub."
-	fixForgeRefused   = "Change the pull request or the run as GitHub's answer says, then submit again."
+	fixUnreadable     = "Report to the maintainers of qory-github that GitHub's answer could not be read."
+	FixForgeRefused   = "Change the pull request or the run as GitHub's answer says, then submit again."
 )
 
 func (e *SubmitRefused) Error() string {
@@ -152,12 +156,16 @@ func (e *SubmitRefused) Error() string {
 func (e *SubmitRefused) Unwrap() error { return e.Err }
 
 // Detail is the text of the failure report's detail: Fix, then GitHub's status and
-// message when the refusal comes from an answer. It is one line of at most [MaxDetail] characters,
-// with no control character, and no token: see [OneLine].
+// message when the refusal comes from an answer, else Message when it has one. It is one
+// line of at most [MaxDetail] characters, with no control character, and no token: see
+// [OneLine].
 func (e *SubmitRefused) Detail() string {
 	d := e.Fix
-	if e.Status != 0 {
+	switch {
+	case e.Status != 0:
 		d += " GitHub answered " + strconv.Itoa(e.Status) + ": " + e.Message
+	case e.Message != "":
+		d += " " + e.Message
 	}
 	return OneLine(d, MaxDetail)
 }
@@ -170,29 +178,6 @@ func AnswerOf(err error) (int, string) {
 		return e.status, OneLine(e.message, MaxDetail)
 	}
 	return 0, ""
-}
-
-// LineForbidden matches the characters that a line of prose in the contract may not
-// have: the control characters, C0, DEL and C1, the bidirectional controls, the line and
-// paragraph separators, and the format characters that are usually not shown.
-var LineForbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
-
-// secretShape matches what looks like a credential: a GitHub token, a bearer value, and
-// the user information of an address.
-var secretShape = regexp.MustCompile(`(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})|bearer\s+\S+|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
-
-// OneLine is s as one line of at most max characters: each forbidden character, see
-// [LineForbidden], and each run of white space is one space, anything that looks like a
-// credential is replaced by "[removed]", and the rest is cut at max characters.
-func OneLine(s string, max int) string {
-	s = strings.ToValidUTF8(s, "")
-	s = LineForbidden.ReplaceAllString(s, " ")
-	s = secretShape.ReplaceAllString(s, "[removed]")
-	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > max {
-		s = strings.TrimRight(string(r[:max]), " ")
-	}
-	return s
 }
 
 // ghPull is a pull request as GitHub's API writes it.
@@ -297,11 +282,7 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 	default:
 		res, err = c.updatePull(ctx, p, tok, d, *found)
 	}
-	var refused *SubmitRefused
-	if errors.As(err, &refused) && tok != "" {
-		refused.Message = strings.ReplaceAll(refused.Message, tok, "[removed]")
-	}
-	return res, err
+	return res, Scrubbed(err, tok)
 }
 
 // CheckDraftText returns a [*SubmitRefused] with the reason too_long for a description of
@@ -363,7 +344,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 		case a.status == http.StatusOK:
 			var got ghPull
 			if err := json.Unmarshal(a.body, &got); err != nil {
-				return nil, fmt.Errorf("%s: GitHub's answer: %w", reading, err)
+				return nil, unreadable(reading, err)
 			}
 			if got.Number == d.Number && got.isDraftOf(d) {
 				return &got, nil
@@ -383,7 +364,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var listed []ghPull
 	if err := json.Unmarshal(a.body, &listed); err != nil {
-		return nil, fmt.Errorf("%s: GitHub's answer: %w", listing, err)
+		return nil, unreadable(listing, err)
 	}
 	var ours []ghPull
 	for _, l := range listed {
@@ -404,7 +385,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var got ghPull
 	if err := json.Unmarshal(a.body, &got); err != nil {
-		return nil, fmt.Errorf("%s: GitHub's answer: %w", reading, err)
+		return nil, unreadable(reading, err)
 	}
 	return &got, nil
 }
@@ -464,10 +445,10 @@ func lineFeeds(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 func resultOf(a *apiReply, what, action string) (DraftResult, error) {
 	var got ghPull
 	if err := json.Unmarshal(a.body, &got); err != nil {
-		return DraftResult{}, fmt.Errorf("%s: GitHub's answer: %w", what, err)
+		return DraftResult{}, unreadable(what, err)
 	}
 	if got.Number <= 0 || got.HTMLURL == "" {
-		return DraftResult{}, fmt.Errorf("%s: GitHub's answer has no number or address", what)
+		return DraftResult{}, unreadable(what, errors.New("it has no number or address"))
 	}
 	return DraftResult{Number: got.Number, URL: got.HTMLURL, Title: got.Title, State: got.state(), Action: action}, nil
 }
@@ -479,7 +460,7 @@ func resultOf(a *apiReply, what, action string) (DraftResult, error) {
 // pull request exists already. creating is whether the step creates the pull request,
 // whose 422 can name a head or base branch that does not exist.
 func submitFailed(a *apiReply, what string, creating bool) error {
-	err := a.err(what)
+	err := a.detailedErr(what)
 	switch {
 	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
 		return refusedBy(a, ReasonNotPermitted, fixMoved, err)
@@ -512,10 +493,57 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 			return refusedBy(a, ReasonBranchGone, fix, err)
 		}
 		return forgeRefused(a, err)
-	case a.status >= 400 && a.status < 500 && a.status != http.StatusUnauthorized && a.status != http.StatusForbidden && a.status != http.StatusRequestTimeout && a.status != http.StatusTooManyRequests:
+	case refusedStatus(a.status):
 		return forgeRefused(a, err)
 	}
 	return err
+}
+
+// refusedStatus is whether a retry gets the same answer to a status: a 4xx status other
+// than 401 (the token is dropped), 403 and 404 (not_permitted), 408 and 429 (busy).
+func refusedStatus(status int) bool {
+	return status >= 400 && status < 500 && status != http.StatusUnauthorized && status != http.StatusForbidden &&
+		status != http.StatusNotFound && status != http.StatusRequestTimeout && status != http.StatusTooManyRequests
+}
+
+// AnswerRefused is whether err, or an error it wraps, is GitHub's answer with a 4xx status
+// that a retry does not change and that no other reason covers, see [ReasonForgeRefused].
+func AnswerRefused(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && refusedStatus(e.status)
+}
+
+// ErrUnreadableAnswer is wrapped in the error of an answer of GitHub to a request of
+// [Client.SubmitDraft] that is not JSON of the shape GitHub documents.
+var ErrUnreadableAnswer = errors.New("GitHub's answer could not be read")
+
+// unreadable is the error for GitHub's answer to what, which could not be read, for cause.
+func unreadable(what string, cause error) error {
+	return fmt.Errorf("%s: %w: %w", what, ErrUnreadableAnswer, cause)
+}
+
+// EndedRefusal is the refusal to report for a repository whose retries ended after cause,
+// the error of its last try. A [*SubmitRefused] is itself. A 401 that kept coming is
+// not_permitted: the token or the App's key is refused. A 4xx status that a retry does not
+// change, as the 422 that says a pull request exists already, when the pull request
+// never showed up, or an answer that could not be read, is forge_refused. Anything else
+// is unreachable: a timeout, a failed connection, a rate limit or busy status, or a 5xx
+// status.
+func EndedRefusal(cause error) *SubmitRefused {
+	var refused *SubmitRefused
+	if errors.As(cause, &refused) {
+		return refused
+	}
+	status, message := AnswerOf(cause)
+	switch {
+	case Unauthorized(cause):
+		return &SubmitRefused{Reason: ReasonNotPermitted, Fix: FixTokenRefused, Err: cause, Status: status, Message: message}
+	case AnswerRefused(cause):
+		return &SubmitRefused{Reason: ReasonForgeRefused, Fix: FixForgeRefused, Err: cause, Status: status, Message: message}
+	case errors.Is(cause, ErrUnreadableAnswer):
+		return &SubmitRefused{Reason: ReasonForgeRefused, Fix: fixUnreadable, Err: cause, Message: ErrUnreadableAnswer.Error() + "."}
+	}
+	return &SubmitRefused{Reason: ReasonUnreachable, Fix: FixUnreachable, Err: cause, Status: status, Message: message}
 }
 
 // refusedBy is the [*SubmitRefused] for the answer a, with its status and message.
@@ -525,12 +553,20 @@ func refusedBy(a *apiReply, reason, fix string, err error) error {
 
 // forgeRefused is the [*SubmitRefused] of an answer that no other reason covers.
 func forgeRefused(a *apiReply, err error) error {
-	return refusedBy(a, ReasonForgeRefused, fixForgeRefused, err)
+	return refusedBy(a, ReasonForgeRefused, FixForgeRefused, err)
+}
+
+// detailedErr is [apiReply.err] with the message of [apiReply.forgeMessage], which has the
+// errors GitHub lists too.
+func (a *apiReply) detailedErr(what string) error {
+	e := a.err(what).(*answerError)
+	e.message = a.forgeMessage()
+	return e
 }
 
 // forgeMessage is the text of GitHub's refusal: its message, and each error it lists, as
-// "field code message", on one line. It is cut at [MaxDetail] characters, and has no
-// token.
+// "resource field code message", joined by semicolons. It is raw: [Scrubbed] makes it one
+// line with no credential, since only it knows the token.
 func (a *apiReply) forgeMessage() string {
 	var e struct {
 		Message string            `json:"message"`
@@ -553,7 +589,7 @@ func (a *apiReply) forgeMessage() string {
 	if text == "" {
 		text = http.StatusText(a.status)
 	}
-	return OneLine(text, MaxDetail)
+	return text
 }
 
 // branchInvalid matches GitHub's message for a head or base that is no branch, which it
