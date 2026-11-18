@@ -271,8 +271,9 @@ For each repository of the entry, the adapter:
   request to GitHub.
 - When the entry asks for a draft, looks for the pull request from the entry's branch into
   its base branch in that repository, of any state, and reads it. A pull request from a
-  fork, or into another base branch, is not that pull request. The `number` of an `update` entry is a hint: if GitHub has no pull
-  request with that number, head and base, the adapter looks by the head branch.
+  fork, or into another base branch, is not that pull request. The `number` of an
+  `update` entry is a hint: if GitHub has no pull request with that number, head and
+  base, the adapter looks by the head branch.
 - Opens a draft pull request from the branch into the entry's base branch when there is
   none. If more than one is, the adapter chooses none and reports `unreachable`.
 - Changes nothing in a pull request that is closed or merged, and reports its state
@@ -281,14 +282,22 @@ For each repository of the entry, the adapter:
   `updated`, or `kept` when nothing differs.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
-and the line `<!-- qory:end -->`. GitHub does not show the two lines. On an update, the
-adapter replaces only the text from the first start line through the first end line after
-it. Text before and after the block stays. When a person removed a marker, the adapter
-adds a blank line and a new block at the end of the description and changes nothing else.
+and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
+have spaces, tabs or a carriage return after the marker. On an update, the adapter finds
+the first end line that has a start line before it, and pairs it with the last start line
+before that end line. It replaces the text from the start of that start line through the
+end marker with the new block, and every other character stays, the text before and after
+the block and anything after the end marker on its line. The block's line breaks are CRLF
+when the first line break of the description is CRLF, otherwise LF. When no start line is
+followed by an end line, as when a person removed a marker, the adapter adds a blank line
+and a new block at the end of the description and changes nothing else.
 
 The adapter changes the title to the run's title only while the pull request's title
 equals the title of the previous version of the submission. A title that a person edited
 stays. The description of the run is at most 20000 characters and the title at most 256.
+The title in the reply to Qory Apiary is the pull request's title without the control,
+bidirectional and invisible characters that Qory Apiary refuses; the pull request keeps its
+title.
 
 When the adapter cannot do what a repository asks for, and a retry cannot change that, it
 sends Qory Apiary a failure report for that repository with one reason. The other
@@ -296,7 +305,7 @@ repositories of the entry are not stopped.
 
 | Reason | Cause |
 |---|---|
-| `not_permitted` | GitHub answered 403 or 404, or the App has no installation on the repository, or the installation is suspended. Give the App the Pull requests permission and access to the repository. |
+| `not_permitted` | GitHub answered 404, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended. Give the App the Pull requests permission and access to the repository. |
 | `branch_gone` | GitHub has no head branch or no base branch of that name. Push the branch again. |
 | `too_long` | The title or the description is over the limit of 256 or 20000 characters, or GitHub's 422 says the pull request's description is too long. |
 | `unreachable` | GitHub failed or did not answer for a day, or more than one pull request has the head branch, or GitHub answered 400 or another 422. |

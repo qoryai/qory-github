@@ -21,7 +21,8 @@ change what the program does, and notes it under Upgrading.
   version's title. A closed or merged pull request is not changed. One repository that
   fails does not stop the others. A repository that GitHub refuses for good is reported to
   Qory Apiary with the reason `not_permitted`, `branch_gone`, `too_long` or `unreachable`;
-  the App needs the permission Pull requests: read and write.
+  the App needs the permission Pull requests: read and write. The title in the reply
+  has none of the control, bidirectional or invisible characters that Qory Apiary refuses.
 - The description of the adapter has `submissions: true` in `roles.source`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. The program sets a GitHub commit link for each commit of a

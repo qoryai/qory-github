@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +88,10 @@ func addressesOf(repo github.Repository, t contracts.SubmissionTarget) (contract
 // again. Every error but the first ends with "(submission {id}, {path})".
 func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t contracts.SubmissionTarget) (contracts.SubmittedTarget, error) {
 	where := " (submission " + ch.SubmissionID + ", " + t.Path + ")"
+	// The schema of the entry makes the cases below unreachable: Qory Apiary writes only
+	// the system and the paths of the adapter's repositories, and a draft only with a
+	// text and a base branch. They are Qory Apiary's defects, so they are logged and
+	// passed, with no report.
 	if t.System != githubSystem {
 		return contracts.SubmittedTarget{}, Permanent(errors.New("report this Qory Apiary defect: the entry's system is not github.com" + where))
 	}
@@ -143,8 +148,26 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	default:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
-	reply.Draft = &contracts.SubmittedDraft{Number: got.Number, URL: got.URL, Title: got.Title, State: got.State, Action: got.Action}
+	reply.Draft = &contracts.SubmittedDraft{Number: got.Number, URL: got.URL, Title: replyTitle(got.Title, ch.Text.Title), State: got.State, Action: got.Action}
 	return reply, nil
+}
+
+// titleForbidden matches the characters that a draft's title in a reply may not have, as
+// the contract's rule of a prose line lists them: the control characters, C0, DEL and
+// C1, the bidirectional controls, the line and paragraph separators, and the format
+// characters that are usually not shown.
+var titleForbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+
+// replyTitle is the title of the pull request on GitHub as the reply sends it, without
+// the characters in [titleForbidden], which a person may have put in it: Qory Apiary
+// refuses a reply that has one. The pull request is not changed. A title left with
+// nothing but spaces is replaced by title, the run's title.
+func replyTitle(current, title string) string {
+	shown := titleForbidden.ReplaceAllString(strings.ToValidUTF8(current, ""), "")
+	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
+		return title
+	}
+	return shown
 }
 
 // targetState is what the feed keeps of one repository of a submission entry: whether it

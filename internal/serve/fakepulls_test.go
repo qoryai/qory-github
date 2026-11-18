@@ -22,12 +22,13 @@ type ghPullRec struct {
 
 // pullStore is the stand-in GitHub's pull requests, under f.mu, with what a test may
 // change: pullFail answers a request, by its method and path, with a status and a body
-// when it returns a status other than 0; goneBranches are the branches the repository
-// has none of, by name; noInstallation are the repositories the App has no installation
+// when it returns a status other than 0, with the headers in failHeader; goneBranches
+// are the branches the repository has none of, by name; noInstallation are the repositories the App has no installation
 // on, by owner/name.
 type pullStore struct {
 	pulls          []*ghPullRec
 	pullFail       func(method, path string) (int, string)
+	failHeader     map[string]string
 	goneBranches   map[string]bool
 	noInstallation map[string]bool
 }
@@ -60,6 +61,9 @@ func (f *fakeGitHub) pullsAPI(w http.ResponseWriter, r *http.Request, b []byte, 
 	}
 	if f.pullFail != nil {
 		if status, body := f.pullFail(r.Method, r.URL.Path); status != 0 {
+			for k, v := range f.failHeader {
+				w.Header().Set(k, v)
+			}
 			answer(status, body)
 			return
 		}
