@@ -28,17 +28,19 @@ change what the program does, and notes it under Upgrading.
   Apiary refuses.
 - The description of the adapter has `submissions: true` in `roles.source`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
-  module's `submit_program`. The program sets a GitHub commit link for each commit of a
-  run's submission file. After a passed round with a title and a description, it opens a
-  draft pull request from the branch in `ref` into the base branch listed in
-  `QORY_SUBMIT_BASES`, or updates the title and description of the open one, and writes
-  its number and link into the file. It reaches `api.github.com` only through the proxy
-  on the unix socket in `QORY_PROXY_SOCKET`, and sends no token. The program updates
-  only an open pull request from that branch of that repository into that base branch.
-  Every call to GitHub ends by 100 seconds after the program starts. Exit 1 means a call
-  to GitHub failed or a write of the file failed. Exit 2 means wrong input: with a wrong
-  structure, the file is unchanged; with a wrong input of the drafts, such as a missing
-  base branch, the file has only the commit links.
+  module's `submit_program`. It is a POSIX `sh` script that uses `gh`. qory runs it on your
+  machine, outside the sandbox that a run uses, once for each repository of a run that has no run code, after
+  it pushed the branch. The program prints the GitHub address of each commit and, for a run
+  with hand-off text, opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the
+  one that exists, with the login of `gh`. The title it prints has none of the characters that the contract refuses; when nothing is left, it prints `QORY_SUBMIT_TITLE`, cleaned the same way. It finds the pull request by its head branch and
+  repository alone, in any state. Of several it takes the highest number
+  that is not closed and not merged, otherwise the highest number. It replaces only the text between the lines
+  `<!-- qory:start -->` and `<!-- qory:end -->` of the description, keeps the title, and
+  changes nothing in a closed or merged pull request. It prints the result as lines
+  (`draft_number`, `draft_url`, `draft_title`, `draft_state`, `draft_action`, `commit_url`).
+  Exit 1 means a call to `gh` failed, exit 2 an input it cannot use, and exit 3 a missing
+  login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first line on
+  standard error. The program pushes nothing and needs no Node, `jq` or proxy.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

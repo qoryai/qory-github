@@ -1,61 +1,373 @@
 package opendraft
 
 import (
-	"bufio"
-	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"fmt"
-	"io"
-	"log"
-	"math/big"
-	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
-	"time"
-	"unicode/utf8"
 
+	"github.com/qoryai/integrations/contracts"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	password = "pw-7f3a9c-never-printed"
-	ref      = "qory/wi_01HZX"
-	// repoA has 21 characters, the length the stderr lines are kept within 100 for.
-	repoA = "acme-corp/widgets-app"
-	repoB = "acme-corp/gadgets"
+	repo       = "acme-corp/widgets-app"
+	branch     = "qory/run-01HZX"
+	baseBranch = "main"
+	title      = "Show delivery dates at checkout"
+	loginLine  = "Run `gh auth login`, then `qory run` again."
+	secret     = "ghp_never-printed-0123456789abcdef"
+	startLine  = "<!-- qory:start -->"
+	endLine    = "<!-- qory:end -->"
 )
 
-// Commit ids of the submissions: the base, the two commits in commits[], and the head.
-var (
-	baseCommit = strings.Repeat("a", 40)
-	midCommit  = strings.Repeat("b", 40)
-	fixCommit  = strings.Repeat("d", 40)
-	headCommit = strings.Repeat("c", 40)
-)
+func sha(c string) string { return strings.Repeat(c, 40) }
 
-func script(t *testing.T) string {
-	t.Helper()
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node is not on PATH; CI has it")
+func block(text string) string { return startLine + "\n" + text + "\n" + endLine }
+
+// fakeGh is a stand-in for gh: a shell script first on PATH that records each call and
+// prints the output that the test stored for it. In the mode jq it runs the --jq
+// expression of the program with the real jq over the stored JSON, as gh does; in the
+// mode text it prints the stored output of that expression.
+const fakeGh = `#!/bin/sh
+d=$FAKE_GH_DIR
+n=$(cat "$d/count" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" >"$d/count"
+: >"$d/call.$n"
+for a in "$@"; do printf '%s\n' "$a" >>"$d/call.$n"; done
+prev=
+method=GET
+endpoint=
+jq=
+for a in "$@"; do
+	case $prev in
+	--body-file) cp "$a" "$d/call.$n.file" ;;
+	-X) method=$a ;;
+	--jq) jq=$a ;;
+	esac
+	case $a in
+	body=@*) cp "${a#body=@}" "$d/call.$n.file" ;;
+	repos/*) endpoint=$a ;;
+	esac
+	prev=$a
+done
+case "$1 $2" in
+"auth token") key=auth ;;
+"pr create") key=create ;;
+*)
+	case "$method $endpoint" in
+	"GET "*/pulls) key=list ;;
+	"GET "*/pulls/*) key=read.${endpoint##*/} ;;
+	"PATCH "*) key=patch ;;
+	*) echo "fake gh: unexpected call $*" >&2; exit 99 ;;
+	esac
+	;;
+esac
+k=$(cat "$d/k.$key" 2>/dev/null || echo 0)
+k=$((k + 1))
+echo "$k" >"$d/k.$key"
+pick() { if [ -f "$d/$key.$k.$1" ]; then echo "$d/$key.$k.$1"; else echo "$d/$key.$1"; fi; }
+if [ -f "$(pick err)" ]; then cat "$(pick err)" >&2; fi
+if [ -n "$jq" ] && [ -n "${FAKE_GH_JQ:-}" ]; then
+	jq -r "$jq" "$(pick json)"
+elif [ -f "$(pick out)" ]; then
+	cat "$(pick out)"
+fi
+if [ -f "$(pick status)" ]; then exit "$(cat "$(pick status)")"; fi
+exit 0
+`
+
+const fakeGit = `#!/bin/sh
+echo "$@" >>"$FAKE_GH_DIR/git-called"
+exit 1
+`
+
+// pull is a pull request that the fake gh returns.
+type pull struct {
+	Number   int
+	Ref      string // empty is the branch of the run
+	Repo     string // empty is the repository; "-" is no head repository
+	State    string // empty is open
+	Title    string
+	Body     string
+	NullBody bool
+	Draft    bool
+	Merged   bool
+}
+
+func (p pull) norm() pull {
+	if p.Ref == "" {
+		p.Ref = branch
 	}
+	if p.Repo == "" {
+		p.Repo = repo
+	}
+	if p.State == "" {
+		p.State = "open"
+	}
+	if p.Title == "" {
+		p.Title = "Title of " + strconv.Itoa(p.Number)
+	}
+	return p
+}
+
+func (p pull) url() string { return "https://github.com/" + repo + "/pull/" + strconv.Itoa(p.Number) }
+
+// text is what gh prints for the program's --jq expression: 8 lines, and for a read the
+// description with the line feed that gh adds.
+func (p pull) text(read bool) string {
+	p = p.norm()
+	s := fmt.Sprintf("%d\n%s\n%s\n%s\n%t\n%t\n%s\n%s\n", p.Number, p.Ref, p.Repo, p.State, p.Merged, p.Draft, jqTitle(p.Title), p.url())
+	if read {
+		s += p.Body + "\n"
+	}
+	return s
+}
+
+func (p pull) json() map[string]any {
+	p = p.norm()
+	m := map[string]any{"number": p.Number, "state": p.State, "draft": p.Draft, "title": p.Title,
+		"html_url": p.url(), "merged_at": nil, "body": p.Body, "head": map[string]any{"ref": p.Ref, "repo": nil}}
+	if p.Merged {
+		m["merged_at"] = "2026-11-01T10:00:00Z"
+	}
+	if p.NullBody {
+		m["body"] = nil
+	}
+	if p.Repo != "-" {
+		m["head"].(map[string]any)["repo"] = map[string]any{"full_name": p.Repo}
+	}
+	return m
+}
+
+// forbidden is the set of characters that the contract's draft_title refuses, as the
+// adapter's cleanTitle removes them.
+var forbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+
+// jqTitle is what the --jq expression of the program prints for a title: the title
+// without the forbidden characters, or nothing when only spaces are left.
+func jqTitle(title string) string {
+	shown := forbidden.ReplaceAllString(title, "")
+	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
+		return ""
+	}
+	return shown
+}
+
+type fake struct {
+	t     *testing.T
+	dir   string
+	bin   string
+	tmp   string
+	mode  string
+	input map[string]string
+}
+
+func newFake(t *testing.T, mode string) *fake {
+	t.Helper()
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh is not on PATH: the program needs a POSIX shell")
+	}
+	if mode == "jq" {
+		if _, err := exec.LookPath("jq"); err != nil {
+			t.Skip("jq is not on PATH: the mode that runs the --jq expression needs it")
+		}
+	}
+	f := &fake{t: t, dir: t.TempDir(), bin: t.TempDir(), tmp: t.TempDir(), mode: mode}
+	// The PATH has the tools the program may use, and the fake gh and git.
+	for _, tool := range []string{"sh", "sed", "awk", "grep", "tr", "head", "cut", "wc", "cat", "cmp", "mktemp", "rm", "tail", "jq", "dirname", "env", "cp"} {
+		if p, err := exec.LookPath(tool); err == nil {
+			if err := os.Symlink(p, filepath.Join(f.bin, tool)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	f.write(filepath.Join(f.bin, "gh"), fakeGh, 0o755)
+	f.write(filepath.Join(f.bin, "git"), fakeGit, 0o755)
+	f.input = map[string]string{
+		"QORY_SUBMIT_SYSTEM":      "github.com",
+		"QORY_SUBMIT_PATH":        repo,
+		"QORY_SUBMIT_BRANCH":      branch,
+		"QORY_SUBMIT_BASE_BRANCH": baseBranch,
+		"QORY_SUBMIT_BASE_COMMIT": sha("a"),
+		"QORY_SUBMIT_COMMITS":     sha("b") + " " + sha("c"),
+		"QORY_SUBMIT_DRAFT":       "open",
+		"QORY_SUBMIT_TITLE":       title,
+	}
+	f.setText("Show the delivery date.")
+	f.set("list.out", "")
+	f.set("list.json", "[]")
+	return f
+}
+
+func (f *fake) write(path, content string, mode os.FileMode) {
+	f.t.Helper()
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fake) set(name, content string) { f.write(filepath.Join(f.dir, name), content, 0o644) }
+
+func (f *fake) setText(text string) {
+	f.t.Helper()
+	p := filepath.Join(f.t.TempDir(), "description.md")
+	f.write(p, text, 0o644)
+	f.input["QORY_SUBMIT_DESCRIPTION_FILE"] = p
+}
+
+// setList sets what the search from the branch returns.
+func (f *fake) setList(ps ...pull) {
+	f.t.Helper()
+	var text strings.Builder
+	var js []map[string]any
+	for _, p := range ps {
+		text.WriteString(p.text(false))
+		js = append(js, p.json())
+	}
+	b, err := json.Marshal(js)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.set("list.out", text.String())
+	f.set("list.json", string(b))
+}
+
+// setRead sets what the read of one pull request returns.
+func (f *fake) setRead(p pull) {
+	f.t.Helper()
+	b, err := json.Marshal(p.json())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	key := "read." + strconv.Itoa(p.Number)
+	f.set(key+".out", p.text(true))
+	f.set(key+".json", string(b))
+}
+
+// have makes the pull requests exist: the search returns them, and each can be read.
+func (f *fake) have(ps ...pull) {
+	f.setList(ps...)
+	for _, p := range ps {
+		f.setRead(p)
+	}
+}
+
+type result struct {
+	stdout, stderr string
+	code           int
+}
+
+func (f *fake) run(env ...string) result {
+	f.t.Helper()
+	var shell []string
+	if sh := os.Getenv("OPEN_DRAFT_TEST_SHELL"); sh != "" {
+		// A shell that runs the program in place of its shebang, such as dash.
+		shell = []string{sh}
+	}
+	return f.runProgram(program(f.t), shell, env...)
+}
+
+func (f *fake) runProgram(prog string, shell []string, env ...string) result {
+	f.t.Helper()
+	vars := map[string]string{}
+	for k, v := range f.input {
+		vars[k] = v
+	}
+	for _, e := range env {
+		k, v, _ := strings.Cut(e, "=")
+		if v == "\x00" {
+			delete(vars, k)
+		} else {
+			vars[k] = v
+		}
+	}
+	cmd := exec.Command(prog)
+	if shell != nil {
+		cmd = exec.Command(shell[0], append(shell[1:], prog)...)
+	}
+	cmd.Dir = f.t.TempDir()
+	cmd.Env = []string{"PATH=" + f.bin, "HOME=" + f.t.TempDir(), "TMPDIR=" + f.tmp, "GH_TOKEN=" + secret, "FAKE_GH_DIR=" + f.dir}
+	if f.mode == "jq" {
+		cmd.Env = append(cmd.Env, "FAKE_GH_JQ=1")
+	}
+	for k, v := range vars {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		f.t.Fatal(err)
+	}
+	r := result{out.String(), errb.String(), code}
+	if left, _ := filepath.Glob(filepath.Join(f.tmp, "*")); len(left) > 0 {
+		f.t.Errorf("the program left %v in TMPDIR", left)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "git-called")); err == nil {
+		f.t.Errorf("the program ran git")
+	}
+	for _, s := range []string{r.stdout, r.stderr} {
+		if strings.Contains(s, secret) {
+			f.t.Errorf("the output has the token: %q", s)
+		}
+	}
+	return r
+}
+
+// calls are the calls to gh, each as its arguments, and files the copies of the files
+// that a call named.
+func (f *fake) calls() [][]string {
+	var all [][]string
+	for n := 1; ; n++ {
+		b, err := os.ReadFile(filepath.Join(f.dir, fmt.Sprintf("call.%d", n)))
+		if err != nil {
+			return all
+		}
+		all = append(all, strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"))
+	}
+}
+
+func (f *fake) file(n int) string {
+	b, err := os.ReadFile(filepath.Join(f.dir, fmt.Sprintf("call.%d.file", n)))
+	if err != nil {
+		f.t.Fatalf("call %d has no file: %v", n, err)
+	}
+	return string(b)
+}
+
+// kinds lists the calls by their kind: auth, list, read, create, patch.
+func (f *fake) kinds() []string {
+	var ks []string
+	for _, c := range f.calls() {
+		line := strings.Join(c, " ")
+		switch {
+		case strings.HasPrefix(line, "auth token"):
+			ks = append(ks, "auth")
+		case strings.HasPrefix(line, "pr create"):
+			ks = append(ks, "create")
+		case strings.Contains(line, "-X PATCH"):
+			ks = append(ks, "patch")
+		case strings.Contains(line, "/pulls/"):
+			ks = append(ks, "read")
+		default:
+			ks = append(ks, "list")
+		}
+	}
+	return ks
+}
+
+func program(t *testing.T) string {
+	t.Helper()
 	p, err := filepath.Abs("../../modules/github/bin/open-draft")
 	if err != nil {
 		t.Fatal(err)
@@ -63,962 +375,700 @@ func script(t *testing.T) string {
 	return p
 }
 
-// call is one request that the stand-in GitHub received.
-type call struct {
-	Method string
-	Path   string
-	Query  string
-	Body   map[string]any
-}
-
-// pull is an open pull request of the stand-in GitHub. HeadRepo is the full name of the
-// head's repository: empty is the pull request's repository, and "-" is null, a
-// deleted fork.
-type pull struct {
-	Number   int
-	Title    string
-	Body     string
-	Head     string
-	HeadRepo string
-	Base     string
-	Draft    bool
-}
-
-// response is a status, headers and a body that the stand-in GitHub returns as they are.
-type response struct {
-	status int
-	body   string
-	header map[string]string
-}
-
-// github is a stand-in for api.github.com: pull requests per repository, and responses
-// to return for a method on a repository in place of the stand-in's.
-type github struct {
-	mu    sync.Mutex
-	calls []call
-	pulls map[string][]*pull
-	// fixed are the responses by "METHOD owner/name", such as "POST acme-corp/gadgets".
-	fixed  map[string]response
-	badURL bool
-}
-
-func (g *github) setPulls(repo string, pulls ...*pull) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.pulls[repo] = pulls
-}
-
-func (g *github) pullsOf(repo string) []pull {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	var out []pull
-	for _, p := range g.pulls[repo] {
-		out = append(out, *p)
-	}
-	return out
-}
-
-func (g *github) markReady(repo string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for _, p := range g.pulls[repo] {
-		p.Draft = false
+func eachMode(t *testing.T, fn func(t *testing.T, mode string)) {
+	for _, mode := range []string{"text", "jq"} {
+		t.Run(mode, func(t *testing.T) { fn(t, mode) })
 	}
 }
 
-func (g *github) fix(key string, status int, body string) {
-	g.fixHeader(key, status, body, nil)
+// commitLines are the lines for the base commit and the two commits of the default input.
+func commitLines() string {
+	var s strings.Builder
+	for _, c := range []string{"a", "b", "c"} {
+		fmt.Fprintf(&s, "commit_url %s https://github.com/%s/commit/%s\n", sha(c), repo, sha(c))
+	}
+	return s.String()
 }
 
-func (g *github) fixHeader(key string, status int, body string, header map[string]string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.fixed[key] = response{status, body, header}
+func draftLines(n int, ttl, state, action string) string {
+	return fmt.Sprintf("draft_number %d\ndraft_url https://github.com/%s/pull/%d\ndraft_title %s\ndraft_state %s\ndraft_action %s\n", n, repo, n, ttl, state, action)
 }
 
-var pullsPath = regexp.MustCompile(`^/repos/([^/]+/[^/]+)/pulls(?:/(\d+))?$`)
-
-func (g *github) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	c := call{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery}
-	if r.Body != nil {
-		raw, _ := io.ReadAll(r.Body)
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &c.Body); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-		}
-	}
-	g.calls = append(g.calls, c)
-	for h, want := range map[string]string{
-		"Accept": "application/vnd.github+json", "X-Github-Api-Version": "2022-11-28",
-		"User-Agent": "qory-github-open-draft",
-	} {
-		if r.Header.Get(h) != want {
-			http.Error(w, "header "+h, http.StatusBadRequest)
-			return
-		}
-	}
-	if r.Header.Get("Authorization") != "" {
-		http.Error(w, "the program sent a token", http.StatusBadRequest)
-		return
-	}
-	m := pullsPath.FindStringSubmatch(r.URL.Path)
-	if m == nil {
-		http.NotFound(w, r)
-		return
-	}
-	repo := m[1]
-	if f, ok := g.fixed[r.Method+" "+repo]; ok {
-		w.Header().Set("Content-Type", "application/json")
-		for k, v := range f.header {
-			w.Header().Set(k, v)
-		}
-		w.WriteHeader(f.status)
-		_, _ = io.WriteString(w, f.body)
-		return
-	}
-	render := func(p *pull) map[string]any {
-		u := "https://github.com/" + repo + "/pull/" + strconv.Itoa(p.Number)
-		if g.badURL {
-			u = "https://github.com/someone/else/pull/" + strconv.Itoa(p.Number)
-		}
-		var headRepo any = map[string]any{"full_name": repo}
-		switch p.HeadRepo {
-		case "":
-		case "-":
-			headRepo = nil
-		default:
-			headRepo = map[string]any{"full_name": p.HeadRepo}
-		}
-		return map[string]any{
-			"number": p.Number, "html_url": u, "title": p.Title, "body": p.Body, "draft": p.Draft, "state": "open",
-			"head": map[string]any{"ref": p.Head, "repo": headRepo}, "base": map[string]any{"ref": p.Base},
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	switch {
-	case r.Method == http.MethodGet && m[2] == "":
-		// Every open pull request, whatever the head parameter: the program filters.
-		out := []map[string]any{}
-		for _, p := range g.pulls[repo] {
-			out = append(out, render(p))
-		}
-		_ = json.NewEncoder(w).Encode(out)
-	case r.Method == http.MethodPost && m[2] == "":
-		n := 34
-		for _, p := range g.pulls[repo] {
-			n = max(n, p.Number+1)
-		}
-		p := &pull{Number: n, Title: c.Body["title"].(string),
-			Body: c.Body["body"].(string), Head: c.Body["head"].(string), Base: c.Body["base"].(string),
-			Draft: c.Body["draft"] == true}
-		g.pulls[repo] = append(g.pulls[repo], p)
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(render(p))
-	case r.Method == http.MethodPatch && m[2] != "":
-		n, _ := strconv.Atoi(m[2])
-		for _, p := range g.pulls[repo] {
-			if p.Number == n {
-				p.Title, p.Body = c.Body["title"].(string), c.Body["body"].(string)
-				_ = json.NewEncoder(w).Encode(render(p))
-				return
-			}
-		}
-		http.NotFound(w, r)
-	default:
-		http.Error(w, "unexpected", http.StatusMethodNotAllowed)
-	}
-}
-
-func (g *github) recorded() []call {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return append([]call(nil), g.calls...)
-}
-
-// env is a stand-in GitHub behind a stand-in proxy, and the files of one run.
-type env struct {
-	gh     *github
-	dir    string
-	socket string
-	caFile string
-	mu     sync.Mutex
-	// tunnels counts the connections the proxy accepted; connectStatus, when set, is
-	// the status the proxy returns to every CONNECT. connectReply, when set, is written
-	// in one write in place of the proxy's response; with closeAfter, the proxy then
-	// closes the connection, and without it, waits for the program to close it.
-	tunnels       int
-	connectStatus int
-	// cert is the stand-in GitHub's certificate, see [env.issue].
-	cert         *tls.Certificate
-	connectReply string
-	closeAfter   bool
-	// vars are environment variables that run adds after the others.
-	vars []string
-}
-
-func (e *env) tunnelCount() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.tunnels
-}
-
-// newEnv starts the stand-in GitHub with a certificate for api.github.com from a CA in
-// caFile, and a CONNECT proxy on a unix socket that requires the user qory and password.
-func newEnv(t *testing.T) *env {
+func wantResult(t *testing.T, r result, code int, stdout string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "od")
-	if err != nil {
-		t.Fatal(err)
+	if r.code != code || r.stdout != stdout {
+		t.Errorf("exit %d (want %d), stdout %q, want %q, stderr %q", r.code, code, r.stdout, stdout, r.stderr)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	e := &env{gh: &github{pulls: map[string][]*pull{}, fixed: map[string]response{}}, dir: dir,
-		socket: filepath.Join(dir, "p.sock"), caFile: filepath.Join(dir, "ca.pem")}
+}
 
-	e.issue(x509.KeyUsageCertSign)
-	srv := httptest.NewUnstartedServer(e.gh)
-	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
-	srv.TLS = &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.cert, nil
-	}}
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
-
-	ln, err := net.Listen("unix", e.socket)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	upstream := srv.Listener.Addr().String()
-	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte("qory:"+password))
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			e.mu.Lock()
-			e.tunnels++
-			e.mu.Unlock()
-			go e.proxy(c, upstream, auth)
+func TestAFirstRunOpensOneDraft(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		f := newFake(t, mode)
+		f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+		f.setRead(pull{Number: 12, Draft: true, Title: title, Body: block("Show the delivery date.")})
+		r := f.run()
+		wantResult(t, r, 0, commitLines()+draftLines(12, title, "draft", "opened"))
+		if r.stderr != "" {
+			t.Errorf("stderr %q", r.stderr)
 		}
-	}()
-	return e
-}
-
-func (e *env) proxy(c net.Conn, upstream, auth string) {
-	defer func() { _ = c.Close() }()
-	br := bufio.NewReader(c)
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		return
-	}
-	if req.Method != http.MethodConnect || req.Host != "api.github.com:443" {
-		_, _ = io.WriteString(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-		return
-	}
-	e.mu.Lock()
-	status, reply, closeAfter := e.connectStatus, e.connectReply, e.closeAfter
-	e.mu.Unlock()
-	if reply != "" {
-		_, _ = io.WriteString(c, reply)
-		if !closeAfter {
-			_, _ = io.Copy(io.Discard, br)
+		if got, want := strings.Join(f.kinds(), " "), "auth list create read"; got != want {
+			t.Fatalf("calls %s, want %s", got, want)
 		}
-		return
-	}
-	if status != 0 {
-		_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
-		return
-	}
-	if req.Header.Get("Proxy-Authorization") != auth {
-		_, _ = io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
-		return
-	}
-	up, err := net.Dial("tcp", upstream)
-	if err != nil {
-		_, _ = io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-		return
-	}
-	defer func() { _ = up.Close() }()
-	_, _ = io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n")
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(up, br); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(c, up); done <- struct{}{} }()
-	<-done
-}
-
-// issue makes a CA whose certificate has the key usage caUsage, writes it to caFile,
-// and sets the stand-in GitHub's certificate to one for api.github.com that the CA
-// signed.
-func (e *env) issue(caUsage x509.KeyUsage) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "stand-in CA"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
-		BasicConstraintsValid: true, KeyUsage: caUsage}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		panic(err)
-	}
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		panic(err)
-	}
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "api.github.com"},
-		DNSNames: []string{"api.github.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
-	if err != nil {
-		panic(err)
-	}
-	if err := os.WriteFile(e.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
-		panic(err)
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.cert = &tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
-}
-
-// otherCA is the PEM of a CA that did not sign the stand-in's certificate.
-func otherCA() []byte {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "other CA"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true,
-		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-}
-
-// result is one run of the program.
-type result struct {
-	code           int
-	stdout, stderr string
-}
-
-// run runs the program with the submission and bases files in the env's folder. A nil
-// bases leaves the bases file out; the extra variables override the defaults.
-func (e *env) run(t *testing.T, submission any, bases any, extra ...string) (result, map[string]any) {
-	t.Helper()
-	file := filepath.Join(e.dir, "submission.json")
-	writeJSON(t, file, submission)
-	vars := []string{"PATH=" + os.Getenv("PATH"), "QORY_SUBMISSION_FILE=" + file,
-		"QORY_PROXY_SOCKET=" + e.socket, "QORY_PROXY_PASSWORD=" + password, "SSL_CERT_FILE=" + e.caFile}
-	if bases != nil {
-		bf := filepath.Join(e.dir, "bases.json")
-		writeJSON(t, bf, bases)
-		vars = append(vars, "QORY_SUBMIT_BASES="+bf)
-	}
-	return e.runRaw(t, file, append(append(vars, extra...), e.vars...))
-}
-
-func (e *env) runRaw(t *testing.T, file string, vars []string) (result, map[string]any) {
-	t.Helper()
-	cmd := exec.Command(script(t))
-	cmd.Env = vars
-	var out, errOut bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errOut
-	err := cmd.Run()
-	r := result{stdout: out.String(), stderr: errOut.String()}
-	var exit *exec.ExitError
-	switch {
-	case errors.As(err, &exit):
-		r.code = exit.ExitCode()
-	case err != nil:
-		t.Fatal(err)
-	}
-	t.Logf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
-	if strings.Contains(r.stdout+r.stderr, password) {
-		t.Errorf("the output contains the proxy password:\n%s%s", r.stdout, r.stderr)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(r.stderr), "\n") {
-		// A line with a file path may pass 100 characters; the fix stays at the front.
-		if utf8.RuneCountInString(line) > 100 && !strings.Contains(line, e.dir) {
-			t.Errorf("stderr line is %d characters, over 100: %s", len(line), line)
+		calls := f.calls()
+		wantAuth := "auth token --hostname github.com"
+		if got := strings.Join(calls[0], " "); got != wantAuth {
+			t.Errorf("auth call %q, want %q", got, wantAuth)
 		}
-	}
-	var got map[string]any
-	if raw, err := os.ReadFile(file); err == nil {
-		_ = json.Unmarshal(raw, &got)
-	}
-	if _, err := os.Lstat(file + ".tmp"); err == nil {
-		t.Errorf("%s.tmp is left behind", file)
-	}
-	return r, got
+		list := calls[1]
+		wantList := []string{"api", "-X", "GET", "--hostname", "github.com", "repos/" + repo + "/pulls",
+			"-f", "head=acme-corp:" + branch, "-f", "state=all", "-f", "per_page=100", "--jq"}
+		if strings.Join(list[:len(list)-1], "\x00") != strings.Join(wantList, "\x00") {
+			t.Errorf("search call %q, want %q and an expression", list, wantList)
+		}
+		create := calls[2]
+		wantCreate := []string{"pr", "create", "--repo", "github.com/" + repo, "--draft", "--head", branch, "--base", baseBranch,
+			"--title", title, "--body-file"}
+		if strings.Join(create[:len(create)-1], "\x00") != strings.Join(wantCreate, "\x00") {
+			t.Errorf("create call %q, want %q and a file", create, wantCreate)
+		}
+		if got, want := f.file(3), block("Show the delivery date."); got != want {
+			t.Errorf("the description is %q, want %q", got, want)
+		}
+	})
 }
 
-func writeJSON(t *testing.T, path string, v any) {
-	t.Helper()
-	var raw []byte
-	if s, ok := v.(string); ok {
-		raw = []byte(s)
-	} else {
-		var err error
-		if raw, err = json.MarshalIndent(v, "", "  "); err != nil {
+func TestAnOpenedDraftThatIsReadyShowsOpen(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+	f.setRead(pull{Number: 12, Title: "Edited by GitHub", Body: block("x")})
+	wantResult(t, f.run(), 0, commitLines()+draftLines(12, "Edited by GitHub", "open", "opened"))
+}
+
+func TestARunWithoutAPrintedAddressFindsTheDraftFromTheBranch(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("create.out", "created\n")
+	f.set("list.2.out", pull{Number: 31, Draft: true, Title: title}.text(false))
+	f.setRead(pull{Number: 31, Draft: true, Title: title})
+	wantResult(t, f.run(), 0, commitLines()+draftLines(31, title, "draft", "opened"))
+}
+
+func TestALaterRunUpdatesOnlyTheBlockAndNeverTheTitle(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		f := newFake(t, mode)
+		f.setText("Second round.\nTwo lines.")
+		existing := "Dana above.\n\n" + block("First round.") + "\n\nDana below."
+		f.have(pull{Number: 8, Draft: true, Title: "Dana renamed this", Body: existing})
+		r := f.run()
+		wantResult(t, r, 0, commitLines()+draftLines(8, "Dana renamed this", "draft", "updated"))
+		if got, want := strings.Join(f.kinds(), " "), "auth list read patch"; got != want {
+			t.Fatalf("calls %s, want %s", got, want)
+		}
+		patch := f.calls()[3]
+		if len(patch) != 9 || strings.Join(patch[:7], " ") != "api -X PATCH --hostname github.com repos/"+repo+"/pulls/8 -F" ||
+			!strings.HasPrefix(patch[7], "body=@") || patch[8] != "--silent" {
+			t.Errorf("update call %q: it sends the description alone", patch)
+		}
+		if got, want := f.file(4), "Dana above.\n\n"+block("Second round.\nTwo lines.")+"\n\nDana below."; got != want {
+			t.Errorf("the description is %q, want %q", got, want)
+		}
+	})
+}
+
+func TestARunWhoseTextIsInTheBlockChangesNothing(t *testing.T) {
+	f := newFake(t, "text")
+	f.have(pull{Number: 8, Title: "Dana renamed this", Body: "Before.\n" + block("Show the delivery date.")})
+	wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Dana renamed this", "open", "kept"))
+	if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+		t.Errorf("calls %s", got)
+	}
+}
+
+func TestAClosedOrMergedPullRequestIsNotEdited(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		for _, c := range []struct {
+			name  string
+			p     pull
+			state string
+		}{
+			{"closed", pull{Number: 4, State: "closed", Title: "Closed one", Body: "Text."}, "closed"},
+			{"merged", pull{Number: 5, State: "closed", Merged: true, Title: "Merged one", Body: "Text."}, "merged"},
+			{"a draft that was closed", pull{Number: 6, State: "closed", Draft: true, Title: "Closed draft", Body: "Text."}, "closed"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.have(c.p)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(c.p.Number, c.p.Title, c.state, "kept"))
+				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+					t.Errorf("calls %s: it changes nothing and opens nothing", got)
+				}
+			})
+		}
+	})
+}
+
+// The draft among several: the highest number that is not closed and not merged, else
+// the highest number.
+func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		closed := pull{Number: 5, State: "closed", Title: "Five"}
+		open7 := pull{Number: 7, Title: "Seven", Draft: true, Body: "Text."}
+		open9 := pull{Number: 9, Title: "Nine", Draft: true, Body: "Text."}
+		merged11 := pull{Number: 11, State: "closed", Merged: true, Title: "Eleven"}
+		closed12 := pull{Number: 12, State: "closed", Title: "Twelve"}
+		fork := pull{Number: 20, Repo: "someone/widgets-app", Title: "Fork"}
+		noRepo := pull{Number: 21, Repo: "-", Title: "Deleted fork"}
+		otherBranch := pull{Number: 22, Ref: "other", Title: "Other branch"}
+		upper := pull{Number: 23, Repo: "Acme-Corp/Widgets-App", Title: "Upper case", Draft: true, Body: "Text."}
+		for _, c := range []struct {
+			name   string
+			ps     []pull
+			want   pull
+			state  string
+			action string
+		}{
+			{"the highest that is not closed or merged", []pull{open7, closed, open9, merged11, closed12}, open9, "draft", "updated"},
+			{"none is open, so the highest number", []pull{closed, merged11, closed12}, closed12, "closed", "kept"},
+			{"none is open and the highest is merged", []pull{closed, closed12, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}}, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}, "merged", "kept"},
+			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7, "draft", "updated"},
+			{"the repository is compared without regard to case", []pull{open7, upper}, upper, "draft", "updated"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.setText("New text.")
+				f.have(c.ps...)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, c.state, c.action))
+				kinds := strings.Join(f.kinds(), " ")
+				if want := map[string]string{"updated": "auth list read patch", "kept": "auth list read"}[c.action]; kinds != want {
+					t.Errorf("calls %s, want %s", kinds, want)
+				}
+			})
+		}
+	})
+}
+
+func TestADescriptionIsWrittenByTheRuleOfTheContract(t *testing.T) {
+	dirs, err := filepath.Glob("testdata/description/*")
+	if err != nil || len(dirs) < 20 {
+		t.Fatalf("fixtures %v, %v", dirs, err)
+	}
+	read := func(path string) string {
+		b, err := os.ReadFile(path)
+		if err != nil {
 			t.Fatal(err)
 		}
+		return string(b)
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
+	eachMode(t, func(t *testing.T, mode string) {
+		for _, dir := range dirs {
+			existing, text, want := read(dir+"/existing.md"), read(dir+"/text.md"), read(dir+"/result.md")
+			for _, null := range []bool{false, true} {
+				if null && existing != "" {
+					continue
+				}
+				t.Run(filepath.Base(dir)+fmt.Sprint(map[bool]string{true: " null", false: ""}[null]), func(t *testing.T) {
+					t.Parallel()
+					f := newFake(t, mode)
+					f.setText(text)
+					f.have(pull{Number: 3, Body: existing, NullBody: null})
+					r := f.run()
+					if want == existing {
+						wantResult(t, r, 0, commitLines()+draftLines(3, "Title of 3", "open", "kept"))
+						if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+							t.Errorf("calls %s", got)
+						}
+						return
+					}
+					wantResult(t, r, 0, commitLines()+draftLines(3, "Title of 3", "open", "updated"))
+					if got := strings.Join(f.kinds(), " "); got != "auth list read patch" {
+						t.Fatalf("calls %s", got)
+					}
+					if got := f.file(4); got != want {
+						t.Errorf("the description is %q, want %q", got, want)
+					}
+				})
+			}
+		}
+	})
+}
+
+// The adapter writes the description with contracts.MarkedDescription: the program gives
+// the same bytes for the same description and text, the cases of the contract's fixtures
+// and the cases of the adapter's tests (internal/serve/submission_test.go).
+func TestTheProgramWritesWhatTheAdapterWrites(t *testing.T) {
+	type c struct{ name, existing, text string }
+	cases := []c{
+		{"a person's lines around the block", "Dana above.\n\n" + block("First.") + "\n\nDana below.", "Second.\nTwo lines."},
+		{"no markers", "Dana wrote all of this.", "Second text."},
+		{"the block is the text already", block("Same text."), "Same text."},
+		{"a CRLF description with a multi-line block", "Dana above.\r\n" + strings.ReplaceAll(block("Line one.\nLine two.\n\nLine four."), "\n", "\r\n") + "\r\nDana below.", "Line one.\nLine two.\n\nLine four."},
+		{"a stray start marker", "Intro.\n" + startLine + "\nA person wrote this.\n", "One."},
+		{"a stray start marker and a block", "Intro.\n" + startLine + "\nA person wrote this.\n\n" + block("One."), "Two."},
+		{"an end marker before a start marker", endLine + "\ntext\n" + startLine + "\n", "Text."},
+		{"a marker with trailing spaces and a tab", startLine + " \t\nold\n" + endLine + "  \r\nafter", "New."},
+		{"only a line feed", "\n", "Text."},
+		{"two line feeds", "\n\n", "Text."},
+		{"a carriage return line", "\r\n", "Text."},
+		{"a line of spaces", "   ", "Text."},
+		{"an empty text", "Before.\n" + block("Old."), ""},
+		{"a text with a trailing line feed", "Before.", "Text.\n"},
+		{"two blocks", block("One.") + "\nmiddle\n" + block("Two."), "New."},
+		{"a long description", strings.Repeat("A line of the description.\n", 2000), "Text."},
+	}
+	dirs, _ := filepath.Glob("testdata/description/*")
+	for _, dir := range dirs {
+		e, _ := os.ReadFile(dir + "/existing.md")
+		x, _ := os.ReadFile(dir + "/text.md")
+		cases = append(cases, c{filepath.Base(dir), string(e), string(x)})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFake(t, "text")
+			f.setText(tc.text)
+			f.have(pull{Number: 3, Body: tc.existing})
+			r := f.run()
+			want := contracts.MarkedDescription(tc.existing, tc.text)
+			if r.code != 0 {
+				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+			}
+			if want == tc.existing {
+				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+					t.Errorf("calls %s: the adapter writes nothing", got)
+				}
+				return
+			}
+			if got := strings.Join(f.kinds(), " "); got != "auth list read patch" {
+				t.Fatalf("calls %s", got)
+			}
+			if got := f.file(4); got != want {
+				t.Errorf("the program writes %q, the adapter writes %q", got, want)
+			}
+		})
 	}
 }
 
-func repo(path, system string) map[string]any {
-	return map[string]any{"system": system, "path": path, "commit": headCommit,
-		"base":    map[string]any{"commit": baseCommit},
-		"commits": []any{map[string]any{"commit": midCommit, "step": "deliverable:d-1"}, map[string]any{"commit": fixCommit, "step": "fix:f1"}},
-		"draft":   map[string]any{"none": "not-passed"}}
+func TestARunWithNoDraftPrintsOnlyTheAddresses(t *testing.T) {
+	f := newFake(t, "text")
+	r := f.run("QORY_SUBMIT_DRAFT=none", "QORY_SUBMIT_TITLE=\x00", "QORY_SUBMIT_DESCRIPTION_FILE=\x00", "QORY_SUBMIT_BASE_BRANCH=\x00")
+	wantResult(t, r, 0, commitLines())
+	if len(f.calls()) != 0 || r.stderr != "" {
+		t.Errorf("calls %v, stderr %q: no call to gh is needed", f.calls(), r.stderr)
+	}
 }
 
-func submission(verdict, title string, repos ...map[string]any) map[string]any {
-	list := make([]any, len(repos))
-	for i, r := range repos {
-		list[i] = r
+func TestEachCommitGetsAnAddress(t *testing.T) {
+	f := newFake(t, "text")
+	var ids, want []string
+	for _, c := range []string{"1", "2", "3", "4"} {
+		ids = append(ids, sha(c))
 	}
-	s := map[string]any{"ref": ref, "verdict": verdict, "repositories": list}
-	if title != "" {
-		s["text"] = map[string]any{"title": title, "description": "What changed and why."}
+	want = append(want, "commit_url "+sha("a")+" https://github.com/"+repo+"/commit/"+sha("a"))
+	for _, id := range ids {
+		want = append(want, "commit_url "+id+" https://github.com/"+repo+"/commit/"+id)
 	}
-	return s
+	r := f.run("QORY_SUBMIT_DRAFT=none", "QORY_SUBMIT_COMMITS="+strings.Join(ids, " "))
+	wantResult(t, r, 0, strings.Join(want, "\n")+"\n")
+	// A SHA-256 repository has 64 digits.
+	long := strings.Repeat("e", 64)
+	r = f.run("QORY_SUBMIT_DRAFT=none", "QORY_SUBMIT_BASE_COMMIT="+long, "QORY_SUBMIT_COMMITS="+long)
+	wantResult(t, r, 0, "commit_url "+long+" https://github.com/"+repo+"/commit/"+long+"\ncommit_url "+long+" https://github.com/"+repo+"/commit/"+long+"\n")
+	var hundred []string
+	for i := range 100 {
+		hundred = append(hundred, fmt.Sprintf("%040x", i+1))
+	}
+	r = f.run("QORY_SUBMIT_DRAFT=none", "QORY_SUBMIT_COMMITS="+strings.Join(hundred, " "))
+	if r.code != 0 || strings.Count(r.stdout, "\n") != 101 {
+		t.Errorf("exit %d, %d lines", r.code, strings.Count(r.stdout, "\n"))
+	}
 }
 
-func bases(paths ...string) []any {
-	out := []any{}
-	for _, p := range paths {
-		out = append(out, map[string]any{"system": "github.com", "path": p, "base": "main"})
+func TestNoLoginIsExit3WithTheLoginCommandFirst(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("auth.err", "no oauth token found for github.com\n")
+	f.set("auth.status", "1")
+	r := f.run()
+	if r.code != 3 || strings.SplitN(r.stderr, "\n", 2)[0] != loginLine || r.stderr != loginLine+"\n" {
+		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
 	}
-	return out
+	// The login is read locally with gh auth token; gh auth status, which calls GitHub, is not run.
+	calls := f.calls()
+	if len(calls) != 1 || strings.Join(calls[0], " ") != "auth token --hostname github.com" {
+		t.Errorf("calls %q", calls)
+	}
+	if r.stdout != commitLines() {
+		t.Errorf("stdout %q", r.stdout)
+	}
 }
 
-func entry(s map[string]any, i int) map[string]any {
-	return s["repositories"].([]any)[i].(map[string]any)
+func TestTheTokenIsNeverPrinted(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("auth.out", secret+"\n")
+	f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+	f.setRead(pull{Number: 12, Draft: true, Title: title})
+	r := f.run()
+	if r.code != 0 || strings.Contains(r.stdout+r.stderr, secret) {
+		t.Errorf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+	}
 }
 
-func link(path, commit string) string {
-	return "https://github.com/" + path + "/commit/" + commit
-}
-
-// checkLinks checks the four commit links of a github.com entry made by repo.
-func checkLinks(t *testing.T, r map[string]any, path string) {
-	t.Helper()
-	if r["commit_url"] != link(path, headCommit) {
-		t.Errorf("commit_url = %v", r["commit_url"])
-	}
-	if b := r["base"].(map[string]any); b["commit_url"] != link(path, baseCommit) {
-		t.Errorf("base.commit_url = %v", b["commit_url"])
-	}
-	for i, want := range []string{midCommit, fixCommit} {
-		c := r["commits"].([]any)[i].(map[string]any)
-		if c["commit_url"] != link(path, want) {
-			t.Errorf("commits[%d].commit_url = %v", i, c["commit_url"])
+func TestANetworkFailureIsExit1NotALoginError(t *testing.T) {
+	for _, key := range []string{"list", "create", "read.8", "patch"} {
+		f := newFake(t, "text")
+		if key != "list" && key != "create" {
+			f.have(pull{Number: 8, Body: "old"})
+		}
+		f.set(key+".err", `Get "https://api.github.com/repos/acme-corp/widgets-app/pulls": dial tcp: lookup api.github.com: no such host`+"\n")
+		f.set(key+".status", "1")
+		r := f.run()
+		if r.code != 1 || strings.Contains(r.stderr, "gh auth login") || !strings.Contains(r.stderr, "no such host") || strings.Count(r.stderr, "\n") != 1 {
+			t.Errorf("%s: exit %d, stderr %q", key, r.code, r.stderr)
 		}
 	}
 }
 
-func TestManifestDeclaresTheProgram(t *testing.T) {
-	raw, err := os.ReadFile("../../modules/github/qory-module.yaml")
+func TestARejectedLoginIsExit3(t *testing.T) {
+	for _, key := range []string{"list", "create", "patch"} {
+		f := newFake(t, "text")
+		switch key {
+		case "create":
+			f.set("create.err", "gh: Bad credentials (HTTP 401)\n")
+		case "patch":
+			f.have(pull{Number: 8, Body: "old"})
+		}
+		f.set(key+".err", "gh: Bad credentials (HTTP 401)\n")
+		f.set(key+".status", "1")
+		r := f.run()
+		if r.code != 3 || r.stderr != loginLine+"\n" {
+			t.Errorf("%s: exit %d, stderr %q", key, r.code, r.stderr)
+		}
+	}
+}
+
+func TestAFailedCallIsExit1WithTheFixAndTheCauseOnTheFirstLine(t *testing.T) {
+	for _, c := range []struct{ key, cause, what string }{
+		{"list", "gh: Bad gateway (HTTP 502)", "the search for the pull request of the branch"},
+		{"create", "gh: Validation Failed (HTTP 422)\nA pull request already exists", "the opening of the draft pull request"},
+		{"read.8", "gh: Not Found (HTTP 404)", "the read of pull request 8"},
+		{"patch", "gh: Resource not accessible by integration (HTTP 403)", "the update of pull request 8"},
+	} {
+		t.Run(c.key, func(t *testing.T) {
+			f := newFake(t, "text")
+			if c.key != "list" && c.key != "create" {
+				f.have(pull{Number: 8, Body: "old"})
+			}
+			first, rest, _ := strings.Cut(c.cause, "\n")
+			f.set(c.key+".err", first+" token "+secret+"\n"+rest+"\n")
+			f.set(c.key+".status", "1")
+			r := f.run()
+			gotFirst := strings.SplitN(r.stderr, "\n", 2)[0]
+			wantFirst := "Check your gh login and its access to " + repo + ", then run `qory run` again: " + c.what + " failed: " +
+				strings.SplitN(c.cause, "\n", 2)[0] + " token ***"
+			if r.code != 1 || gotFirst != wantFirst || r.stderr != gotFirst+"\n" {
+				t.Errorf("exit %d, stderr %q, want the line %q", r.code, r.stderr, wantFirst)
+			}
+			if !strings.HasPrefix(r.stdout, commitLines()) || strings.Contains(r.stdout, "draft_") {
+				t.Errorf("stdout %q: the addresses stay, and no draft line", r.stdout)
+			}
+		})
+	}
+}
+
+func TestAFailedCallWithNoMessageIsExit1(t *testing.T) {
+	f := newFake(t, "text")
+	f.set("list.status", "1")
+	r := f.run()
+	if r.code != 1 || !strings.HasSuffix(r.stderr, "failed: gh printed no message\n") {
+		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+	}
+}
+
+func TestAReadThatReturnsNoPullRequestIsExit1(t *testing.T) {
+	f := newFake(t, "text")
+	f.setList(pull{Number: 8})
+	f.set("read.8.out", "")
+	r := f.run()
+	if r.code != 1 || !strings.HasPrefix(r.stderr, "Check that gh reaches github.com") {
+		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+	}
+}
+
+func TestNoGhIsExit1WithTheFixFirst(t *testing.T) {
+	f := newFake(t, "text")
+	if err := os.Remove(filepath.Join(f.bin, "gh")); err != nil {
+		t.Fatal(err)
+	}
+	r := f.run()
+	if r.code != 1 || !strings.HasPrefix(r.stderr, "Install gh from https://cli.github.com") {
+		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+	}
+}
+
+func TestTheCapsOf20000And256Characters(t *testing.T) {
+	two := "é" // two bytes, one character
+	for _, c := range []struct {
+		name, ttl, text string
+		code            int
+	}{
+		{"a description of 20000 characters", title, strings.Repeat(two, 20000), 0},
+		{"a description of 20001 characters", title, strings.Repeat(two, 20001), 2},
+		{"a description of 20000 ASCII characters", title, strings.Repeat("d", 20000), 0},
+		{"a description of 20001 ASCII characters", title, strings.Repeat("d", 20001), 2},
+		{"a title of 256 characters", strings.Repeat(two, 256), "Text.", 0},
+		{"a title of 257 characters", strings.Repeat(two, 257), "Text.", 2},
+		{"a title of 256 ASCII characters", strings.Repeat("t", 256), "Text.", 0},
+		{"a title of 257 ASCII characters", strings.Repeat("t", 257), "Text.", 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t, "text")
+			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+			f.setRead(pull{Number: 12, Draft: true, Title: c.ttl})
+			f.setText(c.text)
+			r := f.run("QORY_SUBMIT_TITLE=" + c.ttl)
+			if r.code != c.code {
+				t.Fatalf("exit %d, want %d, stderr %q", r.code, c.code, r.stderr)
+			}
+			if c.code == 2 && (r.stdout != "" || len(f.calls()) != 0 || !strings.HasPrefix(r.stderr, "Shorten ")) {
+				t.Errorf("stdout %q, calls %v, stderr %q", r.stdout, f.calls(), r.stderr)
+			}
+		})
+	}
+}
+
+func TestInputsThatCannotBeUsedAreExit2WithTheFixFirst(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"no system", []string{"QORY_SUBMIT_SYSTEM=\x00"}, "Set QORY_SUBMIT_SYSTEM"},
+		{"another system", []string{"QORY_SUBMIT_SYSTEM=code.example.com"}, "Compose a submit program for code.example.com"},
+		{"no path", []string{"QORY_SUBMIT_PATH=\x00"}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"a path with no name", []string{"QORY_SUBMIT_PATH=acme"}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"a path of three parts", []string{"QORY_SUBMIT_PATH=a/b/c"}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"a path with a dot name", []string{"QORY_SUBMIT_PATH=acme/.."}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"a path with a space", []string{"QORY_SUBMIT_PATH=acme/my app"}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"an owner that starts with a dash", []string{"QORY_SUBMIT_PATH=-acme/app"}, "Set QORY_SUBMIT_PATH to owner/name"},
+		{"no branch", []string{"QORY_SUBMIT_BRANCH=\x00"}, "Set QORY_SUBMIT_BRANCH to a branch name: it is empty"},
+		{"a branch that starts with a dash", []string{"QORY_SUBMIT_BRANCH=-x"}, "Set QORY_SUBMIT_BRANCH to a branch name that git accepts"},
+		{"a branch with a space", []string{"QORY_SUBMIT_BRANCH=a b"}, "Set QORY_SUBMIT_BRANCH to a branch name that git accepts"},
+		{"a branch with two dots", []string{"QORY_SUBMIT_BRANCH=a..b"}, "Set QORY_SUBMIT_BRANCH to a branch name that git accepts"},
+		{"a branch with a line feed", []string{"QORY_SUBMIT_BRANCH=a\nb"}, "Set QORY_SUBMIT_BRANCH to a branch name: the value has a control character"},
+		{"a draft that is neither open nor none", []string{"QORY_SUBMIT_DRAFT=update"}, "Set QORY_SUBMIT_DRAFT to open or none"},
+		{"a short base commit", []string{"QORY_SUBMIT_BASE_COMMIT=abc123"}, "Set QORY_SUBMIT_BASE_COMMIT"},
+		{"an upper-case base commit", []string{"QORY_SUBMIT_BASE_COMMIT=" + strings.Repeat("A", 40)}, "Set QORY_SUBMIT_BASE_COMMIT"},
+		{"no commits", []string{"QORY_SUBMIT_COMMITS=\x00"}, "Set QORY_SUBMIT_COMMITS to 1 to 100 commit ids: it has 0"},
+		{"a commit that is not a commit id", []string{"QORY_SUBMIT_COMMITS=" + sha("b") + " main"}, "Set QORY_SUBMIT_COMMITS to commit ids"},
+		{"commits on two lines", []string{"QORY_SUBMIT_COMMITS=" + sha("b") + "\n" + sha("c")}, "Join the commit ids in QORY_SUBMIT_COMMITS"},
+		{"commits joined by two spaces", []string{"QORY_SUBMIT_COMMITS=" + sha("b") + "  " + sha("c")}, "Join the commit ids in QORY_SUBMIT_COMMITS"},
+		{"no title", []string{"QORY_SUBMIT_TITLE=\x00"}, "Set QORY_SUBMIT_TITLE"},
+		{"a title with a line feed", []string{"QORY_SUBMIT_TITLE=a\nb"}, "Set QORY_SUBMIT_TITLE to a title on one line"},
+		{"a title of spaces", []string{"QORY_SUBMIT_TITLE=   "}, "Set QORY_SUBMIT_TITLE to a title with a character"},
+		{"no base branch", []string{"QORY_SUBMIT_BASE_BRANCH=\x00"}, "Set QORY_SUBMIT_BASE_BRANCH to the base branch of the draft"},
+		{"a bad base branch", []string{"QORY_SUBMIT_BASE_BRANCH=a~b"}, "Set QORY_SUBMIT_BASE_BRANCH to a branch name that git accepts"},
+		{"no description file", []string{"QORY_SUBMIT_DESCRIPTION_FILE=\x00"}, "Set QORY_SUBMIT_DESCRIPTION_FILE"},
+		{"a description file that is missing", []string{"QORY_SUBMIT_DESCRIPTION_FILE=/nonexistent/d.md"}, "Make the description file readable"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFake(t, "text")
+			r := f.run(c.env...)
+			if r.code != 2 || r.stdout != "" || !strings.HasPrefix(r.stderr, c.want) || strings.Count(r.stderr, "\n") != 1 || len(f.calls()) != 0 {
+				t.Errorf("exit %d, stdout %q, stderr %q, calls %v; want stderr that starts %q", r.code, r.stdout, r.stderr, f.calls(), c.want)
+			}
+			if first := strings.SplitN(r.stderr, "\n", 2)[0]; len(first) > 200 {
+				t.Errorf("the line has %d characters", len(first))
+			}
+		})
+	}
+}
+
+func TestACarriageReturnInTheDescriptionFileKeepsItsBytes(t *testing.T) {
+	f := newFake(t, "text")
+	f.setText("One.\r\nTwo.\r\n")
+	f.have(pull{Number: 3, Body: "Plain."})
+	wantResult(t, f.run(), 0, commitLines()+draftLines(3, "Title of 3", "open", "updated"))
+	if got, want := f.file(4), "Plain.\n\n"+startLine+"\nOne.\r\nTwo.\r\n\n"+endLine; got != want {
+		t.Errorf("the description is %q, want %q", got, want)
+	}
+}
+
+func TestTheProgramRunsUnderDash(t *testing.T) {
+	dash, err := exec.LookPath("dash")
+	if err != nil {
+		t.Skip("dash is not on PATH")
+	}
+	for _, args := range [][]string{{dash}, {"sh"}} {
+		f := newFake(t, "text")
+		f.have(pull{Number: 8, Draft: true, Body: "Dana.\n" + block("Old.")})
+		sh := args
+		if args[0] == "sh" {
+			p, _ := exec.LookPath("sh")
+			sh = []string{p}
+		}
+		r := f.runProgram(program(t), sh)
+		wantResult(t, r, 0, commitLines()+draftLines(8, "Title of 8", "draft", "updated"))
+		if out, err := exec.Command(sh[0], "-n", program(t)).CombinedOutput(); err != nil {
+			t.Errorf("%s -n: %v: %s", sh[0], err, out)
+		}
+	}
+}
+
+func TestTheModuleDeclaresTheProgram(t *testing.T) {
+	b, err := os.ReadFile("../../modules/github/qory-module.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var m struct {
-		APIVersion    string `yaml:"apiVersion"`
 		Name          string `yaml:"name"`
 		SubmitProgram struct {
 			Command []string `yaml:"command"`
 		} `yaml:"submit_program"`
 	}
-	if err := yaml.Unmarshal(raw, &m); err != nil {
+	if err := yaml.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.APIVersion != "qory.dev/v1alpha1" || m.Name != "github" ||
-		!reflect.DeepEqual(m.SubmitProgram.Command, []string{"bin/open-draft"}) {
-		t.Fatalf("manifest = %+v", m)
+	if m.Name != "github" || len(m.SubmitProgram.Command) != 1 || m.SubmitProgram.Command[0] != "bin/open-draft" {
+		t.Errorf("the manifest is %+v", m)
 	}
 	fi, err := os.Stat("../../modules/github/bin/open-draft")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm()&0o111 != 0o111 {
+	if fi.Mode()&0o111 == 0 {
 		t.Errorf("bin/open-draft mode = %v, want executable", fi.Mode())
 	}
-}
-
-func TestFirstPassedRunOpensDraft(t *testing.T) {
-	e := newEnv(t)
-	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
-	if r.code != 0 {
-		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
-	}
-	calls := e.gh.recorded()
-	if len(calls) != 2 || calls[0].Method != "GET" || calls[1].Method != "POST" {
-		t.Fatalf("calls = %+v", calls)
-	}
-	if calls[0].Path != "/repos/"+repoA+"/pulls" || calls[0].Query != "head=acme-corp%3Aqory%2Fwi_01HZX&state=open&per_page=100" {
-		t.Errorf("GET = %+v", calls[0])
-	}
-	want := map[string]any{"title": "Add the widget", "body": "What changed and why.", "head": ref, "base": "main", "draft": true}
-	if !reflect.DeepEqual(calls[1].Body, want) {
-		t.Errorf("POST body = %v, want %v", calls[1].Body, want)
-	}
-	url := "https://github.com/" + repoA + "/pull/34"
-	wantDraft := map[string]any{"number": 34.0, "url": url, "title": "Add the widget", "state": "draft", "action": "opened"}
-	if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, wantDraft) {
-		t.Errorf("draft = %v, want %v", d, wantDraft)
-	}
-	checkLinks(t, entry(got, 0), repoA)
-	if r.stdout != url+" opened\n" {
-		t.Errorf("stdout = %q", r.stdout)
-	}
-}
-
-func TestLaterPassedRunUpdatesSameDraft(t *testing.T) {
-	e := newEnv(t)
-	if r, _ := e.run(t, submission("passed", "First title", repo(repoA, "github.com")), bases(repoA)); r.code != 0 {
-		t.Fatalf("first run: exit %d, stderr %q", r.code, r.stderr)
-	}
-	// A member marks the draft ready for review between the runs.
-	e.gh.markReady(repoA)
-	r, got := e.run(t, submission("passed", "Second title", repo(repoA, "github.com")), bases(repoA))
-	if r.code != 0 {
-		t.Fatalf("second run: exit %d, stderr %q", r.code, r.stderr)
-	}
-	calls := e.gh.recorded()[2:]
-	if len(calls) != 2 || calls[1].Method != "PATCH" || calls[1].Path != "/repos/"+repoA+"/pulls/34" {
-		t.Fatalf("calls = %+v", calls)
-	}
-	if want := map[string]any{"title": "Second title", "body": "What changed and why."}; !reflect.DeepEqual(calls[1].Body, want) {
-		t.Errorf("PATCH body = %v, want only title and body", calls[1].Body)
-	}
-	url := "https://github.com/" + repoA + "/pull/34"
-	wantDraft := map[string]any{"number": 34.0, "url": url, "title": "Second title", "state": "open", "action": "updated"}
-	if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, wantDraft) {
-		t.Errorf("draft = %v, want %v", d, wantDraft)
-	}
-	if n := len(e.gh.pullsOf(repoA)); n != 1 {
-		t.Errorf("%d pull requests, want 1", n)
-	}
-	if r.stdout != url+" updated\n" {
-		t.Errorf("stdout = %q", r.stdout)
-	}
-}
-
-// others are open pull requests that the program must not update: another branch's,
-// one into another base, one from a fork with the same branch name, and one from a
-// deleted fork.
-func others() []*pull {
-	return []*pull{
-		{Number: 41, Head: "qory/wi_OTHER", Base: "main"},
-		{Number: 43, Head: ref, Base: "dev"},
-		{Number: 44, Head: ref, HeadRepo: "fork-owner/widgets-app", Base: "main"},
-		{Number: 45, Head: ref, HeadRepo: "-", Base: "main"},
-	}
-}
-
-func TestOnlyTheRunsPullRequestIsUpdated(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		pulls  []*pull
-		method string
-		path   string
-	}{
-		{"the run's among others", append(others(), &pull{Number: 42, Head: ref, HeadRepo: "ACME-Corp/Widgets-App", Base: "main"}),
-			"PATCH", "/repos/" + repoA + "/pulls/42"},
-		{"only others", others(), "POST", "/repos/" + repoA + "/pulls"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t)
-			for _, p := range tc.pulls {
-				p.Title, p.Body, p.Draft = "Old", "Old", true
-			}
-			e.gh.setPulls(repoA, tc.pulls...)
-			r, _ := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
-			if r.code != 0 {
-				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
-			}
-			calls := e.gh.recorded()
-			if len(calls) != 2 || calls[1].Method != tc.method || calls[1].Path != tc.path {
-				t.Fatalf("calls = %+v, want %s %s", calls, tc.method, tc.path)
-			}
-		})
-	}
-}
-
-func TestTwoOfTheRunsPullRequests(t *testing.T) {
-	e := newEnv(t)
-	e.gh.setPulls(repoA, append(others(),
-		&pull{Number: 42, Head: ref, Base: "main", Title: "Old", Body: "Old"},
-		&pull{Number: 47, Head: ref, Base: "main", Title: "Old", Body: "Old"})...)
-	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
-	want := "Close all but one of the run's open pull requests on " + repoA + ": GET pulls listed 2\n"
-	if r.code != 1 || r.stderr != want {
-		t.Fatalf("exit %d, stderr %q; want 1 and %q", r.code, r.stderr, want)
-	}
-	if calls := e.gh.recorded(); len(calls) != 1 {
-		t.Errorf("calls = %+v, want the GET alone", calls)
-	}
-	checkLinks(t, entry(got, 0), repoA)
-}
-
-func TestLinkInAnotherCase(t *testing.T) {
-	e := newEnv(t)
-	e.gh.fix("POST "+repoA, 201, `{"number":34,"html_url":"https://github.com/ACME-Corp/Widgets-App/pull/34","title":"Add the widget","draft":true,"state":"open"}`)
-	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA))
-	url := "https://github.com/" + repoA + "/pull/34"
-	if r.code != 0 || r.stdout != url+" opened\n" {
-		t.Fatalf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
-	}
-	if d := entry(got, 0)["draft"].(map[string]any); d["url"] != url {
-		t.Errorf("draft url = %v, want %s", d["url"], url)
-	}
-}
-
-func TestTitleOf256CodePoints(t *testing.T) {
-	e := newEnv(t)
-	title := strings.Repeat("\U0001F600", 256)
-	r, got := e.run(t, submission("passed", title, repo(repoA, "github.com")), bases(repoA))
-	if r.code != 0 {
-		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
-	}
-	if d := entry(got, 0)["draft"].(map[string]any); d["title"] != title {
-		t.Errorf("draft title = %v", d["title"])
-	}
-}
-
-func TestFailedWriteLeavesNoTmp(t *testing.T) {
-	e := newEnv(t)
-	file := filepath.Join(e.dir, "submission.json")
-	// A submission.json.tmp that links to a missing folder makes the write fail, also for
-	// root; the program removes the link.
-	if err := os.Symlink(filepath.Join(e.dir, "missing", "x"), file+".tmp"); err != nil {
+	src, err := os.ReadFile("../../modules/github/bin/open-draft")
+	if err != nil {
 		t.Fatal(err)
 	}
-	s := submission("changes-requested", "Add the widget", repo(repoA, "github.com"))
-	r, _ := e.run(t, s, nil)
-	want := "Make the folder of QORY_SUBMISSION_FILE writable: writing " + file + " failed (ENOENT)\n"
-	if r.code != 1 || r.stderr != want {
-		t.Errorf("exit %d, stderr %q; want 1 and %q", r.code, r.stderr, want)
+	if !strings.HasPrefix(string(src), "#!/bin/sh\n") {
+		t.Errorf("the program does not start with #!/bin/sh")
 	}
-	before, _ := json.MarshalIndent(s, "", "  ")
-	if after, _ := os.ReadFile(file); !bytes.Equal(before, after) {
-		t.Errorf("the file changed:\n%s", after)
-	}
-}
-
-// TestFourCommitsGetLinks runs a submission with four commits, the base, two in commits[]
-// and the head, for every verdict: each commit gets its link, and only the passed round
-// calls GitHub.
-func TestFourCommitsGetLinks(t *testing.T) {
-	for _, verdict := range []string{"passed", "changes-requested", "escalate", "none"} {
-		t.Run(verdict, func(t *testing.T) {
-			e := newEnv(t)
-			r, got := e.run(t, submission(verdict, "Add the widget", repo(repoA, "github.com")), bases(repoA))
-			if r.code != 0 {
-				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	for _, word := range []string{"QORY_SUBMIT_BASES", "QORY_PROXY", "node", "python", "git push", "bash"} {
+		for i, line := range strings.Split(string(src), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") && strings.Contains(line, word) {
+				t.Errorf("line %d has %q: %s", i+1, word, line)
 			}
-			checkLinks(t, entry(got, 0), repoA)
-			if verdict == "passed" {
-				if e.tunnelCount() == 0 || len(e.gh.recorded()) != 2 {
-					t.Errorf("%d tunnels and %d calls after a passed round, want the GET and the POST", e.tunnelCount(), len(e.gh.recorded()))
-				}
-				return
-			}
-			if n := e.tunnelCount(); n != 0 || len(e.gh.recorded()) != 0 {
-				t.Errorf("%d tunnels and %d calls after a round that did not pass, want none", n, len(e.gh.recorded()))
-			}
-			if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, map[string]any{"none": "not-passed"}) {
-				t.Errorf("draft = %v, want it unchanged", d)
-			}
-			if r.stdout != "" || r.stderr != "" {
-				t.Errorf("output %q %q, want none", r.stdout, r.stderr)
-			}
-		})
-	}
-}
-
-func TestPassedRunWithNoTextOpensNoDraft(t *testing.T) {
-	e := newEnv(t)
-	r, got := e.run(t, submission("passed", "", repo(repoA, "github.com")), nil)
-	if r.code != 0 || e.tunnelCount() != 0 {
-		t.Fatalf("exit %d, %d tunnels, stderr %q", r.code, e.tunnelCount(), r.stderr)
-	}
-	checkLinks(t, entry(got, 0), repoA)
-	if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, map[string]any{"none": "not-passed"}) {
-		t.Errorf("draft = %v, want it unchanged", d)
-	}
-}
-
-func TestOtherSystemsUntouched(t *testing.T) {
-	e := newEnv(t)
-	other := repo("group/sub/project", "git.example.org")
-	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com"), other), bases(repoA))
-	if r.code != 0 {
-		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
-	}
-	want, _ := json.Marshal(other)
-	if g, _ := json.Marshal(entry(got, 1)); !bytes.Equal(g, want) {
-		t.Errorf("other system's entry = %s, want %s", g, want)
-	}
-	for _, c := range e.gh.recorded() {
-		if strings.Contains(c.Path, "group") {
-			t.Errorf("call for the other system: %+v", c)
 		}
 	}
 }
 
-func TestForbiddenRepositoryKeepsOthers(t *testing.T) {
-	e := newEnv(t)
-	e.gh.fix("POST "+repoA, http.StatusForbidden, `{"message":"Resource not accessible by integration"}`)
-	r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com"), repo(repoB, "github.com")), bases(repoA, repoB))
-	if r.code != 1 {
-		t.Fatalf("exit %d, want 1; stderr %q", r.code, r.stderr)
-	}
-	wantErr := "Give the GitHub App pull_requests: write on acme-corp/widgets-app: POST pulls returned 403\n"
-	if r.stderr != wantErr {
-		t.Errorf("stderr = %q, want %q", r.stderr, wantErr)
-	}
-	if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, map[string]any{"none": "not-passed"}) {
-		t.Errorf("failed repository's draft = %v, want it unchanged", d)
-	}
-	if d := entry(got, 1)["draft"].(map[string]any); d["action"] != "opened" || d["url"] != "https://github.com/"+repoB+"/pull/34" {
-		t.Errorf("other repository's draft = %v", d)
-	}
-	checkLinks(t, entry(got, 0), repoA)
-	checkLinks(t, entry(got, 1), repoB)
-	if r.stdout != "https://github.com/"+repoB+"/pull/34 opened\n" {
-		t.Errorf("stdout = %q", r.stdout)
-	}
-}
-
-func TestFailedCalls(t *testing.T) {
-	const r = repoA
-	link := "https://github.com/" + r + "/pull/34"
-	cases := []struct {
-		name    string
-		setup   func(e *env)
-		extra   []string
-		wantErr string
-	}{
-		{"wrong proxy password", nil, []string{"QORY_PROXY_PASSWORD=wrong"},
-			"Set QORY_PROXY_PASSWORD to the proxy password: the proxy returned 407 for " + r},
-		{"proxy status 502", func(e *env) { e.connectStatus = 502 }, nil,
-			"Check the proxy at QORY_PROXY_SOCKET: CONNECT returned 502 for " + r},
-		{"no proxy", nil, []string{"QORY_PROXY_SOCKET=/nonexistent/p.sock"},
-			"Check the proxy at QORY_PROXY_SOCKET: connecting failed (ENOENT) for " + r},
-		{"no CA", nil, []string{"SSL_CERT_FILE="},
-			"Set SSL_CERT_FILE to the run's CA bundle: TLS failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"},
-		{"other CA", func(e *env) { _ = os.WriteFile(e.caFile, otherCA(), 0o600) }, nil,
-			"Check the CA bundle in SSL_CERT_FILE: TLS failed (UNABLE_TO_VERIFY_LEAF_SIGNATURE)"},
-		{"301", func(e *env) { e.gh.fix("GET "+r, 301, `{"message":"Moved Permanently"}`) }, nil,
-			"Set the targets to the current name of " + r + ": GET pulls returned 301"},
-		{"401", func(e *env) { e.gh.fix("GET "+r, 401, `{"message":"Bad credentials"}`) }, nil,
-			"Check the token the proxy adds for " + r + ": GET pulls returned 401"},
-		{"403 on GET", func(e *env) { e.gh.fix("GET "+r, 403, `{"message":"no"}`) }, nil,
-			"Give the GitHub App pull_requests: read on " + r + ": GET pulls returned 403"},
-		{"404", func(e *env) { e.gh.fix("GET "+r, 404, `{"message":"Not Found"}`) }, nil,
-			"Install the GitHub App on " + r + ": GET pulls returned 404"},
-		{"422", func(e *env) {
-			e.gh.fix("POST "+r, 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`)
-		}, nil, "Check the head and base branches on " + r + ": POST pulls returned 422 (head invalid)"},
-		{"422 no commits", func(e *env) {
-			e.gh.fix("POST "+r, 422, `{"message":"Validation Failed","errors":[{"message":"No commits between main and qory/wi_01HZX, as the branches are the same"}]}`)
-		}, nil, "Push the run's commits to " + r + ": POST pulls returned 422 (No commits between mai...)"},
-		{"422 drafts", func(e *env) {
-			e.gh.fix("POST "+r, 422, `{"message":"Draft pull requests are not supported in this repository."}`)
-		}, nil, "Use a GitHub plan with draft pull requests for " + r + ": POST pulls returned 422"},
-		{"429", func(e *env) { e.gh.fix("GET "+r, 429, `{"message":"Too many requests"}`) }, nil,
-			"Wait for GitHub's rate limit to reset for " + r + ": GET pulls returned 429"},
-		{"403 with no requests left", func(e *env) {
-			e.gh.fixHeader("POST "+r, 403, `{"message":"Forbidden"}`, map[string]string{"X-RateLimit-Remaining": "0"})
-		}, nil, "Wait for GitHub's rate limit to reset for " + r + ": POST pulls returned 403"},
-		{"403 about the rate limit", func(e *env) {
-			e.gh.fix("POST "+r, 403, `{"message":"You have exceeded a secondary rate limit."}`)
-		}, nil, "Wait for GitHub's rate limit to reset for " + r + ": POST pulls returned 403"},
-		{"past the deadline", func(e *env) {
-			// Every Date.now after the first, the program's start, is 100 s later.
-			late := filepath.Join(e.dir, "late.js")
-			_ = os.WriteFile(late, []byte("const now = Date.now; let n = 0; Date.now = () => now() + (n++ ? 100000 : 0);\n"), 0o600)
-			e.vars = append(e.vars, "NODE_OPTIONS=--require="+late)
-		}, nil, "Retry with a later passed round for " + r + ": GET pulls timed out at 100 s"},
-		{"503", func(e *env) { e.gh.fix("POST "+r, 503, `{"message":"unavailable"}`) }, nil,
-			"Retry with a later passed round for " + r + ": POST pulls returned 503"},
-		{"not JSON", func(e *env) { e.gh.fix("POST "+r, 201, `<html>`) }, nil,
-			"Check the proxy for " + r + ": POST pulls returned no valid JSON"},
-		{"GET returns no list", func(e *env) { e.gh.fix("GET "+r, 200, `{"message":"x"}`) }, nil,
-			"Check the proxy for " + r + ": GET pulls returned no list of pull requests"},
-		{"no pull request number", func(e *env) {
-			e.gh.fix("POST "+r, 201, `{"html_url":"`+link+`","title":"Add the widget","draft":true}`)
-		}, nil, "Check the proxy for " + r + ": POST pulls returned no pull request number"},
-		{"unusable title", func(e *env) {
-			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add\u0007the widget","draft":true}`)
-		}, nil, "Check the proxy for " + r + ": POST pulls returned an unusable title"},
-		{"closed pull request", func(e *env) {
-			e.gh.fix("POST "+r, 201, `{"number":34,"html_url":"`+link+`","title":"Add the widget","draft":true,"state":"closed"}`)
-		}, nil, "Check the proxy for " + r + ": POST pulls returned no open pull request"},
-		{"pull request closed before the PATCH", func(e *env) {
-			e.gh.setPulls(r, &pull{Number: 12345, Head: ref, Base: "main", Title: "Old", Body: "Old", Draft: true})
-			e.gh.fix("PATCH "+r, 200, `{"number":12345,"html_url":"https://github.com/`+r+`/pull/12345","title":"Add the widget","draft":true,"state":"closed"}`)
-		}, nil, "Retry with a later passed round for " + r + ": PATCH pulls/12345 returned state closed"},
-		{"CA without keyCertSign", func(e *env) { e.issue(x509.KeyUsageDigitalSignature) }, nil,
-			"Check the CA bundle in SSL_CERT_FILE: TLS failed (UNSPECIFIED)"},
-		{"proxy closes after 200", func(e *env) { e.connectReply, e.closeAfter = "HTTP/1.1 200 OK\r\n\r\n", true }, nil,
-			"Retry with a later passed round for " + r + ": GET pulls failed (ECONNRESET)"},
-		// The alert reaches TLS only through the bytes the program keeps after the head.
-		{"TLS alert after 200", func(e *env) { e.connectReply = "HTTP/1.1 200 OK\r\n\r\n\x15\x03\x03\x00\x02\x02\x28" }, nil,
-			"Check the proxy's tunnel to GitHub: TLS failed (ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE)"},
-		{"another link", func(e *env) { e.gh.badURL = true }, nil,
-			"Check that " + r + " is the repository's current name: pulls returned another link"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t)
-			if tc.setup != nil {
-				tc.setup(e)
-			}
-			start := time.Now()
-			r, got := e.run(t, submission("passed", "Add the widget", repo(repoA, "github.com")), bases(repoA), tc.extra...)
-			// A failed call ends at once, not at the 30 s time-out.
-			if d := time.Since(start); d > 10*time.Second {
-				t.Errorf("the run took %v", d)
-			}
-			if r.code != 1 || r.stderr != tc.wantErr+"\n" || r.stdout != "" {
-				t.Fatalf("exit %d, stdout %q, stderr %q; want 1 and %q", r.code, r.stdout, r.stderr, tc.wantErr)
-			}
-			checkLinks(t, entry(got, 0), repoA)
-			if d := entry(got, 0)["draft"]; !reflect.DeepEqual(d, map[string]any{"none": "not-passed"}) {
-				t.Errorf("draft = %v, want it unchanged", d)
-			}
-			// Past the deadline, no call leaves the program.
-			if tc.name == "past the deadline" && (e.tunnelCount() != 0 || len(e.gh.recorded()) != 0) {
-				t.Errorf("%d tunnels and %d calls past the deadline, want none", e.tunnelCount(), len(e.gh.recorded()))
-			}
-		})
-	}
-}
-
-// withLinks is submission s with the commit links of its github.com entries, as the
-// program writes them.
-func withLinks(t *testing.T, s any) any {
+// parsed checks that qory records the lines of a run: the five draft lines are valid
+// (contracts.ParseSubmitLines gives a draft and no line that it leaves out).
+func parsed(t *testing.T, stdout string) *contracts.SubmittedDraft {
 	t.Helper()
-	raw, _ := json.Marshal(s)
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatal(err)
+	ids := []string{sha("a"), sha("b"), sha("c")}
+	res := contracts.ParseSubmitLines(stdout, "github.com", "open", ids)
+	if res.Draft == nil || len(res.Invalid) != 0 || len(res.CommitURLs) != 3 {
+		t.Fatalf("qory does not record %q: draft %+v, left out %v", stdout, res.Draft, res.Invalid)
 	}
-	for _, r := range out["repositories"].([]any) {
-		r := r.(map[string]any)
-		if r["system"] != "github.com" {
-			continue
-		}
-		path := r["path"].(string)
-		r["commit_url"] = link(path, r["commit"].(string))
-		b := r["base"].(map[string]any)
-		b["commit_url"] = link(path, b["commit"].(string))
-		for _, c := range r["commits"].([]any) {
-			c := c.(map[string]any)
-			c["commit_url"] = link(path, c["commit"].(string))
-		}
-	}
-	return out
+	return res.Draft
 }
 
-// TestBadInputExits2 runs wrong input. A wrong structure leaves the file unchanged; a
-// wrong input of the drafts leaves only the commit links written.
-func TestBadInputExits2(t *testing.T) {
-	good := func() map[string]any { return submission("passed", "Add the widget", repo(repoA, "github.com")) }
-	with := func(f func(s map[string]any)) map[string]any { s := good(); f(s); return s }
-	cases := []struct {
-		name       string
-		submission any
-		bases      any
-		wantErr    string
-		links      bool
-	}{
-		{"not JSON", "{", bases(repoA), "Write valid JSON to the file in QORY_SUBMISSION_FILE: %s does not parse", false},
-		{"no ref", with(func(s map[string]any) { delete(s, "ref") }), bases(repoA),
-			"Fix ref in the submission: it is not qory/wi_<id>", false},
-		{"short commit", with(func(s map[string]any) { entry(s, 0)["commit"] = "abc" }), bases(repoA),
-			"Fix repositories[0].commit in the submission: it is not a 40 or 64 hex commit id", false},
-		{"no draft", with(func(s map[string]any) { delete(entry(s, 0), "draft") }), bases(repoA),
-			"Fix repositories[0].draft in the submission: it is missing or not a JSON object", false},
-		{"path not owner/name", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/team/widgets" }), bases(repoA),
-			"Fix repositories[0].path in the submission: it is not owner/name for github.com", false},
-		{"dot-dot path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.." }), bases(repoA),
-			"Fix repositories[0].path in the submission: it has a ., .. or .git segment", false},
-		{".git path", with(func(s map[string]any) { entry(s, 0)["path"] = "acme/.GIT" }), bases(repoA),
-			"Fix repositories[0].path in the submission: it has a ., .. or .git segment", false},
-		{"title with a control character", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = "Add\tthe widget" }), bases(repoA),
-			"Fix text.title in the submission: it is not 1 to 256 characters with no control character", true},
-		{"title of 257 code points", with(func(s map[string]any) { s["text"].(map[string]any)["title"] = strings.Repeat("\U0001F600", 257) }), bases(repoA),
-			"Fix text.title in the submission: it is not 1 to 256 characters with no control character", true},
-		{"missing base", good(), bases(repoB),
-			"Add acme-corp/widgets-app to the run documents' targets: no base branch for it in QORY_SUBMIT_BASES", true},
-		{"bases entry without base", good(), []any{map[string]any{"system": "github.com", "path": repoA}},
-			"Fix entry 0 of the file in QORY_SUBMIT_BASES: it is not {system, path, base} with a valid branch", true},
-		{"no bases file", good(), nil, "Set QORY_SUBMIT_BASES: the variable is unset or empty", true},
-		{"bases not a list", good(), map[string]any{"x": 1},
-			"Write a list of {system, path, base} to the file in QORY_SUBMIT_BASES: it is not a list", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t)
-			file := filepath.Join(e.dir, "submission.json")
-			r, _ := e.run(t, tc.submission, tc.bases)
-			after, _ := os.ReadFile(file)
-			var before []byte
-			if s, ok := tc.submission.(string); ok {
-				before = []byte(s)
-			} else {
-				before, _ = json.MarshalIndent(tc.submission, "", "  ")
-			}
-			if tc.links {
-				var got any
-				_ = json.Unmarshal(after, &got)
-				if want := withLinks(t, tc.submission); !reflect.DeepEqual(got, want) {
-					t.Errorf("the file is\n%s\nwant the submission with its commit links alone", after)
+func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		classes := map[string]string{
+			"a C0 control":        "\x01",
+			"a delete":            "\x7f",
+			"a line feed":         "\n",
+			"a carriage return":   "\r",
+			"a tab":               "\t",
+			"a C1 control":        "\u0085",
+			"the highest C1":      "\u009f",
+			"a soft hyphen":       "\u00ad",
+			"an Arabic mark":      "\u061c",
+			"a Mongolian vowel":   "\u180e",
+			"a zero width space":  "\u200b",
+			"a left-to-right":     "\u200e",
+			"a right-to-left":     "\u200f",
+			"a line separator":    "\u2028",
+			"a paragraph sep":     "\u2029",
+			"a bidi embedding":    "\u202a",
+			"a bidi override":     "\u202e",
+			"a word joiner":       "\u2060",
+			"an invisible plus":   "\u2064",
+			"an isolate":          "\u2066",
+			"a pop isolate":       "\u2069",
+			"a byte order mark":   "\ufeff",
+			"an annotation start": "\ufff9",
+			"an annotation end":   "\ufffb",
+		}
+		for name, ch := range classes {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: "Show" + ch + " dates", Body: "x"})
+				r := f.run()
+				wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+				if d := parsed(t, r.stdout); d.Title != "Show dates" {
+					t.Errorf("recorded title %q", d.Title)
 				}
-			} else if !bytes.Equal(before, after) {
-				t.Errorf("the file changed:\n%s", after)
-			}
-			wantErr := tc.wantErr
-			if strings.Contains(wantErr, "%s") {
-				wantErr = fmt.Sprintf(wantErr, file)
-			}
-			if r.code != 2 || r.stderr != wantErr+"\n" || r.stdout != "" {
-				t.Errorf("exit %d, stdout %q, stderr %q; want 2 and %q", r.code, r.stdout, r.stderr, wantErr)
-			}
-			if e.tunnelCount() != 0 {
-				t.Errorf("%d tunnels after bad input, want none", e.tunnelCount())
+			})
+		}
+		// A character next to the allowed ones stays: the neighbours of each range.
+		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u206a", "﻾", "￸", "￼", "é", "日本語"} {
+			t.Run("keeps "+keep, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: "Show" + keep, Body: "x"})
+				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Show"+keep, "draft", "updated"))
+			})
+		}
+		t.Run("nothing but forbidden characters and spaces uses the title of the run", func(t *testing.T) {
+			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   "} {
+				f := newFake(t, mode)
+				f.have(pull{Number: 8, Draft: true, Title: ghTitle, Body: "x"})
+				r := f.run("QORY_SUBMIT_TITLE=Show\u200b dates\u202e")
+				wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+				parsed(t, r.stdout)
 			}
 		})
+		t.Run("a closed pull request is cleaned too", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 4, State: "closed", Title: "Old\u200f\nname"})
+			wantResult(t, f.run(), 0, commitLines()+draftLines(4, "Oldname", "closed", "kept"))
+		})
+		t.Run("a new draft shows the title that GitHub has, cleaned", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+			f.setRead(pull{Number: 12, Draft: true, Title: "Show\u200b dates"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(12, "Show dates", "draft", "opened"))
+			parsed(t, r.stdout)
+		})
+	})
+}
+
+func TestATitleOfTheRunWithNothingToShowIsRefused(t *testing.T) {
+	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e "} {
+		f := newFake(t, "text")
+		r := f.run("QORY_SUBMIT_TITLE=" + bad)
+		if r.code != 2 || r.stdout != "" || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
+			t.Errorf("title %q: exit %d, stdout %q, stderr %q, calls %v", bad, r.code, r.stdout, r.stderr, f.calls())
+		}
 	}
 }
 
-func TestMissingSubmissionFile(t *testing.T) {
-	e := newEnv(t)
-	file := filepath.Join(e.dir, "missing.json")
-	r, _ := e.runRaw(t, file, []string{"PATH=" + os.Getenv("PATH"), "QORY_SUBMISSION_FILE=" + file})
-	want := "Set QORY_SUBMISSION_FILE to a readable file: reading " + file + " failed (ENOENT)\n"
-	if r.code != 2 || r.stderr != want {
-		t.Errorf("exit %d, stderr %q; want 2 and %q", r.code, r.stderr, want)
-	}
-	if _, err := os.Stat(file); err == nil {
-		t.Error("the program created the file")
+func TestEveryRunOfTheProgramIsRecordedByQory(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(f *fake)
+	}{
+		{"opened", func(f *fake) {
+			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+			f.setRead(pull{Number: 12, Draft: true, Title: title})
+		}},
+		{"updated", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: "x"}) }},
+		{"kept merged", func(f *fake) { f.have(pull{Number: 8, State: "closed", Merged: true, Title: "Mine"}) }},
+	} {
+		f := newFake(t, "text")
+		c.set(f)
+		r := f.run()
+		if r.code != 0 {
+			t.Fatalf("%s: exit %d, stderr %q", c.name, r.code, r.stderr)
+		}
+		parsed(t, r.stdout)
 	}
 }

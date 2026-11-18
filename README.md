@@ -247,12 +247,11 @@ Tested with git 2.39 and gh 2.100:
   into another owner's repository needs two owners; a run has one.
 
 The harness module in [`modules/github`](modules/github/README.md) contains
-`bin/open-draft`, a program that adds a GitHub link to each commit of a run's submission
-and, after a passed round, opens or updates the draft pull request through the GitHub REST
-API. It reaches GitHub through a proxy on a unix socket and sends no token. The run
-credential for work with access `write` has no item for `api.github.com`, so the
-program cannot reach `api.github.com` through the push proxy: the proxy refuses the
-`CONNECT`. As of 2026-11-17, `qory` does not run the program.
+`bin/open-draft`, a POSIX `sh` program that uses `gh`. After `qory run` pushed the branch
+of a run that has no run code, qory runs it on your machine with your `gh` login. It
+prints the GitHub address of each commit and opens or edits the draft pull request of the
+branch. It pushes nothing and needs `gh` logged in; without a login it exits with status 3
+and asks you to run `gh auth login`.
 
 ### Draft pull requests of a submission
 
