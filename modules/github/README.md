@@ -105,7 +105,7 @@ spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
 | Exit | Meaning |
 |---|---|
 | 0 | Done. |
-| 1 | A call to `gh` failed, `gh` is missing, or `gh` did not answer within 110 seconds. The commit lines are printed; no draft line is. |
+| 1 | A call to `gh` failed, `gh` is missing, or the `gh` call did not finish within 110 seconds. The commit lines are printed; no draft line is. |
 | 2 | An input cannot be used. Nothing is printed on standard output when the input is one of the commits; the commit lines are printed when it is one of the draft. |
 | 3 | `gh` has no login, or GitHub rejected it. |
 
@@ -119,9 +119,9 @@ Check your gh login and its access to owner/name, then run `qory run` again: the
 
 qory stops the program after 120 seconds and then reads no line. The program ends itself
 after 110 seconds when `gh` has not finished: it ends the `gh` call, prints
-``Run `qory run` again; `gh` did not answer within 110 seconds.`` on standard error, and
-exits with status 1, so the commit lines that it printed are read. SIGHUP, SIGINT and SIGTERM end the
-timer, the work and `gh` the same way, with status 1. A SIGKILL of the program leaves its
-timer, a `sleep`, running for up to 110 seconds. The tests set
+``Run `qory run` again: the `gh` call did not finish within 110 seconds.`` on standard
+error, and exits with status 1, so the commit lines that it printed are read. SIGHUP, SIGINT and
+SIGTERM end the timer, the work and `gh` the same way, with status 1. A SIGKILL of the
+program leaves its timer, a `sleep`, running for up to 110 seconds. The tests set
 `OPEN_DRAFT_WATCHDOG_SECONDS`, from 1 to 110, to shorten the limit; the program takes no
 larger value.

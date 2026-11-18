@@ -568,29 +568,29 @@ func TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing.T)
 		forge       string // what the detail has of GitHub's answer after the fix, or none
 		quiet       bool   // GitHub is asked nothing
 	}{
-		{"the list is 403", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub answered 403: Resource not accessible by integration", false},
-		{"the list is 404", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 404, `{"message":"Not Found"}`), "not_permitted", fixNotInstalled, "GitHub answered 404: Not Found", false},
+		{"the list is 403", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub returned 403: Resource not accessible by integration", false},
+		{"the list is 404", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 404, `{"message":"Not Found"}`), "not_permitted", fixNotInstalled, "GitHub returned 404: Not Found", false},
 		{"no installation", "Text.", func(f *fakeGitHub) { f.noInstallation = map[string]bool{"acme/widgets": true} }, "not_permitted", fixNotInstalled, "", false},
-		{"the installation lookup is 403", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 403, `{"message":"Forbidden"}`), "not_permitted", "Check on GitHub that the App is not suspended or blocked, then submit again.", "GitHub answered 403: Forbidden", false},
-		{"the installation lookup is 301", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 301, `{"message":"Moved Permanently"}`), "forge_refused", github.FixMoved, "GitHub answered 301: Moved Permanently", false},
-		{"the installation lookup is 308", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 308, `{"message":"Permanent Redirect"}`), "forge_refused", github.FixMoved, "GitHub answered 308: Permanent Redirect", false},
+		{"the installation lookup is 403", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 403, `{"message":"Forbidden"}`), "not_permitted", "Check on GitHub that the App is not suspended or blocked, then submit again.", "GitHub returned 403: Forbidden", false},
+		{"the installation lookup is 301", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 301, `{"message":"Moved Permanently"}`), "forge_refused", github.FixMoved, "GitHub returned 301: Moved Permanently", false},
+		{"the installation lookup is 308", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 308, `{"message":"Permanent Redirect"}`), "forge_refused", github.FixMoved, "GitHub returned 308: Permanent Redirect", false},
 		{"the installation lookup is 404", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 404, `{"message":"Not Found"}`), "not_permitted", fixNotInstalled, "", false},
 		{"the installation lookup is 302", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 302, `{"message":"Found"}`), "not_permitted", fixNotInstalled, "", false},
 		{"the installation lookup is 307", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 307, `{"message":"Temporary Redirect"}`), "not_permitted", fixNotInstalled, "", false},
 		{"a suspended installation", "Text.", func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", "Unsuspend the App's installation on GitHub.", "", false},
-		{"the create is 403", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub answered 403: Resource not accessible by integration", false},
-		{"the repository moved", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 301, `{"message":"Moved Permanently"}`), "forge_refused", "Link the repository by its new name: GitHub moved it.", "GitHub answered 301: Moved Permanently", false},
-		{"the head branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{testBranch: true} }, "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub answered 422: Validation Failed; PullRequest head invalid", false},
-		{"GitHub's message for an invalid head", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`), "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub answered 422: Validation Failed; PullRequest invalid head invalid", false},
-		{"the base branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{"main": true} }, "branch_gone", "Create the base branch on GitHub, or choose another base branch, then submit again.", "GitHub answered 422: Validation Failed; PullRequest base invalid", false},
+		{"the create is 403", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub returned 403: Resource not accessible by integration", false},
+		{"the repository moved", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 301, `{"message":"Moved Permanently"}`), "forge_refused", "Link the repository by its new name: GitHub moved it.", "GitHub returned 301: Moved Permanently", false},
+		{"the head branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{testBranch: true} }, "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub returned 422: Validation Failed; PullRequest head invalid", false},
+		{"GitHub's message for an invalid head", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`), "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub returned 422: Validation Failed; PullRequest invalid head invalid", false},
+		{"the base branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{"main": true} }, "branch_gone", "Create the base branch on GitHub, or choose another base branch, then submit again.", "GitHub returned 422: Validation Failed; PullRequest base invalid", false},
 		{"a description over 20000 characters", long, nil, "too_long", "Shorten the description of the run to 20000 characters or fewer.", "", true},
-		{"GitHub's 422 for a body too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"body","code":"custom","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", "Shorten the description of the pull request on GitHub outside the Qory block.", "GitHub answered 422: Validation Failed; PullRequest body custom body is too long (maximum is 65536 characters)", false},
-		{"GitHub's 422 for a title too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"title","code":"custom","message":"title is too long (maximum is 256 characters)"}]}`), "too_long", "Shorten the title of the pull request on GitHub to 256 characters or fewer.", "GitHub answered 422: Validation Failed; PullRequest title custom title is too long (maximum is 256 characters)", false},
-		{"400", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 400, `{"message":"Problems parsing JSON"}`), "forge_refused", fixRefused, "GitHub answered 400: Problems parsing JSON", false},
-		{"another 422", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and `+testBranch+`"}]}`), "forge_refused", fixRefused, "GitHub answered 422: Validation Failed; PullRequest custom No commits between main and " + testBranch, false},
-		{"a 422 on the list", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed"}`), "forge_refused", fixRefused, "GitHub answered 422: Validation Failed", false},
-		{"409", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 409, `{"message":"Conflict"}`), "forge_refused", fixRefused, "GitHub answered 409: Conflict", false},
-		{"451", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 451, `{"message":"Unavailable For Legal Reasons"}`), "forge_refused", fixRefused, "GitHub answered 451: Unavailable For Legal Reasons", false},
+		{"GitHub's 422 for a body too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"body","code":"custom","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", "Shorten the description of the pull request on GitHub outside the Qory block.", "GitHub returned 422: Validation Failed; PullRequest body custom body is too long (maximum is 65536 characters)", false},
+		{"GitHub's 422 for a title too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"title","code":"custom","message":"title is too long (maximum is 256 characters)"}]}`), "too_long", "Shorten the title of the pull request on GitHub to 256 characters or fewer.", "GitHub returned 422: Validation Failed; PullRequest title custom title is too long (maximum is 256 characters)", false},
+		{"400", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 400, `{"message":"Problems parsing JSON"}`), "forge_refused", fixRefused, "GitHub returned 400: Problems parsing JSON", false},
+		{"another 422", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and `+testBranch+`"}]}`), "forge_refused", fixRefused, "GitHub returned 422: Validation Failed; PullRequest custom No commits between main and " + testBranch, false},
+		{"a 422 on the list", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed"}`), "forge_refused", fixRefused, "GitHub returned 422: Validation Failed", false},
+		{"409", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 409, `{"message":"Conflict"}`), "forge_refused", fixRefused, "GitHub returned 409: Conflict", false},
+		{"451", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 451, `{"message":"Unavailable For Legal Reasons"}`), "forge_refused", fixRefused, "GitHub returned 451: Unavailable For Legal Reasons", false},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		if tc.set != nil {
@@ -684,7 +684,7 @@ func TestTheDetailOfAForgeRefusalIsOneCleanLine(t *testing.T) {
 		t.Fatalf("%d reports", len(sent))
 	}
 	detail, _ := sent[0].body["detail"].(string)
-	if n := utf8.RuneCountInString(detail); n < 900 || n > 1000 || !strings.HasPrefix(detail, "Change the pull request or the run as GitHub's answer says, then submit again. GitHub answered 400: Line one line two bell separator flipped [removed] and Authorization: [removed] and [removed] ") || github.OneLine(detail, 1000) != detail {
+	if n := utf8.RuneCountInString(detail); n < 900 || n > 1000 || !strings.HasPrefix(detail, "Change the pull request or the run as GitHub's answer says, then submit again. GitHub returned 400: Line one line two bell separator flipped [removed] and Authorization: [removed] and [removed] ") || github.OneLine(detail, 1000) != detail {
 		t.Errorf("the detail has %d characters: %q", n, detail)
 	}
 	for _, secret := range []string{installationToken, "abc.def-123", "secret@", "header-value-9f3a", "cookie-value-77", "ABCD:1234", ghToken} {
@@ -841,7 +841,7 @@ func TestASubmissionThatFailsForADayIsReportedUnreachable(t *testing.T) {
 	if !strings.Contains(w.log.String(), github.FixUnreachable) {
 		t.Errorf("the log %s", w.log.String())
 	}
-	if d, _ := w.apiary.sent(routeChangesFailed)[0].body["detail"].(string); d != github.FixUnreachable+" GitHub answered 502: Bad Gateway" {
+	if d, _ := w.apiary.sent(routeChangesFailed)[0].body["detail"].(string); d != github.FixUnreachable+" GitHub returned 502: Bad Gateway" {
 		t.Errorf("the detail is %q", d)
 	}
 	if r := w.apiary.replies(); len(r) != 1 || len(r[0].Targets) != 1 || r[0].Targets[0].Path != "acme/gadgets" {
@@ -1490,10 +1490,10 @@ func TestWhenTheRetriesEndEachRepositoryIsReportedByItsLastCause(t *testing.T) {
 	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets unreachable", "acme/gadgets forge_refused"}) {
 		t.Fatalf("reports %v", r)
 	}
-	if d := detailOf(w, 0); !strings.HasSuffix(d, "GitHub answered 502: Bad Gateway") {
+	if d := detailOf(w, 0); !strings.HasSuffix(d, "GitHub returned 502: Bad Gateway") {
 		t.Errorf("the first detail is %q", d)
 	}
-	if d := detailOf(w, 1); !strings.Contains(d, "GitHub answered 422: Validation Failed; PullRequest custom A pull request already exists") || strings.Contains(d, "502") {
+	if d := detailOf(w, 1); !strings.Contains(d, "GitHub returned 422: Validation Failed; PullRequest custom A pull request already exists") || strings.Contains(d, "502") {
 		t.Errorf("the second detail is %q", d)
 	}
 }
@@ -1511,13 +1511,13 @@ func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
 		reason string
 		detail string
 	}{
-		{"401 on the pull requests", failAt("GET", "/repos/acme/widgets/pulls", 401, `{"message":"Bad credentials"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: Bad credentials"},
-		{"401 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 401, `{"message":"A JSON web token could not be decoded"}`), false, "not_permitted", github.FixTokenRefused + " GitHub answered 401: A JSON web token could not be decoded"},
-		{"an answer that is no JSON", failAt("GET", "/repos/acme/widgets/pulls", 200, `<html>Unicorn</html>`), false, "forge_refused", "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub answered 200."},
-		{"400 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 400, `{"message":"Bad Request"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 400: Bad Request"},
-		{"422 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 422, `{"message":"Validation Failed"}`), true, "forge_refused", github.FixForgeRefused + " GitHub answered 422: Validation Failed"},
-		{"502", failAt("GET", "/repos/acme/widgets/pulls", 502, `{"message":"Bad Gateway"}`), false, "unreachable", github.FixUnreachable + " GitHub answered 502: Bad Gateway"},
-		{"408", failAt("GET", "/repos/acme/widgets/pulls", 408, `{"message":"Request Timeout"}`), false, "unreachable", github.FixUnreachable + " GitHub answered 408: Request Timeout"},
+		{"401 on the pull requests", failAt("GET", "/repos/acme/widgets/pulls", 401, `{"message":"Bad credentials"}`), false, "not_permitted", github.FixTokenRefused + " GitHub returned 401: Bad credentials"},
+		{"401 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 401, `{"message":"A JSON web token could not be decoded"}`), false, "not_permitted", github.FixTokenRefused + " GitHub returned 401: A JSON web token could not be decoded"},
+		{"an answer that is no JSON", failAt("GET", "/repos/acme/widgets/pulls", 200, `<html>Unicorn</html>`), false, "forge_refused", "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub returned 200."},
+		{"400 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 400, `{"message":"Bad Request"}`), true, "forge_refused", github.FixForgeRefused + " GitHub returned 400: Bad Request"},
+		{"422 on the installation lookup", failAt("GET", "/repos/acme/widgets/installation", 422, `{"message":"Validation Failed"}`), true, "forge_refused", github.FixForgeRefused + " GitHub returned 422: Validation Failed"},
+		{"502", failAt("GET", "/repos/acme/widgets/pulls", 502, `{"message":"Bad Gateway"}`), false, "unreachable", github.FixUnreachable + " GitHub returned 502: Bad Gateway"},
+		{"408", failAt("GET", "/repos/acme/widgets/pulls", 408, `{"message":"Request Timeout"}`), false, "unreachable", github.FixUnreachable + " GitHub returned 408: Request Timeout"},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		setGitHub(w.gh, tc.set)
@@ -1540,7 +1540,7 @@ func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
 // token or with an expiry that is no time is forge_refused with the detail that says the answer's
 // status.
 func TestAMintThatKeepsFailingEndsAsItsReason(t *testing.T) {
-	const unreadable = "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub answered 201."
+	const unreadable = "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub returned 201."
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -1548,10 +1548,10 @@ func TestAMintThatKeepsFailingEndsAsItsReason(t *testing.T) {
 		reason string
 		detail string
 	}{
-		{"403", 403, `{"message":"Resource not accessible by integration"}`, "not_permitted", github.FixPermission + " GitHub answered 403: Resource not accessible by integration"},
-		{"403 with a rate limit", 403, `{"message":"You have exceeded a secondary rate limit."}`, "unreachable", github.FixUnreachable + " GitHub answered 403: You have exceeded a secondary rate limit."},
-		{"429", 429, `{"message":"Too Many Requests"}`, "unreachable", github.FixUnreachable + " GitHub answered 429: Too Many Requests"},
-		{"503", 503, `{"message":"Service Unavailable"}`, "unreachable", github.FixUnreachable + " GitHub answered 503: Service Unavailable"},
+		{"403", 403, `{"message":"Resource not accessible by integration"}`, "not_permitted", github.FixPermission + " GitHub returned 403: Resource not accessible by integration"},
+		{"403 with a rate limit", 403, `{"message":"You have exceeded a secondary rate limit."}`, "unreachable", github.FixUnreachable + " GitHub returned 403: You have exceeded a secondary rate limit."},
+		{"429", 429, `{"message":"Too Many Requests"}`, "unreachable", github.FixUnreachable + " GitHub returned 429: Too Many Requests"},
+		{"503", 503, `{"message":"Service Unavailable"}`, "unreachable", github.FixUnreachable + " GitHub returned 503: Service Unavailable"},
 		{"a redirect", 302, `{"message":"Found"}`, "forge_refused", github.FixForgeRefused},
 		{"no token", 201, `{"expires_at":"2099-01-01T00:00:00Z"}`, "forge_refused", unreadable},
 		{"an expiry that is no time", 201, `{"token":"` + ghToken + `","expires_at":"tomorrow"}`, "forge_refused", unreadable},

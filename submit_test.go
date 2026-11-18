@@ -70,7 +70,7 @@ func TestAnAnswerThatEchoesTheTokenDoesNotCarryItInTheRefusal(t *testing.T) {
 	defer srv.Close()
 	_, err := Client{API: srv.URL}.SubmitDraft(context.Background(), nil, tok, Draft{Repository: Repository{Owner: "acme", Name: "widgets"}, Branch: "qory/wi_1", Base: "main", Title: "T", Description: "D"})
 	refused, ok := err.(*SubmitRefused)
-	if !ok || refused.Reason != ReasonForgeRefused || refused.Status != 400 || strings.Contains(refused.Message, tok) || !strings.Contains(refused.Detail(), "GitHub answered 400: Bad credentials [removed] sent") {
+	if !ok || refused.Reason != ReasonForgeRefused || refused.Status != 400 || strings.Contains(refused.Message, tok) || !strings.Contains(refused.Detail(), "GitHub returned 400: Bad credentials [removed] sent") {
 		t.Errorf("%#v", err)
 	}
 }

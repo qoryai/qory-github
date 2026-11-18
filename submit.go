@@ -167,9 +167,9 @@ func (e *SubmitRefused) Detail() string {
 	d := e.Fix
 	switch {
 	case e.Status != 0 && e.Message == "":
-		d += " GitHub answered " + strconv.Itoa(e.Status) + "."
+		d += " GitHub returned " + strconv.Itoa(e.Status) + "."
 	case e.Status != 0:
-		d += " GitHub answered " + strconv.Itoa(e.Status) + ": " + e.Message
+		d += " GitHub returned " + strconv.Itoa(e.Status) + ": " + e.Message
 	case e.Message != "":
 		d += " " + e.Message
 	}

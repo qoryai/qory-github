@@ -570,7 +570,7 @@ wait "$timer" 2>/dev/null || :
 timer=
 if [ ! -s "$tmp/status" ]; then
 	stopped=1
-	printf 'Run `qory run` again; `gh` did not answer within %s seconds.\n' "$limit" >&2
+	printf 'Run `qory run` again: the `gh` call did not finish within %s seconds.\n' "$limit" >&2
 	exit 1
 fi
 wait "$worker" || :

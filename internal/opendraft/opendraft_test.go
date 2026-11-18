@@ -1181,7 +1181,7 @@ func TestAHungGhEndsTheProgramWithStatus1AndTheAddressesPrinted(t *testing.T) {
 		t.Errorf("the program ended after %v, want about 3 seconds", took)
 	}
 	wantResult(t, r, 1, commitLines())
-	if want := "Run `qory run` again; `gh` did not answer within 3 seconds.\n"; r.stderr != want {
+	if want := "Run `qory run` again: the `gh` call did not finish within 3 seconds.\n"; r.stderr != want {
 		t.Errorf("stderr %q, want %q", r.stderr, want)
 	}
 	// The sleeps are the timer and the hung gh, which the fake makes a sleep.
