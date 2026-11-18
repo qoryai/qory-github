@@ -67,9 +67,9 @@ func shellClass(t *testing.T, text, name string) string {
 
 // TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle: the characters that the
 // program's expression removes from a title are exactly those of the adapter's forbidden
-// set, and its spaces, which make a title blank, are those of the adapter's. The awk
-// rule of the program, which cleans the title of the run, removes the same characters
-// but the C0 controls and DEL, which the program refuses before.
+// set, and its spaces, which make a title blank, are those of the adapter's. The shell
+// list of the program, which cleans the title of the run, has the same characters but the
+// C0 controls and DEL, which the program refuses before.
 func TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle(t *testing.T) {
 	text := openDraftText(t)
 	forbidden := escapedRunes(t, shellClass(t, text, "FORBIDDEN"))
@@ -93,17 +93,17 @@ func TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle(t *testing.T) {
 			t.Fatalf("U+%04X: the adapter takes it for a space: %v, the program: %v", r, !notSpace, spaces[r])
 		}
 	}
-	awkRemoved := awkRunes(t, text, "clean_title")
-	blank := awkRunes(t, text, "is_blank")
+	listed := seqRunes(t, text, "forbidden_seqs")
+	blank := seqRunes(t, text, "space_seqs")
 	if len(blank) != 17 {
-		t.Fatalf("is_blank removes %d characters, the adapter has 17 spaces", len(blank))
+		t.Fatalf("space_seqs lists %d characters, the adapter has 17 spaces", len(blank))
 	}
 	for r := rune(0); r <= 0x10ffff; r++ {
 		if r >= 0xd800 && r <= 0xdfff {
 			continue
 		}
 		if _, notSpace := cleanTitle(string(r)); !github.LineForbidden.MatchString(string(r)) && blank[r] == notSpace {
-			t.Fatalf("U+%04X: the adapter takes it for a space: %v, is_blank: %v", r, !notSpace, blank[r])
+			t.Fatalf("U+%04X: the adapter takes it for a space: %v, space_seqs: %v", r, !notSpace, blank[r])
 		}
 	}
 	for r := rune(0); r <= 0x10ffff; r++ {
@@ -111,16 +111,16 @@ func TestTheProgramAndTheAdapterRefuseTheSameCharactersInATitle(t *testing.T) {
 			continue
 		}
 		c0 := r < 0x20 || r == 0x7f
-		if want := forbidden[r] && !c0; awkRemoved[r] != want {
-			t.Fatalf("U+%04X: the program's awk rule removes it: %v, want %v", r, awkRemoved[r], want)
+		if want := forbidden[r] && !c0; listed[r] != want {
+			t.Fatalf("U+%04X: the program's list has it: %v, want %v", r, listed[r], want)
 		}
 	}
 }
 
-// awkRunes are the code points that the gsub calls of the function fn of the program
-// remove, written there as the octal bytes of their UTF-8 form, each byte a literal or a
-// class, or as a plain space.
-func awkRunes(t *testing.T, text, fn string) runeSet {
+// seqRunes are the code points that the sequences listed by the shell function fn of the
+// program stand for: each is a printf escape of the UTF-8 bytes of one character, such as
+// '\\302\\255', in the word list of the function.
+func seqRunes(t *testing.T, text, fn string) runeSet {
 	t.Helper()
 	start := strings.Index(text, fn+"() {")
 	if start < 0 {
@@ -131,54 +131,24 @@ func awkRunes(t *testing.T, text, fn string) runeSet {
 		t.Fatalf("%s has no end", fn)
 	}
 	body := text[start : start+end]
-	pattern := regexp.MustCompile(`gsub\(/((?:\\[0-7]{3}|\[[^\]]*\]| )+)/, ""\)`)
-	octal := regexp.MustCompile(`\\([0-7]{3})`)
 	out := runeSet{}
-	for _, m := range pattern.FindAllStringSubmatch(body, -1) {
-		var alternatives [][]byte
-		for _, el := range regexp.MustCompile(`\\[0-7]{3}|\[[^\]]*\]| `).FindAllString(m[1], -1) {
-			var bytes []byte
-			if el == " " {
-				bytes = []byte{' '}
-			} else if strings.HasPrefix(el, "[") {
-				inner := el[1 : len(el)-1]
-				for inner != "" {
-					lo := octal.FindStringSubmatch(inner[:4])
-					l, _ := strconv.ParseUint(lo[1], 8, 8)
-					inner = inner[4:]
-					h := l
-					if strings.HasPrefix(inner, "-") {
-						hi := octal.FindStringSubmatch(inner[1:5])
-						h, _ = strconv.ParseUint(hi[1], 8, 8)
-						inner = inner[5:]
-					}
-					for b := l; b <= h; b++ {
-						bytes = append(bytes, byte(b))
-					}
-				}
-			} else {
-				v, _ := strconv.ParseUint(el[1:], 8, 8)
-				bytes = []byte{byte(v)}
+	for _, m := range regexp.MustCompile(`'((?:\\[0-7]{3})+)'`).FindAllStringSubmatch(body, -1) {
+		var bytes []byte
+		for _, o := range regexp.MustCompile(`[0-7]{3}`).FindAllString(m[1], -1) {
+			v, err := strconv.ParseUint(o, 8, 8)
+			if err != nil {
+				t.Fatal(err)
 			}
-			alternatives = append(alternatives, bytes)
+			bytes = append(bytes, byte(v))
 		}
-		seqs := [][]byte{nil}
-		for _, alt := range alternatives {
-			var next [][]byte
-			for _, s := range seqs {
-				for _, b := range alt {
-					next = append(next, append(append([]byte{}, s...), b))
-				}
-			}
-			seqs = next
+		r, n := utf8.DecodeRune(bytes)
+		if r == utf8.RuneError || n != len(bytes) {
+			t.Fatalf("the bytes % x of %s are no one character", bytes, fn)
 		}
-		for _, s := range seqs {
-			r, n := utf8.DecodeRune(s)
-			if r == utf8.RuneError || n != len(s) {
-				t.Fatalf("the bytes % x of clean_title are no one character", s)
-			}
-			out[r] = true
+		if out[r] {
+			t.Fatalf("%s lists U+%04X twice", fn, r)
 		}
+		out[r] = true
 	}
 	return out
 }

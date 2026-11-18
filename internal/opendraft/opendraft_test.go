@@ -188,6 +188,16 @@ func newFake(t *testing.T, mode string) *fake {
 			}
 		}
 	}
+	if awk := os.Getenv("OPEN_DRAFT_TEST_AWK_SUITE"); awk != "" {
+		// An awk that runs every awk program of the suite in place of the one on PATH.
+		if _, err := os.Stat(awk); err != nil {
+			t.Skipf("OPEN_DRAFT_TEST_AWK_SUITE=%s: %v", awk, err)
+		}
+		os.Remove(filepath.Join(f.bin, "awk"))
+		if err := os.Symlink(awk, filepath.Join(f.bin, "awk")); err != nil {
+			t.Fatal(err)
+		}
+	}
 	f.write(filepath.Join(f.bin, "gh"), fakeGh, 0o755)
 	f.write(filepath.Join(f.bin, "git"), fakeGit, 0o755)
 	f.input = map[string]string{
