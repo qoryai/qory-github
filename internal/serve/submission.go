@@ -346,9 +346,10 @@ func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, t contract
 }
 
 // submissionEnded ends the retries of a submission entry whose retries limit has ended:
-// each repository that is not put on GitHub is reported, with the reason of its report
-// that did not reach Qory Apiary, or unreachable, and passed; then the reply for the
-// repositories that are put on GitHub is sent. A report or a reply that fails, not
+// each repository that is not put on GitHub is reported and passed, with the refusal of
+// its report that did not reach Qory Apiary, or else with the reason that
+// [github.EndedRefusal] gives for the last error of that repository's tries; then the
+// reply for the repositories that are put on GitHub is sent. A report or a reply that fails, not
 // permanently, keeps the entry for one more stuckFor, as a comment's report does, see
 // [feed.entry]; then a reply that keeps failing is replaced by a failure report with the
 // reason unreachable for each of its repositories. It returns whether the entry is done,

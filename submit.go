@@ -472,7 +472,7 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 	err := a.detailedErr(what)
 	switch {
 	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
-		return refusedBy(a, ReasonNotPermitted, fixMoved, err)
+		return refusedBy(a, ReasonForgeRefused, fixMoved, err)
 	case a.status == http.StatusNotFound:
 		return refusedBy(a, ReasonNotPermitted, FixNotInstalled, err)
 	case a.status == http.StatusForbidden && !a.rateLimited():
@@ -541,10 +541,10 @@ const fixUnclassified = "Report to the maintainers of qory-github that the adapt
 //   - unreachable, only for a failure to reach GitHub or read its answer from the
 //     connection ([ErrTransport], a timeout), a rate limit (a 403 that says so, or a
 //     429), 408, and a 5xx status;
-//   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, a 404, and
-//     a permanent redirect, 301 or 308: GitHub moved the repository;
-//   - forge_refused, for any other 4xx status, any other redirect, which the adapter never
-//     follows and which comes again, an answer that could not be read, and an error that
+//   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, and a 404;
+//   - forge_refused, for any other 4xx status, a redirect, which the adapter never follows
+//     and which comes again (a 301 or 308 has the fix that says GitHub moved the
+//     repository, [fixMoved]), an answer that arrived but cannot be used, and an error that
 //     is none of these, whose clean text is the message.
 func EndedRefusal(cause error) *SubmitRefused {
 	var refused *SubmitRefused
@@ -568,7 +568,7 @@ func EndedRefusal(cause error) *SubmitRefused {
 		case s == http.StatusNotFound:
 			return report(ReasonNotPermitted, FixNotInstalled)
 		case s == http.StatusMovedPermanently || s == http.StatusPermanentRedirect:
-			return report(ReasonNotPermitted, fixMoved)
+			return report(ReasonForgeRefused, fixMoved)
 		}
 		return report(ReasonForgeRefused, FixForgeRefused)
 	case errors.Is(cause, ErrUnreadableAnswer):

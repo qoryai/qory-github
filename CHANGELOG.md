@@ -22,8 +22,11 @@ change what the program does, and notes it under Upgrading.
   pull request is not changed. One repository that fails does not stop the others. A
   repository that GitHub refuses for good is reported to Qory Apiary with the reason
   `not_permitted`, `branch_gone`, `too_long` or `forge_refused`, and a `detail` with the
-  fix and GitHub's status and message; one that fails for a day is reported
-  `unreachable`. The App needs the permission Pull requests: read and write. The title in
+  fix and GitHub's status and message; one that still fails when the retries end, after a
+  day, is reported with the reason of the last error of its tries: `unreachable` for a
+  failure to reach GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for
+  an answer such as a 404 or a 401 that kept coming. A 301 or 308 is `forge_refused`, and
+  its fix says GitHub moved the repository. The App needs the permission Pull requests: read and write. The title in
   the reply has none of the control, bidirectional or invisible characters that Qory
   Apiary refuses.
 - The description of the adapter has `submissions: true` in `roles.source`.
