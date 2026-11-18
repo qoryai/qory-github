@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	github.com/qoryai/forager v0.7.1-0.20261118114010-92ccf76845ce
-	github.com/qoryai/integrations v0.3.1-0.20261118132203-db384d48fd32
+	github.com/qoryai/integrations v0.3.1-0.20261118135926-83e8bb686af7
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/text v0.14.0

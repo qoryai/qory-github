@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
@@ -352,9 +353,10 @@ func TestATargetWithNoDraftGetsOnlyAddresses(t *testing.T) {
 	}
 }
 
-// TestTwoRepositoriesGetOneDraftAndOneReplyEach: an entry with two repositories opens a
-// draft in each and sends one reply for each, with the addresses of that repository.
-func TestTwoRepositoriesGetOneDraftAndOneReplyEach(t *testing.T) {
+// TestTwoRepositoriesGetOneDraftEachAndOneReply: an entry with two repositories opens a
+// draft in each and sends one reply for the entry, with a target for each, in the entry's
+// order, with the addresses of that repository.
+func TestTwoRepositoriesGetOneDraftEachAndOneReply(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	entry := submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft), targetOf("acme/gadgets", 2, openDraft))
 	checkEntries(t, entry)
@@ -366,12 +368,11 @@ func TestTwoRepositoriesGetOneDraftAndOneReplyEach(t *testing.T) {
 		}
 	}
 	replies := w.apiary.replies()
-	if len(replies) != 2 {
-		t.Fatalf("%d replies", len(replies))
+	if len(replies) != 1 || len(replies[0].Targets) != 2 {
+		t.Fatalf("replies %+v", replies)
 	}
-	for _, r := range replies {
-		tg := r.Targets[0]
-		if !strings.HasPrefix(tg.Base.CommitURL, "https://github.com/"+tg.Path+"/commit/") || tg.Draft == nil || !strings.HasPrefix(tg.Draft.URL, "https://github.com/"+tg.Path+"/pull/") {
+	for i, tg := range replies[0].Targets {
+		if tg.Path != []string{"acme/widgets", "acme/gadgets"}[i] || len(tg.Commits) != i+1 || !strings.HasPrefix(tg.Base.CommitURL, "https://github.com/"+tg.Path+"/commit/") || tg.Draft == nil || !strings.HasPrefix(tg.Draft.URL, "https://github.com/"+tg.Path+"/pull/") {
 			t.Errorf("the reply is %+v", tg)
 		}
 	}
@@ -459,19 +460,64 @@ func TestADraftNumberThatIsGoneIsOnlyAHint(t *testing.T) {
 	}
 }
 
-// TestAPullRequestIntoAnotherBaseIsNotTheDraft: a pull request from the branch into
-// another base branch is not the draft of the entry, as bin/open-draft chooses it, so a
-// draft is opened into the entry's base branch.
-func TestAPullRequestIntoAnotherBaseIsNotTheDraft(t *testing.T) {
+// TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase: the pull request is found by
+// its head branch and repository alone. A pull request from the branch into another base
+// branch, as a person set it, is edited, not joined by a second one, and its base stays;
+// a later version with another base.branch changes no base either.
+func TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setGitHub(w.gh, func(f *fakeGitHub) {
-		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "release", number: 1, title: "Into release"})
+		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "release", number: 1, title: "Into release", draft: true})
 	})
 	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
 	w.stepOK(t)
 	pulls := w.gh.pullRequests("acme/widgets")
-	if len(pulls) != 2 || pulls[1].base != "main" || pulls[0].body != "" {
+	if len(pulls) != 1 || pulls[0].base != "release" || pulls[0].body != blockOf("Text.") {
+		t.Fatalf("pull requests %+v", pulls)
+	}
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Number != 1 || d.Action != "updated" {
+		t.Errorf("the draft is %+v", d)
+	}
+	later := targetOf("acme/widgets", 2, update(1))
+	later.Base.Branch = "develop"
+	w.apiary.add(submissionOf(testSubmissionID2, testTitle, "New text.", later))
+	w.stepOK(t)
+	pulls = w.gh.pullRequests("acme/widgets")
+	if len(pulls) != 1 || pulls[0].base != "release" || pulls[0].body != blockOf("New text.") {
 		t.Errorf("pull requests %+v", pulls)
+	}
+}
+
+// TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more pull
+// requests from the head branch, the entry's number is taken when it is among them;
+// otherwise the newest open one, and a closed or merged one only when none is open, then
+// the newest of those, which is kept as it is. No case is reported unreachable.
+func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *testing.T) {
+	pull := func(n int, base string, closed, merged bool) *ghPullRec {
+		return &ghPullRec{repo: "acme/widgets", head: testBranch, base: base, number: n, title: fmt.Sprint("Pull ", n), draft: !closed, closed: closed, merged: merged}
+	}
+	for _, tc := range []struct {
+		name   string
+		pulls  []*ghPullRec
+		draft  *contracts.DraftRequest
+		number int
+		action string
+		state  string
+	}{
+		{"the entry's number, though an open one is newer", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", false, false)}, update(1), 1, "updated", "draft"},
+		{"a number that is not among them: the newest open one", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", true, false), pull(3, "main", false, false), pull(4, "main", true, false)}, update(9), 3, "updated", "draft"},
+		{"an open one, with bases that differ", []*ghPullRec{pull(1, "release", true, false), pull(2, "develop", false, false)}, openDraft, 2, "updated", "draft"},
+		{"none open: the newest, which is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true), pull(3, "main", true, false)}, openDraft, 3, "kept", "closed"},
+		{"none open, the newest is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true)}, openDraft, 2, "kept", "merged"},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, func(f *fakeGitHub) { f.pulls = tc.pulls })
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, tc.draft)))
+		w.stepOK(t)
+		d := w.apiary.draftsReplied()["acme/widgets"]
+		if d == nil || d.Number != tc.number || d.Action != tc.action || d.State != tc.state || len(w.apiary.submissionReports()) != 0 || len(w.gh.pullRequests("acme/widgets")) != len(tc.pulls) {
+			t.Errorf("%s: the draft is %+v, reports %v", tc.name, d, w.apiary.submissionReports())
+		}
 	}
 }
 
@@ -492,61 +538,54 @@ func TestAPullRequestFromAForkIsNotTheDraft(t *testing.T) {
 
 // TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason: each case is an entry
 // whose draft a retry cannot open or update; one failure report, which passes the
-// contract's schema, has the submission_id, system, path and the reason; no reply is
-// sent; the cursor moves; the log has the fix once, with the submission_id and without
-// the text or the token.
+// contract's schema, has the submission_id, system, path, the reason and a detail that
+// starts with the fix line of that case, at most 100 characters; no reply is sent; the
+// cursor moves; the log has the fix once, with the submission_id and without the text or
+// the token.
 func TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing.T) {
 	long := strings.Repeat("a", 20001)
+	forbidden := func(method, path string, status int, body string) func(f *fakeGitHub) {
+		return func(f *fakeGitHub) {
+			f.pullFail = func(m, p string) (int, string) {
+				if m == method && p == path {
+					return status, body
+				}
+				return 0, ""
+			}
+		}
+	}
+	const (
+		fixNotInstalled = "Install the App on the repository with the permission Pull requests: write."
+		fixPermission   = "Give the App's installation the permission Pull requests: write on the repository."
+		fixRefused      = "Change the pull request or the run as GitHub's answer says, then submit again."
+	)
 	for _, tc := range []struct {
 		name        string
 		description string
 		set         func(f *fakeGitHub)
 		want        string
-		quiet       bool // GitHub is asked nothing
+		fix         string
+		forge       string // what the detail has of GitHub's answer after the fix, or none
+		quiet       bool   // GitHub is asked nothing
 	}{
-		{"the list is 403", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 403}[m == "GET" && p == "/repos/acme/widgets/pulls"], `{"message":"Resource not accessible by integration"}`
-			}
-		}, "not_permitted", false},
-		{"the list is 404", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 404}[m == "GET" && p == "/repos/acme/widgets/pulls"], `{"message":"Not Found"}`
-			}
-		}, "not_permitted", false},
-		{"no installation", "Text.", func(f *fakeGitHub) { f.noInstallation = map[string]bool{"acme/widgets": true} }, "not_permitted", false},
-		{"a suspended installation", "Text.", func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", false},
-		{"the create is 403", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 403}[m == "POST" && p == "/repos/acme/widgets/pulls"], `{"message":"Resource not accessible by integration"}`
-			}
-		}, "not_permitted", false},
-		{"the head branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{testBranch: true} }, "branch_gone", false},
-		{"GitHub's message for an invalid head", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 422}[m == "POST" && p == "/repos/acme/widgets/pulls"], `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`
-			}
-		}, "branch_gone", false},
-		{"the base branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{"main": true} }, "branch_gone", false},
-		{"a description over 20000 characters", long, nil, "too_long", true},
-		{"GitHub's 422 for a body too long", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 422}[m == "POST" && p == "/repos/acme/widgets/pulls"], `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"body","code":"custom","message":"body is too long (maximum is 65536 characters)"}]}`
-			}
-		}, "too_long", false},
-		{"two pull requests have the head", "Text.", func(f *fakeGitHub) {
-			f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 1, closed: true}, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 2})
-		}, "unreachable", false},
-		{"400", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 400}[m == "POST" && p == "/repos/acme/widgets/pulls"], `{"message":"Problems parsing JSON"}`
-			}
-		}, "unreachable", false},
-		{"another 422", "Text.", func(f *fakeGitHub) {
-			f.pullFail = func(m, p string) (int, string) {
-				return map[bool]int{true: 422}[m == "POST" && p == "/repos/acme/widgets/pulls"], `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and ` + testBranch + `"}]}`
-			}
-		}, "unreachable", false},
+		{"the list is 403", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub answered 403: Resource not accessible by integration", false},
+		{"the list is 404", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 404, `{"message":"Not Found"}`), "not_permitted", fixNotInstalled, "GitHub answered 404: Not Found", false},
+		{"no installation", "Text.", func(f *fakeGitHub) { f.noInstallation = map[string]bool{"acme/widgets": true} }, "not_permitted", fixNotInstalled, "", false},
+		{"the installation lookup is 403", "Text.", forbidden("GET", "/repos/acme/widgets/installation", 403, `{"message":"Forbidden"}`), "not_permitted", "Check on GitHub that the App is not suspended or blocked, then submit again.", "GitHub answered 403: Forbidden", false},
+		{"a suspended installation", "Text.", func(f *fakeGitHub) { f.installSuspended = true }, "not_permitted", "Unsuspend the App's installation on GitHub.", "", false},
+		{"the create is 403", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 403, `{"message":"Resource not accessible by integration"}`), "not_permitted", fixPermission, "GitHub answered 403: Resource not accessible by integration", false},
+		{"the repository moved", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 301, `{"message":"Moved Permanently"}`), "not_permitted", "Link the repository by its new name: GitHub moved it.", "GitHub answered 301: Moved Permanently", false},
+		{"the head branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{testBranch: true} }, "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub answered 422: Validation Failed; PullRequest head invalid", false},
+		{"GitHub's message for an invalid head", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"invalid","message":"head\ninvalid"}]}`), "branch_gone", "Push the run's branch to the repository again, then submit again.", "GitHub answered 422: Validation Failed; PullRequest invalid head invalid", false},
+		{"the base branch is gone", "Text.", func(f *fakeGitHub) { f.goneBranches = map[string]bool{"main": true} }, "branch_gone", "Create the base branch on GitHub, or choose another base branch, then submit again.", "GitHub answered 422: Validation Failed; PullRequest base invalid", false},
+		{"a description over 20000 characters", long, nil, "too_long", "Shorten the description of the run to 20000 characters or fewer.", "", true},
+		{"GitHub's 422 for a body too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"body","code":"custom","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", "Shorten the description of the pull request on GitHub outside the Qory block.", "GitHub answered 422: Validation Failed; PullRequest body custom body is too long (maximum is 65536 characters)", false},
+		{"GitHub's 422 for a title too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"title","code":"custom","message":"title is too long (maximum is 256 characters)"}]}`), "too_long", "Shorten the title of the pull request on GitHub to 256 characters or fewer.", "GitHub answered 422: Validation Failed; PullRequest title custom title is too long (maximum is 256 characters)", false},
+		{"400", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 400, `{"message":"Problems parsing JSON"}`), "forge_refused", fixRefused, "GitHub answered 400: Problems parsing JSON", false},
+		{"another 422", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and `+testBranch+`"}]}`), "forge_refused", fixRefused, "GitHub answered 422: Validation Failed; PullRequest custom No commits between main and " + testBranch, false},
+		{"a 422 on the list", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed"}`), "forge_refused", fixRefused, "GitHub answered 422: Validation Failed", false},
+		{"409", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 409, `{"message":"Conflict"}`), "forge_refused", fixRefused, "GitHub answered 409: Conflict", false},
+		{"451", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 451, `{"message":"Unavailable For Legal Reasons"}`), "forge_refused", fixRefused, "GitHub answered 451: Unavailable For Legal Reasons", false},
 	} {
 		w := newWired(t, filepath.Join(t.TempDir(), "state"))
 		if tc.set != nil {
@@ -571,9 +610,12 @@ func TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing.T)
 		if report["submission_id"] != testSubmissionID || report["system"] != githubSystem || report["comment_id"] != nil {
 			t.Errorf("%s: the report is %v", tc.name, report)
 		}
+		detail, _ := report["detail"].(string)
+		if len(tc.fix) > 100 || !strings.HasSuffix(tc.fix, ".") || !strings.HasPrefix(detail, tc.fix) || (tc.forge == "" && detail != tc.fix) || (tc.forge != "" && detail != tc.fix+" "+tc.forge) {
+			t.Errorf("%s: the detail is %q, want the fix %q and %q", tc.name, detail, tc.fix, tc.forge)
+		}
 		logged := w.log.String()
-		fix := strings.TrimSuffix((&github.SubmitRefused{Reason: tc.want, Err: errors.New("x")}).Error(), ": x")
-		if strings.Count(logged, fix) != 1 || !strings.Contains(logged, testSubmissionID) || !strings.Contains(logged, "failure report sent to Qory Apiary with the reason "+tc.want) {
+		if strings.Count(logged, tc.fix) != 1 || !strings.Contains(logged, testSubmissionID) || !strings.Contains(logged, "failure report sent to Qory Apiary with the reason "+tc.want) {
 			t.Errorf("%s: the log %s", tc.name, logged)
 		}
 		if strings.Contains(logged, "aaaaaaaa") || strings.Contains(logged, ghToken) {
@@ -584,6 +626,65 @@ func TestASubmissionThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing.T)
 		w.gh.mu.Unlock()
 		if tc.quiet && asked != 0 {
 			t.Errorf("%s: GitHub was asked %d times", tc.name, asked)
+		}
+	}
+}
+
+// TestAnAnswerThatTryingAgainCanChangeIsNotReported: GitHub's 408 and 5xx on the create
+// and the 401, each the same as for the other pull request calls, leave the entry to be
+// applied again: the step fails, nothing is reported, and the cursor stays.
+func TestAnAnswerThatTryingAgainCanChangeIsNotReported(t *testing.T) {
+	for _, status := range []int{408, 500, 502, 503} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, func(f *fakeGitHub) {
+			f.pullFail = func(m, p string) (int, string) {
+				if m == "POST" && p == "/repos/acme/widgets/pulls" {
+					return status, `{"message":"Try again"}`
+				}
+				return 0, ""
+			}
+		})
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || len(w.apiary.submissionReports()) != 0 || !cursorIs(w, "") {
+			t.Errorf("%d: step %v, reports %v", status, err, w.apiary.submissionReports())
+		}
+	}
+}
+
+// TestTheDetailOfAForgeRefusalIsOneCleanLine: GitHub's message with a newline and control
+// characters, a token and a bearer value in it, and 5000 characters, is one line of at
+// most 1000 characters that starts with the fix, with no token and no header value of the
+// answer.
+func TestTheDetailOfAForgeRefusalIsOneCleanLine(t *testing.T) {
+	const installationToken = "ghs_16C7e42F292c6912E7710c838347Ae178B4a"
+	message := "Line one\nline two\r\n\x07bell\u2028separator \u202eflipped " + installationToken + " and Authorization: Bearer abc.def-123 and https://user:secret@example.com/x " + strings.Repeat("long ", 1000)
+	body, err := json.Marshal(map[string]any{"message": message})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.failHeader = map[string]string{"X-Secret-Header": "header-value-9f3a", "Set-Cookie": "session=cookie-value-77", "X-GitHub-Request-Id": "ABCD:1234"}
+		f.pullFail = func(m, p string) (int, string) {
+			if m == "POST" && p == "/repos/acme/widgets/pulls" {
+				return 400, string(body)
+			}
+			return 0, ""
+		}
+	})
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	sent := w.apiary.sent(routeChangesFailed)
+	if len(sent) != 1 {
+		t.Fatalf("%d reports", len(sent))
+	}
+	detail, _ := sent[0].body["detail"].(string)
+	if n := utf8.RuneCountInString(detail); n < 900 || n > 1000 || !strings.HasPrefix(detail, "Change the pull request or the run as GitHub's answer says, then submit again. GitHub answered 400: Line one line two bell separator flipped [removed] and Authorization: [removed] and [removed] ") || github.OneLine(detail, 1000) != detail {
+		t.Errorf("the detail has %d characters: %q", n, detail)
+	}
+	for _, secret := range []string{installationToken, "abc.def-123", "secret@", "header-value-9f3a", "cookie-value-77", "ABCD:1234", ghToken} {
+		if strings.Contains(string(sent[0].raw), secret) {
+			t.Errorf("the report has %q", secret)
 		}
 	}
 }
@@ -611,7 +712,8 @@ func TestTheCapsOf20000And256Characters(t *testing.T) {
 }
 
 // TestAPullRequestWhoseBodyGrowsPastGitHubsLimitIsTooLong: a person's long description
-// plus the block is over GitHub's limit, whose 422 is reported as too_long.
+// plus the block is over GitHub's limit of 65536 characters, so the update is reported as
+// too_long with the fix for that description, and GitHub is sent no update.
 func TestAPullRequestWhoseBodyGrowsPastGitHubsLimitIsTooLong(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	w.apiary.add(submissionOf(testSubmissionID, testTitle, "First.", targetOf("acme/widgets", 1, openDraft)))
@@ -622,10 +724,16 @@ func TestAPullRequestWhoseBodyGrowsPastGitHubsLimitIsTooLong(t *testing.T) {
 	if r := w.apiary.submissionReports(); len(r) != 1 || r[0] != "acme/widgets too_long" {
 		t.Errorf("reports %v", r)
 	}
+	if d, _ := w.apiary.sent(routeChangesFailed)[0].body["detail"].(string); d != "Shorten the description of the pull request on GitHub outside the Qory block." {
+		t.Errorf("the detail is %q", d)
+	}
+	if slices.Contains(w.gh.pullCalls(), "PATCH /repos/acme/widgets/pulls/1") {
+		t.Error("GitHub was sent the update")
+	}
 }
 
 // TestOneRepositoryFailingDoesNotBlockTheOther: a refused repository is reported and the
-// other is replied to, in one step that moves the cursor.
+// other is in the one reply for the entry, in one step that moves the cursor.
 func TestOneRepositoryFailingDoesNotBlockTheOther(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setGitHub(w.gh, func(f *fakeGitHub) { f.noInstallation = map[string]bool{"acme/widgets": true} })
@@ -634,8 +742,8 @@ func TestOneRepositoryFailingDoesNotBlockTheOther(t *testing.T) {
 	if r := w.apiary.submissionReports(); len(r) != 1 || r[0] != "acme/widgets not_permitted" {
 		t.Errorf("reports %v", r)
 	}
-	if d := w.apiary.draftsReplied(); len(d) != 1 || d["acme/gadgets"] == nil {
-		t.Errorf("drafts %+v", d)
+	if d, r := w.apiary.draftsReplied(), w.apiary.replies(); len(d) != 1 || d["acme/gadgets"] == nil || len(r) != 1 || len(r[0].Targets) != 1 {
+		t.Errorf("drafts %+v, replies %+v", d, r)
 	}
 	if !cursorIs(w, "c_1") {
 		t.Error("the cursor did not move")
@@ -643,8 +751,8 @@ func TestOneRepositoryFailingDoesNotBlockTheOther(t *testing.T) {
 }
 
 // TestTheCursorMovesOnlyWhenEveryRepositoryIsDone: one repository fails, not for good,
-// while the other is replied to once; the cursor stays, and the next read applies the one
-// that failed alone.
+// while the other's draft is opened once; no reply is sent and the cursor stays, and the
+// next read applies the one that failed alone and sends the one reply for the entry.
 func TestTheCursorMovesOnlyWhenEveryRepositoryIsDone(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setGitHub(w.gh, func(f *fakeGitHub) {
@@ -662,15 +770,15 @@ func TestTheCursorMovesOnlyWhenEveryRepositoryIsDone(t *testing.T) {
 	if !cursorIs(w, "") {
 		t.Error("the cursor moved")
 	}
-	if d := w.apiary.draftsReplied(); len(d) != 1 || d["acme/gadgets"] == nil {
-		t.Errorf("drafts %+v", d)
+	if r := w.apiary.replies(); len(r) != 0 || len(w.gh.pullRequests("acme/gadgets")) != 1 {
+		t.Errorf("replies %+v before every repository is put on GitHub", r)
 	}
 	setGitHub(w.gh, func(f *fakeGitHub) { f.pullFail = nil })
 	w.stepOK(t)
 	if !cursorIs(w, "c_1") {
 		t.Error("the cursor did not move")
 	}
-	if d := w.apiary.draftsReplied(); len(d) != 2 || len(w.apiary.replies()) != 2 {
+	if d := w.apiary.draftsReplied(); len(d) != 2 || len(w.apiary.replies()) != 1 {
 		t.Errorf("drafts %+v, %d replies", d, len(w.apiary.replies()))
 	}
 	if got := len(w.gh.pullRequests("acme/gadgets")); got != 1 {
@@ -689,8 +797,9 @@ func TestTheCursorMovesOnlyWhenEveryRepositoryIsDone(t *testing.T) {
 
 // TestASubmissionThatFailsForADayIsReportedUnreachable has GitHub return 502 for a day:
 // the entry stays, with no report, until the day has passed, then each repository that
-// is not done is reported unreachable and the entry is passed. A repository replied to
-// before is not reported.
+// is not put on GitHub is reported unreachable, the one reply for the repositories that
+// are is sent, and the entry is passed. A repository that is put on GitHub is not
+// reported.
 func TestASubmissionThatFailsForADayIsReportedUnreachable(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
 	setGitHub(w.gh, func(f *fakeGitHub) {
@@ -724,9 +833,14 @@ func TestASubmissionThatFailsForADayIsReportedUnreachable(t *testing.T) {
 	if !cursorIs(w, "c_1") {
 		t.Error("the cursor did not move")
 	}
-	fix := strings.TrimSuffix((&github.SubmitRefused{Reason: "unreachable", Err: errors.New("x")}).Error(), ": x")
-	if !strings.Contains(w.log.String(), fix) {
+	if !strings.Contains(w.log.String(), github.FixUnreachable) {
 		t.Errorf("the log %s", w.log.String())
+	}
+	if d, _ := w.apiary.sent(routeChangesFailed)[0].body["detail"].(string); d != github.FixUnreachable+" GitHub answered 502: Bad Gateway" {
+		t.Errorf("the detail is %q", d)
+	}
+	if r := w.apiary.replies(); len(r) != 1 || len(r[0].Targets) != 1 || r[0].Targets[0].Path != "acme/gadgets" {
+		t.Errorf("replies %+v", r)
 	}
 }
 
@@ -1034,43 +1148,135 @@ func TestAFailedReplyAfterTheDraftOpenedOpensNoSecondDraft(t *testing.T) {
 	if posts != 1 || len(sent) != 2 || !cursorIs(w, "c_1") {
 		t.Errorf("%d posts, %d replies sent", posts, len(sent))
 	}
-	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "kept" || d.Number != 1 {
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "opened" || d.Number != 1 {
 		t.Errorf("the draft is %+v", d)
+	}
+	lists := 0
+	for _, c := range w.gh.pullCalls() {
+		if strings.HasPrefix(c, "GET /repos/acme/widgets/pulls?") {
+			lists++
+		}
+	}
+	if lists != 1 {
+		t.Errorf("GitHub was asked %d times for the pull requests of the branch, want 1", lists)
 	}
 }
 
 // TestARateLimitOnTheInstallationLookupIsRetriedAndAPlain403IsNotPermitted: GitHub's 403
-// for a rate limit on the lookup of the repository's installation is no refusal, so the
-// entry stays and nothing is reported, and the next step opens the draft; a plain 403 on
-// the lookup is reported not_permitted.
+// for a rate limit on the lookup of the repository's installation, which its headers say
+// (Retry-After, or X-RateLimit-Remaining 0), is no refusal, so the entry stays and
+// nothing is reported, and the next step opens the draft; a plain 403 on the lookup is
+// reported not_permitted.
 func TestARateLimitOnTheInstallationLookupIsRetriedAndAPlain403IsNotPermitted(t *testing.T) {
-	failLookup := func(body string) func(f *fakeGitHub) {
-		return func(f *fakeGitHub) {
+	for _, tc := range []struct {
+		name    string
+		header  map[string]string
+		message string
+		retried bool
+	}{
+		{"Retry-After", map[string]string{"Retry-After": "60"}, "Forbidden", true},
+		{"no request left", map[string]string{"X-RateLimit-Remaining": "0"}, "Forbidden", true},
+		{"a request left", map[string]string{"X-RateLimit-Remaining": "4999"}, "Forbidden", false},
+		{"no header", nil, "Resource not accessible by integration", false},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, func(f *fakeGitHub) {
+			f.failHeader = tc.header
 			f.pullFail = func(m, p string) (int, string) {
 				if m == "GET" && p == "/repos/acme/widgets/installation" {
-					return 403, body
+					return 403, `{"message":"` + tc.message + `"}`
 				}
 				return 0, ""
 			}
+		})
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		if !tc.retried {
+			w.stepOK(t)
+			if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets not_permitted"}) || !cursorIs(w, "c_1") {
+				t.Errorf("%s: reports %v", tc.name, r)
+			}
+			continue
+		}
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") || len(w.apiary.submissionReports()) != 0 {
+			t.Fatalf("%s: err %v, reports %v", tc.name, err, w.apiary.submissionReports())
+		}
+		setGitHub(w.gh, func(f *fakeGitHub) { f.pullFail = nil })
+		w.stepOK(t)
+		if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "opened" || !cursorIs(w, "c_1") {
+			t.Errorf("%s: the draft is %+v", tc.name, d)
 		}
 	}
+}
+
+// TestAnUpdateOfAnEmptyDescriptionWritesTheBlockAlone: a pull request whose description
+// is empty, which GitHub returns as null, gets the block alone, with no blank line before
+// it and no other text; with CRLF in the run's text nothing else changes.
+func TestAnUpdateOfAnEmptyDescriptionWritesTheBlockAlone(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	setGitHub(w.gh, failLookup(`{"message":"API rate limit exceeded for the App."}`))
-	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
-	if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") || len(w.apiary.submissionReports()) != 0 {
-		t.Fatalf("err %v, reports %v", err, w.apiary.submissionReports())
-	}
-	setGitHub(w.gh, func(f *fakeGitHub) { f.pullFail = nil })
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 1, title: testTitle, draft: true})
+	})
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, update(1))))
 	w.stepOK(t)
-	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "opened" || !cursorIs(w, "c_1") {
+	if pulls := w.gh.pullRequests("acme/widgets"); len(pulls) != 1 || pulls[0].body != blockOf("Text.") || !strings.HasPrefix(pulls[0].body, "<!-- qory:start -->\n") {
+		t.Errorf("pull requests %+v", pulls)
+	}
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "updated" {
 		t.Errorf("the draft is %+v", d)
 	}
-	w = newWired(t, filepath.Join(t.TempDir(), "state"))
-	setGitHub(w.gh, failLookup(`{"message":"Resource not accessible by integration"}`))
+}
+
+// TestAReplyThatKeepsFailingEndsAsFailureReports: Qory Apiary refuses the reply of an
+// entry with a 503 for two days after the first failure; the drafts exist, so the entry
+// is applied once, and when its retries end each repository of the reply is reported
+// unreachable, once, and the entry is passed.
+func TestAReplyThatKeepsFailingEndsAsFailureReports(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeChangesSubmitted {
+			return http.StatusServiceUnavailable, `{"error":"unavailable"}`
+		}
+		return 0, ""
+	}
+	now := time.Now()
+	w.feed.now = func() time.Time { return now }
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft), targetOf("acme/gadgets", 1, openDraft)))
+	for _, after := range []time.Duration{0, stuckFor, stuckFor - time.Second} {
+		now = now.Add(after)
+		if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") {
+			t.Fatalf("after %v: err %v", after, err)
+		}
+	}
+	if r := w.apiary.submissionReports(); len(r) != 0 {
+		t.Errorf("reported too early: %v", r)
+	}
+	now = now.Add(time.Second)
+	w.stepOK(t)
+	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets unreachable", "acme/gadgets unreachable"}) || !cursorIs(w, "c_1") {
+		t.Errorf("reports %v", r)
+	}
+	for _, repo := range []string{"acme/widgets", "acme/gadgets"} {
+		if got := len(w.gh.pullRequests(repo)); got != 1 {
+			t.Errorf("%s: %d pull requests", repo, got)
+		}
+	}
+}
+
+// TestAReplyThatQoryApiaryRefusesIsLoggedAndTheEntryIsDone: a 400 for the reply is
+// Permanent, as for every request; the entry is done, with no failure report, and the
+// reply is not sent again.
+func TestAReplyThatQoryApiaryRefusesIsLoggedAndTheEntryIsDone(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeChangesSubmitted {
+			return http.StatusBadRequest, `{"error":"invalid_request"}`
+		}
+		return 0, ""
+	}
 	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
 	w.stepOK(t)
-	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets not_permitted"}) || !cursorIs(w, "c_1") {
-		t.Errorf("reports %v", r)
+	if !cursorIs(w, "c_1") || len(w.apiary.submissionReports()) != 0 || len(w.apiary.sent(routeChangesSubmitted)) != 1 || !strings.Contains(w.log.String(), "the reply for a submission failed permanently") {
+		t.Errorf("reports %v, log %s", w.apiary.submissionReports(), w.log.String())
 	}
 }
 

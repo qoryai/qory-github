@@ -269,46 +269,70 @@ For each repository of the entry, the adapter:
   `https://github.com/owner/name/commit/<commit>`. It does so for every entry, also after
   a session that did not pass, when the entry asks for no draft and the adapter makes no
   request to GitHub.
-- When the entry asks for a draft, looks for the pull request from the entry's branch into
-  its base branch in that repository, of any state, and reads it. A pull request from a
-  fork, or into another base branch, is not that pull request. The `number` of an
-  `update` entry is a hint: if GitHub has no pull request with that number, head and
-  base, the adapter looks by the head branch.
+- When the entry asks for a draft, looks for the pull request from the entry's branch in
+  that repository, of any state, and reads it. It finds the pull request by the head
+  branch and the repository alone, never by the base branch: a pull request from a fork
+  is not that pull request, and a pull request into another base branch is. The `number`
+  of an `update` entry is a hint: if GitHub has no pull request with that number from the
+  branch, the adapter looks by the head branch. When several pull requests have the
+  head branch, the adapter takes the one with the entry's `number` when it is among them,
+  otherwise the open or draft one with the highest number, and when none is open, the
+  closed or merged one with the highest number.
 - Opens a draft pull request from the branch into the entry's base branch when there is
-  none. If more than one is, the adapter chooses none and reports `unreachable`.
+  none. It never changes the base branch of an existing pull request, so a later entry
+  with another `base.branch` edits the same pull request and leaves its base as the
+  person set it.
 - Changes nothing in a pull request that is closed or merged, and reports its state
   (`closed` or `merged`) with the action `kept`.
 - Changes an open or draft pull request only where something differs, and reports
   `updated`, or `kept` when nothing differs.
 
+The adapter sends Qory Apiary one reply for the entry, with one target for each
+repository that it put on GitHub, in the entry's order, once it has dealt with every
+repository of the entry. A repository that failed for good gets a failure report, as
+below, and is not in the reply. While a repository fails and may succeed on a retry, for
+example after a 5xx status, the adapter holds the reply and applies that repository again
+without applying the others again. When the retries end, after a day of failures, it
+reports that repository as `unreachable` and sends the reply for the others. If Qory
+Apiary does not take the reply for a day more, the adapter reports each repository of the
+reply as `unreachable`.
+
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
-have spaces, tabs or a carriage return after the marker. On an update, the adapter finds
-the first end line that has a start line before it, and pairs it with the last start line
-before that end line. It replaces the text from the start of that start line through the
-end marker with the new block, and every other character stays, the text before and after
-the block and anything after the end marker on its line. The block's line breaks are CRLF
-when the first line break of the description is CRLF, otherwise LF. When no start line is
-followed by an end line, as when a person removed a marker, the adapter adds a blank line
-and a new block at the end of the description and changes nothing else.
+have spaces, tabs or a carriage return after the marker. An empty description becomes
+the block alone, with no blank line before it. On an update of any other description, the
+adapter finds the first end line that has a start line before it, and pairs it with the
+last start line before that end line. It replaces the text from the start of that start
+line through the end marker with the new block, and every other character stays, the
+text before and after the block and anything after the end marker on its line. The
+block's line breaks are CRLF when the first line break of the description is CRLF,
+otherwise LF. When no start line is followed by an end line, as when a person removed a
+marker, the adapter adds a blank line and a new block at the end of the description and
+changes nothing else.
 
 The adapter changes the title to the run's title only while the pull request's title
 equals the title of the previous version of the submission. A title that a person edited
-stays. The description of the run is at most 20000 characters and the title at most 256.
-The title in the reply to Qory Apiary is the pull request's title without the control,
-bidirectional and invisible characters that Qory Apiary refuses; the pull request keeps its
-title. When that leaves only spaces, the reply has the run's title, cleaned the same way.
+stays. The description of the run is at most 20000 characters and the title at most 256;
+GitHub keeps at most 65536 characters in a description, and an update that would pass
+that is reported as `too_long` before GitHub is asked. The title in the reply to Qory
+Apiary is the pull request's title without the control, bidirectional and invisible
+characters that Qory Apiary refuses; the pull request keeps its title. When that leaves
+only spaces, the reply has the run's title, cleaned the same way.
 
 When the adapter cannot do what a repository asks for, and a retry cannot change that, it
-sends Qory Apiary a failure report for that repository with one reason. The other
-repositories of the entry are not stopped.
+sends Qory Apiary a failure report for that repository with one reason and a `detail`. The
+other repositories of the entry are not stopped. The `detail` is one line of at most
+1000 characters: the fix for that case, as a sentence that says what a person does, then
+GitHub's status and message when GitHub's answer caused the failure, with no token, no
+header and no address with a password.
 
 | Reason | Cause |
 |---|---|
-| `not_permitted` | GitHub answered 404, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended. Give the App the Pull requests permission and access to the repository. |
-| `branch_gone` | GitHub has no head branch or no base branch of that name. Push the branch again. |
-| `too_long` | The title or the description is over the limit of 256 or 20000 characters, or GitHub's 422 says the pull request's description is too long. |
-| `unreachable` | GitHub failed or did not answer for a day, or more than one pull request has the head branch, or GitHub answered 400 or another 422. |
+| `not_permitted` | GitHub answered 404, a permanent redirect, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended. The fix gives the App the Pull requests permission and access to the repository. |
+| `branch_gone` | GitHub's 422 says the head branch or the base branch does not exist. The fix says which: push the branch again, or create the base branch. |
+| `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix says which text to shorten. |
+| `forge_refused` | GitHub answered 400, or 422 for any cause other than a missing branch or a length limit, or another 4xx status that a retry does not change: the same request fails again. The `detail` has GitHub's status and message. |
+| `unreachable` | GitHub timed out, did not connect, was busy or answered 5xx for a day. |
 
 ### Token expiry
 

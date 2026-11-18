@@ -281,7 +281,7 @@ func (a *apiReply) err(what string) error {
 	if e.Message == "" {
 		e.Message = http.StatusText(a.status)
 	}
-	return &answerError{what: what, status: a.status, message: e.Message}
+	return &answerError{what: what, status: a.status, message: e.Message, limited: a.status == http.StatusForbidden && a.rateLimited()}
 }
 
 // send makes one request to the API with an installation token, paced by p, or by a new

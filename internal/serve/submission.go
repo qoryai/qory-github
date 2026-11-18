@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -107,8 +107,9 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	if ch.Text == nil || t.Base.Branch == "" {
 		return contracts.SubmittedTarget{}, Permanent(errors.New("report this Qory Apiary defect: the entry asks for a draft without text or without a base branch" + where))
 	}
-	refuse := func(reason string, err error) error {
-		return &github.SubmitRefused{Reason: reason, Err: fmt.Errorf("%w%s", err, where)}
+	refuse := func(reason, fix string, err error) error {
+		status, message := github.AnswerOf(err)
+		return &github.SubmitRefused{Reason: reason, Fix: fix, Err: fmt.Errorf("%w%s", err, where), Status: status, Message: message}
 	}
 	// The run's title, cleaned, is what the reply has when the pull request's title is
 	// left with nothing. The schema of the entry gives it a character that is not a space,
@@ -118,23 +119,23 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 		return contracts.SubmittedTarget{}, Permanent(errors.New("report this Qory Apiary defect: the entry's title has no character that is not a space or forbidden" + where))
 	}
 	if err := github.CheckDraftText(ch.Text.Title, ch.Text.Description); err != nil {
-		var refused *github.SubmitRefused
-		errors.As(err, &refused)
-		return contracts.SubmittedTarget{}, refuse(refused.Reason, refused.Err)
+		return contracts.SubmittedTarget{}, within(err, where)
 	}
 	installation, _, err := a.GitHub.RepositoryInstallation(ctx, a.AppID, a.Key, repo)
 	switch {
 	case errors.Is(err, github.ErrNotInstalled):
-		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, err)
-	case github.Forbidden(err) && !strings.Contains(strings.ToLower(err.Error()), "rate limit"):
-		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, err)
+		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixNotInstalled, err)
+	case github.Forbidden(err) && !github.RateLimited(err):
+		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixAppForbidden, err)
 	case err != nil:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
 	tok, err := a.pullToken(ctx, installation, repo)
 	switch {
-	case errors.Is(err, github.ErrMintRefused) || errors.Is(err, github.ErrSuspended):
-		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, err)
+	case errors.Is(err, github.ErrSuspended):
+		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixSuspended, err)
+	case errors.Is(err, github.ErrMintRefused):
+		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixPermission, err)
 	case err != nil:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
@@ -148,8 +149,7 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	switch {
 	case err == nil:
 	case errors.As(err, &refused):
-		// refused.Err, not err: the new error's text starts with the fix once.
-		return contracts.SubmittedTarget{}, refuse(refused.Reason, refused.Err)
+		return contracts.SubmittedTarget{}, within(refused, where)
 	case errors.Is(err, github.ErrInvalidChange):
 		return contracts.SubmittedTarget{}, Permanent(fmt.Errorf("%w%s", err, where))
 	default:
@@ -159,11 +159,19 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	return reply, nil
 }
 
+// within is the refusal err, a [*github.SubmitRefused], with where after its cause, so
+// the text still starts with the fix, once.
+func within(err error, where string) error {
+	var refused *github.SubmitRefused
+	errors.As(err, &refused)
+	r := *refused
+	r.Err = fmt.Errorf("%w%s", refused.Err, where)
+	return &r
+}
+
 // titleForbidden matches the characters that a draft's title in a reply may not have, as
-// the contract's rule of a prose line lists them: the control characters, C0, DEL and
-// C1, the bidirectional controls, the line and paragraph separators, and the format
-// characters that are usually not shown.
-var titleForbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+// the contract's rule of a prose line lists them, see [github.LineForbidden].
+var titleForbidden = github.LineForbidden
 
 // cleanTitle is title without the characters in [titleForbidden], and whether it has a
 // character that is not a space, as the contract's draft_title needs.
@@ -185,11 +193,13 @@ func replyTitle(current, fallback string) string {
 }
 
 // targetState is what the feed keeps of one repository of a submission entry: whether it
-// is done, replied or reported or passed, and the reason of its failure report that did
-// not reach Qory Apiary, or empty.
+// is done, reported or passed or replied to; the reply for it, when it is put on GitHub
+// and waits for the entry's reply; and the refusal whose failure report did not reach
+// Qory Apiary, or nil.
 type targetState struct {
-	done   bool
-	reason string
+	done    bool
+	reply   *contracts.SubmittedTarget
+	refused *github.SubmitRefused
 }
 
 // target is the state of the repository with the system and path of t.
@@ -207,15 +217,17 @@ func (s *entryState) target(t contracts.SubmissionTarget) *targetState {
 }
 
 // submission applies a submission entry: each repository in turn, each by itself, so one
-// that fails does not stop the others. A repository that is put on GitHub is replied to
-// Qory Apiary, see [Apiary.ChangesSubmitted]; one that a retry cannot put on GitHub, a
-// [*github.SubmitRefused], is reported with the error's reason, see [feed.reportTarget];
-// one that is [Permanent] is logged and passed. A repository that is done, replied,
-// reported or passed, is not applied again while state, the entry's state, stands. The
-// entry is done once every repository is; the error of one that is not is the first
-// error of the entry, with the count of the others, see [failures]. An entry with no
-// submission_id of the contract's shape, or with no repository or more than 20, is
-// [Permanent].
+// that fails does not stop the others. A repository that is put on GitHub waits for the
+// entry's reply. One that a retry cannot put on GitHub, a [*github.SubmitRefused], is
+// reported with the error's reason, see [feed.reportTarget], and is not in the reply; one
+// that is [Permanent] is logged and passed. Once no repository is left to apply, the
+// feed sends Qory Apiary one reply for the entry, with each repository that is put on
+// GitHub, see [feed.reply]. A repository that waits for the reply, or is reported or
+// passed, is not applied again while state, the entry's state, stands. The entry is done
+// once its reply, if it has one, is sent. The error of a repository that is not applied
+// is the first error of the entry, with the count of the others, see [failures], and no
+// reply is sent until each repository is. An entry with no submission_id of the
+// contract's shape, or with no repository or more than 20, is [Permanent].
 func (f *feed) submission(ctx context.Context, state *entryState, ch contracts.Change) error {
 	if err := github.CheckSubmissionID(ch.SubmissionID); err != nil {
 		return Permanent(err)
@@ -226,59 +238,93 @@ func (f *feed) submission(ctx context.Context, state *entryState, ch contracts.C
 	var errs []error
 	for _, t := range ch.Targets {
 		ts := state.target(t)
-		if ts.done {
+		if ts.done || ts.reply != nil {
 			continue
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := f.target(ctx, ch, t, ts); err != nil {
+		reply, err := f.target(ctx, ch, t, ts)
+		switch {
+		case err != nil:
 			errs = append(errs, err)
-			continue
+		case reply != nil:
+			ts.reply = reply
+		default:
+			ts.done = true
 		}
-		ts.done = true
 	}
 	if len(errs) > 0 {
 		return failures(errs)
 	}
-	return nil
+	return f.reply(ctx, state, ch)
 }
 
 // maxSubmissionTargets is the most repositories of a submission entry, as the contract
 // allows.
 const maxSubmissionTargets = 20
 
-// target applies one repository of a submission entry, see [feed.submission]. A nil
-// error means the repository is done.
-func (f *feed) target(ctx context.Context, ch contracts.Change, t contracts.SubmissionTarget, ts *targetState) error {
+// target applies one repository of a submission entry, see [feed.submission]. It returns
+// the reply for the repository once it is put on GitHub, and nil with a nil error once
+// the repository is reported or passed.
+func (f *feed) target(ctx context.Context, ch contracts.Change, t contracts.SubmissionTarget, ts *targetState) (*contracts.SubmittedTarget, error) {
 	reply, err := f.adapter.applySubmission(ctx, ch, t)
 	var refused *github.SubmitRefused
 	switch {
 	case err == nil:
-		err = f.apiary.ChangesSubmitted(ctx, contracts.ChangesSubmitted{Version: contracts.Version, SubmissionID: ch.SubmissionID, Targets: []contracts.SubmittedTarget{reply}})
-		if IsPermanent(err) {
-			f.log.Error("the reply for a repository of a submission failed permanently, and is passed", slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("error", err.Error()))
-			return nil
-		}
-		return err
+		return &reply, nil
 	case errors.As(err, &refused):
-		ts.reason = refused.Reason
-		return f.reportTarget(ctx, ch, t, refused.Reason, err)
+		ts.refused = refused
+		return nil, f.reportTarget(ctx, ch, t, refused, err)
 	case IsPermanent(err):
 		f.log.Error("a repository of a submission failed, and is passed", slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("error", err.Error()))
+		return nil, nil
+	}
+	return nil, err
+}
+
+// reply sends Qory Apiary the reply for the entry ch: the repositories that wait for it
+// in state, in the entry's order. It sends nothing when none waits, as when each is
+// reported or passed. Once the reply is sent, or fails permanently, as with Qory Apiary's
+// 400 or 403, each is done; the draft exists, and the reply is not sent again. Any other
+// failure leaves the repositories waiting, and the next step sends the reply again.
+func (f *feed) reply(ctx context.Context, state *entryState, ch contracts.Change) error {
+	var held []*targetState
+	var targets []contracts.SubmittedTarget
+	for _, t := range ch.Targets {
+		ts := state.target(t)
+		if ts.reply == nil || ts.done || slices.Contains(held, ts) {
+			continue
+		}
+		held = append(held, ts)
+		targets = append(targets, *ts.reply)
+	}
+	if len(held) == 0 {
 		return nil
 	}
-	return err
+	err := f.apiary.ChangesSubmitted(ctx, contracts.ChangesSubmitted{Version: contracts.Version, SubmissionID: ch.SubmissionID, Targets: targets})
+	switch {
+	case err == nil:
+	case IsPermanent(err):
+		f.log.Error("the reply for a submission failed permanently, and is passed", slog.String("submission_id", ch.SubmissionID), slog.Int("repositories", len(held)), slog.String("error", err.Error()))
+	default:
+		return err
+	}
+	for _, ts := range held {
+		ts.done = true
+	}
+	return nil
 }
 
 // reportTarget sends Qory Apiary the failure report of the repository t of the entry ch,
-// for reason, after cause, see [Apiary.ChangesFailed], and logs it. It returns nil once
-// the report is sent, or failed permanently, as with Qory Apiary's 400 or 403; the
-// repository is then passed. A report that fails otherwise is a [*reportPending], and
-// the repository is applied again, until each limit of the entry's retries has passed by
-// one more stuckFor, see [feed.entry].
-func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, t contracts.SubmissionTarget, reason string, cause error) error {
-	err := f.apiary.ChangesFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, SubmissionID: ch.SubmissionID, System: t.System, Path: t.Path, Reason: reason})
+// with the reason and the detail of refused, after cause, see [Apiary.SubmissionFailed],
+// and logs it. It returns nil once the report is sent, or failed permanently, as with
+// Qory Apiary's 400 or 403; the repository is then passed. A report that fails otherwise
+// is a [*reportPending], and the repository is applied again, until each limit of the
+// entry's retries has passed by one more stuckFor, see [feed.entry].
+func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, t contracts.SubmissionTarget, refused *github.SubmitRefused, cause error) error {
+	reason := refused.Reason
+	err := f.apiary.SubmissionFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, SubmissionID: ch.SubmissionID, System: t.System, Path: t.Path, Reason: reason}, refused.Detail())
 	attrs := []any{slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("reason", reason)}
 	switch {
 	case err == nil:
@@ -293,28 +339,53 @@ func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, t contract
 }
 
 // submissionEnded ends the retries of a submission entry whose retries limit has ended:
-// each repository that is not done is reported, with the reason of its report that did
-// not reach Qory Apiary, or unreachable, and passed. A report that fails, not
-// permanently, keeps the entry for one more stuckFor, as a comment's does, see
-// [feed.entry]. It returns whether the entry is done, and the error that keeps it.
+// each repository that is not put on GitHub is reported, with the reason of its report
+// that did not reach Qory Apiary, or unreachable, and passed; then the reply for the
+// repositories that are put on GitHub is sent. A report or a reply that fails, not
+// permanently, keeps the entry for one more stuckFor, as a comment's report does, see
+// [feed.entry]; then a reply that keeps failing is replaced by a failure report with the
+// reason unreachable for each of its repositories. It returns whether the entry is done,
+// and the error that keeps it.
 func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contracts.Change, cause error, failed, since time.Duration, limit string) (bool, error) {
+	more := func(what string, t contracts.SubmissionTarget, rerr error) bool {
+		if retriesEnded(failed, since, stuckFor) == "" {
+			return false
+		}
+		f.log.Error("check that Qory Apiary returns 204 for "+what+": one failed for a day or more; the repository is passed", slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("error", rerr.Error()), slog.String("retries_ended", limit))
+		return true
+	}
+	unreachable := func(cause error) *github.SubmitRefused {
+		status, message := github.AnswerOf(cause)
+		return &github.SubmitRefused{Reason: github.ReasonUnreachable, Fix: github.FixUnreachable, Err: cause, Status: status, Message: message}
+	}
 	for _, t := range ch.Targets {
 		ts := state.target(t)
-		if ts.done {
+		if ts.done || ts.reply != nil {
 			continue
 		}
-		reason := github.ReasonUnreachable
-		if ts.reason != "" {
-			reason = ts.reason
+		refused := ts.refused
+		if refused == nil {
+			refused = unreachable(cause)
 		}
-		var repoCause error = &github.SubmitRefused{Reason: reason, Err: cause}
-		if rerr := f.reportTarget(ctx, ch, t, reason, repoCause); rerr != nil {
-			if retriesEnded(failed, since, stuckFor) == "" {
-				return false, rerr
-			}
-			f.log.Error("check that Qory Apiary returns 204 for failure reports: one failed for a day or more; the repository is passed", slog.String("submission_id", ch.SubmissionID), slog.String("path", t.Path), slog.String("reason", reason), slog.String("error", rerr.Error()), slog.String("retries_ended", limit))
+		if rerr := f.reportTarget(ctx, ch, t, refused, refused); rerr != nil && !more("failure reports", t, rerr) {
+			return false, rerr
 		}
 		ts.done = true
+	}
+	rerr := f.reply(ctx, state, ch)
+	if rerr == nil {
+		return true, nil
+	}
+	if retriesEnded(failed, since, stuckFor) == "" {
+		return false, rerr
+	}
+	for _, t := range ch.Targets {
+		if ts := state.target(t); ts.reply != nil && !ts.done {
+			if err := f.reportTarget(ctx, ch, t, unreachable(rerr), rerr); err != nil {
+				more("failure reports", t, err)
+			}
+			ts.done = true
+		}
 	}
 	return true, nil
 }

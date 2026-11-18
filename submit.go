@@ -3,10 +3,12 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -21,8 +23,8 @@ import (
 const (
 	DraftStateDraft  = contracts.DraftStateDraft
 	DraftStateOpen   = contracts.DraftStateOpen
-	DraftStateClosed = "closed"
-	DraftStateMerged = "merged"
+	DraftStateClosed = contracts.DraftStateClosed
+	DraftStateMerged = contracts.DraftStateMerged
 
 	DraftOpened  = contracts.DraftOpened
 	DraftUpdated = contracts.DraftUpdated
@@ -31,6 +33,11 @@ const (
 	// ReasonBranchGone is the failure report's reason for a draft whose head branch or
 	// base branch GitHub returns as not existing.
 	ReasonBranchGone = "branch_gone"
+
+	// ReasonForgeRefused is the failure report's reason for a request that GitHub
+	// refused with a status that no other reason covers, such as 400, so the same
+	// request fails again.
+	ReasonForgeRefused = "forge_refused"
 )
 
 const (
@@ -39,6 +46,11 @@ const (
 	MaxDraftDescription = 20000
 	// MaxDraftTitle is the most characters of a draft's title.
 	MaxDraftTitle = 256
+	// MaxPullBody is the most characters GitHub keeps in the description of a pull
+	// request, the person's text and the marked block together.
+	MaxPullBody = 65536
+	// MaxDetail is the most characters of the detail of a failure report.
+	MaxDetail = 1000
 )
 
 // forgeTitlePrefix is the text GitHub puts before the title of a draft that is not ready:
@@ -96,29 +108,92 @@ type DraftResult struct {
 
 // SubmitRefused is the error of a draft that a retry cannot open or update, since the
 // retry would fail the same way. Reason is the failure report's reason, [ReasonNotPermitted],
-// [ReasonUnreachable], [ReasonBranchGone] or [ReasonTooLong]; Err contains GitHub's
-// status and message, or the check that stopped the call. Its text is the fix for
-// Reason, see [submitFixes], then Err's text.
+// [ReasonUnreachable], [ReasonBranchGone], [ReasonTooLong] or [ReasonForgeRefused]. Fix is
+// the one line that says what a person does, at most 100 characters, ending with a
+// period; each failing case has a different one, see the Fix constants. Err is the cause: GitHub's
+// status and message, or the check that stopped the call. Status and Message are GitHub's
+// answer when the refusal comes from one, else 0 and empty; Message is one line with no
+// token, see [OneLine]. The text of the error is Fix, then Err's text.
 type SubmitRefused struct {
-	Reason string
-	Err    error
+	Reason  string
+	Fix     string
+	Err     error
+	Status  int
+	Message string
 }
 
-// submitFixes is the fix that starts the text of a [*SubmitRefused], for each reason.
-var submitFixes = map[string]string{
-	ReasonNotPermitted: "check the App's installation: it needs the repository and the permission pull requests: write",
-	ReasonUnreachable:  "open the draft pull request on GitHub by hand, or submit again later",
-	ReasonBranchGone:   "push the branch again, and check that the base branch exists on GitHub",
-	ReasonTooLong:      "shorten the title or the description of the pull request on GitHub, and submit again",
-}
+// The fix lines of the failures that do not come from an answer of GitHub to a request of
+// [Client.SubmitDraft]: the caller makes them. Each is a line for a person, at most 100
+// characters.
+const (
+	FixNotInstalled   = "Install the App on the repository with the permission Pull requests: write."
+	FixPermission     = "Give the App's installation the permission Pull requests: write on the repository."
+	FixSuspended      = "Unsuspend the App's installation on GitHub."
+	FixAppForbidden   = "Check on GitHub that the App is not suspended or blocked, then submit again."
+	FixUnreachable    = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
+	fixMoved          = "Link the repository by its new name: GitHub moved it."
+	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
+	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
+	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
+	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
+	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
+	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
+	fixPullTitle      = "Shorten the title of the pull request on GitHub to 256 characters or fewer."
+	fixPullText       = "Shorten the title or the description of the pull request on GitHub."
+	fixForgeRefused   = "Change the pull request or the run as GitHub's answer says, then submit again."
+)
 
 func (e *SubmitRefused) Error() string {
-	if fix, ok := submitFixes[e.Reason]; ok {
-		return fix + ": " + e.Err.Error()
+	if e.Fix != "" {
+		return e.Fix + " " + e.Err.Error()
 	}
 	return e.Err.Error()
 }
 func (e *SubmitRefused) Unwrap() error { return e.Err }
+
+// Detail is the text of the failure report's detail: Fix, then GitHub's status and
+// message when the refusal comes from an answer. It is one line of at most [MaxDetail] characters,
+// with no control character, and no token: see [OneLine].
+func (e *SubmitRefused) Detail() string {
+	d := e.Fix
+	if e.Status != 0 {
+		d += " GitHub answered " + strconv.Itoa(e.Status) + ": " + e.Message
+	}
+	return OneLine(d, MaxDetail)
+}
+
+// AnswerOf is the status and the message of GitHub's answer that err, or an error it
+// wraps, is, as one line with no token, or 0 and empty when err is no answer.
+func AnswerOf(err error) (int, string) {
+	var e *answerError
+	if errors.As(err, &e) {
+		return e.status, OneLine(e.message, MaxDetail)
+	}
+	return 0, ""
+}
+
+// LineForbidden matches the characters that a line of prose in the contract may not
+// have: the control characters, C0, DEL and C1, the bidirectional controls, the line and
+// paragraph separators, and the format characters that are usually not shown.
+var LineForbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
+
+// secretShape matches what looks like a credential: a GitHub token, a bearer value, and
+// the user information of an address.
+var secretShape = regexp.MustCompile(`(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})|bearer\s+\S+|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
+
+// OneLine is s as one line of at most max characters: each forbidden character, see
+// [LineForbidden], and each run of white space is one space, anything that looks like a
+// credential is replaced by "[removed]", and the rest is cut at max characters.
+func OneLine(s string, max int) string {
+	s = strings.ToValidUTF8(s, "")
+	s = LineForbidden.ReplaceAllString(s, " ")
+	s = secretShape.ReplaceAllString(s, "[removed]")
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > max {
+		s = strings.TrimRight(string(r[:max]), " ")
+	}
+	return s
+}
 
 // ghPull is a pull request as GitHub's API writes it.
 type ghPull struct {
@@ -167,9 +242,12 @@ func (p ghPull) body() string {
 // SubmitDraft puts the draft pull request of a submission on GitHub, as the App, with
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
-// Pacer when p is nil. It looks for the pull request from d.Branch of the repository
-// into d.Base, of any state, by the number d.Number when it is above 0, which is a hint, and by the
-// head branch otherwise or when GitHub has no pull request with that number and head.
+// Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
+// into any base branch, of any state: by the number d.Number when it is above 0, which is a
+// hint, and by the head branch otherwise or when GitHub has no pull request with that
+// number and head. Of several pull requests from the branch it takes the one with the
+// number d.Number, else the open one with the highest number, else the closed or merged
+// one with the highest number. It never changes the base branch of a pull request.
 //
 //   - None found: it opens a draft pull request from d.Branch into d.Base, with d.Title
 //     and the description [contracts.MarkedDescription] writes for no earlier one;
@@ -177,19 +255,22 @@ func (p ghPull) body() string {
 //   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
 //     the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
-//     [contracts.MarkedDescription] writes for the description it has, and the title to
-//     the one [contracts.NextTitle] gives, and sends only what changes; the action is
-//     [DraftUpdated], or [DraftKept] when nothing changes.
+//     [contracts.MarkedDescription] writes for the description it has, which is the block
+//     alone for an empty description, and the title to the one [contracts.NextTitle]
+//     gives, and sends only what changes; the action is [DraftUpdated], or [DraftKept]
+//     when nothing changes.
 //
 // A description of more than [MaxDraftDescription] characters, or a title of more than
-// [MaxDraftTitle], is refused as too_long before any request. Every error that a retry
-// cannot change is a [*SubmitRefused] with its reason: a 404, a 403 that is no rate
-// limit, or a permanent redirect, not_permitted; a 422 for a head or base branch that
-// does not exist, branch_gone; a 422 for a text too long, too_long; a 400, any other 422,
-// or more than one pull request from the branch, unreachable. Every other error may pass,
-// as a 5xx, a timeout or a 401, and the call can be made again; a 422 that says a pull
-// request exists already is among them, since the next call finds it. No error contains
-// the token, the title or the description.
+// [MaxDraftTitle], is refused as too_long before any request, and so is a description
+// that the update would make longer than [MaxPullBody]. Every error that a retry cannot
+// change is a [*SubmitRefused] with its reason: a 404, a 403 that is no rate limit, or a
+// permanent redirect, not_permitted; a 422 for a head or base branch that does not exist,
+// branch_gone; a 422 for a text too long, too_long; a 400, any other 422, and any other
+// 4xx status that is no 401, 403, 404, 408 or 429, forge_refused. Each carries GitHub's
+// status and message, see [SubmitRefused.Detail]. Every other error may pass, as a 5xx, a
+// timeout or a 401, and the call can be made again; a 422 that says a pull request exists
+// already is among them, since the next call finds it. No error contains the token, the
+// title or the description.
 func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) (DraftResult, error) {
 	repo := d.Repository
 	if !ownerShape.MatchString(repo.Owner) || !nameShape.MatchString(repo.Name) || repo.Name == "." || repo.Name == ".." {
@@ -207,14 +288,20 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 	if p == nil {
 		p = &Pacer{}
 	}
+	var res DraftResult
 	found, err := c.findPull(ctx, p, tok, d)
-	if err != nil {
-		return DraftResult{}, err
+	switch {
+	case err != nil:
+	case found == nil:
+		res, err = c.openPull(ctx, p, tok, d)
+	default:
+		res, err = c.updatePull(ctx, p, tok, d, *found)
 	}
-	if found == nil {
-		return c.openPull(ctx, p, tok, d)
+	var refused *SubmitRefused
+	if errors.As(err, &refused) && tok != "" {
+		refused.Message = strings.ReplaceAll(refused.Message, tok, "[removed]")
 	}
-	return c.updatePull(ctx, p, tok, d, *found)
+	return res, err
 }
 
 // CheckDraftText returns a [*SubmitRefused] with the reason too_long for a description of
@@ -223,10 +310,10 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 // before it asks GitHub for anything else.
 func CheckDraftText(title, description string) error {
 	if n := utf8.RuneCountInString(description); n > MaxDraftDescription {
-		return &SubmitRefused{Reason: ReasonTooLong, Err: fmt.Errorf("the description is %d characters; the limit is %d", n, MaxDraftDescription)}
+		return &SubmitRefused{Reason: ReasonTooLong, Fix: fixRunDescription, Err: fmt.Errorf("the description of the run is %d characters; the limit is %d", n, MaxDraftDescription)}
 	}
 	if n := utf8.RuneCountInString(title); n > MaxDraftTitle {
-		return &SubmitRefused{Reason: ReasonTooLong, Err: fmt.Errorf("the title is %d characters; the limit is %d", n, MaxDraftTitle)}
+		return &SubmitRefused{Reason: ReasonTooLong, Fix: fixRunTitle, Err: fmt.Errorf("the title of the run is %d characters; the limit is %d", n, MaxDraftTitle)}
 	}
 	return nil
 }
@@ -235,9 +322,32 @@ func CheckDraftText(title, description string) error {
 func pullsPath(repo Repository) string { return "/repos/" + repo.String() + "/pulls" }
 
 // isDraftOf is whether p is a pull request from d.Branch of d's repository itself, not of
-// a fork, into d.Base, as the program bin/open-draft chooses it.
+// a fork, into any base branch: the base branch is the one a person set, and a later
+// version of a submission with another base branch edits the same pull request, which
+// keeps its base.
 func (p ghPull) isDraftOf(d Draft) bool {
-	return p.Head.Ref == d.Branch && p.Base.Ref == d.Base && p.Head.Repo != nil && strings.EqualFold(p.Head.Repo.FullName, d.Repository.String())
+	return p.Head.Ref == d.Branch && p.Head.Repo != nil && strings.EqualFold(p.Head.Repo.FullName, d.Repository.String())
+}
+
+// chosenOf is the pull request of ps, which all have the head branch of the draft, that
+// the draft belongs to: the open one with the highest number, else, when none is open,
+// the closed or merged one with the highest number. The pull request with the entry's
+// number is not among ps: [Client.findPull] reads it first. ps has at least one.
+func chosenOf(ps []ghPull) ghPull {
+	best := -1
+	for i, p := range ps {
+		switch {
+		case best < 0:
+			best = i
+		case (p.State == "open") != (ps[best].State == "open"):
+			if p.State == "open" {
+				best = i
+			}
+		case p.Number > ps[best].Number:
+			best = i
+		}
+	}
+	return ps[best]
 }
 
 // findPull finds the pull request from d.Branch, of any state, and reads it. It is nil
@@ -275,21 +385,17 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	if err := json.Unmarshal(a.body, &listed); err != nil {
 		return nil, fmt.Errorf("%s: GitHub's answer: %w", listing, err)
 	}
-	var numbers []int
+	var ours []ghPull
 	for _, l := range listed {
 		if l.isDraftOf(d) {
-			numbers = append(numbers, l.Number)
+			ours = append(ours, l)
 		}
 	}
-	switch len(numbers) {
-	case 0:
+	if len(ours) == 0 {
 		return nil, nil
-	case 1:
-	default:
-		return nil, &SubmitRefused{Reason: ReasonUnreachable, Err: fmt.Errorf("%s: %d pull requests have that head branch, so none is chosen", listing, len(numbers))}
 	}
 	const reading = "reading the pull request from the branch"
-	a, err = c.send(ctx, p, false, reading, http.MethodGet, pullsPath(d.Repository)+"/"+strconv.Itoa(numbers[0]), tok, nil)
+	a, err = c.send(ctx, p, false, reading, http.MethodGet, pullsPath(d.Repository)+"/"+strconv.Itoa(chosenOf(ours).Number), tok, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -337,6 +443,9 @@ func (c Client) updatePull(ctx context.Context, p *Pacer, tok string, d Draft, f
 	if len(patch) == 0 {
 		return kept, nil
 	}
+	if n := utf8.RuneCountInString(patch["body"]); n > MaxPullBody {
+		return DraftResult{}, &SubmitRefused{Reason: ReasonTooLong, Fix: fixPullBody, Err: fmt.Errorf("updating the pull request: the description with the block would be %d characters; GitHub's limit is %d", n, MaxPullBody)}
+	}
 	const updating = "updating the pull request"
 	a, err := c.send(ctx, p, false, updating, http.MethodPatch, pullsPath(d.Repository)+"/"+strconv.Itoa(found.Number), tok, patch)
 	if err != nil {
@@ -365,39 +474,100 @@ func resultOf(a *apiReply, what, action string) (DraftResult, error) {
 
 // submitFailed is the error for an answer to a step of [Client.SubmitDraft] whose status
 // is not the step's success status: a [*SubmitRefused] when a retry would get the same
-// status, and GitHub's status and message alone otherwise. creating is whether the step
-// creates the pull request, whose 422 can name a head or base branch that does not exist.
+// status, and GitHub's status and message alone otherwise. A retry gets another status
+// after a 401 (the token is dropped), a rate limit, a 408, a 5xx, or a 422 that says the
+// pull request exists already. creating is whether the step creates the pull request,
+// whose 422 can name a head or base branch that does not exist.
 func submitFailed(a *apiReply, what string, creating bool) error {
 	err := a.err(what)
 	switch {
-	case a.status == http.StatusNotFound || a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
-		return &SubmitRefused{Reason: ReasonNotPermitted, Err: err}
+	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
+		return refusedBy(a, ReasonNotPermitted, fixMoved, err)
+	case a.status == http.StatusNotFound:
+		return refusedBy(a, ReasonNotPermitted, FixNotInstalled, err)
 	case a.status == http.StatusForbidden && !a.rateLimited():
-		return &SubmitRefused{Reason: ReasonNotPermitted, Err: err}
+		return refusedBy(a, ReasonNotPermitted, FixPermission, err)
 	case a.status == http.StatusUnprocessableEntity:
 		v := a.validation()
 		switch {
-		case v.tooLong:
-			return &SubmitRefused{Reason: ReasonTooLong, Err: err}
 		case v.exists:
 			return err
+		case v.tooLong:
+			fix := fixPullText
+			switch {
+			case v.bodyLong && !v.titleLong:
+				fix = fixPullBody
+			case v.titleLong && !v.bodyLong:
+				fix = fixPullTitle
+			}
+			return refusedBy(a, ReasonTooLong, fix, err)
 		case creating && v.branch:
-			return &SubmitRefused{Reason: ReasonBranchGone, Err: err}
+			fix := fixBranchGone
+			switch {
+			case v.head && !v.base:
+				fix = fixHeadGone
+			case v.base && !v.head:
+				fix = fixBaseGone
+			}
+			return refusedBy(a, ReasonBranchGone, fix, err)
 		}
-		return &SubmitRefused{Reason: ReasonUnreachable, Err: err}
-	case a.status == http.StatusBadRequest:
-		return &SubmitRefused{Reason: ReasonUnreachable, Err: err}
+		return forgeRefused(a, err)
+	case a.status >= 400 && a.status < 500 && a.status != http.StatusUnauthorized && a.status != http.StatusForbidden && a.status != http.StatusRequestTimeout && a.status != http.StatusTooManyRequests:
+		return forgeRefused(a, err)
 	}
 	return err
+}
+
+// refusedBy is the [*SubmitRefused] for the answer a, with its status and message.
+func refusedBy(a *apiReply, reason, fix string, err error) error {
+	return &SubmitRefused{Reason: reason, Fix: fix, Err: err, Status: a.status, Message: a.forgeMessage()}
+}
+
+// forgeRefused is the [*SubmitRefused] of an answer that no other reason covers.
+func forgeRefused(a *apiReply, err error) error {
+	return refusedBy(a, ReasonForgeRefused, fixForgeRefused, err)
+}
+
+// forgeMessage is the text of GitHub's refusal: its message, and each error it lists, as
+// "field code message", on one line. It is cut at [MaxDetail] characters, and has no
+// token.
+func (a *apiReply) forgeMessage() string {
+	var e struct {
+		Message string            `json:"message"`
+		Errors  []json.RawMessage `json:"errors"`
+	}
+	json.Unmarshal(a.body, &e)
+	parts := []string{e.Message}
+	for _, raw := range e.Errors {
+		var x struct{ Resource, Field, Code, Message string }
+		if json.Unmarshal(raw, &x) != nil {
+			var text string
+			if json.Unmarshal(raw, &text) == nil {
+				parts = append(parts, text)
+			}
+			continue
+		}
+		parts = append(parts, strings.Join(slices.DeleteFunc([]string{x.Resource, x.Field, x.Code, x.Message}, func(s string) bool { return s == "" }), " "))
+	}
+	text := strings.Join(slices.DeleteFunc(parts, func(s string) bool { return s == "" }), "; ")
+	if text == "" {
+		text = http.StatusText(a.status)
+	}
+	return OneLine(text, MaxDetail)
 }
 
 // branchInvalid matches GitHub's message for a head or base that is no branch, which it
 // writes as "head invalid" with a space or a line break, when it sets no field.
 var branchInvalid = regexp.MustCompile(`(?i)^(head|base)\s+invalid`)
 
-// validationOf is what GitHub's 422 says: a text too long, a head or base that is not a
-// branch of the repository, or a pull request that exists already.
-type validationOf struct{ tooLong, branch, exists bool }
+// validationOf is what GitHub's 422 says: a text too long, in the title or in the
+// description, a head or base that is not a branch of the repository, which of the two,
+// or a pull request that exists already.
+type validationOf struct {
+	tooLong, titleLong, bodyLong bool
+	branch, head, base           bool
+	exists                       bool
+}
 
 // validation reads GitHub's 422.
 func (a *apiReply) validation() validationOf {
@@ -418,10 +588,18 @@ func (a *apiReply) validation() validationOf {
 		switch {
 		case strings.Contains(text, "too long"):
 			v.tooLong = true
+			v.titleLong = v.titleLong || x.Field == "title" || strings.HasPrefix(text, "title ")
+			v.bodyLong = v.bodyLong || x.Field == "body" || strings.HasPrefix(text, "body ")
 		case strings.Contains(text, "already exists"):
 			v.exists = true
-		case (x.Field == "head" || x.Field == "base") && x.Code == "invalid", branchInvalid.MatchString(x.Message):
+		case (x.Field == "head" || x.Field == "base") && x.Code == "invalid":
 			v.branch = true
+			v.head = v.head || x.Field == "head"
+			v.base = v.base || x.Field == "base"
+		case branchInvalid.MatchString(x.Message):
+			v.branch = true
+			v.head = v.head || strings.HasPrefix(text, "head")
+			v.base = v.base || strings.HasPrefix(text, "base")
 		}
 	}
 	v.tooLong = v.tooLong || strings.Contains(strings.ToLower(e.Message), "too long")

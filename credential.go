@@ -452,7 +452,8 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
+		limited := (&apiReply{status: resp.StatusCode, header: resp.Header, body: b}).rateLimited()
+		return &answerError{what: what, status: resp.StatusCode, message: e.Message, limited: limited && resp.StatusCode == http.StatusForbidden}
 	}
 	if out == nil {
 		return nil
@@ -469,6 +470,8 @@ type answerError struct {
 	what    string
 	status  int
 	message string
+	// limited is whether the answer is a 403 for GitHub's rate limit, not a refusal.
+	limited bool
 }
 
 func (e *answerError) Error() string {
@@ -482,6 +485,13 @@ func (e *answerError) Error() string {
 func Forbidden(err error) bool {
 	var e *answerError
 	return errors.As(err, &e) && e.status == http.StatusForbidden
+}
+
+// RateLimited is whether err, or an error it wraps, is GitHub's 403 for its rate limit, as
+// its headers or its message say, which passes rather than refuses: a retry can succeed.
+func RateLimited(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.limited
 }
 
 // Unauthorized is whether err, or an error it wraps, is GitHub's 401 to a request

@@ -372,10 +372,20 @@ func (a *Apiary) ChangesFailed(ctx context.Context, req contracts.ChangesFailed)
 	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
 }
 
+// SubmissionFailed sends POST /v1/work-items/changes/failed for a repository of a
+// submission entry: the adapter stopped trying to put the repository with the
+// submission_id, system and path in req on GitHub, for req's reason, with detail, see
+// [github.SubmitRefused.Detail]. Qory Apiary answers as for [Apiary.ChangesFailed].
+func (a *Apiary) SubmissionFailed(ctx context.Context, req contracts.ChangesFailed, detail string) error {
+	what := "sending the failure report of the submission " + req.SubmissionID
+	req.Detail = detail
+	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+}
+
 // ChangesSubmitted sends POST /v1/work-items/changes/submitted: what the adapter put on
-// GitHub for the repositories of the submission entry with the submission_id in req.
-// Qory Apiary keeps the first reply for a repository and answers the signed 204 to a
-// later one, so a repeated reply is no error. Its 400 and 403 are [Permanent], as every
+// GitHub for the repositories of the submission entry with the submission_id in req, one
+// reply for the entry. Qory Apiary keeps the first reply for a repository and answers
+// the signed 204 to a later one, so a repeated reply is no error. Its 400 and 403 are [Permanent], as every
 // request's are: the reply is not sent again.
 func (a *Apiary) ChangesSubmitted(ctx context.Context, req contracts.ChangesSubmitted) error {
 	return a.post(ctx, "sending the reply for the submission "+req.SubmissionID, routeChangesSubmitted, "", "", func(t string) any { req.Time = t; return req })

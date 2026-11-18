@@ -14,15 +14,18 @@ change what the program does, and notes it under Upgrading.
   token of the App for that one repository with `pull_requests: write` and no other
   permission. For each repository of the entry it sends Qory Apiary the address of the
   base commit and of each commit, with or without a draft, and, when the entry asks for a
-  draft, the pull request's number, address, title, state and action. It finds the pull
-  request from the branch into the base branch, of any state, opens a draft when there is
-  none, and changes only the text between the lines `<!-- qory:start -->` and
-  `<!-- qory:end -->` of the description, and the title only while it equals the previous
-  version's title. A closed or merged pull request is not changed. One repository that
-  fails does not stop the others. A repository that GitHub refuses for good is reported to
-  Qory Apiary with the reason `not_permitted`, `branch_gone`, `too_long` or `unreachable`;
-  the App needs the permission Pull requests: read and write. The title in the reply
-  has none of the control, bidirectional or invisible characters that Qory Apiary refuses.
+  draft, the pull request's number, address, title, state and action, in one reply for
+  the entry. It finds the pull request by its head branch and repository, of any state,
+  and never by its base branch, opens a draft when there is none, and changes only the
+  text between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description,
+  and the title only while it equals the previous version's title. A closed or merged
+  pull request is not changed. One repository that fails does not stop the others. A
+  repository that GitHub refuses for good is reported to Qory Apiary with the reason
+  `not_permitted`, `branch_gone`, `too_long` or `forge_refused`, and a `detail` with the
+  fix and GitHub's status and message; one that fails for a day is reported
+  `unreachable`. The App needs the permission Pull requests: read and write. The title in
+  the reply has none of the control, bidirectional or invisible characters that Qory
+  Apiary refuses.
 - The description of the adapter has `submissions: true` in `roles.source`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. The program sets a GitHub commit link for each commit of a
