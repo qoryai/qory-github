@@ -207,9 +207,9 @@ Qory Apiary has a list of paths for each purpose and access:
   token. A query string is not part of a path, so `/owner/name.git/info/refs` is covered
   for both services, `git-receive-pack` and `git-upload-pack`.
 - GitHub mints the `write` token with `contents: write` and no other permission, so it
-  cannot change pull requests even on a path it reaches. The `read` token has
-  `contents`, `metadata` and `pull_requests` `read`, and the token for a harness has
-  `contents` `read`.
+  cannot open, edit or comment on a pull request: it has no pull request permission.
+  The `read` token has `contents`, `metadata` and `pull_requests` `read`, and the token
+  for a harness has `contents` `read`.
 - A run with the access `write-no-push` (a checkout that is writable but cannot push)
   gets the `read` credential: Qory Apiary sends the call with access `read` for it.
 
