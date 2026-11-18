@@ -1038,3 +1038,63 @@ func TestAFailedReplyAfterTheDraftOpenedOpensNoSecondDraft(t *testing.T) {
 		t.Errorf("the draft is %+v", d)
 	}
 }
+
+// TestARateLimitOnTheInstallationLookupIsRetriedAndAPlain403IsNotPermitted: GitHub's 403
+// for a rate limit on the lookup of the repository's installation is no refusal, so the
+// entry stays and nothing is reported, and the next step opens the draft; a plain 403 on
+// the lookup is reported not_permitted.
+func TestARateLimitOnTheInstallationLookupIsRetriedAndAPlain403IsNotPermitted(t *testing.T) {
+	failLookup := func(body string) func(f *fakeGitHub) {
+		return func(f *fakeGitHub) {
+			f.pullFail = func(m, p string) (int, string) {
+				if m == "GET" && p == "/repos/acme/widgets/installation" {
+					return 403, body
+				}
+				return 0, ""
+			}
+		}
+	}
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, failLookup(`{"message":"API rate limit exceeded for the App."}`))
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") || len(w.apiary.submissionReports()) != 0 {
+		t.Fatalf("err %v, reports %v", err, w.apiary.submissionReports())
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.pullFail = nil })
+	w.stepOK(t)
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "opened" || !cursorIs(w, "c_1") {
+		t.Errorf("the draft is %+v", d)
+	}
+	w = newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, failLookup(`{"message":"Resource not accessible by integration"}`))
+	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets not_permitted"}) || !cursorIs(w, "c_1") {
+		t.Errorf("reports %v", r)
+	}
+}
+
+// TestTheRunsTitleInTheReplyIsCleanedToo: a pull request whose title is nothing but
+// invisible characters gets the run's title in the reply, without the forbidden characters
+// the run's title has; a run's title with no usable character is Qory Apiary's defect, so
+// it is logged and passed before any request, with no reply and no report.
+func TestTheRunsTitleInTheReplyIsCleanedToo(t *testing.T) {
+	w := newWired(t, filepath.Join(t.TempDir(), "state"))
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 1, title: "\u200b\u2060", draft: true})
+	})
+	w.apiary.add(submissionOf(testSubmissionID, "Fix\u200b the widget", "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Title != "Fix the widget" {
+		t.Errorf("the draft is %+v", d)
+	}
+	w2 := newWired(t, filepath.Join(t.TempDir(), "state"))
+	w2.apiary.add(submissionOf(testSubmissionID, "\u200b \u202e", "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w2.stepOK(t)
+	if len(w2.gh.pullCalls()) != 0 || len(w2.apiary.replies()) != 0 || len(w2.apiary.sent(routeChangesFailed)) != 0 || !cursorIs(w2, "c_1") {
+		t.Errorf("the entry was not passed quietly")
+	}
+	if !strings.Contains(w2.log.String(), "the entry's title has no character") {
+		t.Errorf("the log %s", w2.log.String())
+	}
+}

@@ -297,7 +297,7 @@ equals the title of the previous version of the submission. A title that a perso
 stays. The description of the run is at most 20000 characters and the title at most 256.
 The title in the reply to Qory Apiary is the pull request's title without the control,
 bidirectional and invisible characters that Qory Apiary refuses; the pull request keeps its
-title.
+title. When that leaves only spaces, the reply has the run's title, cleaned the same way.
 
 When the adapter cannot do what a repository asks for, and a retry cannot change that, it
 sends Qory Apiary a failure report for that repository with one reason. The other

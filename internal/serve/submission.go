@@ -110,6 +110,13 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	refuse := func(reason string, err error) error {
 		return &github.SubmitRefused{Reason: reason, Err: fmt.Errorf("%w%s", err, where)}
 	}
+	// The run's title, cleaned, is what the reply has when the pull request's title is
+	// left with nothing. The schema of the entry gives it a character that is not a space,
+	// so an entry without one is Qory Apiary's defect, found before any request.
+	fallback, ok := cleanTitle(ch.Text.Title)
+	if !ok {
+		return contracts.SubmittedTarget{}, Permanent(errors.New("report this Qory Apiary defect: the entry's title has no character that is not a space or forbidden" + where))
+	}
 	if err := github.CheckDraftText(ch.Text.Title, ch.Text.Description); err != nil {
 		var refused *github.SubmitRefused
 		errors.As(err, &refused)
@@ -148,7 +155,7 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	default:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
-	reply.Draft = &contracts.SubmittedDraft{Number: got.Number, URL: got.URL, Title: replyTitle(got.Title, ch.Text.Title), State: got.State, Action: got.Action}
+	reply.Draft = &contracts.SubmittedDraft{Number: got.Number, URL: got.URL, Title: replyTitle(got.Title, fallback), State: got.State, Action: got.Action}
 	return reply, nil
 }
 
@@ -158,16 +165,23 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 // characters that are usually not shown.
 var titleForbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
 
+// cleanTitle is title without the characters in [titleForbidden], and whether it has a
+// character that is not a space, as the contract's draft_title needs.
+func cleanTitle(title string) (string, bool) {
+	shown := titleForbidden.ReplaceAllString(strings.ToValidUTF8(title, ""), "")
+	return shown, strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") != ""
+}
+
 // replyTitle is the title of the pull request on GitHub as the reply sends it, without
 // the characters in [titleForbidden], which a person may have put in it: Qory Apiary
 // refuses a reply that has one. The pull request is not changed. A title left with
-// nothing but spaces is replaced by title, the run's title.
-func replyTitle(current, title string) string {
-	shown := titleForbidden.ReplaceAllString(strings.ToValidUTF8(current, ""), "")
-	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
-		return title
+// nothing but spaces is replaced by fallback, the run's title, which [cleanTitle] made
+// valid.
+func replyTitle(current, fallback string) string {
+	if shown, ok := cleanTitle(current); ok {
+		return shown
 	}
-	return shown
+	return fallback
 }
 
 // targetState is what the feed keeps of one repository of a submission entry: whether it

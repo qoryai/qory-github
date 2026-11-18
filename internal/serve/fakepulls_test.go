@@ -23,8 +23,8 @@ type ghPullRec struct {
 // pullStore is the stand-in GitHub's pull requests, under f.mu, with what a test may
 // change: pullFail answers a request, by its method and path, with a status and a body
 // when it returns a status other than 0, with the headers in failHeader; goneBranches
-// are the branches the repository has none of, by name; noInstallation are the repositories the App has no installation
-// on, by owner/name.
+// are the branches the repository has none of, by name; noInstallation are the
+// repositories the App has no installation on, by owner/name.
 type pullStore struct {
 	pulls          []*ghPullRec
 	pullFail       func(method, path string) (int, string)
