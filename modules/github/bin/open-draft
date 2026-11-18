@@ -41,13 +41,32 @@ tmp=
 timer=
 worker=
 stopped=
+# running is true when the process $1 runs. A process that ended but has not been waited
+# for stays in the process table as a zombie: it is not running, and kill -0 still
+# succeeds for it. The state comes from /proc; where there is none, from ps when $2 is
+# ps, which starts a process, so a loop does not pass it.
+running() {
+	kill -0 "$1" 2>/dev/null || return 1
+	_st=
+	if [ -r "/proc/$1/stat" ]; then
+		read -r _st <"/proc/$1/stat" 2>/dev/null || :
+		_st=${_st##*) }
+	elif [ "${2:-}" = ps ]; then
+		_st=$(ps -o stat= -p "$1" 2>/dev/null || :)
+	fi
+	case $_st in
+	Z*) return 1 ;;
+	esac
+	return 0
+}
+
 cleanup() {
 	# A signal or the watchdog stopped the program before the work ended: end what it
 	# started. After a normal end the pids are gone, and nothing is signalled.
 	if [ -n "$stopped" ]; then
 		# End the worker and the timer first, so no other gh starts. Then send TERM to gh
-		# and check 2000 times, with no pause, whether it is gone. If it is still there,
-		# sleep 1 second and send KILL, without a second check.
+		# and check up to 2000 times, with no pause, whether it ended. If it still runs,
+		# sleep 1 second, check again, and send KILL if it runs.
 		for _p in "$worker" "$timer"; do
 			if [ -n "$_p" ]; then
 				kill "$_p" 2>/dev/null || :
@@ -55,15 +74,17 @@ cleanup() {
 			fi
 		done
 		_gh=$(cat "$tmp/gh.pid" 2>/dev/null || :)
-		if [ -n "$_gh" ] && kill -0 "$_gh" 2>/dev/null; then
+		if [ -n "$_gh" ] && running "$_gh" ps; then
 			kill "$_gh" 2>/dev/null || :
 			_n=0
-			while [ "$_n" -lt 2000 ] && kill -0 "$_gh" 2>/dev/null; do
+			while [ "$_n" -lt 2000 ] && running "$_gh"; do
 				_n=$((_n + 1))
 			done
-			if kill -0 "$_gh" 2>/dev/null; then
+			if running "$_gh" ps; then
 				sleep 1
-				kill -9 "$_gh" 2>/dev/null || :
+				if running "$_gh" ps; then
+					kill -9 "$_gh" 2>/dev/null || :
+				fi
 			fi
 		fi
 	fi

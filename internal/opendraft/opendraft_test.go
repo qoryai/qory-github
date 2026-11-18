@@ -1,6 +1,7 @@
 package opendraft
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1150,13 +1151,39 @@ func (f *fake) sleeps() [][]string {
 	return out
 }
 
-// alive returns the process ids, of those given, that still run after up to 3 seconds.
+// running is whether the process pid runs. A process that ended and was not waited for
+// is a zombie: signal 0 reaches it, and it is not running. A container whose first
+// process does not wait for orphans, such as the CI image, keeps them as zombies.
+func running(pid int) bool {
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	state := ""
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		// The state follows the name in parentheses, which may hold spaces.
+		if i := bytes.LastIndexByte(b, ')'); i >= 0 && i+2 < len(b) {
+			state = string(b[i+2 : i+3])
+		}
+	} else if out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output(); err == nil {
+		state = strings.TrimSpace(string(out))
+	}
+	return !strings.HasPrefix(state, "Z")
+}
+
+// alive returns the process ids, of those given, that still run after up to 3 seconds,
+// each once.
 func alive(pids ...string) []string {
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		var left []string
+		seen := map[string]bool{}
 		for _, p := range pids {
-			if p != "" && exec.Command("kill", "-0", p).Run() == nil {
+			n, err := strconv.Atoi(p)
+			if err != nil || seen[p] {
+				continue
+			}
+			seen[p] = true
+			if running(n) {
 				left = append(left, p)
 			}
 		}
@@ -1184,9 +1211,14 @@ func TestAHungGhEndsTheProgramWithStatus1AndTheAddressesPrinted(t *testing.T) {
 	if want := "Run `qory run` again: the `gh` call did not finish within 3 seconds.\n"; r.stderr != want {
 		t.Errorf("stderr %q, want %q", r.stderr, want)
 	}
-	// The sleeps are the timer and the hung gh, which the fake makes a sleep.
+	// The sleeps are the timer and the hung gh, which the fake makes a sleep. The sleep of
+	// 1 second is the wait of the cleanup for a gh that does not end at TERM, which this
+	// run needs only when gh ends late.
 	var pids []string
 	for _, s := range f.sleeps() {
+		if len(s) > 1 && s[1] == "1" {
+			continue
+		}
 		pids = append(pids, s[0])
 	}
 	if len(pids) != 2 {
