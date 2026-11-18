@@ -10,7 +10,8 @@ but `gh`. A run that starts from a run code runs no program: `qory-github-server
 opens its draft pull request.
 
 `bin/open-draft` is a POSIX `sh` script. It uses `gh`, and `sed`, `awk`, `grep`, `tr`,
-`head`, `cut`, `wc`, `cat`, `cmp` and `mktemp`. It needs no `jq`, Python or Node.
+`head`, `tail`, `cut`, `wc`, `cat`, `cmp`, `mktemp` and `rm`. It needs no `jq`, Python or
+Node. As of 2026-11-18, `qory` does not run the program yet.
 
 ## Requirements
 
@@ -40,7 +41,7 @@ empty.
 | `QORY_SUBMIT_DRAFT` | `open`, or `none` to print the addresses only. |
 | `QORY_SUBMIT_TITLE` | The title of a new draft, 1 to 256 characters on one line. |
 | `QORY_SUBMIT_DESCRIPTION_FILE` | The path of a file with the description text, at most 20000 characters. |
-| `QORY_SUBMIT_DRAFT_NUMBER` | Optional, 1 to 9 digits. Chooses the draft when several pull requests have the branch as their head. |
+| `QORY_SUBMIT_DRAFT_NUMBER` | Optional, 1 to 9 digits. Not in the contract's table, and qory sets it for no run today. Chooses the draft when several pull requests have the branch as their head. |
 
 `gh` reads `GH_TOKEN` and `GH_HOST` from the environment. The program prints neither.
 

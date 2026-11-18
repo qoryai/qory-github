@@ -38,7 +38,8 @@ change what the program does, and notes it under Upgrading.
   (`draft_number`, `draft_url`, `draft_title`, `draft_state`, `draft_action`, `commit_url`).
   Exit 1 means a call to `gh` failed, exit 2 an input it cannot use, and exit 3 a missing
   login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first line on
-  standard error. The program pushes nothing and needs no Node, `jq` or proxy.
+  standard error. The program pushes nothing and needs no Node, `jq` or proxy. As of 2026-11-18, `qory` does
+  not run it yet.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the
   GitHub App, have Qory Apiary's set-up look: its header, the heading Set up the GitHub
   App, and the steps Start, On GitHub and Done. Start has the form. The page that opens

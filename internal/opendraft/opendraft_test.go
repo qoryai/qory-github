@@ -251,7 +251,12 @@ type result struct {
 
 func (f *fake) run(env ...string) result {
 	f.t.Helper()
-	return f.runProgram(program(f.t), nil, env...)
+	var shell []string
+	if sh := os.Getenv("OPEN_DRAFT_TEST_SHELL"); sh != "" {
+		// A shell that runs the program in place of its shebang, such as dash.
+		shell = []string{sh}
+	}
+	return f.runProgram(program(f.t), shell, env...)
 }
 
 func (f *fake) runProgram(prog string, shell []string, env ...string) result {
