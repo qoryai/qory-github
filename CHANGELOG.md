@@ -45,7 +45,7 @@ change what the program does, and notes it under Upgrading.
   `<!-- qory:end -->` of the description, keeps the title, and changes nothing in a closed
   or merged pull request. It prints the result as lines (`draft_number`, `draft_url`,
   `draft_title`, `draft_state`, `draft_action`, `commit_url`). Exit 1 means a call to `gh`
-  failed, exit 2 an input it cannot use, and exit 3 a missing login of `gh`, with
+  failed or did not answer within 110 seconds, exit 2 an input it cannot use, and exit 3 a missing login of `gh`, with
   ``Run `gh auth login`, then `qory run` again.`` as the first line on standard error.
   The program pushes nothing.
 - The set-up pages of `qory-github-server serve`, where an instance admin creates the

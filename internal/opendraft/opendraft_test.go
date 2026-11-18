@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qoryai/integrations/contracts"
 	"gopkg.in/yaml.v3"
@@ -40,6 +41,13 @@ n=$(cat "$d/count" 2>/dev/null || echo 0)
 n=$((n + 1))
 echo "$n" >"$d/count"
 : >"$d/call.$n"
+echo $$ >"$d/pid.$n"
+if [ "$n" = 1 ]; then
+	# The program starts the timer before its first call; wait until the fake sleep has
+	# written its line, so a test reads it, whatever the load.
+	i=0
+	while [ ! -s "$d/sleep.args" ] && [ "$i" -lt 100000 ]; do i=$((i + 1)); done
+fi
 for a in "$@"; do printf '%s\n' "$a" >>"$d/call.$n"; done
 prev=
 method=GET
@@ -69,6 +77,7 @@ case "$1 $2" in
 	esac
 	;;
 esac
+if [ -f "$d/hang.$key" ]; then exec sleep 31337; fi
 k=$(cat "$d/k.$key" 2>/dev/null || echo 0)
 k=$((k + 1))
 echo "$k" >"$d/k.$key"
@@ -187,6 +196,10 @@ func newFake(t *testing.T, mode string) *fake {
 				t.Fatal(err)
 			}
 		}
+	}
+	// sleep records its process id and its arguments, then runs the real one.
+	if realSleep, err := exec.LookPath("sleep"); err == nil {
+		f.write(filepath.Join(f.bin, "sleep"), "#!/bin/sh\necho \"$$ $@\" >>\""+f.dir+"/sleep.args\"\nexec "+realSleep+" \"$@\"\n", 0o755)
 	}
 	if awk := os.Getenv("OPEN_DRAFT_TEST_AWK_SUITE"); awk != "" {
 		// An awk that runs every awk program of the suite in place of the one on PATH.
@@ -839,11 +852,19 @@ func TestTheCapsOf20000And256Characters(t *testing.T) {
 			if r.code != c.code {
 				t.Fatalf("exit %d, want %d, stderr %q", r.code, c.code, r.stderr)
 			}
-			if c.code == 2 && (r.stdout != "" || len(f.calls()) != 0 || !strings.HasPrefix(r.stderr, "Shorten ")) {
+			if c.code == 2 && (r.stdout != commitLines() || len(f.calls()) != 0 || !strings.HasPrefix(r.stderr, "Shorten ")) {
 				t.Errorf("stdout %q, calls %v, stderr %q", r.stdout, f.calls(), r.stderr)
 			}
 		})
 	}
+}
+
+// draftInputs are the cases of TestInputsThatCannotBeUsedAreExit2WithTheFixFirst whose bad
+// input is one of the draft's: the program has printed the commit addresses before it
+// refuses them, since they need only the commits.
+var draftInputs = map[string]bool{
+	"no title": true, "a title with a line feed": true, "a title of spaces": true, "no base branch": true,
+	"a bad base branch": true, "no description file": true, "a description file that is missing": true,
 }
 
 func TestInputsThatCannotBeUsedAreExit2WithTheFixFirst(t *testing.T) {
@@ -884,8 +905,12 @@ func TestInputsThatCannotBeUsedAreExit2WithTheFixFirst(t *testing.T) {
 			t.Parallel()
 			f := newFake(t, "text")
 			r := f.run(c.env...)
-			if r.code != 2 || r.stdout != "" || !strings.HasPrefix(r.stderr, c.want) || strings.Count(r.stderr, "\n") != 1 || len(f.calls()) != 0 {
-				t.Errorf("exit %d, stdout %q, stderr %q, calls %v; want stderr that starts %q", r.code, r.stdout, r.stderr, f.calls(), c.want)
+			wantOut := ""
+			if draftInputs[c.name] {
+				wantOut = commitLines()
+			}
+			if r.code != 2 || r.stdout != wantOut || !strings.HasPrefix(r.stderr, c.want) || strings.Count(r.stderr, "\n") != 1 || len(f.calls()) != 0 {
+				t.Errorf("exit %d, stdout %q, stderr %q, calls %v; want stdout %q and stderr that starts %q", r.code, r.stdout, r.stderr, f.calls(), wantOut, c.want)
 			}
 			if first := strings.SplitN(r.stderr, "\n", 2)[0]; len(first) > 200 {
 				t.Errorf("the line has %d characters", len(first))
@@ -1055,7 +1080,7 @@ func TestATitleOfTheRunWithNothingToShowIsRefused(t *testing.T) {
 	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e "} {
 		f := newFake(t, "text")
 		r := f.run("QORY_SUBMIT_TITLE=" + bad)
-		if r.code != 2 || r.stdout != "" || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
+		if r.code != 2 || r.stdout != commitLines() || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
 			t.Errorf("title %q: exit %d, stdout %q, stderr %q, calls %v", bad, r.code, r.stdout, r.stderr, f.calls())
 		}
 	}
@@ -1080,5 +1105,129 @@ func TestEveryRunOfTheProgramIsRecordedByQory(t *testing.T) {
 			t.Fatalf("%s: exit %d, stderr %q", c.name, r.code, r.stderr)
 		}
 		parsed(t, r.stdout)
+	}
+}
+
+// TestTheAddressesAreOnStandardOutputWhenTheDraftInputsAreBad: with QORY_SUBMIT_DRAFT open
+// and no base branch, the program exits 2 with the fix on standard error, and has printed
+// the address of each commit, which qory reads: the contract reads the lines of a program
+// that exits 2, and a draft that they do not make is recorded as program-failed.
+func TestTheAddressesAreOnStandardOutputWhenTheDraftInputsAreBad(t *testing.T) {
+	f := newFake(t, "text")
+	r := f.run("QORY_SUBMIT_BASE_BRANCH=\x00")
+	if r.code != 2 || r.stdout != commitLines() || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_BASE_BRANCH") || len(f.calls()) != 0 {
+		t.Errorf("exit %d, stdout %q, stderr %q, calls %v", r.code, r.stdout, r.stderr, f.calls())
+	}
+}
+
+// sleeps are the process ids and the arguments of the sleeps that the program started.
+func (f *fake) sleeps() [][]string {
+	b, _ := os.ReadFile(filepath.Join(f.dir, "sleep.args"))
+	var out [][]string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if w := strings.Fields(l); len(w) > 0 {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// alive returns the process ids, of those given, that still run after up to 3 seconds.
+func alive(pids ...string) []string {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var left []string
+		for _, p := range pids {
+			if p != "" && exec.Command("kill", "-0", p).Run() == nil {
+				left = append(left, p)
+			}
+		}
+		if len(left) == 0 || time.Now().After(deadline) {
+			return left
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestAHungGhEndsTheProgramWithStatus1AndTheAddressesPrinted: gh does not answer the
+// search for the pull request. The program ends with status 1 after the watchdog's limit,
+// 3 seconds here, with the fix on the first line of standard error and the commit lines on
+// standard output, and no process of the program is left: neither gh nor the timer.
+func TestAHungGhEndsTheProgramWithStatus1AndTheAddressesPrinted(t *testing.T) {
+	f := newFake(t, "text")
+	f.have(pull{Number: 8, Draft: true, Body: block("Old.")})
+	f.set("hang.list", "")
+	began := time.Now()
+	r := f.run("OPEN_DRAFT_WATCHDOG_SECONDS=3")
+	if took := time.Since(began); took > 15*time.Second || took < 2*time.Second {
+		t.Errorf("the program ended after %v, want about 3 seconds", took)
+	}
+	wantResult(t, r, 1, commitLines())
+	if want := "Run `qory run` again; `gh` did not answer within 3 seconds.\n"; r.stderr != want {
+		t.Errorf("stderr %q, want %q", r.stderr, want)
+	}
+	// The sleeps are the timer and the hung gh, which the fake makes a sleep.
+	var pids []string
+	for _, s := range f.sleeps() {
+		pids = append(pids, s[0])
+	}
+	if len(pids) != 2 {
+		t.Fatalf("the program started %d sleeps, want the timer and the hung gh: %v", len(pids), f.sleeps())
+	}
+	if left := alive(pids...); len(left) != 0 {
+		t.Errorf("processes %v are still running", left)
+	}
+}
+
+// TestTheWatchdogLeavesNoTimerAfterAnEndOfTheWork: a run that ends in time, with any
+// status, leaves no sleep of the timer, and the program waits for none.
+func TestTheWatchdogLeavesNoTimerAfterAnEndOfTheWork(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(f *fake)
+		code int
+	}{
+		{"done", func(f *fake) { f.have(pull{Number: 8, Draft: true, Body: block("Old.")}) }, 0},
+		{"gh fails", func(f *fake) { f.have(pull{Number: 8}); f.set("list.status", "1") }, 1},
+		{"no login", func(f *fake) { f.set("auth.status", "1") }, 3},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake(t, "text")
+			c.set(f)
+			began := time.Now()
+			r := f.run("OPEN_DRAFT_WATCHDOG_SECONDS=4")
+			if r.code != c.code || time.Since(began) > 3*time.Second {
+				t.Errorf("exit %d after %v, want %d at once; stderr %q", r.code, time.Since(began), c.code, r.stderr)
+			}
+			var pids []string
+			for _, s := range f.sleeps() {
+				pids = append(pids, s[0])
+			}
+			if len(pids) != 1 {
+				t.Fatalf("the program started %d sleeps, want the timer: %v", len(pids), f.sleeps())
+			}
+			if left := alive(pids...); len(left) != 0 {
+				t.Errorf("the timer %v is still running", left)
+			}
+		})
+	}
+}
+
+// TestTheWatchdogLimitIsAtMost110Seconds: the variable of the tests takes 1 to 110, and
+// any other value is 110.
+func TestTheWatchdogLimitIsAtMost110Seconds(t *testing.T) {
+	for _, c := range []struct{ value, want string }{
+		{"", "110"}, {"5", "5"}, {"110", "110"}, {"111", "110"}, {"999", "110"}, {"0", "110"}, {"05", "110"},
+		{"-5", "110"}, {"abc", "110"}, {"5 ", "110"}, {"99999999999999999999", "110"},
+	} {
+		f := newFake(t, "text")
+		f.have(pull{Number: 8, Draft: true, Body: block("Old.")})
+		r := f.run("OPEN_DRAFT_WATCHDOG_SECONDS=" + c.value)
+		if r.code != 0 {
+			t.Fatalf("%q: exit %d, stderr %q", c.value, r.code, r.stderr)
+		}
+		if got := f.sleeps(); len(got) != 1 || len(got[0]) != 2 || got[0][1] != c.want {
+			t.Errorf("%q: the timer slept %q, want %s", c.value, got, c.want)
+		}
 	}
 }

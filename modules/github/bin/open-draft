@@ -38,13 +38,25 @@ LIST_JQ=".[] | $FIELDS"
 READ_JQ="$FIELDS, (.body // \"\")"
 
 tmp=
+timer=
+worker=
+stopped=
 cleanup() {
+	# A signal or the watchdog stopped the program before the work ended: end what it
+	# started. After a normal end the pids are gone, and nothing is signalled.
+	if [ -n "$stopped" ]; then
+		for _p in "$timer" "$worker" "$(cat "$tmp/gh.pid" 2>/dev/null || :)"; do
+			if [ -n "$_p" ]; then
+				kill "$_p" 2>/dev/null || :
+			fi
+		done
+	fi
 	if [ -n "$tmp" ]; then
 		rm -rf "$tmp"
 	fi
 }
 trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
+trap 'stopped=1; exit 1' HUP INT TERM
 
 # refuse prints the fix on stderr and ends with status 2: the inputs cannot be used.
 refuse() {
@@ -234,6 +246,14 @@ if [ "$count" -lt 1 ] || [ "$count" -gt 100 ]; then
 	refuse "Set QORY_SUBMIT_COMMITS to 1 to 100 commit ids: it has $count."
 fi
 
+# ----------------------------------------------------- the commit addresses
+
+# The addresses need no more than the commits, so they are printed when the inputs of the
+# draft cannot be used: qory reads the lines that a program printed before it exited 2.
+for c in $base_commit $commits; do
+	printf 'commit_url %s https://%s/%s/commit/%s\n' "$c" "$HOST" "$path" "$c"
+done
+
 title=
 fallback_title=
 base_branch=
@@ -275,29 +295,9 @@ if [ "$draft" = open ]; then
 	fi
 fi
 
-# ----------------------------------------------------- the commit addresses
-
-for c in $base_commit $commits; do
-	printf 'commit_url %s https://%s/%s/commit/%s\n' "$c" "$HOST" "$path" "$c"
-done
-
 if [ "$draft" = none ]; then
 	exit 0
 fi
-
-# ----------------------------------------------------------------- the login
-
-if ! command -v gh >/dev/null 2>&1; then
-	fail 'Install gh from https://cli.github.com, run `gh auth login`, then `qory run` again.'
-fi
-# gh auth token reads the login from the credential store of gh: it calls no server, and
-# its output, the token, goes nowhere. A token that GitHub rejects ends a later call with HTTP 401.
-if ! gh auth token --hostname "$HOST" >/dev/null 2>&1 </dev/null; then
-	printf '%s\n' "$LOGIN_LINE" >&2
-	exit 3
-fi
-
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/open-draft.XXXXXX")
 
 # gh_fail ends the program for a failed gh call: it prints the fix, then the cause
 # that gh gave, with every token of the environment masked. A rejected login is the
@@ -328,7 +328,7 @@ gh_fail() {
 
 # read_pull reads pull request $1 into $tmp/pull: 8 lines and its description.
 read_pull() {
-	if ! gh api -X GET --hostname "$HOST" "repos/$path/pulls/$1" --jq "$READ_JQ" \
+	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls/$1" --jq "$READ_JQ" \
 		>"$tmp/pull" 2>"$tmp/gh.err" </dev/null; then
 		gh_fail "the read of pull request $1"
 	fi
@@ -341,7 +341,7 @@ read_pull() {
 # at the head branch and the repository alone, in any state. Of several it takes the
 # highest number that is not closed and not merged, else the highest number.
 find_pull() {
-	if ! gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
+	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
 		-f "head=$owner:$branch" -f state=all -f per_page=100 --jq "$LIST_JQ" \
 		>"$tmp/list" 2>"$tmp/gh.err" </dev/null; then
 		gh_fail 'the search for the pull request of the branch'
@@ -458,48 +458,103 @@ print_draft() {
 	printf 'draft_action %s\n' "$_action"
 }
 
-# ----------------------------------------------------------------- the draft
+# ---------------------------------------------------------------- the work
 
-number=
-find_pull
+# publish logs in to gh and opens or edits the draft. It runs in the background, see the
+# watchdog below, and prints the draft lines last.
+publish() {
+	if ! command -v gh >/dev/null 2>&1; then
+		fail 'Install gh from https://cli.github.com, run `gh auth login`, then `qory run` again.'
+	fi
+	# gh auth token reads the login from the credential store of gh: it calls no server, and
+	# its output, the token, goes nowhere. A token that GitHub rejects ends a later call with HTTP 401.
+	if ! run_gh auth token --hostname "$HOST" >/dev/null 2>&1 </dev/null; then
+		printf '%s\n' "$LOGIN_LINE" >&2
+		exit 3
+	fi
 
-if [ -z "$number" ]; then
-	{
-		printf '%s\n' "$START"
-		cat <"$description_file"
-		printf '\n%s' "$END"
-	} >"$tmp/body"
-	if ! gh pr create --repo "$HOST/$path" --draft --head "$branch" --base "$base_branch" \
-		--title "$title" --body-file "$tmp/body" >"$tmp/created" 2>"$tmp/gh.err" </dev/null; then
-		gh_fail 'the opening of the draft pull request'
-	fi
-	number=$(sed -n 's|^.*/pull/\([1-9][0-9]*\)[^0-9]*$|\1|p' "$tmp/created" | tail -n 1)
+	number=
+	find_pull
+
 	if [ -z "$number" ]; then
-		find_pull
+		{
+			printf '%s\n' "$START"
+			cat <"$description_file"
+			printf '\n%s' "$END"
+		} >"$tmp/body"
+		if ! run_gh pr create --repo "$HOST/$path" --draft --head "$branch" --base "$base_branch" \
+			--title "$title" --body-file "$tmp/body" >"$tmp/created" 2>"$tmp/gh.err" </dev/null; then
+			gh_fail 'the opening of the draft pull request'
+		fi
+		number=$(sed -n 's|^.*/pull/\([1-9][0-9]*\)[^0-9]*$|\1|p' "$tmp/created" | tail -n 1)
+		if [ -z "$number" ]; then
+			find_pull
+		fi
+		if [ -z "$number" ]; then
+			fail "Check $path on $HOST: gh opened a pull request, and the search for it from the branch found none."
+		fi
+		read_pull "$number"
+		print_draft opened
+		exit 0
 	fi
-	if [ -z "$number" ]; then
-		fail "Check $path on $HOST: gh opened a pull request, and the search for it from the branch found none."
-	fi
+
 	read_pull "$number"
-	print_draft opened
-	exit 0
-fi
+	state=$(sed -n 4p "$tmp/pull")
+	merged=$(sed -n 5p "$tmp/pull")
+	if [ "$state" != open ] || [ "$merged" = true ]; then
+		print_draft kept
+		exit 0
+	fi
 
-read_pull "$number"
-state=$(sed -n 4p "$tmp/pull")
-merged=$(sed -n 5p "$tmp/pull")
-if [ "$state" != open ] || [ "$merged" = true ]; then
-	print_draft kept
-	exit 0
-fi
+	marked_description "$description_file"
+	if cmp -s "$tmp/before" "$tmp/after"; then
+		print_draft kept
+		exit 0
+	fi
+	if ! run_gh api -X PATCH --hostname "$HOST" "repos/$path/pulls/$number" -F "body=@$tmp/after" \
+		--silent >"$tmp/patched" 2>"$tmp/gh.err" </dev/null; then
+		gh_fail "the update of pull request $number"
+	fi
+	print_draft updated
+}
 
-marked_description "$description_file"
-if cmp -s "$tmp/before" "$tmp/after"; then
-	print_draft kept
+# run_gh runs the gh program in the background and waits for it, so the watchdog can end it.
+run_gh() {
+	command gh "$@" &
+	echo "$!" >"$tmp/gh.pid"
+	wait "$!"
+}
+
+# ------------------------------------------------------------------ the watchdog
+
+# qory stops a program after 120 seconds and then reads no line. The work runs in the
+# background, and the program ends with status 1 after 110 seconds when it has not
+# finished, so the commit lines that it printed are read. OPEN_DRAFT_WATCHDOG_SECONDS,
+# from 1 to 110, is for tests only: no larger value is taken.
+limit=110
+case ${OPEN_DRAFT_WATCHDOG_SECONDS:-} in
+[1-9] | [1-9][0-9] | 10[0-9] | 110) limit=$OPEN_DRAFT_WATCHDOG_SECONDS ;;
+esac
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/open-draft.XXXXXX")
+sleep "$limit" &
+timer=$!
+{
+	trap - HUP INT TERM
+	# The end of the work, with any status, writes it and ends the timer.
+	trap 'echo "$?" >"$tmp/status"; kill "$timer" 2>/dev/null || :' EXIT
+	publish
 	exit 0
+} &
+worker=$!
+# A shell may report the timer, which the end of the work signals, on standard error.
+wait "$timer" 2>/dev/null || :
+timer=
+if [ ! -s "$tmp/status" ]; then
+	stopped=1
+	printf 'Run `qory run` again; `gh` did not answer within %s seconds.\n' "$limit" >&2
+	exit 1
 fi
-if ! gh api -X PATCH --hostname "$HOST" "repos/$path/pulls/$number" -F "body=@$tmp/after" \
-	--silent >"$tmp/patched" 2>"$tmp/gh.err" </dev/null; then
-	gh_fail "the update of pull request $number"
-fi
-print_draft updated
+wait "$worker" || :
+worker=
+exit "$(cat "$tmp/status")"

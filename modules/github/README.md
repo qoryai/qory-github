@@ -49,24 +49,27 @@ empty.
 
 ## What the program does
 
-1. It checks the inputs. A value that it cannot use ends the program with status 2
-   before it prints a line.
+1. It checks the inputs of the commits: the system, the path, the branch, `QORY_SUBMIT_DRAFT`,
+   the base commit and the commits. A value that it cannot use ends the program with
+   status 2 before it prints a line.
 2. It prints `commit_url <commit> https://github.com/<owner>/<name>/commit/<commit>` for
-   the base commit and each commit. With `QORY_SUBMIT_DRAFT` `none`, it ends here and
-   runs no `gh`.
-3. It runs `gh auth token --hostname github.com`, which reads the login from the credential
+   the base commit and each commit.
+3. With `QORY_SUBMIT_DRAFT` `open`, it checks the inputs of the draft: the title, the base
+   branch and the description file. A value that it cannot use ends the program with
+   status 2, after the commit lines. With `none`, it ends here and runs no `gh`.
+4. It runs `gh auth token --hostname github.com`, which reads the login from the credential
    store of `gh` and calls no server. It discards the token.
-4. It searches for the pull requests of the repository with the head branch, in any
+5. It searches for the pull requests of the repository with the head branch, in any
    state (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and
    `state=all`). It ignores the base branch, the branch of a fork with the same name,
    and a pull request whose head repository is gone. Of several it takes the one
    with the highest number that is not closed and not merged, otherwise the one with the
    highest number.
-5. With none, it runs `gh pr create --draft` with the branch, the base branch, the title
+6. With none, it runs `gh pr create --draft` with the branch, the base branch, the title
    and the description. The description is the block alone.
-6. With one that is closed or merged, it changes nothing and prints its state with the
+7. With one that is closed or merged, it changes nothing and prints its state with the
    action `kept`.
-7. With one that is open or a draft, it keeps the title and replaces the text between
+8. With one that is open or a draft, it keeps the title and replaces the text between
    the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description with the
    text of the file, through `gh api` with the method `PATCH`. It sends nothing when the
    description stays the same, and prints the action `kept`.
@@ -102,8 +105,8 @@ spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
 | Exit | Meaning |
 |---|---|
 | 0 | Done. |
-| 1 | A call to `gh` failed, or `gh` is missing. The commit lines are printed; no draft line is. |
-| 2 | An input cannot be used. Nothing is printed on standard output. |
+| 1 | A call to `gh` failed, `gh` is missing, or `gh` did not answer within 110 seconds. The commit lines are printed; no draft line is. |
+| 2 | An input cannot be used. Nothing is printed on standard output when the input is one of the commits; the commit lines are printed when it is one of the draft. |
 | 3 | `gh` has no login, or GitHub rejected it. |
 
 Standard error has one line. It starts with the fix. For a failed call, it ends with the
@@ -114,4 +117,8 @@ the environment masked:
 Check your gh login and its access to owner/name, then run `qory run` again: the update of pull request 34 failed: gh: Resource not accessible by integration (HTTP 403)
 ```
 
-qory stops the program after 120 seconds.
+qory stops the program after 120 seconds and then reads no line. The program ends itself
+after 110 seconds when `gh` has not finished: it ends the `gh` call, prints ``Run `qory run`
+again; `gh` did not answer within 110 seconds.`` on standard error, and exits with status 1,
+so the commit lines that it printed are read. The tests set `OPEN_DRAFT_WATCHDOG_SECONDS`, from 1 to 110, to shorten the limit; the
+program takes no larger value.
