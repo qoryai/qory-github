@@ -73,15 +73,15 @@ change what the program does, and notes it under Upgrading.
 
 ### Changed
 
-- The run credential for work with access `write` reaches only the push and its pull
-  request: on `github.com`, `/owner/name.git/info/refs` and
-  `/owner/name.git/git-receive-pack`; on `api.github.com`, `/repos/owner/name/pulls` and
-  `/repos/owner/name/pulls/{}`. Before, it reached every path of the repository on both
-  hosts and `/graphql`. A call to another path, such as
-  `/owner/name.git/git-upload-pack` or `/graphql`, gets no token under it. A query string
-  is not part of a path, so `/owner/name.git/info/refs` is covered for both services,
-  `git-receive-pack` and `git-upload-pack`. The run credential for work with access
-  `read` and the one for a harness are unchanged.
+- The run credential for work with access `write` reaches only git's push: on
+  `github.com`, `/owner/name.git/info/refs` and `/owner/name.git/git-receive-pack`. It
+  has no item for `api.github.com`, so it reaches no REST path and not `/graphql`. Before,
+  it reached every path of the repository on both hosts and `/graphql`. A call to another
+  path, such as `/owner/name.git/git-upload-pack`, `/repos/owner/name/pulls` or
+  `/graphql`, gets no token under it. A query string is not part of a path, so
+  `/owner/name.git/info/refs` is covered for both services, `git-receive-pack` and
+  `git-upload-pack`. The run credential for work with access `read` and the one for a
+  harness are unchanged.
 - The adapter applies the entries of Qory Apiary's change feed that come after a failing
   entry while it retries that entry. The adapter applies an entry for the same issue
   only after it. A collection entry and the entries of its repository apply in the

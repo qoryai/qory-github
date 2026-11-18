@@ -605,8 +605,8 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 // runCredentialUses is the apply of a run credential for purpose and access:
 //
 //   - for work with access write, [github.PushUses]: the push calls on github.com and
-//     the pull request calls on api.github.com, so the token that can write reaches no
-//     other path;
+//     nothing on api.github.com, so the token that can write reaches GitHub only for
+//     git's push;
 //   - for work with access read, which includes a run whose documents have the access
 //     write-no-push, [github.Uses];
 //   - for a harness, the github.com item of [github.Uses] alone.

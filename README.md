@@ -198,18 +198,14 @@ Qory Apiary has a list of paths for each purpose and access:
 | Purpose and access | Host | Paths, per repository |
 |---|---|---|
 | `work`, `write` | `github.com` | `/owner/name.git/info/refs`, `/owner/name.git/git-receive-pack` |
-| `work`, `write` | `api.github.com` | `/repos/owner/name/pulls`, `/repos/owner/name/pulls/{}` |
 | `work`, `read` | `github.com`, `api.github.com` | the paths of the table in What the token reaches |
 | `harness` | `github.com` | the `github.com` paths of the table in What the token reaches |
 
-- `{}` matches one path segment that is not empty: `/repos/owner/name/pulls/12` matches,
-  and `/repos/owner/name/pulls/12/merge` and `/repos/owner/name/pulls/` do not.
-- The `write` credential covers the push and its pull request. A request to any other
-  path, such as `/graphql`, `/owner/name.git/git-upload-pack` or
-  `/repos/owner/name/issues`, gets no token. A query string is not part of a path, so
-  `/owner/name.git/info/refs` is covered for both services, `git-receive-pack` and
-  `git-upload-pack`. `gh pr create` calls `/graphql`, which the `write` token does not
-  cover.
+- The `write` credential has one item, for `github.com`, and none for `api.github.com`.
+  The token reaches GitHub only for git's push. A request to any other path, such as
+  `/graphql`, `/owner/name.git/git-upload-pack` or `/repos/owner/name/pulls`, gets no
+  token. A query string is not part of a path, so `/owner/name.git/info/refs` is covered
+  for both services, `git-receive-pack` and `git-upload-pack`.
 - A run with the access `write-no-push` (a checkout that is writable but cannot push)
   gets the `read` credential: Qory Apiary sends the call with access `read` for it.
 
@@ -249,8 +245,9 @@ Tested with git 2.39 and gh 2.100:
 The harness module in [`modules/github`](modules/github/README.md) contains
 `bin/open-draft`, a program that adds a GitHub link to each commit of a run's submission
 and, after a passed round, opens or updates the draft pull request through the GitHub REST
-API. It reaches GitHub through a proxy on a unix socket and sends no token. As of
-2026-11-17, `qory` does not run the program.
+API. It reaches GitHub through a proxy on a unix socket and sends no token. The run
+credential for work with access `write` has no item for `api.github.com`, so the proxy
+adds no token to the program's calls. As of 2026-11-17, `qory` does not run the program.
 
 ### Token expiry
 
