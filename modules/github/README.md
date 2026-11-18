@@ -10,8 +10,7 @@ but `gh`. A run that starts from a run code runs no program: `qory-github-server
 opens its draft pull request.
 
 `bin/open-draft` is a POSIX `sh` script. It uses `gh`, and `sed`, `awk`, `grep`, `tr`,
-`head`, `tail`, `cut`, `wc`, `cat`, `cmp`, `mktemp` and `rm`. It needs no `jq`, Python or
-Node.
+`head`, `tail`, `cut`, `wc`, `cat`, `cmp`, `mktemp` and `rm`. It needs no `jq` or Python.
 
 To try the program, set the variables under Inputs and run `bin/open-draft`.
 
