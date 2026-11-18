@@ -1048,6 +1048,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.oldRead != nil {
 			f.oldRead()
 		}
+	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && f.pullMint != nil && strings.Contains(string(b), "pull_requests"):
+		status, body := f.pullMint()
+		w.WriteHeader(status)
+		io.WriteString(w, body)
 	case r.Method == "POST" && (r.URL.Path == "/app/installations/42/access_tokens" || r.URL.Path == "/app/installations/9/access_tokens"):
 		f.mints = append(f.mints, string(b))
 		w.WriteHeader(201)

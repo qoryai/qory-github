@@ -31,6 +31,9 @@ type pullStore struct {
 	failHeader     map[string]string
 	goneBranches   map[string]bool
 	noInstallation map[string]bool
+	// pullMint, when set, answers the mint of the token for pull requests, which asks for
+	// pull_requests, with the status and the body it returns.
+	pullMint func() (int, string)
 }
 
 // pullsRoute reports whether path is one of the pull request API's of a repository the

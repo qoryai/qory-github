@@ -275,11 +275,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	if got.Token == "" {
-		return nil, errors.New(minting + ": GitHub answered without a token")
+		return nil, unreadableAt(minting+": GitHub answered without a token", nil)
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
+		return nil, unreadableAt(fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
@@ -440,7 +440,7 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
+		return fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -459,7 +459,7 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		return nil
 	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
+		return unreadableAt(fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	return nil
 }

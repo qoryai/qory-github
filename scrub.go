@@ -3,21 +3,25 @@ package github
 import (
 	"errors"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
-// lineForbidden is the character class of the characters that a line of prose in the
-// contract may not have: the control characters, C0, DEL and C1, the bidirectional
-// controls, the line and paragraph separators, and the format characters that are
-// usually not shown.
-const lineForbidden = `[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`
+// lineForbiddenSet is the body of the character class of the characters that a line of
+// prose in the contract may not have: the control characters, C0, DEL and C1, the
+// bidirectional controls, the line and paragraph separators, and the format characters
+// that are usually not shown. A cleaned text has none of them.
+const lineForbiddenSet = `\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}`
 
-// LineForbidden matches one character of [lineForbidden].
-var LineForbidden = regexp.MustCompile(lineForbidden)
+// LineForbidden matches one character of [lineForbiddenSet].
+var LineForbidden = regexp.MustCompile(`[` + lineForbiddenSet + `]`)
 
-// between matches any number of forbidden characters, so a pattern built with [spread]
-// finds a credential that a line break splits.
-const between = `(?:` + lineForbidden + `)*`
+// between matches any number of characters that may split a credential: the forbidden
+// characters, and every other format character, such as U+200C and U+200D. It is for
+// matching only; a cleaned text keeps the format characters that the contract allows.
+const between = `(?:[` + lineForbiddenSet + `\p{Cf}])*`
 
 // spread is the pattern for the literal text lit, with [between] between its characters.
 func spread(lit string) string {
@@ -28,26 +32,75 @@ func spread(lit string) string {
 	return strings.Join(parts, between)
 }
 
-// secretShape matches what looks like a credential, also when a line break or another
-// forbidden character splits it: a GitHub token, a signed token of three parts, a bearer
-// value, and the user information of an address.
-var secretShape = regexp.MustCompile(`(?i)\b(?:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)(?:` + between + `[A-Za-z0-9_]){8,}` +
-	`|\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){1,2}` +
-	`|bearer\s+\S+` +
-	`|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
+// space matches white space, or a character of [between], between the words of a
+// credential.
+const space = `(?:\s|[` + lineForbiddenSet + `\p{Cf}])+`
 
-// OneLine is s as one line of at most max characters. It first replaces by "[removed]"
-// each of secrets, a literal credential, and anything that looks like a credential, also
-// when a forbidden character splits it, and only then replaces each forbidden character
-// (see [LineForbidden]) and each run of white space by one space and cuts the rest at max
-// characters, so no part of a credential is left by the cut.
+// tokenChars is the pattern for n or more characters of a token, each of which a
+// character of [between] may precede.
+func tokenChars(class string, n int) string {
+	return `(?:` + between + class + `){` + strconv.Itoa(n) + `,}`
+}
+
+var (
+	// authorizationHeader matches a header value, with a scheme and a value, or a value
+	// alone, and the group is what stays: the name of the header.
+	authorizationHeader = regexp.MustCompile(`(?i)(` + spread("authorization") + `\s*[:=]\s*)(?:[a-z][a-z0-9_-]*\s+\S+|\S+)`)
+	// secretShape matches what looks like a credential, also when a line break or another
+	// character of [between] splits it: a GitHub token, a signed token of three parts, a
+	// bearer or basic value, a block of a PEM key, and the user information of an address.
+	secretShape = regexp.MustCompile(`(?i)(?:` + spread("gh") + between + `[pousr]` + between + `_|` + spread("github_pat_") + `)` + tokenChars(`[A-Za-z0-9_]`, 8) +
+		`|` + spread("eyJ") + tokenChars(`[A-Za-z0-9_-]`, 8) + `(?:` + between + `\.` + tokenChars(`[A-Za-z0-9_-]`, 1) + `){1,2}` +
+		`|` + spread("bearer") + space + `(?:` + between + `\S)+` +
+		`|` + spread("basic") + space + tokenChars(`[A-Za-z0-9+/=_-]`, 8) +
+		`|(?s:-----BEGIN[^-]*KEY-----.*?(?:-----END[^-]*KEY-----|$))` +
+		`|\b[a-z][a-z0-9+.-]*://[^\s/@]*@\S*`)
+)
+
+// preCut is the most bytes of a text [OneLine] reads: what follows is left out before
+// any pattern runs, so a long answer costs the same as a short one.
+const preCut = 64 << 10
+
+// maxCredential is the most characters of a run at the end of a cut text that [cutAt]
+// takes for a credential and drops: no credential has more.
+const maxCredential = 4096
+
+// cutAt is s cut at about max bytes on a character boundary, and without the run of
+// characters that a credential has at its end, at most [maxCredential] of them, so a
+// credential that the cut halves leaves no part of it.
+func cutAt(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	s = s[:max]
+	for trimmed := 0; len(s) > 0 && trimmed < maxCredential; trimmed++ {
+		r, n := utf8.DecodeLastRuneInString(s)
+		if !(r < utf8.RuneSelf && (r == '_' || r == '-' || r == '.' || r == '+' || r == '/' || r == '=' ||
+			'0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z') || unicode.Is(unicode.Cf, r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029') {
+			break
+		}
+		s = s[:len(s)-n]
+	}
+	return s
+}
+
+// OneLine is s as one line of at most max characters. It reads at most 64 KiB of s. It
+// first replaces by "[removed]" each of secrets, a literal credential, and anything that
+// looks like a credential, also when a forbidden character splits it, and only then
+// replaces each forbidden character (see [LineForbidden]) and each run of white space by
+// one space and cuts the rest at max characters, so no part of a credential is left by
+// the cut.
 func OneLine(s string, max int, secrets ...string) string {
-	s = strings.ToValidUTF8(s, "")
+	s = cutAt(strings.ToValidUTF8(s, ""), preCut)
 	for _, secret := range secrets {
 		if secret != "" {
 			s = regexp.MustCompile(spread(secret)).ReplaceAllString(s, "[removed]")
 		}
 	}
+	s = authorizationHeader.ReplaceAllString(s, "${1}[removed]")
 	s = secretShape.ReplaceAllString(s, "[removed]")
 	s = LineForbidden.ReplaceAllString(s, " ")
 	s = strings.Join(strings.Fields(s), " ")
@@ -61,10 +114,14 @@ func OneLine(s string, max int, secrets ...string) string {
 const maxErrorText = 2000
 
 // scrubbedError is an error whose text is clean, see [Scrubbed], and that wraps the
-// error it was made from, so errors.Is and errors.As find what they found before.
+// error it was made from, so errors.Is and errors.As find what they found before. When
+// the error wraps an answer of GitHub, status and message are the answer's, the message
+// clean, so a caller never reads the raw one again, see [AnswerOf].
 type scrubbedError struct {
-	err  error
-	text string
+	err     error
+	text    string
+	status  int
+	message string
 }
 
 func (e *scrubbedError) Error() string { return e.text }
@@ -85,5 +142,31 @@ func Scrubbed(err error, secrets ...string) error {
 		r.Message = OneLine(refused.Message, MaxDetail, secrets...)
 		return &r
 	}
-	return &scrubbedError{err: err, text: OneLine(err.Error(), maxErrorText, secrets...)}
+	out := &scrubbedError{err: err, text: OneLine(err.Error(), maxErrorText, secrets...)}
+	var answered *answerError
+	if errors.As(err, &answered) {
+		out.status, out.message = answered.status, OneLine(answered.message, MaxDetail, secrets...)
+	}
+	return out
 }
+
+// ErrTransport is wrapped in the error of a request that did not reach GitHub or whose
+// answer could not be read from the connection: a timeout, a failed connection. A retry
+// can succeed.
+var ErrTransport = errors.New("GitHub's API could not be reached")
+
+// unreadableError is the error for an answer of GitHub that does not have the shape the
+// adapter reads. It is [ErrUnreadableAnswer] for errors.Is, and says text.
+type unreadableError struct {
+	text  string
+	cause error
+}
+
+func (e *unreadableError) Error() string { return e.text }
+func (e *unreadableError) Unwrap() error { return e.cause }
+
+// Is makes the error [ErrUnreadableAnswer] for errors.Is.
+func (e *unreadableError) Is(target error) bool { return target == ErrUnreadableAnswer }
+
+// unreadableAt is the [unreadableError] that says text, for cause, which may be nil.
+func unreadableAt(text string, cause error) error { return &unreadableError{text: text, cause: cause} }

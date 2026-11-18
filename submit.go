@@ -128,9 +128,12 @@ type SubmitRefused struct {
 // [Client.SubmitDraft]: the caller makes them. Each is a line for a person, at most 100
 // characters.
 const (
-	FixNotInstalled   = "Install the App on the repository with the permission Pull requests: write."
-	FixPermission     = "Give the App's installation the permission Pull requests: write on the repository."
-	FixTokenRefused   = "Check that the App's key and installation are valid on GitHub, then submit again."
+	FixNotInstalled = "Install the App on the repository with the permission Pull requests: write."
+	FixPermission   = "Give the App's installation the permission Pull requests: write on the repository."
+	FixTokenRefused = "Check that the App's key and installation are valid on GitHub, then submit again."
+	// FixReplyRefused is the fix line for a repository that is on GitHub, whose reply
+	// Qory Apiary did not take for the time the retries last.
+	FixReplyRefused   = "The pull request exists: check that Qory Apiary is reachable and takes the reply."
 	FixSuspended      = "Unsuspend the App's installation on GitHub."
 	FixAppForbidden   = "Check on GitHub that the App is not suspended or blocked, then submit again."
 	FixUnreachable    = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
@@ -173,6 +176,10 @@ func (e *SubmitRefused) Detail() string {
 // AnswerOf is the status and the message of GitHub's answer that err, or an error it
 // wraps, is, as one line with no token, or 0 and empty when err is no answer.
 func AnswerOf(err error) (int, string) {
+	var scrubbed *scrubbedError
+	if errors.As(err, &scrubbed) && scrubbed.status != 0 {
+		return scrubbed.status, scrubbed.message
+	}
 	var e *answerError
 	if errors.As(err, &e) {
 		return e.status, OneLine(e.message, MaxDetail)
@@ -522,28 +529,58 @@ func unreadable(what string, cause error) error {
 	return fmt.Errorf("%s: %w: %w", what, ErrUnreadableAnswer, cause)
 }
 
+// fixUnclassified is the fix line for an error that is neither an answer of GitHub nor a
+// failure to reach it.
+const fixUnclassified = "Report to the maintainers of qory-github that the adapter failed in a way it does not know."
+
 // EndedRefusal is the refusal to report for a repository whose retries ended after cause,
-// the error of its last try. A [*SubmitRefused] is itself. A 401 that kept coming is
-// not_permitted: the token or the App's key is refused. A 4xx status that a retry does not
-// change, as the 422 that says a pull request exists already, when the pull request
-// never showed up, or an answer that could not be read, is forge_refused. Anything else
-// is unreachable: a timeout, a failed connection, a rate limit or busy status, or a 5xx
-// status.
+// the error of its last try. A [*SubmitRefused] is itself. Otherwise the reason is by the
+// last error:
+//   - unreachable, only for a failure to reach GitHub or read its answer from the
+//     connection ([ErrTransport], a timeout), a rate limit (a 403 that says so, or a
+//     429), 408, and a 5xx status;
+//   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, a 404, and
+//     a permanent redirect, 301 or 308: GitHub moved the repository;
+//   - forge_refused, for any other 4xx status, any other redirect, which the adapter never
+//     follows and which comes again, an answer that could not be read, and an error that
+//     is none of these, whose clean text is the message.
 func EndedRefusal(cause error) *SubmitRefused {
 	var refused *SubmitRefused
 	if errors.As(cause, &refused) {
 		return refused
 	}
 	status, message := AnswerOf(cause)
-	switch {
-	case Unauthorized(cause):
-		return &SubmitRefused{Reason: ReasonNotPermitted, Fix: FixTokenRefused, Err: cause, Status: status, Message: message}
-	case AnswerRefused(cause):
-		return &SubmitRefused{Reason: ReasonForgeRefused, Fix: FixForgeRefused, Err: cause, Status: status, Message: message}
-	case errors.Is(cause, ErrUnreadableAnswer):
-		return &SubmitRefused{Reason: ReasonForgeRefused, Fix: fixUnreadable, Err: cause, Message: ErrUnreadableAnswer.Error() + "."}
+	report := func(reason, fix string) *SubmitRefused {
+		return &SubmitRefused{Reason: reason, Fix: fix, Err: cause, Status: status, Message: message}
 	}
-	return &SubmitRefused{Reason: ReasonUnreachable, Fix: FixUnreachable, Err: cause, Status: status, Message: message}
+	var answered *answerError
+	switch {
+	case errors.As(cause, &answered):
+		switch s := answered.status; {
+		case s == http.StatusUnauthorized:
+			return report(ReasonNotPermitted, FixTokenRefused)
+		case s == http.StatusForbidden && answered.limited, s == http.StatusRequestTimeout, s == http.StatusTooManyRequests, s >= 500:
+			return report(ReasonUnreachable, FixUnreachable)
+		case s == http.StatusForbidden:
+			return report(ReasonNotPermitted, FixPermission)
+		case s == http.StatusNotFound:
+			return report(ReasonNotPermitted, FixNotInstalled)
+		case s == http.StatusMovedPermanently || s == http.StatusPermanentRedirect:
+			return report(ReasonNotPermitted, fixMoved)
+		}
+		return report(ReasonForgeRefused, FixForgeRefused)
+	case errors.Is(cause, ErrUnreadableAnswer):
+		r := report(ReasonForgeRefused, fixUnreadable)
+		r.Message = ErrUnreadableAnswer.Error() + "."
+		return r
+	case errors.Is(cause, errMintRedirected):
+		return report(ReasonForgeRefused, FixForgeRefused)
+	case errors.Is(cause, ErrTransport), errors.Is(cause, context.DeadlineExceeded), errors.Is(cause, context.Canceled):
+		return report(ReasonUnreachable, FixUnreachable)
+	}
+	r := report(ReasonForgeRefused, fixUnclassified)
+	r.Message = OneLine(cause.Error(), MaxDetail)
+	return r
 }
 
 // refusedBy is the [*SubmitRefused] for the answer a, with its status and message.

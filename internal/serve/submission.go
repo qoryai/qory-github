@@ -389,7 +389,8 @@ func (f *feed) submissionEnded(ctx context.Context, state *entryState, ch contra
 	}
 	for _, t := range ch.Targets {
 		if ts := state.target(t); ts.reply != nil && !ts.done {
-			if err := f.reportTarget(ctx, ch, t, github.EndedRefusal(rerr), rerr); err != nil {
+			replyRefused := &github.SubmitRefused{Reason: github.ReasonUnreachable, Fix: github.FixReplyRefused, Err: rerr, Message: github.OneLine(rerr.Error(), github.MaxDetail)}
+			if err := f.reportTarget(ctx, ch, t, replyRefused, rerr); err != nil {
 				more("failure reports", t, err)
 			}
 			ts.done = true

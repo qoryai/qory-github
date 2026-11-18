@@ -1260,6 +1260,11 @@ func TestAReplyThatKeepsFailingEndsAsFailureReports(t *testing.T) {
 			t.Errorf("%s: %d pull requests", repo, got)
 		}
 	}
+	for n := range 2 {
+		if d := detailOf(w, n); !strings.HasPrefix(d, github.FixReplyRefused+" ") || !strings.Contains(d, "503") {
+			t.Errorf("the detail %d is %q", n, d)
+		}
+	}
 }
 
 // TestAReplyThatQoryApiaryRefusesIsLoggedAndTheEntryIsDone: a 400 for the reply is
@@ -1413,10 +1418,10 @@ func TestNoTextOfAnErrorHasTheTokenOrALineBreak(t *testing.T) {
 // has neither.
 func TestTheErrorOfTheInstallationLookupHasNoCredentialOrLineBreak(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	setGitHub(w.gh, failAt("GET", "/repos/acme/widgets/installation", 502, `{"message":"jwt eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0In0.c2lnbmF0dXJl\nend"}`))
+	setGitHub(w.gh, failAt("GET", "/repos/acme/widgets/installation", 502, `{"message":"first\njwt eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0In0.c2lnbmF0dXJl end"}`))
 	w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
 	err := w.feed.step(context.Background())
-	if err == nil || strings.Contains(err.Error(), "eyJ") || strings.ContainsAny(err.Error(), "\r\n") || !strings.Contains(err.Error(), "jwt [removed] end") {
+	if err == nil || strings.Contains(err.Error(), "eyJ") || strings.ContainsAny(err.Error(), "\r\n") || !strings.Contains(err.Error(), "first jwt [removed] end") {
 		t.Errorf("err %v", err)
 	}
 }
@@ -1482,6 +1487,43 @@ func TestACauseThatKeepsComingEndsAsItsReason(t *testing.T) {
 		}
 		if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets " + tc.reason}) || detailOf(w, 0) != tc.detail {
 			t.Errorf("%s: reports %v, detail %q", tc.name, r, detailOf(w, 0))
+		}
+	}
+}
+
+// TestAMintThatKeepsFailingEndsAsItsReason: the mint of the token for pull requests fails
+// on every try, so the entry is applied again until its retries end, then reported by the
+// last answer: a 403 that is no rate limit is not_permitted, a 403 that says rate limit,
+// a 429 and a 503 are unreachable, a redirect is forge_refused, and an answer with no
+// token or with an expiry that is no time is forge_refused with the detail that the answer
+// could not be read.
+func TestAMintThatKeepsFailingEndsAsItsReason(t *testing.T) {
+	const unreadable = "Report to the maintainers of qory-github that GitHub's answer could not be read. GitHub's answer could not be read."
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		reason string
+		detail string
+	}{
+		{"403", 403, `{"message":"Resource not accessible by integration"}`, "not_permitted", github.FixPermission + " GitHub answered 403: Resource not accessible by integration"},
+		{"403 with a rate limit", 403, `{"message":"You have exceeded a secondary rate limit."}`, "unreachable", github.FixUnreachable + " GitHub answered 403: You have exceeded a secondary rate limit."},
+		{"429", 429, `{"message":"Too Many Requests"}`, "unreachable", github.FixUnreachable + " GitHub answered 429: Too Many Requests"},
+		{"503", 503, `{"message":"Service Unavailable"}`, "unreachable", github.FixUnreachable + " GitHub answered 503: Service Unavailable"},
+		{"a redirect", 302, `{"message":"Found"}`, "forge_refused", github.FixForgeRefused},
+		{"no token", 201, `{"expires_at":"2099-01-01T00:00:00Z"}`, "forge_refused", unreadable},
+		{"an expiry that is no time", 201, `{"token":"` + ghToken + `","expires_at":"tomorrow"}`, "forge_refused", unreadable},
+		{"no JSON", 201, `<html>Unicorn</html>`, "forge_refused", unreadable},
+	} {
+		w := newWired(t, filepath.Join(t.TempDir(), "state"))
+		setGitHub(w.gh, func(f *fakeGitHub) { f.pullMint = func() (int, string) { return tc.status, tc.body } })
+		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		runPastRetries(t, w)
+		if r := w.apiary.submissionReports(); !slices.Equal(r, []string{"acme/widgets " + tc.reason}) || detailOf(w, 0) != tc.detail {
+			t.Errorf("%s: reports %v, detail %q", tc.name, r, detailOf(w, 0))
+		}
+		if strings.Contains(w.log.String(), ghToken) {
+			t.Errorf("%s: the log has the token", tc.name)
 		}
 	}
 }

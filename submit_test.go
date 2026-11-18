@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -149,8 +150,19 @@ func TestEndedRefusalByTheLastCause(t *testing.T) {
 		{"429", answer(429), ReasonUnreachable},
 		{"a rate limit", limited, ReasonUnreachable},
 		{"a timeout", context.DeadlineExceeded, ReasonUnreachable},
-		{"a failed connection", errors.New("dial tcp: connection refused"), ReasonUnreachable},
+		{"a failed connection", fmt.Errorf("w: %w: %w", ErrTransport, errors.New("dial tcp: connection refused")), ReasonUnreachable},
 		{"401", answer(401), ReasonNotPermitted},
+		{"403 that is no rate limit", answer(403), ReasonNotPermitted},
+		{"404", answer(404), ReasonNotPermitted},
+		{"301, a moved repository", answer(301), ReasonNotPermitted},
+		{"308, a moved repository", answer(308), ReasonNotPermitted},
+		{"302, a redirect that is not followed", answer(302), ReasonForgeRefused},
+		{"307, a redirect that is not followed", answer(307), ReasonForgeRefused},
+		{"the redirect of a mint", errMintRedirected, ReasonForgeRefused},
+		{"an answer without a token", unreadableAt("minting: GitHub answered without a token", nil), ReasonForgeRefused},
+		{"an expiry that is no time", unreadableAt(`minting: the expiry "x" is not a time`, errors.New("x")), ReasonForgeRefused},
+		{"a canceled call", context.Canceled, ReasonUnreachable},
+		{"an error that is no answer and no failure to reach GitHub", errors.New("no private key"), ReasonForgeRefused},
 		{"400", answer(400), ReasonForgeRefused},
 		{"409", answer(409), ReasonForgeRefused},
 		{"422", answer(422), ReasonForgeRefused},
@@ -161,5 +173,99 @@ func TestEndedRefusalByTheLastCause(t *testing.T) {
 		if got.Reason != tc.reason || got.Fix == "" || got.Detail() == "" {
 			t.Errorf("%s: %s, want %s", tc.name, got.Reason, tc.reason)
 		}
+	}
+}
+
+// TestTheDetailOfAnEndedRefusalHasNoTokenThatTheMessageHas: the message of a 502 has the
+// token after a word character (a prefix glued to it), a literal secret that is no
+// pattern, and a line break; after Scrubbed with the secret, EndedRefusal and Detail,
+// the detail has none of them, though EndedRefusal reads the answer through the error it
+// wraps.
+func TestTheDetailOfAnEndedRefusalHasNoTokenThatTheMessageHas(t *testing.T) {
+	const plain = "a-plain-secret-value"
+	const token = "ghs_AbCdEfGh1234567890"
+	cause := &answerError{what: "w", status: 502, message: "bad creds for xx" + token + " and token_" + token + "\n" + plain[:6] + "\n" + plain[6:] + " end"}
+	ended := EndedRefusal(fmt.Errorf("%w (submission)", Scrubbed(cause, plain)))
+	detail := ended.Detail()
+	if ended.Reason != ReasonUnreachable || strings.Contains(detail, "AbCdEf") || strings.Contains(detail, plain[:6]) || strings.Contains(detail, "secret") || !strings.HasSuffix(detail, "end") || strings.ContainsAny(detail, "\r\n") {
+		t.Errorf("%s: %q", ended.Reason, detail)
+	}
+}
+
+// TestACredentialIsRemovedInEveryShapeItTakes: each text has a credential in a shape that
+// a line break, a zero-width character or a prefix may hide; the output has no part of it.
+func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
+	jwt := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjM0In0.c2lnbmF0dXJl"
+	for _, tc := range []struct {
+		name, in string
+		gone     []string
+	}{
+		{"a token after a word character", "xghs_AbCdEfGh1234567890 and token_ghs_AbCdEfGh1234567890", []string{"AbCdEfGh"}},
+		{"a token with U+200C inside", "ghs_AbCd\u200cEfGh12345678", []string{"AbCd", "EfGh"}},
+		{"a token with U+200D inside", "ghs_AbCd\u200dEfGh12345678", []string{"AbCd", "EfGh"}},
+		{"a signed token split by line breaks", "eyJhbGciOiJSUzI1NiJ9.eyJpc3Mi\nOiIxMjM0In0.c2ln\nbmF0dXJl", []string{"OiIxMjM0", "bmF0dXJl", "hbGciOiJS"}},
+		{"a signed token whole", jwt, []string{"hbGciOiJS", "c2lnbmF0"}},
+		{"a bearer value split by a line break", "Bearer abc123\ndef456 done", []string{"abc123", "def456"}},
+		{"a bearer value after a zero-width space", "bearer\u200bxyz98765", []string{"xyz98765"}},
+		{"a bearer value after a line break", "bearer\nxyz98765", []string{"xyz98765"}},
+		{"an authorization header with a scheme", "Authorization: Token abcdef12345 more", []string{"abcdef12345"}},
+		{"an authorization header with a value", "authorization=abcdef12345", []string{"abcdef12345"}},
+		{"an authorization header split", "Authori\nzation: Custom abcdef12345", []string{"abcdef12345"}},
+		{"a basic value", "Basic dXNlcjpwYXNzd29yZA==", []string{"dXNlcjpw"}},
+		{"a PEM block", "key -----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcdefgh\n-----END RSA PRIVATE KEY----- after", []string{"MIIEow", "abcdefgh"}},
+		{"a PEM block with no end", "key -----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBg\nrest", []string{"MIIEvg", "rest"}},
+		{"an address with a password", "see https://user:hunter2@example.com/x", []string{"hunter2"}},
+	} {
+		got := OneLine(tc.in, 1000)
+		for _, part := range tc.gone {
+			if strings.Contains(got, part) {
+				t.Errorf("%s: %q has %q", tc.name, got, part)
+			}
+		}
+		if !strings.Contains(got, "[removed]") || LineForbidden.MatchString(got) {
+			t.Errorf("%s: %q", tc.name, got)
+		}
+	}
+}
+
+// TestALongTextIsCutBeforeTheCredentialsAreFoundWithoutLeavingAPrefix: a text of megabytes
+// is read to 64 KiB; a token that starts before that cut and ends after it leaves no
+// prefix, and the work takes a fraction of a second.
+func TestALongTextIsCutBeforeTheCredentialsAreFoundWithoutLeavingAPrefix(t *testing.T) {
+	const token = "ghs_AbCdEfGh1234567890AbCdEfGh1234567890"
+	for _, start := range []int{65500, 65530, 65533, 65535, 65536 - len("ghs_Ab")} {
+		got := OneLine(strings.Repeat("\n", start)+token+strings.Repeat("x ", 1000), 1000)
+		if strings.Contains(got, "ghs") || strings.Contains(got, "AbCd") {
+			t.Errorf("start %d: %q", start, got)
+		}
+	}
+	long := strings.Repeat("word ghs_AbCdEfGh1234567890 ", 1000000)
+	began := time.Now()
+	if got := OneLine(long, 1000); strings.Contains(got, "AbCd") || time.Since(began) > 2*time.Second {
+		t.Errorf("%d characters in %v", len(long), time.Since(began))
+	}
+	if got := OneLine("é"+strings.Repeat("y", 70000), 1000); !utf8.ValidString(got) || len(got) != 1000+1 {
+		t.Errorf("%d bytes", len(got))
+	}
+}
+
+// TestAnUnreadableAnswerOfACallIsUnreadable: GitHub's answers to the installation lookup
+// that are no JSON, or have no id or login, are [ErrUnreadableAnswer], as is a failure to
+// reach GitHub [ErrTransport].
+func TestAnUnreadableAnswerOfACallIsUnreadable(t *testing.T) {
+	for _, body := range []string{`<html>Unicorn</html>`, `{"id":0}`, `{"id":42,"account":{"login":"bad name"}}`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
+		_, _, err := Client{API: srv.URL}.RepositoryInstallation(context.Background(), appID, key(t), Repository{Owner: "acme", Name: "widgets"})
+		srv.Close()
+		if !errors.Is(err, ErrUnreadableAnswer) || errors.Is(err, ErrTransport) || EndedRefusal(err).Reason != ReasonForgeRefused {
+			t.Errorf("%s: %v", body, err)
+		}
+	}
+	srv := httptest.NewServer(http.NotFoundHandler())
+	api := srv.URL
+	srv.Close()
+	_, _, err := Client{API: api}.RepositoryInstallation(context.Background(), appID, key(t), Repository{Owner: "acme", Name: "widgets"})
+	if !errors.Is(err, ErrTransport) || errors.Is(err, ErrUnreadableAnswer) || EndedRefusal(err).Reason != ReasonUnreachable {
+		t.Errorf("%v", err)
 	}
 }

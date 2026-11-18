@@ -295,7 +295,7 @@ example after a 5xx status, the adapter holds the reply and applies that reposit
 without applying the others again. When the retries end, after a day of failures, it
 reports that repository as `unreachable` and sends the reply for the others. If Qory
 Apiary does not take the reply for a day more, the adapter reports each repository of the
-reply as `unreachable`.
+reply as `unreachable`, with a `detail` that says the pull request exists.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
@@ -328,10 +328,10 @@ header and no address with a password.
 
 | Reason | Cause |
 |---|---|
-| `not_permitted` | GitHub answered 404, a permanent redirect, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub answered 401 until the retries ended. The fix gives the App the Pull requests permission and access to the repository. |
+| `not_permitted` | GitHub answered 404, a permanent redirect, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub answered 401 until the retries ended, also for the token of the installation. The fix gives the App the Pull requests permission and access to the repository. |
 | `branch_gone` | GitHub's 422 says the head branch or the base branch does not exist. The fix says which: push the branch again, or create the base branch. |
 | `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix says which text to shorten. |
-| `forge_refused` | GitHub answered 400, or 422 for any cause other than a missing branch or a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that could not be read, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
+| `forge_refused` | GitHub answered 400, or 422 for any cause other than a missing branch or a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or a redirect other than a move (302, 307), or an answer that could not be read, or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
 | `unreachable` | GitHub timed out, did not connect, was busy, rate limited or answered 5xx for a day. Each repository is reported by the last error of that repository's tries. |
 
 ### Token expiry
