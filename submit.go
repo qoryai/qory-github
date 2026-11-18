@@ -137,7 +137,7 @@ const (
 	FixSuspended    = "Unsuspend the App's installation on GitHub."
 	FixAppForbidden = "Check on GitHub that the App is not suspended or blocked, then submit again."
 	FixUnreachable  = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
-	// FixMoved is the fix line for a repository that GitHub answers 301 or 308 for.
+	// FixMoved is the fix line for a repository for which GitHub returns 301 or 308.
 	FixMoved          = "Link the repository by its new name: GitHub moved it."
 	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
 	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
