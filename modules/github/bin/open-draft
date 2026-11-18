@@ -45,9 +45,9 @@ cleanup() {
 	# A signal or the watchdog stopped the program before the work ended: end what it
 	# started. After a normal end the pids are gone, and nothing is signalled.
 	if [ -n "$stopped" ]; then
-		# The worker and the timer first, so the worker starts no other gh; they end at
-		# TERM, and wait reaps them. Then the gh that the worker left: TERM, and KILL
-		# after 1 second for a gh that ignores TERM.
+		# End the worker and the timer first, so no other gh starts. Then send TERM to gh
+		# and check 2000 times, with no pause, whether it is gone. If it is still there,
+		# sleep 1 second and send KILL, without a second check.
 		for _p in "$worker" "$timer"; do
 			if [ -n "$_p" ]; then
 				kill "$_p" 2>/dev/null || :
