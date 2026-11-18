@@ -16,7 +16,7 @@ import (
 // text of a refusal and the detail of its failure report, ends with a period and fits in
 // 100 characters.
 func TestEveryFixLineIsOneSentenceOfAtMost100Characters(t *testing.T) {
-	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, fixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixRunDescription, fixRunTitle, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused} {
+	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, FixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixRunDescription, fixRunTitle, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused} {
 		if n := utf8.RuneCountInString(fix); n > 100 || !strings.HasSuffix(fix, ".") || strings.Contains(fix, "\n") {
 			t.Errorf("%d characters: %q", n, fix)
 		}
@@ -413,5 +413,27 @@ func TestAnAnswerCutDuringItsBodyOfAPagedReadIsATransportFailure(t *testing.T) {
 	if !errors.Is(err, ErrTransport) || errors.Is(err, ErrUnreadableAnswer) || EndedRefusal(err).Reason != ReasonUnreachable ||
 		!strings.Contains(err.Error(), "the connection failed while GitHub's answer was read") {
 		t.Errorf("%v", err)
+	}
+}
+
+// TestARedirectOnTheInstallationLookupSaysTheRepositoryMovedOnlyFor301And308: the lookup
+// of the repository's installation is [ErrNotInstalled] for a 404 and for any redirect,
+// and also [ErrRepositoryMoved], with GitHub's status and message, for a 301 or 308.
+func TestARedirectOnTheInstallationLookupSaysTheRepositoryMovedOnlyFor301And308(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		moved  bool
+	}{{301, true}, {308, true}, {302, false}, {307, false}, {404, false}} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Location", "https://api.github.com/repositories/1/installation")
+			w.WriteHeader(tc.status)
+			w.Write([]byte(`{"message":"Moved"}`))
+		}))
+		_, _, err := Client{API: srv.URL}.RepositoryInstallation(context.Background(), appID, key(t), Repository{Owner: "acme", Name: "widgets"})
+		srv.Close()
+		status, _ := AnswerOf(Scrubbed(err))
+		if !errors.Is(err, ErrNotInstalled) || errors.Is(err, ErrRepositoryMoved) != tc.moved || (status == tc.status) != tc.moved {
+			t.Errorf("%d: %v, status %d", tc.status, err, status)
+		}
 	}
 }

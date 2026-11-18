@@ -133,11 +133,12 @@ const (
 	FixTokenRefused = "Check that the App's key and installation are valid on GitHub, then submit again."
 	// FixReplyRefused is the fix line for a repository that is on GitHub, whose reply
 	// Qory Apiary did not take for the time the retries last.
-	FixReplyRefused   = "The pull request exists: check that Qory Apiary is reachable and takes the reply."
-	FixSuspended      = "Unsuspend the App's installation on GitHub."
-	FixAppForbidden   = "Check on GitHub that the App is not suspended or blocked, then submit again."
-	FixUnreachable    = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
-	fixMoved          = "Link the repository by its new name: GitHub moved it."
+	FixReplyRefused = "The pull request exists: check that Qory Apiary is reachable and takes the reply."
+	FixSuspended    = "Unsuspend the App's installation on GitHub."
+	FixAppForbidden = "Check on GitHub that the App is not suspended or blocked, then submit again."
+	FixUnreachable  = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
+	// FixMoved is the fix line for a repository that GitHub answers 301 or 308 for.
+	FixMoved          = "Link the repository by its new name: GitHub moved it."
 	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
 	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
@@ -472,7 +473,7 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 	err := a.detailedErr(what)
 	switch {
 	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
-		return refusedBy(a, ReasonForgeRefused, fixMoved, err)
+		return refusedBy(a, ReasonForgeRefused, FixMoved, err)
 	case a.status == http.StatusNotFound:
 		return refusedBy(a, ReasonNotPermitted, FixNotInstalled, err)
 	case a.status == http.StatusForbidden && !a.rateLimited():
@@ -544,7 +545,7 @@ const fixUnclassified = "Report to the maintainers of qory-github that the adapt
 //   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, and a 404;
 //   - forge_refused, for any other 4xx status, a redirect, which the adapter never follows
 //     and which comes again (a 301 or 308 has the fix that says GitHub moved the
-//     repository, [fixMoved]), an answer that arrived but cannot be used, and an error that
+//     repository, [FixMoved]), an answer that arrived but cannot be used, and an error that
 //     is none of these, whose clean text is the message.
 func EndedRefusal(cause error) *SubmitRefused {
 	var refused *SubmitRefused
@@ -568,7 +569,7 @@ func EndedRefusal(cause error) *SubmitRefused {
 		case s == http.StatusNotFound:
 			return report(ReasonNotPermitted, FixNotInstalled)
 		case s == http.StatusMovedPermanently || s == http.StatusPermanentRedirect:
-			return report(ReasonForgeRefused, fixMoved)
+			return report(ReasonForgeRefused, FixMoved)
 		}
 		return report(ReasonForgeRefused, FixForgeRefused)
 	case errors.Is(cause, ErrUnreadableAnswer):

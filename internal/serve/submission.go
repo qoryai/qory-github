@@ -124,6 +124,8 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	installation, _, err := a.GitHub.RepositoryInstallation(ctx, a.AppID, a.Key, repo)
 	err = github.Scrubbed(err)
 	switch {
+	case errors.Is(err, github.ErrRepositoryMoved):
+		return contracts.SubmittedTarget{}, refuse(github.ReasonForgeRefused, github.FixMoved, err)
 	case errors.Is(err, github.ErrNotInstalled):
 		return contracts.SubmittedTarget{}, refuse(github.ReasonNotPermitted, github.FixNotInstalled, err)
 	case github.Forbidden(err) && !github.RateLimited(err):

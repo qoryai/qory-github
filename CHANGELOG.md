@@ -25,8 +25,9 @@ change what the program does, and notes it under Upgrading.
   fix and GitHub's status and message; one that still fails when the retries end, after a
   day, is reported with the reason of the last error of its tries: `unreachable` for a
   failure to reach GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for
-  an answer such as a 404 or a 401 that kept coming. A 301 or 308 is `forge_refused`, and
-  its fix says GitHub moved the repository. The App needs the permission Pull requests: read and write. The title in
+  an answer such as a 404 or a 401 that kept coming. A 301 or 308, also on the lookup of the
+  installation, is `forge_refused`, and its fix says GitHub moved the repository; a 404 or
+  403 on the lookup stays `not_permitted`. The App needs the permission Pull requests: read and write. The title in
   the reply has none of the control, bidirectional or invisible characters that Qory
   Apiary refuses.
 - The description of the adapter has `submissions: true` in `roles.source`.
