@@ -253,6 +253,15 @@ prints the GitHub address of each commit and opens or edits the draft pull reque
 branch. It pushes nothing and needs `gh` logged in; without a login it exits with status 3
 and asks you to run `gh auth login`.
 
+### Repositories in Qory Apiary
+
+`qory-github-server serve` lists each repository of the App's installations to Qory Apiary
+as a collection. The collection's `ref` is the repository's id on GitHub in decimal, such
+as `1296269`, so a rename or a transfer of the repository keeps the `ref`. The collection's
+target is that `ref` and, as optional data, the address of the repository: `system`
+`github.com` and `path` `owner/name`. After a rename, the next listing has the new `path`
+under the same `ref`. Each issue is an item whose target has the same `ref` and address.
+
 ### Draft pull requests of a submission
 
 `qory-github-server serve` opens or updates the draft pull request for each `submission`
