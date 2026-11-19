@@ -386,7 +386,7 @@ func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
 	}
 	for i, it := range items[0].Items {
 		n := strconv.Itoa(i + 1)
-		if it.Ref != "1296269#"+n || it.URL != "https://github.com/acme/widgets/issues/"+n || it.Target == nil || it.Target.Collection != "1296269" || it.Target.Address == nil || it.Target.Address.System != "github.com" || it.Target.Address.Path != "acme/widgets" {
+		if it.Ref != "1296269#"+n || it.URL != "https://github.com/acme/widgets/issues/"+n || it.Target == nil || it.Target.Collection != "1296269" || it.Target.Address == nil || it.Target.Address.System != l.Client.WebHost() || it.Target.Address.Path != "acme/widgets" {
 			t.Errorf("item %+v", it)
 		}
 	}
