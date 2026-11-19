@@ -200,11 +200,11 @@ func TestRepositoriesAddedListsTheCollections(t *testing.T) {
 	// The collections are named by their repositories' ids; their titles, URLs and
 	// targets name the repositories as GitHub does.
 	want := []contracts.Collection{
-		{Ref: widgetsRef, Title: "acme/widgets", URL: "https://github.com/acme/widgets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/widgets"}},
-		{Ref: gadgetsRef, Title: "acme/gadgets", URL: "https://github.com/acme/gadgets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/gadgets"}},
+		{Ref: widgetsRef, Title: "acme/widgets", URL: "https://github.com/acme/widgets", Target: &contracts.Target{Collection: widgetsRef, Address: &contracts.TargetAddress{System: w.adapter.GitHub.WebHost(), Path: "acme/widgets"}}},
+		{Ref: gadgetsRef, Title: "acme/gadgets", URL: "https://github.com/acme/gadgets", Target: &contracts.Target{Collection: gadgetsRef, Address: &contracts.TargetAddress{System: w.adapter.GitHub.WebHost(), Path: "acme/gadgets"}}},
 	}
 	for i, c := range req.Collections {
-		if c.Ref != want[i].Ref || c.Title != want[i].Title || c.URL != want[i].URL || c.Target == nil || *c.Target != *want[i].Target {
+		if c.Ref != want[i].Ref || c.Title != want[i].Title || c.URL != want[i].URL || !reflect.DeepEqual(c.Target, want[i].Target) {
 			t.Errorf("collection %d: %+v, want %+v", i, c, want[i])
 		}
 	}
@@ -1546,7 +1546,7 @@ func TestTextsPastTheContractsLimitsReachQoryApiaryValid(t *testing.T) {
 		var req contracts.SourceItems
 		json.Unmarshal(sent.raw, &req)
 		it := req.Items[0]
-		if len(req.Items) != 1 || !reflect.DeepEqual(it.Labels, []string{strings.Repeat("a", 100)}) || it.FiledBy.Name != strings.Repeat("n", 100) || it.Target == nil || it.Target.System != "127.0.0.1" {
+		if len(req.Items) != 1 || !reflect.DeepEqual(it.Labels, []string{strings.Repeat("a", 100)}) || it.FiledBy.Name != strings.Repeat("n", 100) || it.Target == nil || it.Target.Address == nil || it.Target.Address.System != "127.0.0.1" {
 			t.Errorf("sent %s", sent.raw)
 		}
 	}
@@ -4324,8 +4324,8 @@ func TestARepositoryRenamedIsListedAgainAndNotDisconnected(t *testing.T) {
 	}
 	var req contracts.SourceCollections
 	json.Unmarshal(sent[0].raw, &req)
-	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
-	if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{Collection: widgetsRef, Address: &contracts.TargetAddress{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}}
+	if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || !reflect.DeepEqual(req.Collections[0].Target, want.Target) {
 		t.Errorf("sent %s", sent[0].raw)
 	}
 	if got := w.disconnected(0); len(got) != 0 {
@@ -4684,11 +4684,11 @@ func TestARenamedRepositoryIsNotSentWithItsOldNameFromAFirstListingKept(t *testi
 	if len(sent) != 3 {
 		t.Fatalf("%d parts sent", len(sent))
 	}
-	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}
+	want := contracts.Collection{Ref: widgetsRef, Title: "acme/sprockets", URL: "https://github.com/acme/sprockets", Target: &contracts.Target{Collection: widgetsRef, Address: &contracts.TargetAddress{System: w.adapter.GitHub.WebHost(), Path: "acme/sprockets"}}}
 	for i, s := range sent[1:] {
 		var req contracts.SourceCollections
 		json.Unmarshal(s.raw, &req)
-		if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || req.Collections[0].Target == nil || *req.Collections[0].Target != *want.Target {
+		if len(req.Collections) != 1 || req.Collections[0].Ref != want.Ref || req.Collections[0].Title != want.Title || req.Collections[0].URL != want.URL || !reflect.DeepEqual(req.Collections[0].Target, want.Target) {
 			t.Errorf("part %d after the rename: %s", i+1, s.raw)
 		}
 		if strings.Contains(string(s.raw), "acme/widgets") {

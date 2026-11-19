@@ -46,7 +46,7 @@ func targetOf(path string, commits int, draft *contracts.DraftRequest) contracts
 
 var (
 	openDraft = &contracts.DraftRequest{Action: contracts.DraftOpen}
-	update    = func(n int) *contracts.DraftRequest {
+	update    = func(n int64) *contracts.DraftRequest {
 		return &contracts.DraftRequest{Action: contracts.DraftUpdate, Number: n}
 	}
 )
@@ -515,7 +515,7 @@ func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *test
 		w.apiary.add(submissionOf(testSubmissionID, testTitle, "Text.", targetOf("acme/widgets", 1, tc.draft)))
 		w.stepOK(t)
 		d := w.apiary.draftsReplied()["acme/widgets"]
-		if d == nil || d.Number != tc.number || d.Action != tc.action || d.State != tc.state || len(w.apiary.submissionReports()) != 0 || len(w.gh.pullRequests("acme/widgets")) != len(tc.pulls) {
+		if d == nil || d.Number != int64(tc.number) || d.Action != tc.action || d.State != tc.state || len(w.apiary.submissionReports()) != 0 || len(w.gh.pullRequests("acme/widgets")) != len(tc.pulls) {
 			t.Errorf("%s: the draft is %+v, reports %v", tc.name, d, w.apiary.submissionReports())
 		}
 	}

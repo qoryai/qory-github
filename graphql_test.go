@@ -360,7 +360,7 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 // GraphQL for the repository's id as fullDatabaseId, a BigInt, and not as databaseId, a
 // 32-bit Int, the collection's ref and every item's are that id, "<id>#<n>", the
 // comments on an item are read through /repositories/{id} and sent on "<id>#<n>", and
-// the item's URL and target's path still name the repository as GitHub does. A
+// the item's URL and the path of its target's address still name the repository as GitHub does. A
 // repository GraphQL answers without an id, with another, or with one that is not a
 // JSON string of decimal digits alone, with no sign and no leading zero, within an
 // int64, as a ref's id is, is not the one the listing is for: the listing fails, with
@@ -386,7 +386,7 @@ func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
 	}
 	for i, it := range items[0].Items {
 		n := strconv.Itoa(i + 1)
-		if it.Ref != "1296269#"+n || it.URL != "https://github.com/acme/widgets/issues/"+n || it.Target == nil || it.Target.Path != "acme/widgets" {
+		if it.Ref != "1296269#"+n || it.URL != "https://github.com/acme/widgets/issues/"+n || it.Target == nil || it.Target.Collection != "1296269" || it.Target.Address == nil || it.Target.Address.System != "github.com" || it.Target.Address.Path != "acme/widgets" {
 			t.Errorf("item %+v", it)
 		}
 	}
@@ -468,7 +468,7 @@ func TestARepositoryNamedOtherwiseWithItsIDIsListed(t *testing.T) {
 		var paths []string
 		for _, req := range s.items() {
 			for _, it := range req.Items {
-				paths = append(paths, it.Target.Path)
+				paths = append(paths, it.Target.Address.Path)
 			}
 		}
 		if strings.Join(refs, " ") != "1296269#1 1296269#2 1296269#3" || strings.Join(paths, " ") != tc.paths || !parts[len(parts)-1].Complete {
