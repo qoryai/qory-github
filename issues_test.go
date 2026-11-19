@@ -513,6 +513,30 @@ func TestTheTargetsSystemIsGitHubsWebsite(t *testing.T) {
 	}
 }
 
+// TestATargetIsTheCollectionAndAnOptionalAddress: a repository's target has its
+// collection ref, which a rename keeps, and its address, which a rename changes; a
+// collection whose target has no address is listed, and one whose address has no path
+// is skipped.
+func TestATargetIsTheCollectionAndAnOptionalAddress(t *testing.T) {
+	was := targetOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/widgets"})
+	now := targetOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/sprockets"})
+	if was.Collection != "1296269" || now.Collection != was.Collection || was.Address.Path != "acme/widgets" || now.Address.Path != "acme/sprockets" {
+		t.Errorf("before the rename %+v %+v, after %+v %+v", was, *was.Address, now, *now.Address)
+	}
+	c := contracts.Collection{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}
+	for target, want := range map[*contracts.Target]string{
+		nil:                 "",
+		{Collection: c.Ref}: "",
+		was:                 "",
+		{Collection: c.Ref, Address: &contracts.TargetAddress{System: "github.com"}}: fmt.Sprintf("the path of its target's address is empty or longer than %d characters", contractLimits().path),
+	} {
+		c.Target = target
+		if got := checkCollection(c); got != want {
+			t.Errorf("target %+v: %q, want %q", target, got, want)
+		}
+	}
+}
+
 func str(s string) *string { return &s }
 
 // TestAnIssueMapsToAnItem checks every row of the mapping.
