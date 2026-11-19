@@ -262,26 +262,34 @@ target is that `ref` and, as optional data, the address of the repository: `syst
 `github.com` and `path` `owner/name`. After a rename, the next listing has the new `path`
 under the same `ref`. Each issue is an item whose target has the same `ref` and address.
 
-### Draft pull requests of a submission
+### Draft pull requests of a change request
 
-`qory-github-server serve` opens or updates the draft pull request for each `submission`
-entry that Qory Apiary writes to its change feed, one repository at a time. It calls
-GitHub's REST API with an installation token of the App for that one repository, which has
+`qory-github-server serve` opens or updates the draft pull request for each
+`change_request` entry of the kind `pull-request` that Qory Apiary writes to its change
+feed, one entry and so one repository at a time. The description of the adapter lists that
+kind in `roles.source.change_kinds`. It calls GitHub's REST API with an installation token of the App for that one repository, which has
 `pull_requests: write` and no other permission. The App needs the permission Pull requests:
 read and write on its installation; an App that `qory-github setup` creates has it. The run
 and its machine hold no token for this.
 
-For each repository of the entry, the adapter:
+For each entry, the adapter:
 
+- Finds the repository by the `collection` of the entry's target, the repository's id on
+  GitHub, and reads its current name, so a repository that was renamed still gets its
+  draft. The target's address, where it has one, is checked only for its `system`, which
+  must be the host of the GitHub the adapter reaches (`github.com`), and for a `path` of
+  the shape `owner/name`; an entry with any other address is logged and passed.
+- Checks the entry's `data`: the branch name, the base, the commit ids, and the `draft`
+  member. Data that breaks a rule gets a failure report with the reason `refused`.
 - Sends Qory Apiary the address of the base commit and of each listed commit,
-  `https://github.com/owner/name/commit/<commit>`. It does so for every entry, also after
-  a session that did not pass, when the entry asks for no draft and the adapter makes no
-  request to GitHub.
-- When the entry asks for a draft, looks for the pull request from the entry's branch in
+  `https://github.com/owner/name/commit/<commit>`, in the `data` of the reply. It does so
+  for every entry, also after a session that did not pass, when the entry asks for no
+  draft.
+- When the entry's `data` has a `draft`, looks for the pull request from the entry's branch in
   that repository, of any state, and reads it. It finds the pull request by the head
   branch and the repository alone, never by the base branch: a pull request from a fork
   is not that pull request, and a pull request into another base branch is. The `number`
-  of an `update` entry is a hint: if GitHub has no pull request with that number from the
+  of a `draft` with the action `update` is a hint: if GitHub has no pull request with that number from the
   branch, the adapter looks by the head branch. When several pull requests have the
   head branch, the adapter takes the one with the entry's `number` when it is among them,
   otherwise the open or draft one with the highest number, and when none is open, the
@@ -295,15 +303,16 @@ For each repository of the entry, the adapter:
 - Changes an open or draft pull request only where something differs, and reports
   `updated`, or `kept` when nothing differs.
 
-The adapter sends Qory Apiary one reply for the entry, with one target for each
-repository that it put on GitHub, in the entry's order, once it has dealt with every
-repository of the entry. A repository that failed for good gets a failure report, as
-below, and is not in the reply. While a repository fails and may succeed on a retry, for
-example after a 5xx status, the adapter holds the reply and applies that repository again
-without applying the others again. When the retries end, after a day of failures, it
-reports that repository as `unreachable` and sends the reply for the others. If Qory
-Apiary does not take the reply for a day more, the adapter reports each repository of the
-reply as `unreachable`, with a `detail` that says the pull request exists.
+The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
+`address` of the pull request (its `url`, and its number as `ref`) and the `action`
+(`created`, `updated` or `kept`) when the entry has a `draft`, and neither when it has
+none. The `data` of the reply has the commit addresses and, for a draft, its `number`,
+`title` and `state`. An entry that fails for good gets a failure report, as below, and no
+reply. While an entry fails and may succeed on a retry, for example after a 5xx status,
+the adapter applies the entry again, and the entries after it for the same repository
+wait. When the retries end, after a day of failures, it reports the entry as
+`unreachable`. If Qory Apiary does not take the reply for a day more, the adapter reports
+the entry as `unreachable`, with a `detail` that says the pull request exists.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
@@ -319,7 +328,7 @@ marker, the adapter adds a blank line and a new block at the end of the descript
 changes nothing else.
 
 The adapter changes the title to the run's title only while the pull request's title
-equals the title of the previous version of the submission. A title that a person edited
+equals `previous.title` of the entry. A title that a person edited
 stays. The description of the run is at most 20000 characters and the title at most 256;
 GitHub keeps at most 65536 characters in a description, and an update that would pass
 that is reported as `too_long` before GitHub is asked. The title in the reply to Qory
@@ -327,20 +336,20 @@ Apiary is the pull request's title without the control, bidirectional and invisi
 characters that Qory Apiary refuses; the pull request keeps its title. When that leaves
 only spaces, the reply has the run's title, cleaned the same way.
 
-When the adapter cannot do what a repository asks for, and a retry cannot change that, it
-sends Qory Apiary a failure report for that repository with one reason and a `detail`. The
-other repositories of the entry are not stopped. The `detail` is one line of at most
+When the adapter cannot do what an entry asks for, and a retry cannot change that, it
+sends Qory Apiary a failure report for that entry with one reason and a `detail`. The
+`detail` is one line of at most
 1000 characters: the fix for that case, as a sentence that says what a person does, then
 GitHub's status and message when GitHub's answer caused the failure, with no token, no
 header and no address with a password.
 
 | Reason | Cause |
 |---|---|
-| `not_permitted` | GitHub returned 404, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix gives the App the Pull requests permission and access to the repository. |
-| `branch_gone` | GitHub's 422 says the head branch or the base branch does not exist. The fix says which: push the branch again, or create the base branch. |
+| `not_permitted` | GitHub returned 404 for a request about the pull request, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix gives the App the Pull requests permission and access to the repository. |
+| `target_gone` | GitHub returned 404 or 410 for the repository's id, or 301 or 308, also on the lookup of the installation. The fix says to check that the repository exists and the App's installation reaches it, or, for a 301 or 308, that GitHub moved the repository. |
 | `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix says which text to shorten. |
-| `forge_refused` | GitHub returned 400, or 422 for any cause other than a missing branch or a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or a redirect (for a 301 or 308 the fix says that GitHub moved the repository: link it by its new name), or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
-| `unreachable` | GitHub timed out, did not connect, closed the connection while its answer was read, was busy, rate limited or returned 5xx for a day. Each repository is reported by the last error of that repository's tries. |
+| `refused` | The entry's `change_kind` is not `pull-request`, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix says which: push the branch again, or create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
+| `unreachable` | GitHub timed out, did not connect, closed the connection while its answer was read, was busy, rate limited or returned 5xx for a day. Each entry is reported by the last error of its tries. |
 
 ### Token expiry
 

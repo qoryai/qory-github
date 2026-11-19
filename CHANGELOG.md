@@ -9,28 +9,40 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` opens or updates the draft pull request for each `submission`
-  entry of Qory Apiary's change feed, in Go, over GitHub's REST API, with an installation
-  token of the App for that one repository with `pull_requests: write` and no other
-  permission. For each repository of the entry it sends Qory Apiary the address of the
-  base commit and of each commit, with or without a draft, and, when the entry asks for a
-  draft, the pull request's number, address, title, state and action, in one reply for the
-  entry. It finds the pull request by its head branch and repository, of any state, and
-  never by its base branch, opens a draft when there is none, and changes only the text
-  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and
-  the title only while it equals the previous version's title. A closed or merged pull
-  request is not changed. One repository that fails does not stop the others. A repository
-  that GitHub refuses for good is reported to Qory Apiary with the reason `not_permitted`,
-  `branch_gone`, `too_long` or `forge_refused`, and a `detail` with the fix and GitHub's
-  status and message; one that still fails when the retries end, after a day, is reported
-  with the reason of the last error of its tries: `unreachable` for a failure to reach
-  GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such
-  as a 404 or a 401 that kept coming. A 301 or 308, also on the lookup of the
-  installation, is `forge_refused`, and its fix says GitHub moved the repository; a 302,
-  307, 404 or 403 on the lookup stays `not_permitted`. The App needs the permission Pull
-  requests: read and write. The title in the reply has none of the control, bidirectional
-  or invisible characters that Qory Apiary refuses.
-- The description of the adapter has `submissions: true` in `roles.source`.
+- `qory-github-server serve` opens or updates the draft pull request for each
+  `change_request` entry of the kind `pull-request` in Qory Apiary's change feed, in Go,
+  over GitHub's REST API, with an installation token of the App for that one repository
+  with `pull_requests: write` and no other permission. An entry has one target, so a
+  change request for two repositories is two entries. The adapter finds the repository by
+  the target's `collection`, the repository's id, so a renamed repository still gets its
+  draft; the address of the target is checked for the host and for the shape `owner/name`
+  and is not what finds the repository. For each entry it sends Qory Apiary one reply
+  with the address of the base commit and of each commit in `data`, with or without a
+  draft, and, when `data` has a `draft`, the pull request's `address` (its `url`, and its
+  number as `ref`), the action `created`, `updated` or `kept`, and in `data` the
+  pull request's number, title and state. It finds the pull request by its head branch
+  and repository, of any state, and never by its base branch, opens a draft when there is
+  none, and changes only the text between the lines `<!-- qory:start -->` and
+  `<!-- qory:end -->` of the description, and the title only while it equals
+  `previous.title`. A closed or merged pull request is not changed. The adapter reads the
+  members `branch`, `base`, `commits`, `earlier_commits` and `draft` of `data` and checks
+  each: a branch name that git accepts, full commit ids, 1 to 100 commits that end in the
+  head commit, a `draft` of the action `open`, or `update` with a `number` from 1; data
+  that breaks a rule is reported as `refused`. An entry of another `change_kind` is
+  reported as `refused`, with a `detail` that starts with the fix. An entry that GitHub
+  refuses for good is reported to Qory Apiary with the reason `not_permitted`,
+  `target_gone`, `too_long` or `refused`, and a `detail` with the fix and GitHub's status
+  and message; one that still fails when the retries end, after a day, is reported with
+  the reason of the last error of its tries: `unreachable` for a failure to reach GitHub,
+  a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such as a 404
+  or a 401 that kept coming. A 301 or 308, also on the lookup of the installation, is
+  `target_gone`, and its fix says GitHub moved the repository; a 404 or 410 for the
+  repository's id is `target_gone` too, and a 302, 307, 404 or 403 on the lookup stays
+  `not_permitted`. The App needs the permission Pull requests: read and
+  write. The title in the reply has none of the control, bidirectional or invisible
+  characters that Qory Apiary refuses.
+- The description of the adapter lists the change kind `pull-request` in
+  `roles.source.change_kinds`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. It is a POSIX `sh` script that uses `gh`. qory runs it on
   your machine, outside the sandbox that a run uses, once for each repository of a run
@@ -87,7 +99,7 @@ change what the program does, and notes it under Upgrading.
   comment's first failure, the adapter logs one line with the `comment_id` and moves
   past the comment.
 - Qory Apiary writes a change feed entry of kind `watch` when a run stores a
-  submission version. The adapter drops each `watch` entry, which changes nothing. The
+  change request version. The adapter drops each `watch` entry, which changes nothing. The
   adapter moves its cursor past the entry and applies the entries after it.
 
 ### Changed
