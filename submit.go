@@ -17,9 +17,10 @@ import (
 )
 
 // The names of the change request entry's contract that [Client.SubmitDraft] and its callers
-// use, in one place. The states and actions are those of the draft in
-// changes-submitted.schema.json. closed and merged are the states of a pull request that
-// GitHub closed or merged, which SubmitDraft never edits.
+// use, in one place. The states are those of a pull request in the data of the reply for a
+// pull-request change request: draft, open, closed and merged, the last two for a pull
+// request that GitHub closed or merged, which SubmitDraft never edits. The actions are
+// those of [Client.SubmitDraft]: opened, updated and kept.
 const (
 	DraftStateDraft  = contracts.DraftStateDraft
 	DraftStateOpen   = contracts.DraftStateOpen
