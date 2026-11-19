@@ -60,8 +60,8 @@ func TestParsePullRequestDataReadsTheMembers(t *testing.T) {
 	}
 }
 
-// TestParsePullRequestDataRefusesEachBrokenRule: each rule the contract's earlier
-// submission entry had is refused, as refused, with the fix first and no value in the text.
+// TestParsePullRequestDataRefusesEachBrokenRule: each rule of the removed submission entry
+// is refused, as refused, with the fix first and no value in the text.
 func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 	many := func(n int) []any {
 		var out []any
@@ -117,6 +117,7 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"an update with a fraction", `{"action":"update","number":1.5}`, nil, "", "data.draft.number is not"},
 		{"an update past int64", `{"action":"update","number":9223372036854775808}`, nil, "", "data.draft.number is not"},
 		{"an update of a string number", `{"action":"update","number":"4"}`, nil, "", "data.draft.number is not"},
+		{"an open draft with a null number", `{"action":"open","number":null}`, nil, "", "data.draft.number is set"},
 		{"a draft of the action close", `{"action":"close"}`, nil, "", "data.draft.action"},
 		{"data that is an array", "", nil, `[]`, "not a JSON object"},
 		{"data that is null", "", nil, `null`, "not a JSON object"},

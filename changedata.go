@@ -79,7 +79,7 @@ type rawData struct {
 }
 
 // ParsePullRequestData reads the data of a change request of the kind pull-request, and
-// checks the rules the contract's earlier submission entry had: the branch names git
+// checks the rules the removed submission entry had: the branch names git
 // accepts, full commit ids, 1 to 100 commits that end in the head commit, each with a
 // step of 1 to 128 characters, earlier_commits from 1, only with exactly 100 commits, a
 // draft of the action open without a number or update with one from 1 to

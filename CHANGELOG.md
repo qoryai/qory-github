@@ -36,7 +36,7 @@ change what the program does, and notes it under Upgrading.
   the reason of the last error of its tries: `unreachable` for a failure to reach GitHub,
   a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such as a 404
   or a 401 that kept coming. A 301 or 308, also on the lookup of the installation, is
-  `target_gone`, and its fix says GitHub moved the repository; a 404 or 410 for the
+  `target_gone`, with the fix to link the repository by its new name; a 404 or 410 for the
   repository's id is `target_gone` too, and a 302, 307, 404 or 403 on the lookup stays
   `not_permitted`. The App needs the permission Pull requests: read and
   write. The title in the reply has none of the control, bidirectional or invisible

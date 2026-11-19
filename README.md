@@ -267,8 +267,9 @@ under the same `ref`. Each issue is an item whose target has the same `ref` and 
 `qory-github-server serve` opens or updates the draft pull request for each
 `change_request` entry of the kind `pull-request` that Qory Apiary writes to its change
 feed, one entry and so one repository at a time. The description of the adapter lists that
-kind in `roles.source.change_kinds`. It calls GitHub's REST API with an installation token of the App for that one repository, which has
-`pull_requests: write` and no other permission. The App needs the permission Pull requests:
+kind in `roles.source.change_kinds`. It calls GitHub's REST API with an installation token
+of the App for that one repository, which has `pull_requests: write` and no other
+permission. The App needs the permission Pull requests:
 read and write on its installation; an App that `qory-github setup` creates has it. The run
 and its machine hold no token for this.
 
@@ -285,12 +286,12 @@ For each entry, the adapter:
   `https://github.com/owner/name/commit/<commit>`, in the `data` of the reply. It does so
   for every entry, also after a session that did not pass, when the entry asks for no
   draft.
-- When the entry's `data` has a `draft`, looks for the pull request from the entry's branch in
-  that repository, of any state, and reads it. It finds the pull request by the head
+- When the entry's `data` has a `draft`, looks for the pull request from the entry's
+  branch in that repository, of any state, and reads it. It finds the pull request by the head
   branch and the repository alone, never by the base branch: a pull request from a fork
   is not that pull request, and a pull request into another base branch is. The `number`
-  of a `draft` with the action `update` is a hint: if GitHub has no pull request with that number from the
-  branch, the adapter looks by the head branch. When several pull requests have the
+  of a `draft` with the action `update` is a hint: if GitHub has no pull request with that
+  number from the branch, the adapter looks by the head branch. When several pull requests have the
   head branch, the adapter takes the one with the entry's `number` when it is among them,
   otherwise the open or draft one with the highest number, and when none is open, the
   closed or merged one with the highest number.
@@ -312,7 +313,7 @@ reply. While an entry fails and may succeed on a retry, for example after a 5xx 
 the adapter applies the entry again, and the entries after it for the same repository
 wait. When the retries end, after a day of failures, it reports the entry as
 `unreachable`. If Qory Apiary does not take the reply for a day more, the adapter reports
-the entry as `unreachable`, with a `detail` that says the pull request exists.
+the entry as `unreachable`, with a `detail` that states that the pull request exists.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
@@ -345,10 +346,10 @@ header and no address with a password.
 
 | Reason | Cause |
 |---|---|
-| `not_permitted` | GitHub returned 404 for a request about the pull request, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix gives the App the Pull requests permission and access to the repository. |
-| `target_gone` | GitHub returned 404 or 410 for the repository's id, or 301 or 308, also on the lookup of the installation. The fix says to check that the repository exists and the App's installation reaches it, or, for a 301 or 308, that GitHub moved the repository. |
-| `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix says which text to shorten. |
-| `refused` | The entry's `change_kind` is not `pull-request`, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix says which: push the branch again, or create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
+| `not_permitted` | GitHub returned 404 for a request about the pull request, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix is to give the App the Pull requests permission and access to the repository. |
+| `target_gone` | GitHub returned 404 or 410 for the repository's id, or 301 or 308, also on the lookup of the installation. The fix is to check that the repository exists and the App's installation reaches it; for a 301 or 308 it is to link the repository by its new name. |
+| `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix names the text to shorten. |
+| `refused` | The entry's `change_kind` is not `pull-request`, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix is to push the branch again, or to create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message. |
 | `unreachable` | GitHub timed out, did not connect, closed the connection while its answer was read, was busy, rate limited or returned 5xx for a day. Each entry is reported by the last error of its tries. |
 
 ### Token expiry

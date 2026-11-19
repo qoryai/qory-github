@@ -107,9 +107,11 @@ func submitRefusal(reason, fix string, err error) error {
 // [github.Client.WebHost], and for a path of the shape owner/name; it is no source of the
 // repository. Qory Apiary writes the address that serve sent for the collection, so an
 // address of another system, and a path of another shape, are Qory Apiary's defects, and
-// [Permanent]. The read is refused with not_permitted when no installation reaches the
-// repository, and with target_gone when GitHub returns that it is gone; any other
-// failure may pass.
+// [Permanent]. The entry is refused with not_permitted when no installation reaches the
+// repository, the installation is suspended, the mint is refused or GitHub returns 403
+// for the read; with target_gone when GitHub returns that the repository is gone; and
+// with refused for another 4xx status that a retry does not change. Any other failure may
+// pass.
 func (a *Adapter) repositoryOf(ctx context.Context, ch contracts.Change, where string) (github.Repository, error) {
 	t := ch.Target
 	if t.Address != nil {
@@ -146,6 +148,10 @@ func (a *Adapter) repositoryOf(ctx context.Context, ch contracts.Change, where s
 		return github.Repository{}, submitRefusal(github.ReasonNotPermitted, github.FixSuspended, fmt.Errorf("%w%s", err, where))
 	case errors.Is(err, github.ErrMintRefused):
 		return github.Repository{}, submitRefusal(github.ReasonNotPermitted, github.FixPermission, fmt.Errorf("%w%s", err, where))
+	case github.Forbidden(err) && !github.RateLimited(err):
+		return github.Repository{}, submitRefusal(github.ReasonNotPermitted, github.FixAppForbidden, fmt.Errorf("%w%s", err, where))
+	case github.AnswerRefused(err):
+		return github.Repository{}, submitRefusal(github.ReasonRefused, github.FixForgeRefused, fmt.Errorf("%w%s", err, where))
 	case err != nil:
 		return github.Repository{}, fmt.Errorf("%w%s", err, where)
 	}
@@ -205,6 +211,9 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (
 		status, message := github.AnswerOf(err)
 		return &github.SubmitRefused{Reason: reason, Fix: fix, Err: fmt.Errorf("%w%s", err, where), Status: status, Message: message}
 	}
+	// shortcut: the installation and the pull token are found by the name read a moment
+	// ago, so a rename in between ends the entry as not_permitted or target_gone; replace
+	// it with a token by repository id when that window shows in a log.
 	installation, _, err := a.GitHub.RepositoryInstallation(ctx, a.AppID, a.Key, repo)
 	err = github.Scrubbed(err)
 	switch {

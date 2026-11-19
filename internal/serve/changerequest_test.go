@@ -835,10 +835,10 @@ func TestAPullRequestWhoseBodyGrowsPastGitHubsLimitIsTooLong(t *testing.T) {
 	}
 }
 
-// TestOneRepositoryFailingDoesNotBlockTheOther: of the two entries of one version, the
-// entry of a refused repository is reported and the other is replied to, in one step that
-// moves the cursor.
-func TestOneRepositoryFailingDoesNotBlockTheOther(t *testing.T) {
+// TestOneEntryFailingDoesNotBlockTheEntryOfAnotherRepository: of two entries for two
+// repositories, the entry of a refused repository is reported and the other is replied
+// to, in one step that moves the cursor.
+func TestOneEntryFailingDoesNotBlockTheEntryOfAnotherRepository(t *testing.T) {
 	w := newChangeWired(t)
 	setGitHub(w.gh, func(f *fakeGitHub) { f.noInstallation = map[string]bool{"acme/widgets": true} })
 	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)), changeOf(testChangeID, testTitle, "Text.", targetOf("acme/gadgets", 1, openDraft)))
@@ -1077,11 +1077,11 @@ func TestTheDeclarationHasNoSubmitModuleAndListsTheChangeKind(t *testing.T) {
 	}
 }
 
-// TestEachRepositoryOfAVersionIsMintedAToken pins that two entries of a version for two
+// TestEachRepositoryIsMintedAToken pins that two entries of a version for two
 // repositories mint one token for each repository, with that repository's name and
 // pull_requests: write, so the token of one is never used for the other; a later entry
 // for the same repository mints no new one.
-func TestEachRepositoryOfAVersionIsMintedAToken(t *testing.T) {
+func TestEachRepositoryIsMintedAToken(t *testing.T) {
 	w := newChangeWired(t)
 	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)), changeOf(testChangeID, testTitle, "Text.", targetOf("acme/gadgets", 1, openDraft)))
 	w.stepOK(t)
@@ -1712,16 +1712,27 @@ func TestATargetWithNoAddressIsFoundByItsCollection(t *testing.T) {
 	}
 }
 
-// TestARepositoryThatIsNotReachedOrGoneIsReported: a repository that no installation
-// reaches is not_permitted with the install fix, and one whose read by its id GitHub
-// answers 404 is target_gone, each with no request for pull requests.
-func TestARepositoryThatIsNotReachedOrGoneIsReported(t *testing.T) {
+// TestARepositoryThatCannotBeReadIsReportedByWhatGitHubReturns: each case ends the entry
+// with a failure report of its reason, whose detail starts with its fix, and no request
+// for pull requests: no installation reaches the repository, the installation is
+// suspended, the mint is refused, GitHub returns 403, 404, 410 or 400 for the read.
+func TestARepositoryThatCannotBeReadIsReportedByWhatGitHubReturns(t *testing.T) {
+	status := func(n int) func(w *wired) {
+		return func(w *wired) { setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = n }) }
+	}
 	for _, tc := range []struct {
 		name, want, fix string
 		set             func(w *wired)
 	}{
 		{"no installation reaches it", "not_permitted", github.FixNotInstalled, func(w *wired) { w.st.Delete(nsRepositories, collectionKey(widgetsRef)) }},
-		{"GitHub answers 404", "target_gone", github.FixGone, func(w *wired) { setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = 404 }) }},
+		{"the installation is suspended", "not_permitted", github.FixSuspended, func(w *wired) { setGitHub(w.gh, func(f *fakeGitHub) { f.installSuspended = true }) }},
+		{"the mint is refused", "not_permitted", github.FixPermission, func(w *wired) {
+			setGitHub(w.gh, func(f *fakeGitHub) { f.refused = []int64{repoID("acme/widgets")} })
+		}},
+		{"403", "not_permitted", github.FixAppForbidden, status(403)},
+		{"404", "target_gone", github.FixGone, status(404)},
+		{"410", "target_gone", github.FixGone, status(410)},
+		{"400", "refused", github.FixForgeRefused, status(400)},
 	} {
 		w := newChangeWired(t)
 		tc.set(w)
@@ -1730,6 +1741,34 @@ func TestARepositoryThatIsNotReachedOrGoneIsReported(t *testing.T) {
 		if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets " + tc.want}) || !strings.HasPrefix(detailOf(w, 0), tc.fix) || len(w.gh.pullCalls()) != 0 || len(w.apiary.replies()) != 0 {
 			t.Errorf("%s: reports %v, detail %q", tc.name, r, detailOf(w, 0))
 		}
+	}
+}
+
+// TestAServerErrorOnTheReadOfTheRepositoryIsRetried: a 502 for the read fails the step with
+// no report, no reply and the cursor where it was; the entry is applied when the read
+// passes.
+func TestAServerErrorOnTheReadOfTheRepositoryIsRetried(t *testing.T) {
+	w := newChangeWired(t)
+	setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = 502 })
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	if err := w.feed.step(context.Background()); err == nil || IsPermanent(err) || !cursorIs(w, "") || len(w.apiary.changeReports()) != 0 {
+		t.Fatalf("err %v", err)
+	}
+	setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = 0 })
+	w.stepOK(t)
+	if r := w.apiary.replies(); len(r) != 1 || len(w.apiary.changeReports()) != 0 {
+		t.Errorf("replies %+v", r)
+	}
+}
+
+// TestACollectionThatIsNoRepositoryIDIsPermanent: repositoryOf refuses it before any
+// request, as the feed does for an entry.
+func TestACollectionThatIsNoRepositoryIDIsPermanent(t *testing.T) {
+	w := newChangeWired(t)
+	ch := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft))
+	ch.Target.Collection = "acme/widgets"
+	if _, err := w.adapter.repositoryOf(context.Background(), ch, ""); err == nil || !IsPermanent(err) || len(w.gh.requests) != 0 {
+		t.Errorf("err %v, %d requests", err, len(w.gh.requests))
 	}
 }
 
