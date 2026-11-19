@@ -527,12 +527,12 @@ func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, 
 }
 
 // IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
-// `system` of the target's address, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
-// unlabeled send the issue as it is now, and deleted sends it closed. Transferred sends
-// the issue closed in the repository it left and, when active says the repository it
-// went to is one Qory Apiary reads, by the ref of its collection, the issue it became
-// there. Every other action, and an event for a pull request, sends nothing. It does no
-// I/O.
+// `system` of the target's address, [Client.WebHost]. Opened, reopened, edited, closed,
+// labeled and unlabeled send the issue as it is now, and deleted sends it closed.
+// Transferred sends the issue closed in the repository it left and, when active says the
+// repository it went to is one Qory Apiary reads, by the ref of its collection, the issue
+// it became there. Every other action, and an event for a pull request, sends nothing. It
+// does no I/O.
 func IssuesWebhook(payload []byte, system string, active func(collectionRef string) bool) (ToSend, error) {
 	var ev struct {
 		Action     string  `json:"action"`
