@@ -537,6 +537,34 @@ func TestATargetIsTheCollectionAndAnOptionalAddress(t *testing.T) {
 	}
 }
 
+// TestAPathOfTheContractsLimitIsTheMostAnAddressTakes: the contract allows an address
+// path of 200 characters, so a collection or an item with a path of 201, or with none,
+// is skipped, and one with a path of 200 is not.
+func TestAPathOfTheContractsLimitIsTheMostAnAddressTakes(t *testing.T) {
+	if n := contractLimits().path; n != 200 {
+		t.Fatalf("the contract's limit for a path is %d, want 200", n)
+	}
+	c := contracts.Collection{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}
+	is := ghIssue{
+		Number: 42, Title: "Widgets spin backwards", State: "open",
+		HTMLURL:   "https://github.com/acme/widgets/issues/42",
+		CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+	}
+	for _, tc := range []struct {
+		path    string
+		skipped bool
+	}{{"", true}, {strings.Repeat("a", 201), true}, {strings.Repeat("a", 200), false}} {
+		c.Target = &contracts.Target{Collection: c.Ref, Address: &contracts.TargetAddress{System: "github.com", Path: tc.path}}
+		_, why, _ := itemOf("github.com", ghRepo{ID: widgetsID, FullName: tc.path}, is)
+		if got := checkCollection(c) != ""; got != tc.skipped {
+			t.Errorf("collection with a path of %d characters: skipped %t, want %t", len(tc.path), got, tc.skipped)
+		}
+		if got := why != ""; got != tc.skipped {
+			t.Errorf("item with a path of %d characters: skipped %t (%q), want %t", len(tc.path), got, why, tc.skipped)
+		}
+	}
+}
+
 func str(s string) *string { return &s }
 
 // TestAnIssueMapsToAnItem checks every row of the mapping.

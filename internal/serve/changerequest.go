@@ -238,6 +238,8 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (
 	case err != nil:
 		return contracts.ChangesSubmitted{}, fmt.Errorf("%w%s", err, where)
 	}
+	// shortcut: int is 64 bits on amd64 and arm64, widen github.Draft.Number for a
+	// 32-bit build.
 	d := github.Draft{Repository: repo, Branch: data.Branch, Base: data.BaseBranch, Title: ch.Title, Description: ch.Text, Number: int(data.Draft.Number)}
 	if ch.Previous != nil {
 		d.PreviousTitle = ch.Previous.Title

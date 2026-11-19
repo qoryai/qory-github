@@ -360,12 +360,12 @@ func TestTheCompleteListingPagesByCursor(t *testing.T) {
 // GraphQL for the repository's id as fullDatabaseId, a BigInt, and not as databaseId, a
 // 32-bit Int, the collection's ref and every item's are that id, "<id>#<n>", the
 // comments on an item are read through /repositories/{id} and sent on "<id>#<n>", and
-// the item's URL and the path of its target's address still name the repository as GitHub does. A
-// repository GraphQL answers without an id, with another, or with one that is not a
-// JSON string of decimal digits alone, with no sign and no leading zero, within an
-// int64, as a ref's id is, is not the one the listing is for: the listing fails, with
-// an error that is not ErrRepositoryGone, so a later listing tries again, and sends
-// nothing.
+// the item's URL and the path of its target's address still name the repository as
+// GitHub does. A repository GraphQL answers without an id, with another, or with one
+// that is not a JSON string of decimal digits alone, with no sign and no leading zero,
+// within an int64, as a ref's id is, is not the one the listing is for: the listing
+// fails, with an error that is not ErrRepositoryGone, so a later listing tries again,
+// and sends nothing.
 func TestTheOpenListingRefsByTheRepositorysID(t *testing.T) {
 	if !strings.Contains(openIssuesQuery, "fullDatabaseId") || strings.Contains(openIssuesQuery, "databaseId") {
 		t.Error("the query does not ask for the repository's id as fullDatabaseId alone")
