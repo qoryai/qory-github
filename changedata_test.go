@@ -58,10 +58,14 @@ func TestParsePullRequestDataReadsTheMembers(t *testing.T) {
 	if err != nil || d.Draft.Number != 34 {
 		t.Errorf("an exponent: %+v, %v", d, err)
 	}
+	d, err = ParsePullRequestData(pullData(`{"action":"update","number":9007199254740993.0}`, nil))
+	if err != nil || d.Draft.Number != 9007199254740993 {
+		t.Errorf("a number past 2^53: %+v, %v", d, err)
+	}
 }
 
-// TestParsePullRequestDataRefusesEachBrokenRule: each rule of the removed submission entry
-// is refused, as refused, with the fix first and no value in the text.
+// TestParsePullRequestDataRefusesEachBrokenRule: each rule of the data is refused, as
+// refused, with the fix first and no value in the text.
 func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 	many := func(n int) []any {
 		var out []any
@@ -85,6 +89,8 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"a branch of 256 characters", "", set("branch", strings.Repeat("a", 256)), "", "data.branch"},
 		{"a branch that is @", "", set("branch", "@"), "", "data.branch"},
 		{"a base branch with a colon", "", set("base", map[string]any{"commit": sha(1), "branch": "a:b"}), "", "data.base.branch"},
+		{"an empty base branch", "", set("base", map[string]any{"commit": sha(1), "branch": ""}), "", "data.base.branch"},
+		{"a null base branch", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":null},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}]}`, "data.base.branch"},
 		{"a short base commit", "", set("base", map[string]any{"commit": "abc", "branch": "main"}), "", "data.base.commit"},
 		{"no base", "", set("base", nil), "", "data.base.commit"},
 		{"a head that is not a commit", "", set("commit", secret), "", "data.commit"},
@@ -118,7 +124,13 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"an update past int64", `{"action":"update","number":9223372036854775808}`, nil, "", "data.draft.number is not"},
 		{"an update of a string number", `{"action":"update","number":"4"}`, nil, "", "data.draft.number is not"},
 		{"an open draft with a null number", `{"action":"open","number":null}`, nil, "", "data.draft.number is set"},
+		{"an update of 1.00000000000000000001", `{"action":"update","number":1.00000000000000000001}`, nil, "", "data.draft.number is not"},
+		{"an update of 1E400", `{"action":"update","number":1E400}`, nil, "", "data.draft.number is not"},
+		{"an update of -0", `{"action":"update","number":-0}`, nil, "", "data.draft.number is not"},
+		{"an update of 9223372036854775808.0", `{"action":"update","number":9223372036854775808.0}`, nil, "", "data.draft.number is not"},
 		{"a draft of the action close", `{"action":"close"}`, nil, "", "data.draft.action"},
+		{"a null draft", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":"main"},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}],"draft":null}`, "data.draft is not an object"},
+		{"a draft that is a number", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":"main"},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}],"draft":5}`, "data.draft is not an object"},
 		{"data that is an array", "", nil, `[]`, "not a JSON object"},
 		{"data that is null", "", nil, `null`, "not a JSON object"},
 		{"a branch that is a number", "", nil, `{"branch": 5}`, "not a JSON object"},
@@ -137,5 +149,43 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 				t.Errorf("the text is %q, want the fix first, then a cause with %q and no value", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// TestAWholeNumberIsReadExactlyOrRefused: a draft number written with a zero fraction or an
+// exponent is the integer it equals, with no digit rounded, as 2^53+1 shows; a number that
+// is not whole, or past the int64 range, is refused.
+func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"34", 34, true},
+		{"34.0", 34, true},
+		{"1e2", 100, true},
+		{"0.5e1", 5, true},
+		{"3.4E+1", 34, true},
+		{"9007199254740993", 9007199254740993, true},
+		{"9007199254740993.0", 9007199254740993, true},
+		{"9.007199254740993e15", 9007199254740993, true},
+		{"9223372036854775807.0", 9223372036854775807, true},
+		{"1.00000000000000000001", 0, false},
+		{"1.5", 0, false},
+		{"9223372036854775808", 0, false},
+		{"9223372036854775808.0", 0, false},
+		{"1E400", 0, false},
+		{"1e1000000000", 0, false},
+		{"1e-1", 0, false},
+		{`"4"`, 0, false},
+		{"null", 0, false},
+		{"0x10", 0, false},
+	} {
+		if n, ok := wholeNumber(json.RawMessage(tc.in)); n != tc.want || ok != tc.ok {
+			t.Errorf("%s: got %d, %v, want %d, %v", tc.in, n, ok, tc.want, tc.ok)
+		}
+	}
+	if _, ok := wholeNumber(nil); ok {
+		t.Error("a missing number is read")
 	}
 }
