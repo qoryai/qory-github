@@ -35,12 +35,13 @@ change what the program does, and notes it under Upgrading.
   and message; one that still fails when the retries end, after a day, is reported with
   the reason of the last error of its tries: `unreachable` for a failure to reach GitHub,
   a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such as a 404
-  or a 401 that kept coming. A 301 or 308, also on the lookup of the installation, is
-  `target_gone`, with the fix to link the repository by its new name; a 404 or 410 for the
-  repository's id is `target_gone` too, and a 302, 307, 404 or 403 on the lookup stays
-  `not_permitted`. The App needs the permission Pull requests: read and
-  write. The title in the reply has none of the control, bidirectional or invisible
-  characters that Qory Apiary refuses.
+  or a 401 that kept coming. A 404, 410, 301 or 308 on the read of the repository by its
+  id is `target_gone`, with the fix to check that the repository exists and the App's
+  installation reaches it. A 301 or 308 on the lookup of the installation
+  or on a pull request call is `target_gone` too, with the fix to link the repository by
+  its new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App
+  needs the permission Pull requests: read and write. The title in the reply has none of
+  the control, bidirectional or invisible characters that Qory Apiary refuses.
 - The description of the adapter lists the change kind `pull-request` in
   `roles.source.change_kinds`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
