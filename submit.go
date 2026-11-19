@@ -16,7 +16,7 @@ import (
 	"github.com/qoryai/integrations/contracts"
 )
 
-// The names of the submission entry's contract that [Client.SubmitDraft] and its callers
+// The names of the change request entry's contract that [Client.SubmitDraft] and its callers
 // use, in one place. The states and actions are those of the draft in
 // changes-submitted.schema.json. closed and merged are the states of a pull request that
 // GitHub closed or merged, which SubmitDraft never edits.
@@ -30,19 +30,24 @@ const (
 	DraftUpdated = contracts.DraftUpdated
 	DraftKept    = contracts.DraftKept
 
-	// ReasonBranchGone is the failure report's reason for a draft whose head branch or
-	// base branch GitHub returns as not existing.
-	ReasonBranchGone = "branch_gone"
+	// ReasonTargetGone is the failure report's reason for a repository that GitHub
+	// returns as moved: the address of the change request's target does not exist any
+	// more.
+	ReasonTargetGone = "target_gone"
 
-	// ReasonForgeRefused is the failure report's reason for a request that GitHub
-	// refused with a status that no other reason covers, such as 400, so the same
-	// request fails again.
-	ReasonForgeRefused = "forge_refused"
+	// ReasonRefused is the failure report's reason for a request that GitHub refused
+	// with a status that no other reason covers, such as 400, or for a head or base
+	// branch that GitHub returns as not existing, so the same request fails again.
+	ReasonRefused = "refused"
+
+	// ChangeKindPullRequest is the one change kind the adapter applies, the kind that
+	// roles.source.change_kinds of the description lists.
+	ChangeKindPullRequest = "pull-request"
 )
 
 const (
 	// MaxDraftDescription is the most characters of the run's text for the description
-	// of a draft, as the submission schema caps it.
+	// of a draft, as the change request schema caps it.
 	MaxDraftDescription = 20000
 	// MaxDraftTitle is the most characters of a draft's title.
 	MaxDraftTitle = 256
@@ -74,19 +79,19 @@ func CommitAddresses(repo Repository, commits ...string) []string {
 	return out
 }
 
-var submissionIDShape = regexp.MustCompile(`^av_[0-9a-hjkmnp-tv-z]{16}$`)
+var changeRequestIDShape = regexp.MustCompile(`^av_[0-9a-hjkmnp-tv-z]{16}$`)
 
-// CheckSubmissionID returns an error when id is not a submission's id in Qory Apiary:
-// av_ and 16 lower-case Crockford base32 characters. The error contains the rule, never
-// the value.
-func CheckSubmissionID(id string) error {
-	if !submissionIDShape.MatchString(id) {
-		return invalidChange("report this Qory Apiary defect: the submission_id is not av_ and 16 lower-case base32 characters")
+// CheckChangeRequestID returns an error when id is not a change request's id in Qory
+// Apiary: av_ and 16 lower-case Crockford base32 characters. The error contains the
+// rule, never the value.
+func CheckChangeRequestID(id string) error {
+	if !changeRequestIDShape.MatchString(id) {
+		return invalidChange("report this Qory Apiary defect: the change_request_id is not av_ and 16 lower-case base32 characters")
 	}
 	return nil
 }
 
-// Draft is what a submission entry asks for one repository: the draft pull request
+// Draft is what a change request entry asks for one repository: the draft pull request
 // from Branch into Base, with the run's text. Number is the number of the pull request
 // of an earlier version's reply, a hint, or 0 for an entry that asks to open one.
 // Description is the content of the marked block of the description, see
@@ -110,7 +115,7 @@ type DraftResult struct {
 
 // SubmitRefused is the error of a draft that a retry cannot open or update, since the
 // retry would fail the same way. Reason is the failure report's reason, [ReasonNotPermitted],
-// [ReasonUnreachable], [ReasonBranchGone], [ReasonTooLong] or [ReasonForgeRefused]. Fix is
+// [ReasonUnreachable], [ReasonTargetGone], [ReasonTooLong] or [ReasonRefused]. Fix is
 // the one line that says what a person does, at most 100 characters, ending with a
 // period; each failing case has a different one, see the Fix constants. Err is the cause: GitHub's
 // status and message, or the check that stopped the call. Status and Message are GitHub's
@@ -138,7 +143,13 @@ const (
 	FixAppForbidden = "Check on GitHub that the App is not suspended or blocked, then submit again."
 	FixUnreachable  = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
 	// FixMoved is the fix line for a repository for which GitHub returns 301 or 308.
-	FixMoved          = "Link the repository by its new name: GitHub moved it."
+	FixMoved = "Link the repository by its new name: GitHub moved it."
+	// FixGone is the fix line for a repository that GitHub returns as deleted, or out of
+	// the App's reach.
+	FixGone = "Check that the repository exists and the App's installation reaches it, then submit again."
+	// FixChangeKind is the fix line for a change request of a kind the adapter does not
+	// apply.
+	FixChangeKind     = "Use the kind pull-request, or connect an adapter that lists the kind of the change."
 	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
 	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
@@ -211,7 +222,7 @@ type ghPull struct {
 	} `json:"base"`
 }
 
-// state is the pull request's state as the reply of a submission has it: merged and
+// state is the pull request's state as the reply of a change request has it: merged and
 // closed for a pull request that was, else draft or open. It is the only place that
 // maps GitHub's words to the contract's.
 func (p ghPull) state() string {
@@ -234,7 +245,7 @@ func (p ghPull) body() string {
 	return *p.Body
 }
 
-// SubmitDraft puts the draft pull request of a submission on GitHub, as the App, with
+// SubmitDraft puts the draft pull request of a change request on GitHub, as the App, with
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
@@ -258,10 +269,10 @@ func (p ghPull) body() string {
 // A description of more than [MaxDraftDescription] characters, or a title of more than
 // [MaxDraftTitle], is refused as too_long before any request, and so is a description
 // that the update would make longer than [MaxPullBody]. Every error that a retry cannot
-// change is a [*SubmitRefused] with its reason: a 404, a 403 that is no rate limit, or a
-// permanent redirect, not_permitted; a 422 for a head or base branch that does not exist,
-// branch_gone; a 422 for a text too long, too_long; a 400, any other 422, and any other
-// 4xx status that is no 401, 403, 404, 408 or 429, forge_refused. Each carries GitHub's
+// change is a [*SubmitRefused] with its reason: a 404 or a 403 that is no rate limit,
+// not_permitted; a permanent redirect, target_gone; a 422 for a text too long, too_long;
+// a 400, a 422 for a head or base branch that does not exist, any other 422, and any
+// other 4xx status that is no 401, 403, 404, 408 or 429, refused. Each carries GitHub's
 // status and message, see [SubmitRefused.Detail]. Every other error may pass, as a 5xx, a
 // timeout or a 401, and the call can be made again; a 422 that says a pull request exists
 // already is among them, since the next call finds it. No error contains the token, the
@@ -314,7 +325,7 @@ func pullsPath(repo Repository) string { return "/repos/" + repo.String() + "/pu
 
 // isDraftOf is whether p is a pull request from d.Branch of d's repository itself, not of
 // a fork, into any base branch: the base branch is the one a person set, and a later
-// version of a submission with another base branch edits the same pull request, which
+// version of a change request with another base branch edits the same pull request, which
 // keeps its base.
 func (p ghPull) isDraftOf(d Draft) bool {
 	return p.Head.Ref == d.Branch && p.Head.Repo != nil && strings.EqualFold(p.Head.Repo.FullName, d.Repository.String())
@@ -345,7 +356,7 @@ func chosenOf(ps []ghPull) ghPull {
 // when there is none.
 func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*ghPull, error) {
 	if d.Number > 0 {
-		const reading = "reading the pull request of an earlier submission"
+		const reading = "reading the pull request of an earlier change request"
 		a, err := c.send(ctx, p, false, reading, http.MethodGet, pullsPath(d.Repository)+"/"+strconv.Itoa(d.Number), tok, nil)
 		if err != nil {
 			return nil, err
@@ -473,7 +484,7 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 	err := a.detailedErr(what)
 	switch {
 	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
-		return refusedBy(a, ReasonForgeRefused, FixMoved, err)
+		return refusedBy(a, ReasonTargetGone, FixMoved, err)
 	case a.status == http.StatusNotFound:
 		return refusedBy(a, ReasonNotPermitted, FixNotInstalled, err)
 	case a.status == http.StatusForbidden && !a.rateLimited():
@@ -500,7 +511,7 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 			case v.base && !v.head:
 				fix = fixBaseGone
 			}
-			return refusedBy(a, ReasonBranchGone, fix, err)
+			return refusedBy(a, ReasonRefused, fix, err)
 		}
 		return forgeRefused(a, err)
 	case refusedStatus(a.status):
@@ -517,7 +528,7 @@ func refusedStatus(status int) bool {
 }
 
 // AnswerRefused is whether err, or an error it wraps, is GitHub's answer with a 4xx status
-// that a retry does not change and that no other reason covers, see [ReasonForgeRefused].
+// that a retry does not change and that no other reason covers, see [ReasonRefused].
 func AnswerRefused(err error) bool {
 	var e *answerError
 	return errors.As(err, &e) && refusedStatus(e.status)
@@ -543,10 +554,10 @@ const fixUnclassified = "Report to the maintainers of qory-github that the adapt
 //     connection ([ErrTransport], a timeout), a rate limit (a 403 that says so, or a
 //     429), 408, and a 5xx status;
 //   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, and a 404;
-//   - forge_refused, for any other 4xx status, a redirect, which the adapter never follows
-//     and which comes again (a 301 or 308 has the fix that says GitHub moved the
-//     repository, [FixMoved]), an answer that arrived but cannot be used, and an error that
-//     is none of these, whose clean text is the message.
+//   - target_gone, for a redirect, which the adapter never follows and which comes again:
+//     a 301 or 308 has the fix that says GitHub moved the repository, [FixMoved];
+//   - refused, for any other 4xx status, an answer that arrived but cannot be used, and an
+//     error that is none of these, whose clean text is the message.
 func EndedRefusal(cause error) *SubmitRefused {
 	var refused *SubmitRefused
 	if errors.As(cause, &refused) {
@@ -569,11 +580,11 @@ func EndedRefusal(cause error) *SubmitRefused {
 		case s == http.StatusNotFound:
 			return report(ReasonNotPermitted, FixNotInstalled)
 		case s == http.StatusMovedPermanently || s == http.StatusPermanentRedirect:
-			return report(ReasonForgeRefused, FixMoved)
+			return report(ReasonTargetGone, FixMoved)
 		}
-		return report(ReasonForgeRefused, FixForgeRefused)
+		return report(ReasonRefused, FixForgeRefused)
 	case errors.Is(cause, ErrUnreadableAnswer):
-		r := report(ReasonForgeRefused, fixUnreadable)
+		r := report(ReasonRefused, fixUnreadable)
 		var unread *unreadableError
 		if errors.As(cause, &unread) {
 			r.Status = unread.status
@@ -583,11 +594,11 @@ func EndedRefusal(cause error) *SubmitRefused {
 		}
 		return r
 	case errors.Is(cause, errMintRedirected):
-		return report(ReasonForgeRefused, FixForgeRefused)
+		return report(ReasonRefused, FixForgeRefused)
 	case errors.Is(cause, ErrTransport), errors.Is(cause, context.DeadlineExceeded), errors.Is(cause, context.Canceled):
 		return report(ReasonUnreachable, FixUnreachable)
 	}
-	r := report(ReasonForgeRefused, fixUnclassified)
+	r := report(ReasonRefused, fixUnclassified)
 	r.Message = OneLine(cause.Error(), MaxDetail)
 	return r
 }
@@ -599,7 +610,7 @@ func refusedBy(a *apiReply, reason, fix string, err error) error {
 
 // forgeRefused is the [*SubmitRefused] of an answer that no other reason covers.
 func forgeRefused(a *apiReply, err error) error {
-	return refusedBy(a, ReasonForgeRefused, FixForgeRefused, err)
+	return refusedBy(a, ReasonRefused, FixForgeRefused, err)
 }
 
 // detailedErr is [apiReply.err] with the message of [apiReply.forgeMessage], which has the

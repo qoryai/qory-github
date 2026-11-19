@@ -637,7 +637,7 @@ func TestADescriptionIsWrittenByTheRuleOfTheContract(t *testing.T) {
 
 // The adapter writes the description with contracts.MarkedDescription: the program gives
 // the same bytes for the same description and text, the cases of the contract's fixtures
-// and the cases of the adapter's tests (internal/serve/submission_test.go).
+// and the cases of the adapter's tests (internal/serve/changerequest_test.go).
 func TestTheProgramWritesWhatTheAdapterWrites(t *testing.T) {
 	type c struct{ name, existing, text string }
 	cases := []c{

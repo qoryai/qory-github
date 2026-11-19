@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,8 +113,8 @@ func (f *feed) unknownLog() *throttle {
 // again after the wait, while the entries after it that do not wait for it apply, see
 // [feed.step]; it is passed and logged once its retries end, see [retriesEnded], so no
 // entry stops the feed for ever; a comment entry is reported as not posted first, see
-// [feed.report], and each repository of a submission entry that is not done is reported
-// as not put on GitHub, see [feed.submissionEnded]. A response that contains an entry
+// [feed.report], and a change_request entry that is not done is reported as not put on
+// GitHub, see [feed.changeRequestEnded]. A response that contains an entry
 // serve cannot apply is rejected whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
@@ -218,7 +217,7 @@ func known(ch contracts.Change) bool {
 		return true
 	case contracts.ChangeCollection, contracts.ChangeGrant:
 		return ch.Status == "linked" || ch.Status == "unlinked"
-	case contracts.ChangeSync, contracts.ChangeWatch, contracts.ChangeSubmission:
+	case contracts.ChangeSync, contracts.ChangeWatch, contracts.ChangeRequest:
 		return true
 	}
 	return false
@@ -229,10 +228,10 @@ func known(ch contracts.Change) bool {
 // is logged and passed; one that fails otherwise is not done, and the page's cursor is
 // not kept, so the next step reads the page again, and a restart applies it again. A
 // comment entry whose comment a retry cannot post is reported to Qory Apiary as not
-// posted, with the reason, before it is passed, see [feed.comment]. A submission
-// entry is done once each of its repositories is replied to, reported as not put on
-// GitHub, or passed, see [feed.submission]; one that fails, not for good, is applied
-// again alone, and a later submission entry of the same branch waits for it. The error of
+// posted, with the reason, before it is passed, see [feed.comment]. A change_request
+// entry is done once its target is replied to, reported as not put on GitHub, or
+// passed, see [feed.changeRequest]; one that fails, not for good, is applied again
+// alone, and a later change_request entry of the same collection waits for it. The error of
 // a step that leaves an entry not done is the first error of the step, with the count
 // of the other entries that failed in it, see [failures].
 //
@@ -344,11 +343,21 @@ type entryState struct {
 	kind, status, ref, commentID string
 	first, since                 time.Time
 	done                         bool
-	// submissionID is a submission entry's submission_id, which identifies it as
-	// commentID does a comment's; targets is what the feed keeps of each of its
-	// repositories, see [feed.submission].
-	submissionID string
-	targets      map[string]*targetState
+	// changeRequestID is a change_request entry's change_request_id, which with its
+	// collection identifies it as commentID does a comment's; applied is what the feed
+	// keeps of its target, see [feed.changeRequest].
+	changeRequestID string
+	collection      string
+	applied         targetState
+}
+
+// targetCollection is the collection ref of the target of a change_request entry, empty
+// when it has none.
+func targetCollection(ch contracts.Change) string {
+	if ch.Target == nil {
+		return ""
+	}
+	return ch.Target.Collection
 }
 
 // entryRef is the ref that identifies ch in its [entryState].
@@ -367,8 +376,8 @@ func entryRef(ch contracts.Change) string {
 // the page read again has other entries there.
 func (f *feed) state(i int, ch contracts.Change) *entryState {
 	s := f.failing.entries[i]
-	if s == nil || s.kind != ch.Kind || s.status != ch.Status || s.ref != entryRef(ch) || s.commentID != ch.CommentID || s.submissionID != ch.SubmissionID {
-		s = &entryState{kind: ch.Kind, status: ch.Status, ref: entryRef(ch), commentID: ch.CommentID, submissionID: ch.SubmissionID}
+	if s == nil || s.kind != ch.Kind || s.status != ch.Status || s.ref != entryRef(ch) || s.commentID != ch.CommentID || s.changeRequestID != ch.ChangeRequestID || s.collection != targetCollection(ch) {
+		s = &entryState{kind: ch.Kind, status: ch.Status, ref: entryRef(ch), commentID: ch.CommentID, changeRequestID: ch.ChangeRequestID, collection: targetCollection(ch)}
 		f.failing.entries[i] = s
 	}
 	return s
@@ -389,16 +398,16 @@ func failures(errs []error) error {
 
 // notDone are the entries of a page that are not done, read so far: the refs of the
 // work item and comment entries; the repositories, by id, of those entries and of the
-// collection entries; the branches of the submission entries; whether a grant entry is
-// among them, whether a sync entry is, and whether any entry other than a sync entry is.
-// Each map has at most one key for each entry of the page and each branch.
+// collection entries; the target collections of the change_request entries; whether a
+// grant entry is among them, whether a sync entry is, and whether any entry other than a
+// sync entry is. Each map has at most one key for each entry of the page.
 type notDone struct {
-	refs, itemRepos, collections, branches map[string]bool
-	grant, any, sync                       bool
+	refs, itemRepos, collections, targets map[string]bool
+	grant, any, sync                      bool
 }
 
 func newNotDone() *notDone {
-	return &notDone{refs: map[string]bool{}, itemRepos: map[string]bool{}, collections: map[string]bool{}, branches: map[string]bool{}}
+	return &notDone{refs: map[string]bool{}, itemRepos: map[string]bool{}, collections: map[string]bool{}, targets: map[string]bool{}}
 }
 
 // itemRepository is the repository id of an item's ref, the part before #.
@@ -418,10 +427,11 @@ func itemRepository(ref string) string {
 //   - A grant entry reads Qory Apiary's copy of the grants, which can drop the links
 //     and the reach of any repository, see [Adapter.syncGrants]. It waits for every
 //     earlier entry, and every later entry except a sync entry waits for it.
-//   - A submission entry opens or updates the pull request of its branch, in each of its
-//     repositories, and a later version's text must not be written before an earlier
-//     one's. It waits for an earlier submission entry that has one of its branches, and
-//     for a grant entry, which can drop the installation that reaches its repositories.
+//   - A change_request entry opens or updates the pull request of its branch in its
+//     target's repository, and a later version's text must not be written before an
+//     earlier one's. It waits for an earlier change_request entry of the same target
+//     collection, as the contract orders them, and for a grant entry, which can drop the
+//     installation that reaches its repository.
 //   - A sync entry writes the sync interval alone, which only the pulls read, see
 //     [syncInterval]. It waits for an earlier sync entry, so the last one sets the
 //     interval, and only a later sync entry waits for it.
@@ -435,8 +445,8 @@ func (p *notDone) waits(ch contracts.Change) bool {
 		return p.any
 	case contracts.ChangeCollection:
 		return p.grant || p.itemRepos[ch.CollectionRef] || p.collections[ch.CollectionRef]
-	case contracts.ChangeSubmission:
-		return p.grant || slices.ContainsFunc(ch.Targets, func(t contracts.SubmissionTarget) bool { return p.branches[t.Branch] })
+	case contracts.ChangeRequest:
+		return p.grant || p.targets[targetCollection(ch)]
 	}
 	return p.grant || p.refs[ch.Ref] || p.collections[itemRepository(ch.Ref)]
 }
@@ -451,10 +461,8 @@ func (p *notDone) add(ch contracts.Change) {
 		p.grant = true
 	case contracts.ChangeCollection:
 		p.collections[ch.CollectionRef] = true
-	case contracts.ChangeSubmission:
-		for _, t := range ch.Targets {
-			p.branches[t.Branch] = true
-		}
+	case contracts.ChangeRequest:
+		p.targets[targetCollection(ch)] = true
 	default:
 		p.refs[ch.Ref] = true
 		p.itemRepos[itemRepository(ch.Ref)] = true
@@ -468,8 +476,8 @@ func (p *notDone) add(ch contracts.Change) {
 // [feed.step].
 func (f *feed) entry(ctx context.Context, state *entryState, ch contracts.Change) (bool, error) {
 	var err error
-	if ch.Kind == contracts.ChangeSubmission {
-		err = f.submission(ctx, state, ch)
+	if ch.Kind == contracts.ChangeRequest {
+		err = f.changeRequest(ctx, state, ch)
 	} else {
 		err = f.apply(ctx, ch)
 	}
@@ -485,12 +493,12 @@ func (f *feed) entry(ctx context.Context, state *entryState, ch contracts.Change
 	if limit == "" {
 		return false, err
 	}
-	if ch.Kind == contracts.ChangeSubmission {
-		done, rerr := f.submissionEnded(ctx, state, ch, err, failed, since, limit)
+	if ch.Kind == contracts.ChangeRequest {
+		done, rerr := f.changeRequestEnded(ctx, state, ch, err, failed, since, limit)
 		if !done {
 			return false, rerr
 		}
-		f.log.Error("a change of the feed kept failing until its retries ended, and is passed", slog.String("kind", ch.Kind), slog.String("submission_id", ch.SubmissionID), slog.String("error", err.Error()), slog.String("retries_ended", limit))
+		f.log.Error("a change of the feed kept failing until its retries ended, and is passed", slog.String("kind", ch.Kind), slog.String("change_request_id", ch.ChangeRequestID), slog.String("error", err.Error()), slog.String("retries_ended", limit))
 		return false, nil
 	}
 	if ch.Kind == contracts.ChangeComment {
@@ -642,8 +650,8 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 		return f.store.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(interval)), 0)
 	case contracts.ChangeWatch:
 		return nil
-	case contracts.ChangeSubmission:
-		return f.submission(ctx, &entryState{}, ch)
+	case contracts.ChangeRequest:
+		return f.changeRequest(ctx, &entryState{}, ch)
 	}
 	return Permanent(errors.New("the change is not one serve knows"))
 }

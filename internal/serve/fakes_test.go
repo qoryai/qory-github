@@ -897,7 +897,10 @@ type fakeGitHub struct {
 	// after it was read, and
 	// gqlNotFound makes GraphQL answer that it resolves no repository by acme/widgets, as
 	// when the name came to name none.
-	readStatus  int
+	readStatus int
+	// widgetsName, when set, is the name GET /repositories/{id} answers for the id of
+	// acme/widgets, as after a rename.
+	widgetsName string
 	gqlIDSet    bool
 	gqlID       any
 	gqlNotFound bool
@@ -1093,7 +1096,13 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && r.URL.Path == widgets && f.issuesOff:
 		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets","has_issues":false}`)
 	case r.Method == "GET" && r.URL.Path == widgets:
-		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+		name := "acme/widgets"
+		if f.widgetsName != "" {
+			name = f.widgetsName
+		}
+		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"`+name+`","html_url":"https://github.com/`+name+`"}`)
+	case r.Method == "GET" && r.URL.Path == "/repositories/"+gadgetsRef:
+		io.WriteString(w, `{"id":`+gadgetsRef+`,"full_name":"acme/gadgets","html_url":"https://github.com/acme/gadgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":
 		f.graphql(w, r, b)
 	case f.reposDown && (strings.HasPrefix(r.URL.Path, "/repos/") || strings.HasPrefix(r.URL.Path, "/repositories/")):
