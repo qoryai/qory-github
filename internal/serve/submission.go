@@ -147,6 +147,8 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	}
 	d := github.Draft{Repository: repo, Branch: t.Branch, Base: t.Base.Branch, Title: ch.Text.Title, Description: ch.Text.Description, PreviousTitle: ch.PreviousTitle}
 	if t.Draft.Action == contracts.DraftUpdate {
+		// shortcut: int is 64 bits on amd64 and arm64, widen github.Draft.Number for a
+		// 32-bit build.
 		d.Number = int(t.Draft.Number)
 	}
 	got, err := a.GitHub.SubmitDraft(ctx, a.pacer(installation), tok, d)

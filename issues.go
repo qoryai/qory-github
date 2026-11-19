@@ -29,11 +29,11 @@ import (
 // the labels past the most an item has are left out, which is logged too; a label cut
 // and the labels left out are named labels in the item's truncated. A collection's
 // title, cut, is logged only, since the contract's collection has no truncated. A field
-// that cannot be cut into the contract, a ref, a URL, the path of a target's address, an empty title
-// or a time that is not RFC 3339, skips its item, comment or collection, which is
-// logged by its ref, never by its text, and the rest are sent. A request is at most
-// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
-// collections.
+// that cannot be cut into the contract, a ref, a URL, the path of a target's address, an
+// empty title or a time that is not RFC 3339, skips its item, comment or collection,
+// which is logged by its ref, never by its text, and the rest are sent. A request is at
+// most contracts.MaxRequest bytes, and lists at most the contract's most items, comments
+// or collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -121,7 +121,7 @@ type (
 	}
 )
 
-// WebHost is the system an item's target names: the website of the API the client
+// WebHost is the `system` of a target's address: the website of the API the client
 // reaches, github.com for GitHub's, and for a test the loopback host. It is the host
 // lower-cased and without its port, as the contract's pattern for a system takes it.
 func (c Client) WebHost() string {
@@ -527,7 +527,7 @@ func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, 
 }
 
 // IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
-// target's system, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
+// `system` of the target's address, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
 // unlabeled send the issue as it is now, and deleted sends it closed. Transferred sends
 // the issue closed in the repository it left and, when active says the repository it
 // went to is one Qory Apiary reads, by the ref of its collection, the issue it became

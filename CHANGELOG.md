@@ -150,8 +150,9 @@ change what the program does, and notes it under Upgrading.
   `target` as `{"collection": "<ref>", "address": {"system": "github.com", "path":
   "owner/name"}}`. Before, `target` was `{"system": "github.com", "path": "owner/name"}`
   and had no `collection`. The `ref` is the repository's id, as before, so a rename or a
-  transfer changes the `path` and keeps the `ref`. An address with an empty path, or one
-  longer than 200 characters, still skips the collection or the item.
+  transfer changes the `path` and keeps the `ref`. A path of 201 to 256 characters is now
+  skipped, with its collection or item, as the contract allows at most 200. An empty path
+  is skipped as before.
 
 ### Upgrading
 
