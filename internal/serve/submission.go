@@ -147,7 +147,9 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	}
 	d := github.Draft{Repository: repo, Branch: t.Branch, Base: t.Base.Branch, Title: ch.Text.Title, Description: ch.Text.Description, PreviousTitle: ch.PreviousTitle}
 	if t.Draft.Action == contracts.DraftUpdate {
-		d.Number = t.Draft.Number
+		// shortcut: int is 64 bits on amd64 and arm64, widen github.Draft.Number for a
+		// 32-bit build.
+		d.Number = int(t.Draft.Number)
 	}
 	got, err := a.GitHub.SubmitDraft(ctx, a.pacer(installation), tok, d)
 	err = a.forgetOn401(installation, err)
@@ -161,7 +163,7 @@ func (a *Adapter) applySubmission(ctx context.Context, ch contracts.Change, t co
 	default:
 		return contracts.SubmittedTarget{}, fmt.Errorf("%w%s", err, where)
 	}
-	reply.Draft = &contracts.SubmittedDraft{Number: got.Number, URL: got.URL, Title: replyTitle(got.Title, fallback), State: got.State, Action: got.Action}
+	reply.Draft = &contracts.SubmittedDraft{Number: int64(got.Number), URL: got.URL, Title: replyTitle(got.Title, fallback), State: got.State, Action: got.Action}
 	return reply, nil
 }
 

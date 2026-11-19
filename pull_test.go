@@ -266,7 +266,7 @@ func TestAPullSendsWhatChangedInEveryStateAndTheCommentsByItem(t *testing.T) {
 			reason = " " + *it.StateReason
 		}
 		got = append(got, it.Ref+" "+it.Key+" "+it.State+reason)
-		if it.Target == nil || it.Target.Path != "acme/widgets" || !strings.HasPrefix(it.URL, "https://github.com/acme/widgets/issues/") {
+		if it.Target == nil || it.Target.Address == nil || it.Target.Address.Path != "acme/widgets" || !strings.HasPrefix(it.URL, "https://github.com/acme/widgets/issues/") {
 			t.Errorf("item %s: target %+v, url %s", it.Ref, it.Target, it.URL)
 		}
 	}

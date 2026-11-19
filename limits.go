@@ -12,9 +12,9 @@ import (
 )
 
 // limits are what Qory Apiary takes, read from the integrations contract's schemas
-// themselves, so the adapter and the contract cannot drift apart: the most characters
-// of each text and ref, Unicode code points as JSON Schema counts them, the most
-// labels, the most entries of each request, and the pattern a target's system fits.
+// themselves, so the adapter and the contract cannot drift apart: the most characters of
+// each text and ref, Unicode code points as JSON Schema counts them, the most labels, the
+// most entries of each request, and the pattern the system of a target's address fits.
 type limits struct {
 	ref, url, title, body, name, label, labels, stateReason, path int
 	items, comments, collections                                  int
@@ -34,8 +34,8 @@ var contractLimits = sync.OnceValue(func() limits {
 		label:       number(defs, "labels", "items", "maxLength"),
 		labels:      number(defs, "labels", "maxItems"),
 		stateReason: number(defs, "state_reason", "maxLength"),
-		path:        number(defs, "target", "properties", "path", "maxLength"),
-		system:      regexp.MustCompile(text(defs, "target", "properties", "system", "pattern")),
+		path:        number(defs, "address_path", "maxLength"),
+		system:      regexp.MustCompile(text(defs, "system", "pattern")),
 		items:       number(schema("source-items.schema.json", "properties"), "items", "maxItems"),
 		comments:    number(schema("source-item-comments.schema.json", "properties"), "comments", "maxItems"),
 		collections: number(schema("source-collections.schema.json", "properties"), "collections", "maxItems"),

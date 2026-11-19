@@ -29,11 +29,11 @@ import (
 // the labels past the most an item has are left out, which is logged too; a label cut
 // and the labels left out are named labels in the item's truncated. A collection's
 // title, cut, is logged only, since the contract's collection has no truncated. A field
-// that cannot be cut into the contract, a ref, a URL, a target's path, an empty title
-// or a time that is not RFC 3339, skips its item, comment or collection, which is
-// logged by its ref, never by its text, and the rest are sent. A request is at most
-// contracts.MaxRequest bytes, and lists at most the contract's most items, comments or
-// collections.
+// that cannot be cut into the contract, a ref, a URL, the path of a target's address, an
+// empty title or a time that is not RFC 3339, skips its item, comment or collection,
+// which is logged by its ref, never by its text, and the rest are sent. A request is at
+// most contracts.MaxRequest bytes, and lists at most the contract's most items, comments
+// or collections.
 
 // timeWidth stands for a request's time while the request is sized: the sink sets the
 // time as it sends the request, and every time the wire carries, in
@@ -121,7 +121,7 @@ type (
 	}
 )
 
-// WebHost is the system an item's target names: the website of the API the client
+// WebHost is the `system` of a target's address: the website of the API the client
 // reaches, github.com for GitHub's, and for a test the loopback host. It is the host
 // lower-cased and without its port, as the contract's pattern for a system takes it.
 func (c Client) WebHost() string {
@@ -217,8 +217,8 @@ func authorOf(u *ghUser, cuts *[]Cut, ref, field string) contracts.Person {
 // the repository's id, #, and the issue's number, such as 1296269#42: GitHub gives
 // neither again, and a repository renamed or transferred keeps its id, where its
 // owner/name changes. A comment's ref is the comment's id. The collection's title, its
-// URL and its target's path, and an item's URL, still name the repository as GitHub
-// does, owner/name.
+// URL and the path of its target's address, and an item's URL, still name the repository
+// as GitHub does, owner/name.
 
 // idShape is a repository's id, or an issue's number, in a ref: decimal digits alone,
 // with no sign and no leading zero, which [parseID] holds to the range of an int64.
@@ -272,6 +272,13 @@ func ParseItemRef(ref string) (id, number int64, ok bool) {
 		return 0, 0, false
 	}
 	return id, number, true
+}
+
+// targetOf is the target of the repository r: its collection ref and its address on
+// system, the repository's owner/name as GitHub shows it. The ref stays the same when
+// the repository is renamed or transferred; the address changes.
+func targetOf(system string, r ghRepo) *contracts.Target {
+	return &contracts.Target{Collection: CollectionRef(r.ID), Address: &contracts.TargetAddress{System: system, Path: r.FullName}}
 }
 
 // collectionOf is a repository's issues as a collection, without a target. A listing
@@ -365,7 +372,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 		Labels:       labelsOf(is.Labels, &cuts, ref),
 		FiledBy:      authorOf(is.User, &cuts, ref, "filed_by.name"),
 		CommentCount: max(is.Comments, 0),
-		Target:       &contracts.Target{System: system, Path: r.FullName},
+		Target:       targetOf(system, r),
 	}
 	var ok1, ok2 bool
 	it.CreatedAt, ok1 = utc(is.CreatedAt)
@@ -379,7 +386,7 @@ func itemOf(system string, r ghRepo, is ghIssue) (contracts.Item, string, []Cut)
 	if why := checkRef(it.Ref); why != "" {
 		return it, why, nil
 	}
-	if why := checkPath(it.Target.Path); why != "" {
+	if why := checkPath(it.Target.Address.Path); why != "" {
 		return it, why, nil
 	}
 	if why := checkURL(it.URL); why != "" {
@@ -429,6 +436,7 @@ func commentOf(c ghComment, slug string, deleted bool) (contracts.Comment, strin
 
 // checkCollection is why a collection is skipped, or "". A listing has fitted its
 // title to the contract's limit, and an event sends only its ref.
+// The address of a target is optional data: a target without one is not checked for it.
 func checkCollection(c contracts.Collection) string {
 	if c.Title == "" {
 		return "its title is empty"
@@ -436,8 +444,8 @@ func checkCollection(c contracts.Collection) string {
 	if why := checkRef(c.Ref); why != "" {
 		return why
 	}
-	if c.Target != nil {
-		if why := checkPath(c.Target.Path); why != "" {
+	if c.Target != nil && c.Target.Address != nil {
+		if why := checkPath(c.Target.Address.Path); why != "" {
 			return why
 		}
 	}
@@ -453,7 +461,7 @@ func checkRef(ref string) string {
 
 func checkPath(path string) string {
 	if n := contractLimits().path; path == "" || tooLong(path, n) {
-		return fmt.Sprintf("its target's path is empty or longer than %d characters", n)
+		return fmt.Sprintf("the path of its target's address is empty or longer than %d characters", n)
 	}
 	return ""
 }
@@ -519,12 +527,12 @@ func (t *ToSend) addItem(c contracts.Collection, it contracts.Item, why string, 
 }
 
 // IssuesWebhook is what an issues event, GitHub's webhook payload, becomes; system is the
-// target's system, [Client.WebHost]. Opened, reopened, edited, closed, labeled and
-// unlabeled send the issue as it is now, and deleted sends it closed. Transferred sends
-// the issue closed in the repository it left and, when active says the repository it
-// went to is one Qory Apiary reads, by the ref of its collection, the issue it became
-// there. Every other action, and an event for a pull request, sends nothing. It does no
-// I/O.
+// `system` of the target's address, [Client.WebHost]. Opened, reopened, edited, closed,
+// labeled and unlabeled send the issue as it is now, and deleted sends it closed.
+// Transferred sends the issue closed in the repository it left and, when active says the
+// repository it went to is one Qory Apiary reads, by the ref of its collection, the issue
+// it became there. Every other action, and an event for a pull request, sends nothing. It
+// does no I/O.
 func IssuesWebhook(payload []byte, system string, active func(collectionRef string) bool) (ToSend, error) {
 	var ev struct {
 		Action     string  `json:"action"`
@@ -919,7 +927,7 @@ func (l Lister) repositoryParts(ctx context.Context, emit func(context.Context, 
 			c := collectionOf(r)
 			c.GrantRef = l.GrantRef
 			c.Title = fit(&cuts, c.Ref, "title", c.Title, contractLimits().title)
-			c.Target = &contracts.Target{System: system, Path: r.FullName}
+			c.Target = targetOf(system, r)
 			if why := checkCollection(c); why != "" {
 				if c.Ref == "" {
 					// No ref names it, so the line names the repository as GitHub does.

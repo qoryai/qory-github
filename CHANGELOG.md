@@ -145,6 +145,14 @@ change what the program does, and notes it under Upgrading.
 - Building `qory-github` from source needs Go 1.27.4, up from 1.27.1: the integrations
   and Forager modules it builds against require Go 1.27.3, and Go 1.27.4 fixes
   GO-2026-6859 in the standard library. The image builds with Go 1.27.4.
+- A repository is a collection with a `ref`, and its target is that `ref` with an
+  optional address. `qory-github-server serve` sends each collection and each issue with
+  `target` as `{"collection": "<ref>", "address": {"system": "github.com", "path":
+  "owner/name"}}`. Before, `target` was `{"system": "github.com", "path": "owner/name"}`
+  and had no `collection`. The `ref` is the repository's id, as before, so a rename or a
+  transfer changes the `path` and keeps the `ref`. A path of 201 to 256 characters is now
+  skipped, with its collection or item, as the contract allows at most 200. An empty path
+  is skipped as before.
 
 ### Upgrading
 
