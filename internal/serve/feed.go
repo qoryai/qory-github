@@ -650,8 +650,6 @@ func (f *feed) apply(ctx context.Context, ch contracts.Change) error {
 		return f.store.Put(nsAdapter, keySyncInterval, []byte(strconv.Itoa(interval)), 0)
 	case contracts.ChangeWatch:
 		return nil
-	case contracts.ChangeRequest:
-		return f.changeRequest(ctx, &entryState{}, ch)
 	}
 	return Permanent(errors.New("the change is not one serve knows"))
 }

@@ -99,33 +99,40 @@ func submitRefusal(reason, fix string, err error) error {
 	return &github.SubmitRefused{Reason: reason, Fix: fix, Err: err}
 }
 
-// repositoryOf is the repository of the target of ch, found by its collection ref, the
-// repository's id: the installation that reaches it reads the repository's current
-// owner/name from GitHub, GET /repositories/{id}, so a repository that was renamed still
-// gets its draft when the entry has its old name. The address of the target, where it
-// has one, is checked for its system, which must be the client's web host, see
-// [github.Client.WebHost], and for a path of the shape owner/name; it is no source of the
-// repository. Qory Apiary writes the address that serve sent for the collection, so an
-// address of another system, and a path of another shape, are Qory Apiary's defects, and
-// [Permanent]. The entry is refused with not_permitted when no installation reaches the
-// repository, the installation is suspended, the mint is refused or GitHub returns 403
-// for the read; with target_gone when GitHub returns that the repository is gone; and
-// with refused for another 4xx status that a retry does not change. Any other failure may
-// pass.
-func (a *Adapter) repositoryOf(ctx context.Context, ch contracts.Change, where string) (github.Repository, error) {
+// checkTarget is the id of the repository that the target of the pull-request entry ch
+// is found by, its collection ref, after the checks of the target, no request sent. The
+// address of the target, where it has one, must be on the system of the client's web host,
+// see [github.Client.WebHost], and have a path of the shape owner/name; it is no source of
+// the repository. Qory Apiary writes the address that serve sent for the collection, so
+// an address of another system, a path of another shape and a collection that is not a
+// repository's id are Qory Apiary's defects, and [Permanent].
+func (a *Adapter) checkTarget(ch contracts.Change, where string) (int64, error) {
 	t := ch.Target
 	if t.Address != nil {
 		if t.Address.System != a.GitHub.WebHost() {
-			return github.Repository{}, Permanent(errors.New("report this Qory Apiary defect: the address's system is not GitHub's host" + where))
+			return 0, Permanent(errors.New("report this Qory Apiary defect: the address's system is not GitHub's host" + where))
 		}
 		if !isOwnerName(t.Address.Path) {
-			return github.Repository{}, Permanent(errors.New("report this Qory Apiary defect: the address's path is not owner/name" + where))
+			return 0, Permanent(errors.New("report this Qory Apiary defect: the address's path is not owner/name" + where))
 		}
 	}
 	id, err := repositoryID(t.Collection)
 	if err != nil {
-		return github.Repository{}, Permanent(fmt.Errorf("report this Qory Apiary defect: %w%s", err, where))
+		return 0, Permanent(fmt.Errorf("report this Qory Apiary defect: %w%s", err, where))
 	}
+	return id, nil
+}
+
+// repositoryOf is the repository with the id id, the one that the target of ch is found
+// by, see [Adapter.checkTarget]: the installation that reaches it reads the repository's
+// current owner/name from GitHub, GET /repositories/{id}, so a repository that was renamed
+// still gets its draft when the entry has its old name. The entry is refused with
+// not_permitted when no installation reaches the repository, the installation is
+// suspended, the mint is refused or GitHub returns 403 for the read; with target_gone when
+// GitHub returns that the repository is gone; and with refused for another 4xx status that
+// a retry does not change. Any other failure may pass.
+func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Change, where string) (github.Repository, error) {
+	t := ch.Target
 	installation, ok, err := reachOf(a.Store, t.Collection)
 	if err != nil {
 		return github.Repository{}, err
@@ -165,29 +172,36 @@ func (a *Adapter) repositoryOf(ctx context.Context, ch contracts.Change, where s
 // with an installation token for that repository with pull_requests: write alone, from
 // the installation that RepositoryInstallation finds by the repository's current path.
 //
-// A change kind that the adapter does not apply, and data that breaks a rule of the
-// kind, see [github.ParsePullRequestData], are a [*github.SubmitRefused] with the reason
-// refused. So is a draft that a retry cannot open or update, whose reason is the reason
-// of the failure report, see [feed.changeRequest]: also not_permitted when no
-// installation reaches the repository, or the mint fails permanently,
-// [github.ErrMintRefused], or GitHub returns that the installation is suspended,
-// [github.ErrSuspended]. A target whose address is of another system or has a path
-// that is not owner/name, or a title with no visible character, is [Permanent]. Every
-// other error may pass, and the entry is applied again. Every error but the first ends with
-// "(change request {id}, {collection})".
+// The checks come in this order, each before any request: the kind, the target, see
+// [Adapter.checkTarget], the data, see [github.ParsePullRequestData], and the title. A
+// change kind that the adapter does not apply, and data that breaks a rule of the kind,
+// are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot
+// open or update, whose reason is the reason of the failure report, see
+// [feed.changeRequest]: also not_permitted when no installation reaches the repository,
+// or the mint fails permanently, [github.ErrMintRefused], or GitHub returns that the
+// installation is suspended, [github.ErrSuspended]. A target whose address is of another
+// system or has a path that is not owner/name, a collection that is not a repository's
+// id, or a title with no visible character, is [Permanent]. Every other error may pass,
+// and the entry is applied again. Every error but the first ends with "(change request
+// {id}, {collection})".
 func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (contracts.ChangesSubmitted, error) {
 	where := " (change request " + ch.ChangeRequestID + ", " + ch.Target.Collection + ")"
 	if ch.ChangeKind != github.ChangeKindPullRequest {
 		cause := fmt.Sprintf("qory-github applies only the kind %s, and the entry has the kind %q.", github.ChangeKindPullRequest, prefixOf(ch.ChangeKind, maxLogged))
 		return contracts.ChangesSubmitted{}, &github.SubmitRefused{Reason: github.ReasonRefused, Fix: github.FixChangeKind, Err: errors.New(cause + where), Message: github.OneLine(cause, github.MaxDetail)}
 	}
+	id, err := a.checkTarget(ch, where)
+	if err != nil {
+		return contracts.ChangesSubmitted{}, err
+	}
 	data, err := github.ParsePullRequestData(ch.Data)
 	if err != nil {
 		return contracts.ChangesSubmitted{}, within(err, where)
 	}
 	// The run's title, cleaned, is what the reply has when the pull request's title is
-	// left with nothing. The schema of the entry gives it a character that is not a space,
-	// so an entry without one is Qory Apiary's defect. Both checks come before any request.
+	// left with nothing. The contract requires a title with a character that is not a
+	// space, so an entry without one is Qory Apiary's defect. Both checks come before any
+	// request.
 	var fallback string
 	if data.Draft != nil {
 		var ok bool
@@ -198,7 +212,7 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (
 			return contracts.ChangesSubmitted{}, within(err, where)
 		}
 	}
-	repo, err := a.repositoryOf(ctx, ch, where)
+	repo, err := a.repositoryOf(ctx, id, ch, where)
 	if err != nil {
 		return contracts.ChangesSubmitted{}, err
 	}
@@ -324,17 +338,15 @@ type targetState struct {
 // the reply, or is reported or passed, is not applied again while state, the entry's
 // state, stands. The feed sends Qory Apiary the reply for a change that is put on GitHub,
 // see [feed.reply], and the entry is done once the reply is sent. An entry with no
-// change_request_id of the contract's shape, or no target, or a target whose collection
-// is not a repository's id, is [Permanent].
+// change_request_id of the contract's shape, or no target, is [Permanent]; so is a
+// pull-request entry whose target is not one that the adapter reads, see
+// [Adapter.checkTarget].
 func (f *feed) changeRequest(ctx context.Context, state *entryState, ch contracts.Change) error {
 	if err := github.CheckChangeRequestID(ch.ChangeRequestID); err != nil {
 		return Permanent(err)
 	}
 	if ch.Target == nil {
 		return Permanent(fmt.Errorf("report this Qory Apiary defect: the entry has no target (change request %s)", ch.ChangeRequestID))
-	}
-	if _, err := repositoryID(ch.Target.Collection); err != nil {
-		return Permanent(fmt.Errorf("report this Qory Apiary defect: %w (change request %s)", err, ch.ChangeRequestID))
 	}
 	ts := &state.applied
 	if !ts.done && ts.reply == nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -277,6 +278,16 @@ func TestAChangeRequestOfTheKindPullRequestOpensOneDraftAndRepliesWithItsAddress
 	}
 	if a := replies[0].Address; a == nil || a.Ref != "1" {
 		t.Errorf("the address is %+v, want the ref 1", a)
+	}
+	// The contract needs the address's host to equal the target's system. The stand-in
+	// answers html_url on github.com while its system is the loopback host, so the
+	// equality cannot show here; the form of the url and the system can.
+	u, err := url.Parse(replies[0].Address.URL)
+	if err != nil || u.Scheme != "https" || u.Port() != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Host != strings.ToLower(u.Host) || strings.Trim(u.Path, "/") == "" {
+		t.Errorf("the address's url %q breaks the contract's form: %v", replies[0].Address.URL, err)
+	}
+	if sys := replies[0].Target.Address.System; sys != w.adapter.GitHub.WebHost() {
+		t.Errorf("the target's system is %q, want the client's web host %q", sys, w.adapter.GitHub.WebHost())
 	}
 	r := replyData(replies[0])
 	if r.Base.Commit != sha(1) || r.Base.CommitURL != "https://github.com/acme/widgets/commit/"+sha(1) || len(r.Commits) != 4 {
@@ -1022,7 +1033,7 @@ func TestAMalformedChangeRequestEntryIsPassedWithoutAReport(t *testing.T) {
 		if !cursorIs(w, "c_1") || len(w.apiary.sent(routeChangesFailed)) != 0 || len(w.apiary.replies()) != 0 || len(w.gh.pullCalls()) != 0 {
 			t.Errorf("entry %+v: the step did not pass it quietly", entry)
 		}
-		if !strings.Contains(w.log.String(), "a change of the feed failed, and is passed") {
+		if !strings.Contains(w.log.String(), "failed, and is passed") {
 			t.Errorf("the log %s", w.log.String())
 		}
 	}
@@ -1715,7 +1726,9 @@ func TestATargetWithNoAddressIsFoundByItsCollection(t *testing.T) {
 // TestARepositoryThatCannotBeReadIsReportedByWhatGitHubReturns: each case ends the entry
 // with a failure report of its reason, whose detail starts with its fix, and no request
 // for pull requests: no installation reaches the repository, the installation is
-// suspended, the mint is refused, GitHub returns 403, 404, 410 or 400 for the read.
+// suspended, the mint is refused, GitHub returns 403, 404, 410, 301, 308 or 400 for the
+// read. The fix for 301 and 308 is the same check as for 404: the read is by id, so it has
+// no new name to link.
 func TestARepositoryThatCannotBeReadIsReportedByWhatGitHubReturns(t *testing.T) {
 	status := func(n int) func(w *wired) {
 		return func(w *wired) { setGitHub(w.gh, func(f *fakeGitHub) { f.readStatus = n }) }
@@ -1732,6 +1745,8 @@ func TestARepositoryThatCannotBeReadIsReportedByWhatGitHubReturns(t *testing.T) 
 		{"403", "not_permitted", github.FixAppForbidden, status(403)},
 		{"404", "target_gone", github.FixGone, status(404)},
 		{"410", "target_gone", github.FixGone, status(410)},
+		{"301", "target_gone", github.FixGone, status(301)},
+		{"308", "target_gone", github.FixGone, status(308)},
 		{"400", "refused", github.FixForgeRefused, status(400)},
 	} {
 		w := newChangeWired(t)
@@ -1761,13 +1776,13 @@ func TestAServerErrorOnTheReadOfTheRepositoryIsRetried(t *testing.T) {
 	}
 }
 
-// TestACollectionThatIsNoRepositoryIDIsPermanent: repositoryOf refuses it before any
-// request, as the feed does for an entry.
+// TestACollectionThatIsNoRepositoryIDIsPermanent: checkTarget refuses it before any
+// request, as applyChangeRequest does for an entry.
 func TestACollectionThatIsNoRepositoryIDIsPermanent(t *testing.T) {
 	w := newChangeWired(t)
 	ch := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft))
 	ch.Target.Collection = "acme/widgets"
-	if _, err := w.adapter.repositoryOf(context.Background(), ch, ""); err == nil || !IsPermanent(err) || len(w.gh.requests) != 0 {
+	if _, err := w.adapter.checkTarget(ch, ""); err == nil || !IsPermanent(err) || len(w.gh.requests) != 0 {
 		t.Errorf("err %v, %d requests", err, len(w.gh.requests))
 	}
 }
@@ -1816,5 +1831,114 @@ func TestAnAddressThatIsNotOwnerSlashNameIsPassed(t *testing.T) {
 	w.stepOK(t)
 	if len(w.apiary.sent(routeChangesFailed)) != 0 || len(w.apiary.replies()) != 0 || len(w.gh.requests) != 0 || !strings.Contains(w.log.String(), "the address's path is not owner/name") {
 		t.Errorf("the entry was not passed quietly: %s", w.log.String())
+	}
+}
+
+// TestAPullRequestEntryWithAnotherAddressAndBadDataIsPassed: the address is checked before
+// the data and the title, so an entry whose address system or path is wrong is logged and
+// passed, with no report, whatever else it has wrong.
+func TestAPullRequestEntryWithAnotherAddressAndBadDataIsPassed(t *testing.T) {
+	for _, tc := range []struct{ name, system, path, want string }{
+		{"another system", "gitlab.example.com", "acme/widgets", "the address's system is not GitHub's host"},
+		{"another path", testHost, "acme/widgets/extra", "the address's path is not owner/name"},
+	} {
+		w := newChangeWired(t)
+		target := targetOf(tc.path, 1, openDraft)
+		target.system = tc.system
+		entry := changeOf(testChangeID, "   ", "Text.", target)
+		entry.Target.Collection = refOf("acme/widgets")
+		entry.Data = json.RawMessage(strings.Replace(string(entry.Data), testBranch, "qory/wi 42", 1))
+		w.apiary.add(entry)
+		w.stepOK(t)
+		if len(w.apiary.sent(routeChangesFailed)) != 0 || len(w.apiary.replies()) != 0 || len(w.gh.requests) != 0 || !cursorIs(w, "c_1") || !strings.Contains(w.log.String(), tc.want) {
+			t.Errorf("%s: the entry was not passed quietly: %s", tc.name, w.log.String())
+		}
+	}
+}
+
+// TestAnEntryOfAnotherKindIsRefusedWhateverItsCollection: the kind is checked first, so an
+// entry of the kind reply is reported with the reason refused and the fix for the kind,
+// also when its collection is no repository's id or its address is of another system.
+func TestAnEntryOfAnotherKindIsRefusedWhateverItsCollection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(ch *contracts.Change)
+	}{
+		{"a collection that is no repository's id", func(ch *contracts.Change) { ch.Target.Collection = "R_1001"; ch.Target.Address = nil }},
+		{"an address of another system", func(ch *contracts.Change) { ch.Target.Address.System = "gitlab.example.com" }},
+	} {
+		w := newChangeWired(t)
+		entry := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft))
+		entry.ChangeKind = "reply"
+		tc.edit(&entry)
+		w.apiary.add(entry)
+		w.stepOK(t)
+		reports := w.apiary.sent(routeChangesFailed)
+		if len(reports) != 1 || reports[0].body["reason"] != "refused" || !strings.HasPrefix(detailOf(w, 0), github.FixChangeKind+" ") || len(w.gh.requests) != 0 || !cursorIs(w, "c_1") {
+			t.Errorf("%s: reports %+v, detail %q", tc.name, reports, detailOf(w, 0))
+		}
+	}
+}
+
+// TestAStoreEntryThatIsNoReachFailsTheStepWithoutAReport: a store entry for the repository
+// that is not an installation's reach is an error that a retry may change: the step fails,
+// no report or reply is sent, and the cursor stays.
+func TestAStoreEntryThatIsNoReachFailsTheStepWithoutAReport(t *testing.T) {
+	w := newChangeWired(t)
+	if err := w.st.Put(nsRepositories, collectionKey(widgetsRef), []byte("not json"), 0); err != nil {
+		t.Fatal(err)
+	}
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	err := w.feed.step(context.Background())
+	if err == nil || IsPermanent(err) || !strings.Contains(err.Error(), "the store's entry for a repository is not one") {
+		t.Fatalf("err %v", err)
+	}
+	if len(w.apiary.changeReports()) != 0 || len(w.apiary.replies()) != 0 || len(w.gh.requests) != 0 || !cursorIs(w, "") {
+		t.Errorf("a report or reply was sent, or the cursor moved")
+	}
+}
+
+// TestACancelledContextAppliesNoChangeRequest: changeRequest returns the context's error
+// before it applies the entry, so no request is sent and the entry keeps no state.
+func TestACancelledContextAppliesNoChangeRequest(t *testing.T) {
+	w := newChangeWired(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	state := &entryState{}
+	err := w.feed.changeRequest(ctx, state, changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	if !errors.Is(err, context.Canceled) || len(w.gh.requests) != 0 || state.applied.done || state.applied.reply != nil || state.applied.cause != nil {
+		t.Errorf("err %v, %d requests, state %+v", err, len(w.gh.requests), state.applied)
+	}
+}
+
+// TestAMintForPullRequestsThatIsRefusedOrSuspendedIsNotPermitted: the read of the repository
+// passes, then the mint of the token for pull requests fails for good, as GitHub answers
+// 422 for permissions the App has not, or the installation is suspended in between: the
+// entry is reported as not_permitted with the fix first, and no pull request is opened.
+func TestAMintForPullRequestsThatIsRefusedOrSuspendedIsNotPermitted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fix  string
+		set  func(f *fakeGitHub)
+	}{
+		{"the mint is refused", github.FixPermission, func(f *fakeGitHub) {
+			f.pullMint = func() (int, string) { return 422, `{"message":"Validation Failed"}` }
+		}},
+		{"the installation is suspended after the read", github.FixSuspended, func(f *fakeGitHub) {
+			f.pullFail = func(method, path string) (int, string) {
+				if strings.HasSuffix(path, "/installation") {
+					f.installSuspended = true
+				}
+				return 0, ""
+			}
+		}},
+	} {
+		w := newChangeWired(t)
+		setGitHub(w.gh, tc.set)
+		w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		w.stepOK(t)
+		if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets not_permitted"}) || !strings.HasPrefix(detailOf(w, 0), tc.fix) || len(w.gh.pullRequests("acme/widgets")) != 0 || len(w.apiary.replies()) != 0 {
+			t.Errorf("%s: reports %v, detail %q", tc.name, r, detailOf(w, 0))
+		}
 	}
 }
