@@ -746,12 +746,14 @@ func retryWait(err error) (time.Duration, bool) {
 //     such a refusal has no code;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
-//     nothing, and the periodic check sends the request again. Each is [Permanent],
-//     and so are 400, 403, 409 and 413, each a [*refusedError]; what a 409
-//     collection_not_linked does is for the request's sender to say, see
+//     nothing, and the periodic check sends the request again. Each is [Permanent], and
+//     so are any other 409 with a code, 400, 403 and 413, each a [*refusedError]; what a
+//     409 collection_not_linked does is for the request's sender to say, see
 //     [Apiary.Items] and [Apiary.Comments]. A 409 with no code, because the body cannot
-//     be read, is an error that may pass instead: it is no known refusal, so nothing
-//     changes and the sender sends the request again, with its backoff;
+//     be read, is no known refusal: it does not call [Apiary.Ended], and it is an error
+//     that may pass, so the worker, the feed and the pull round, which decide by
+//     [IsPermanent], send the request again with their backoff. A caller that decides by
+//     the refusal's status alone does not;
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.
