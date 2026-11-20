@@ -282,25 +282,39 @@ For each entry, the adapter:
   the shape `owner/name`; an entry with any other address is logged and passed. An
   entry whose `must_understand` the adapter cannot meet (see below) is reported as
   `refused` before the adapter checks its address.
-- Checks the entry's `data`: the branch name, the base, the commit ids, and the `draft`
-  member. Data that breaks a rule gets a failure report with the reason `refused`.
+- Checks the entry's `data`, which has the members of the `pull-request` artifact type
+  (the type's schema in the Qory harness is the source of the members): `branch` and
+  `base_branch`, names that git accepts; `head`, `base` and each of `commits`, a commit
+  whose `address.path` is a full commit id; 1 to 100 `commits` that end in `head`;
+  `steps`, each with a full commit id and a `step` of 1 to 128 characters;
+  `earlier_commits`, a whole number from 1, only with exactly 100 `commits`; and
+  `draft`, `true` or `false`. The `target`, `title` and `text` of the data are ignored:
+  the adapter uses those of the entry. Data that breaks a rule gets a failure report with
+  the reason `refused`.
+- Checks the entry's `title` and `text` before it sends anything to GitHub. A title that
+  has a control character, U+2028, U+2029, or a format character other than U+200C and
+  U+200D, or has no character that is not a space, U+200C or U+200D, gets a failure report
+  with the reason `refused` and a `detail` that starts with the fix. A `text` that has a
+  line that is `<!-- qory:start -->` or `<!-- qory:end -->`, with spaces, tabs or a
+  carriage return after it, gets the same report, because the adapter writes the `text`
+  between those two lines and such a line would end the block early on the next update.
 - Sends Qory Apiary the address of the base commit and of each listed commit,
-  `https://github.com/owner/name/commit/<commit>`, in the `data` of the reply. It does so
-  for every entry, also after a session that did not pass, when the entry asks for no
-  draft.
-- When the entry's `data` has a `draft`, looks for the pull request from the entry's
-  branch in that repository, of any state, and reads it. It finds the pull request by
-  the head branch and the repository alone, never by the base branch: a pull request
-  from a fork is not that pull request, and a pull request into another base branch is.
-  The `number` of a `draft` with the action `update` is a hint: if GitHub has no pull
-  request with that number from the branch, the adapter looks by the head branch. When
-  several pull requests have the head branch, the adapter takes the one with the entry's
-  `number` when it is among them, otherwise the open or draft one with the highest
-  number, and when none is open, the closed or merged one with the highest number.
-- Opens a draft pull request from the branch into the entry's base branch when there is
-  none. It never changes the base branch of an existing pull request, so a later entry
-  with another `base.branch` edits the same pull request and leaves its base as the
-  person set it.
+  `https://github.com/owner/name/commit/<commit>`, in the `data` of the reply.
+- Looks for the pull request to update. When the entry has `previous.address` and its
+  `ref` is a pull request number (decimal digits, no sign, no leading zero, at most
+  9223372036854775807), the adapter asks GitHub for that pull request of the repository,
+  and uses it when it is from the entry's branch in that repository itself. Otherwise,
+  and when GitHub has no such pull request, it looks by the head branch of the entry in
+  that repository, of any state. It never looks by the base branch: a pull request from a
+  fork is not that pull request, and a pull request into another base branch is. When
+  several pull requests have the head branch, it takes the open or draft one with the
+  highest number, and when none is open, the closed or merged one with the highest
+  number.
+- Opens a pull request from the branch into the entry's `base_branch` when it finds none,
+  as a draft when `draft` is `true`. It never changes the base branch of an existing pull
+  request, so a later entry with another `base_branch` edits the same pull request and
+  leaves its base as the person set it. It never changes whether an existing pull request
+  is a draft.
 - Changes nothing in a pull request that is closed or merged, and reports its state
   (`closed` or `merged`) with the action `kept`.
 - Changes an open or draft pull request only where something differs, and reports
@@ -317,9 +331,9 @@ The adapter reads the change feed as a reader that may be older than Qory Apiary
 - It reports a `change_request` entry whose `must_understand` lists a pointer that it
   does not define, or is not a list of JSON Pointers, as `refused`, with a `detail` that
   starts with the fix. A pointer below `data` is defined when it points to a member of
-  the pull-request data that the adapter reads: `branch`, `base` with `commit` and
-  `branch`, `commit`, `commits` with `commit` and `step` for each, `earlier_commits`, and
-  `draft` with `action` and `number`.
+  the `pull-request` data: `target`, `title`, `text`, `branch`, `base_branch`, `head`,
+  `base` and each of `commits` with their `collection` and `address`, `steps` with `commit`
+  and `step` for each, `earlier_commits`, and `draft`.
 
 The adapter reads the other documents that Qory Apiary sends it the same way: the
 connect pass, the setup pass, the answer to the grants, the answer to the secrets
@@ -358,9 +372,8 @@ handled as before.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
-(`created`, `updated` or `kept`) when the entry has a `draft`, and neither when it has
-none. The `data` of the reply has the commit addresses and, for a draft, its `number`,
-`title` and `state`. An entry that fails for good gets a failure report, as below, and no
+(`created`, `updated` or `kept`). The `data` of the reply has the commit addresses and the
+pull request's `number`, `title` and `state` (`draft`, `open`, `closed` or `merged`). An entry that fails for good gets a failure report, as below, and no
 reply. While an entry fails and may succeed on a retry, for example after a 5xx status,
 the adapter applies the entry again, and the entries after it for the same repository
 wait. When the retries end, after a day of failures, it reports the entry as
@@ -385,9 +398,9 @@ equals `previous.title` of the entry. A title that a person edited
 stays. The description of the run is at most 20000 characters and the title at most 256;
 GitHub keeps at most 65536 characters in a description, and an update that would pass
 that is reported as `too_long` before GitHub is asked. The title in the reply to Qory
-Apiary is the pull request's title without the control, bidirectional and invisible
-characters that Qory Apiary refuses; the pull request keeps its title. When that leaves
-only spaces, the reply has the run's title, cleaned the same way.
+Apiary is the pull request's title without the characters that the title rule stops, as
+above; the pull request keeps its title. When that leaves no character that is not a
+space, U+200C or U+200D, the reply has the run's title.
 
 When the adapter cannot do what an entry asks for, and a retry cannot change that, it
 sends Qory Apiary a failure report for that entry with one reason and a `detail`. The
@@ -401,7 +414,7 @@ header and no address with a password.
 | `not_permitted` | GitHub returned 404 for a request about the pull request, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix is to give the App the Pull requests permission and access to the repository. |
 | `target_gone` | GitHub returned 404, 410, 301 or 308 for the read of the repository by its id, or 301 or 308 for the lookup of its installation or for a pull request call. The fix for the read by id is to check that the repository exists and the App's installation reaches it. The fix for the lookup or a pull request call is to link the repository by its new name. |
 | `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix names the text to shorten. |
-| `refused` | The entry's `change_kind` is not `pull-request`, or its `must_understand` lists a pointer that the adapter does not define or is not a list of JSON Pointers, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix is to push the branch again, or to create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message, except for a `must_understand` that the adapter cannot meet: that `detail` starts with the fix, has the pointer when there is one, and has no GitHub status or message. |
+| `refused` | The entry's `change_kind` is not `pull-request`, or its `must_understand` lists a pointer that the adapter does not define or is not a list of JSON Pointers, or its `data` breaks a rule of the kind, or its `title` has a character that the title rule stops or no character that is not a space, U+200C or U+200D, or its `text` has a marker line, or GitHub's 422 says the head branch or the base branch does not exist (the fix is to push the branch again, or to create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message, except for a `must_understand` that the adapter cannot meet: that `detail` starts with the fix, has the pointer when there is one, and has no GitHub status or message. |
 | `unreachable` | GitHub timed out, did not connect, closed the connection while its answer was read, was busy, rate limited or returned 5xx for a day. Each entry is reported by the last error of its tries. |
 
 ### Token expiry

@@ -102,6 +102,10 @@ characters that the contract refuses for `draft_title`: control characters, line
 paragraph separators, bidirectional and invisible format characters. When nothing but
 spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
 
+The program removes a fixed list of format characters. The title rule of `qory-github-server`
+stops every format character except U+200C and U+200D, so the program keeps U+206A to U+206F,
+U+E0001 and U+E0020 to U+E007F in a title, and counts U+200C and U+200D as visible.
+
 | Exit | Meaning |
 |---|---|
 | 0 | Done. |

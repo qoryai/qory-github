@@ -17,18 +17,28 @@ change what the program does, and notes it under Upgrading.
   the target's `collection`, the repository's id, so a renamed repository still gets its
   draft; the address of the target is checked for the host and for the shape `owner/name`
   and is not what finds the repository. For each entry it sends Qory Apiary one reply
-  with the address of the base commit and of each commit in `data`, with or without a
-  draft, and, when `data` has a `draft`, the pull request's `address` (its `url`, and its
-  number as `ref`), the action `created`, `updated` or `kept`, and in `data` the
-  pull request's number, title and state. It finds the pull request by its head branch
-  and repository, of any state, and never by its base branch, opens a draft when there is
-  none, and changes only the text between the lines `<!-- qory:start -->` and
-  `<!-- qory:end -->` of the description, and the title only while it equals
-  `previous.title`. A closed or merged pull request is not changed. The adapter reads the
-  members `branch`, `base`, `commits`, `earlier_commits` and `draft` of `data` and checks
-  each: a branch name that git accepts, full commit ids, 1 to 100 commits that end in the
-  head commit, a `draft` of the action `open`, or `update` with a `number` from 1; data
-  that breaks a rule is reported as `refused`. An entry of another `change_kind` is
+  with the address of the base commit and of each commit in `data`, the pull request's
+  `address` (its `url`, and its number as `ref`), the action `created`, `updated` or
+  `kept`, and in `data` the pull request's number, title and state. It updates the pull
+  request at the entry's `previous.address` when the `ref` there is a pull request number
+  from the entry's branch, and otherwise finds the pull request by its head branch and
+  repository, of any state, and never by its base branch. It opens a pull request when it
+  finds none, as a draft when `draft` is `true`, and changes only the text between the
+  lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and the title
+  only while it equals `previous.title`. It never changes whether a pull request is a
+  draft, and does not change a closed or merged pull request. The adapter reads the
+  members of the `pull-request` artifact type (its schema in the Qory harness is the
+  source): `branch`, `base_branch`, `head`, `base`, `commits`, `steps`,
+  `earlier_commits` and `draft`, and checks each: a branch name that git accepts, a full
+  commit id as the address path of each commit, 1 to 100 commits that end in `head`, a
+  `step` of 1 to 128 characters, and `draft` as `true` or `false`; data that breaks a
+  rule is reported as `refused`. A title that has a control character, U+2028, U+2029 or
+  a format character other than U+200C and U+200D, or no character that is not a space,
+  U+200C or U+200D, is reported as `refused` before any request to GitHub, with a `detail`
+  that starts with the fix; so is a `text` that has a line that is `<!-- qory:start -->`
+  or `<!-- qory:end -->`, since the adapter writes the text between those lines. The same
+  rule for characters applies to the failure `detail`, the account title of a grant and
+  the author name of a comment. An entry of another `change_kind` is
   reported as `refused`, with a `detail` that starts with the fix. An entry that GitHub
   refuses for good is reported to Qory Apiary with the reason `not_permitted`,
   `target_gone`, `too_long` or `refused`, and a `detail` with the fix and GitHub's status
@@ -41,7 +51,7 @@ change what the program does, and notes it under Upgrading.
   or on a pull request call is `target_gone` too, with the fix to link the repository by
   its new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App
   needs the permission Pull requests: read and write. The title in the reply has none of
-  the control, bidirectional or invisible characters that Qory Apiary refuses.
+  the characters that the title rule stops.
 - The description of the adapter lists the change kind `pull-request` in
   `roles.source.change_kinds`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
@@ -178,9 +188,10 @@ change what the program does, and notes it under Upgrading.
   the run credential) ignore such a member too. A `change_request` entry whose
   `must_understand` lists a pointer that the adapter does not define, or is not a list,
   is reported as `refused`, with a `detail` that starts with the fix. A pointer below
-  `data` is defined when it points to a member of the pull-request data that the adapter
-  reads: `branch`, `base` with `commit` and `branch`, `commit`, `commits` with `commit`
-  and `step` for each, `earlier_commits`, and `draft` with `action` and `number`. An
+  `data` is defined when it points to a member of the `pull-request` data: `target`,
+  `title`, `text`, `branch`, `base_branch`, `head`, `base` and each of `commits` with their
+  `collection` and `address`, `steps` with `commit` and `step` for each,
+  `earlier_commits`, and `draft`. An
   entry with a status of its kind that the adapter does not know still stops its answer.
 - `qory-github-server serve` matches the name of a member of a document from Qory Apiary
   in exact case: the change feed and its entries, the calls to the adapter, the data of
