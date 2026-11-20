@@ -38,8 +38,8 @@ func pullRequestSchema(t *testing.T) *jsonschema.Schema {
 }
 
 // TestParsePullRequestDataAgreesWithTheTypesSchema: for each change of a member that the
-// adapter reads (branch, base_branch, head, base, commits, steps, earlier_commits, draft),
-// the data is valid by the schema of the pull-request type if and only if
+// adapter reads (branch, base_branch, head, base, commits, steps, earlier_commits,
+// draft), the data is valid by the schema of the pull-request type if and only if
 // [ParsePullRequestData] accepts it. The members that the adapter does not read (target,
 // title, text, the system of an address, a member that the schema does not define) are
 // left alone, so a case of them is not here.
@@ -191,7 +191,8 @@ func TestParsePullRequestDataAgreesWithTheTypesSchema(t *testing.T) {
 	agree := 0
 	for _, p := range probes {
 		data := pullData(func(m map[string]any) {
-			// pullData sets a commits list and steps of fresh maps, so a probe edits them freely.
+			// pullData sets a commits list and steps of fresh maps, so a probe edits them
+			// freely.
 			if p.edit != nil {
 				p.edit(m)
 			}
@@ -208,6 +209,7 @@ func TestParsePullRequestDataAgreesWithTheTypesSchema(t *testing.T) {
 		}
 		agree++
 	}
+	t.Logf("%d cases agree", agree)
 	if agree < 400 {
 		t.Errorf("only %d cases agree", agree)
 	}
@@ -218,7 +220,7 @@ var absent = new(int)
 
 // TestAStoppedCharacterInAMemberIsRefusedWithItsCodePoint: U+202E, U+E0041, U+0007 and
 // U+2028 in the branch, the base branch, a step, and the collection of the head, the base
-// and a commit give a refusal that names the code point and not the value, and U+200C and
+// and a commit give a refusal with the code point and not the value, and U+200C and
 // U+200D pass.
 func TestAStoppedCharacterInAMemberIsRefusedWithItsCodePoint(t *testing.T) {
 	members := map[string]func(v string) func(m map[string]any){

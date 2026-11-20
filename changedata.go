@@ -91,7 +91,7 @@ type rawData struct {
 }
 
 // stopped is the refusal text for a string that has a character that the line rule of the
-// type's schema stops, or "" when it has none. It names the code point, never the value.
+// type's schema stops, or "" when it has none. It has the code point, never the value.
 func stopped(name, s string) string {
 	i := strings.IndexFunc(s, LineStopped)
 	if i < 0 {

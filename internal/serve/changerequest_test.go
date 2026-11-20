@@ -619,9 +619,9 @@ func TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase(t *testing.T) {
 
 // TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more
 // pull requests from the head branch, the entry's number is taken when it is among them;
-// otherwise the newest open one. A closed or merged one is never chosen by the branch, see
-// TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is reported
-// unreachable.
+// otherwise the newest open one. A closed or merged one is never chosen by the branch,
+// see TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is
+// reported unreachable.
 func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *testing.T) {
 	pull := func(n int, base string, closed, merged bool) *ghPullRec {
 		return &ghPullRec{repo: "acme/widgets", head: testBranch, base: base, number: n, title: fmt.Sprint("Pull ", n), draft: !closed, closed: closed, merged: merged}
@@ -1558,12 +1558,12 @@ func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	}
 }
 
-// TestAStoppedCharacterInTheDataIsReportedRefusedBeforeAnyRequest: a character that the line
-// rule of the pull-request type stops (U+202E, U+E0041, U+0007, U+2028), in the branch, the
-// base branch, a step, or the collection of the head, the base or a commit, gives a failure
-// report with the reason refused. The detail starts with the fix, names the code point, and
-// has no stopped character, and no request reaches GitHub. U+200C and U+200D open a pull
-// request.
+// TestAStoppedCharacterInTheDataIsReportedRefusedBeforeAnyRequest: a character that the
+// line rule of the pull-request type stops (U+202E, U+E0041, U+0007, U+2028), in the
+// branch, the base branch, a step, or the collection of the head, the base or a commit,
+// gives a failure report with the reason refused. The detail starts with the fix, names
+// the code point, and has no stopped character, and no request reaches GitHub. U+200C and
+// U+200D open a pull request.
 func TestAStoppedCharacterInTheDataIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	members := map[string]func(m map[string]any, v string){
 		"data.branch":      func(m map[string]any, v string) { m["branch"] = "qory/a" + v },

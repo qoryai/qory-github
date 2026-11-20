@@ -36,8 +36,8 @@ func TestOneLineCleansAndCuts(t *testing.T) {
 	}
 }
 
-// TestTheChosenPullRequestIsTheOneWithTheHighestNumber: of the open pull requests from the
-// branch, the one with the highest number is chosen.
+// TestTheChosenPullRequestIsTheOneWithTheHighestNumber: of the open pull requests from
+// the branch, the one with the highest number is chosen.
 func TestTheChosenPullRequestIsTheOneWithTheHighestNumber(t *testing.T) {
 	pull := func(n int) ghPull { return ghPull{Number: n, State: "open"} }
 	for _, tc := range []struct {

@@ -290,10 +290,10 @@ For each entry, the adapter:
   (the contract's limits of the data apply); `steps`, a list, each with a full commit id
   and a `step` of 1 to 128 characters on one line; `earlier_commits`, a whole number from
   1; and `draft`, `true` or `false`. One line has no control character, no U+2028 or
-  U+2029, and no format character other than U+200C and U+200D. The `target`, `title` and `text` of
-  the data are ignored: the adapter uses those of the entry. Data that breaks a rule gets
-  a failure report with the reason `refused`, and a `detail` that names the member and,
-  for a stopped character, its code point.
+  U+2029, and no format character other than U+200C and U+200D. The `target`, `title` and
+  `text` of the data are ignored: the adapter uses those of the entry. Data that breaks a
+  rule gets a failure report with the reason `refused`, and a `detail` that has the
+  member and, for a stopped character, its code point.
 - Checks the entry's `title` and `text` before it sends anything to GitHub. A title that
   has a control character, U+2028, U+2029, or a format character other than U+200C and
   U+200D, or has no character that is not a space, U+200C or U+200D, gets a failure report
