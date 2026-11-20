@@ -290,7 +290,7 @@ func TestParsePullRequestDataRefusesARepeatedMember(t *testing.T) {
 		"branch":       `{"branch":"other",` + data[1:],
 		"same branch":  `{"branch":"qory/wi_42",` + data[1:],
 		"base":         strings.Replace(data, `"base":{`, `"base":{"commit":"`+sha(9)+`",`, 1),
-		"draft action": strings.Replace(data, `"action":"open"`, `"action":"open","action":"update"`, 1),
+		"draft action": strings.Replace(data, `"action":"open"`, `"action":"update","action":"open"`, 1),
 	} {
 		d, err := ParsePullRequestData(json.RawMessage(doc))
 		var refused *SubmitRefused
