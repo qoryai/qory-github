@@ -58,6 +58,32 @@ func TestTheChosenPullRequestIsTheOpenOneWithTheHighestNumber(t *testing.T) {
 	}
 }
 
+// TestSubmitDraftStopsATitleOrATextThatBreaksTheRulesBeforeAnyRequest: SubmitDraft itself
+// returns a refusal with the reason refused for a text with a marker line and for a title
+// that the title rule stops, and sends nothing to GitHub.
+func TestSubmitDraftStopsATitleOrATextThatBreaksTheRulesBeforeAnyRequest(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	for _, tc := range []struct{ name, title, text, fix string }{
+		{"a marker line", "T", "a\n<!-- qory:end -->\nb", fixMarkerLine},
+		{"a stopped character", "T\u202e", "D", fixTitleStopped},
+		{"a blank title", " \u200d ", "D", fixTitleBlank},
+	} {
+		_, err := Client{API: srv.URL}.SubmitDraft(context.Background(), nil, "tok", Draft{Repository: Repository{Owner: "acme", Name: "widgets"}, Branch: "qory/wi_1", Base: "main", Title: tc.title, Description: tc.text})
+		refused, ok := err.(*SubmitRefused)
+		if !ok || refused.Reason != ReasonRefused || refused.Fix != tc.fix {
+			t.Errorf("%s: %#v", tc.name, err)
+		}
+	}
+	if requests != 0 {
+		t.Errorf("%d requests reached GitHub", requests)
+	}
+}
+
 // TestAnAnswerThatEchoesTheTokenDoesNotCarryItInTheRefusal: GitHub's message for a 400 has
 // the token that was sent; the refusal's message, which the failure report's detail has,
 // does not.

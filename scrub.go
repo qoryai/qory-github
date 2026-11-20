@@ -14,8 +14,8 @@ import (
 // Cc), U+2028, U+2029, and every format character (category Cf) but U+200C and U+200D,
 // which emoji sequences and some scripts need. It is the rule of $defs.line in the
 // contract's description.schema.json, and of a title, an account title, an author name
-// and a failure detail, which refer to it. The Unicode version of the Go release decides
-// which characters are in category Cf.
+// and a failure detail, which refer to it. Which characters are in category Cf depends on
+// the Unicode version of the Go release.
 func LineStopped(r rune) bool {
 	switch r {
 	case '\u2028', '\u2029':

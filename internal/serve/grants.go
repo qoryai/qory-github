@@ -59,9 +59,9 @@ const maxAccountTitle = 1024
 
 // accountOf is the account of an installation's grant, as the grant's report sends it:
 // ref, the GitHub account's id in decimal, and title, its login. A login that is not
-// one line of 1 to [maxAccountTitle] characters with none of the characters
-// that [github.LineStopped] stops, is sent as the ref instead, so the
-// report never breaks the contract.
+// one line of 1 to [maxAccountTitle] characters with none of the characters that
+// [github.LineStopped] stops, is sent as the ref instead, so the report never breaks the
+// contract.
 func accountOf(a github.Account) contracts.Account {
 	ref := strconv.FormatInt(a.ID, 10)
 	title := a.Login

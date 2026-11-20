@@ -167,7 +167,7 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // applyChangeRequest puts one change_request entry on GitHub and returns the reply for
 // it, see [github.Client.SubmitDraft]. The reply has the address of the base commit and
 // of each commit in its data, made with no request, and the address and the action of the
-// pull request, which the adapter opens as a draft or not, as the data's draft says, or
+// pull request, which the adapter opens as a draft when the data's draft is true, or
 // updates, with an installation token for that repository with pull_requests: write
 // alone, from the installation that RepositoryInstallation finds by the repository's
 // current path.

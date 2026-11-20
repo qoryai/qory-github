@@ -173,8 +173,8 @@ func CheckChangeRequestID(id string) error {
 	return nil
 }
 
-// Draft is what a change request entry asks for one repository: the pull request from
-// Branch into Base, with the run's text, a draft when AsDraft. Number is the number of
+// Draft is the pull request of a change request entry for one repository: from Branch
+// into Base, with the run's text, a draft when AsDraft. Number is the number of
 // the pull request at the previous version's address, a hint, or 0 for an entry with
 // none. Description is the content of the marked block of the description, see
 // [markedDescription]. PreviousTitle is the title of the previous version, see
@@ -243,8 +243,8 @@ const (
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
-	fixMarkerLine     = "Remove the lines <!-- qory:start --> and <!-- qory:end --> from the text, then submit again."
-	fixTitleStopped   = "Remove control and invisible format characters from the title, then submit again."
+	fixMarkerLine     = "Remove the marker lines that start with qory:start and qory:end from the text, then submit again."
+	fixTitleStopped   = "Remove control, line-break or invisible format characters from the title, then submit again."
 	fixTitleBlank     = "Give the title a character that is not a space, then submit again."
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
 	fixPullTitle      = "Shorten the title of the pull request on GitHub to 256 characters or fewer."
@@ -377,6 +377,9 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 		return DraftResult{}, invalidChange("report this Qory Apiary defect: the entry has no branch, base branch or title")
 	}
 	if err := CheckDraftText(d.Title, d.Description); err != nil {
+		return DraftResult{}, err
+	}
+	if err := CheckTitle(d.Title); err != nil {
 		return DraftResult{}, err
 	}
 	if err := CheckMarkers(d.Description); err != nil {

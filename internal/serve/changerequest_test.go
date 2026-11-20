@@ -36,7 +36,7 @@ var testHost = github.Client{API: "http://127.0.0.1:1"}.WebHost()
 // sha is the commit id the tests give commit n: 40 hexadecimal digits.
 func sha(n int) string { return fmt.Sprintf("%040x", n) }
 
-// draftAsk is what the test asks of the pull request: Number 0 for an entry that has no
+// draftAsk is what the test sets for the pull request: Number 0 for an entry that has no
 // previous address, or the number in the ref of the previous version's address.
 type draftAsk struct {
 	Number int64
@@ -50,7 +50,7 @@ var (
 // crTarget is the target of a change request entry for the repository path on system:
 // the branch the run pushed, a base at sha(1) on the branch base, and commits commits,
 // sha(2) on; with draft, the entry has a previous address with the number of draft, and
-// ready makes the data ask for a pull request that is no draft.
+// ready sets the data's draft to false, so the pull request is no draft.
 type crTarget struct {
 	path, system, base string
 	commits            int
@@ -1448,9 +1448,9 @@ func TestTheTitleOfThePullRequestInTheReplyIsCleaned(t *testing.T) {
 // request is made. A title with a ZWJ emoji sequence is put on GitHub as it is.
 func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	for _, tc := range []struct{ name, title, fix string }{
-		{"a right-to-left override", "Fix \u202e the widget", "Remove control and invisible format characters"},
-		{"a tag letter", "Fix \U000E0041 the widget", "Remove control and invisible format characters"},
-		{"a line break", "Fix\nthe widget", "Remove control and invisible format characters"},
+		{"a right-to-left override", "Fix \u202e the widget", "Remove control, line-break or invisible format characters"},
+		{"a tag letter", "Fix \U000E0041 the widget", "Remove control, line-break or invisible format characters"},
+		{"a line break", "Fix\nthe widget", "Remove control, line-break or invisible format characters"},
 		{"spaces only", "   ", "Give the title a character that is not a space"},
 		{"ZWJ and ZWNJ only", "\u200d\u200c", "Give the title a character that is not a space"},
 	} {
@@ -1487,7 +1487,7 @@ func TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets refused"}) || !cursorIs(w, "c_1") {
 		t.Fatalf("reports %v", r)
 	}
-	if d := detailOf(w, 0); !strings.HasPrefix(d, "Remove the lines <!-- qory:start --> and <!-- qory:end --> from the text") {
+	if d := detailOf(w, 0); !strings.HasPrefix(d, "Remove the marker lines that start with qory:start and qory:end from the text") {
 		t.Errorf("the detail is %q", d)
 	}
 	if calls := w.gh.pullCalls(); len(calls) != 0 || len(w.gh.pullRequests("acme/widgets")) != 0 {
@@ -1630,7 +1630,7 @@ func TestAPullRequestAtTheAddressThatAPersonFinishedIsKept(t *testing.T) {
 	}
 }
 
-// TestAnUpdateKeepsWhetherThePullRequestIsADraft: the data of an update says draft false,
+// TestAnUpdateKeepsWhetherThePullRequestIsADraft: the data of an update has draft false,
 // and pull request 7 is a draft: the update changes the text and leaves it a draft.
 func TestAnUpdateKeepsWhetherThePullRequestIsADraft(t *testing.T) {
 	w := newChangeWired(t)

@@ -15,8 +15,8 @@ change what the program does, and notes it under Upgrading.
   with `pull_requests: write` and no other permission. An entry has one target, so a
   change request for two repositories is two entries. The adapter finds the repository by
   the target's `collection`, the repository's id, so a renamed repository still gets its
-  draft; the address of the target is checked for the host and for the shape `owner/name`
-  and is not what finds the repository. For each entry it sends Qory Apiary one reply
+  pull request; the address of the target is checked for the host and for the shape
+  `owner/name` and is not what finds the repository. For each entry it sends Qory Apiary one reply
   with the address of the base commit and of each commit in `data`, the pull request's
   `address` (its `url`, and its number as `ref`), the action `created`, `updated` or
   `kept`, and in `data` the pull request's number, title and state. It updates the pull
@@ -189,10 +189,10 @@ change what the program does, and notes it under Upgrading.
   `must_understand` lists a pointer that the adapter does not define, or is not a list,
   is reported as `refused`, with a `detail` that starts with the fix. A pointer below
   `data` is defined when it points to a member of the `pull-request` data: `target`,
-  `title`, `text`, `branch`, `base_branch`, `head`, `base` and each of `commits` with their
-  `collection` and `address`, `steps` with `commit` and `step` for each,
-  `earlier_commits`, and `draft`. An
-  entry with a status of its kind that the adapter does not know still stops its answer.
+  `title`, `text`, `branch`, `base_branch`, `head`, `base` and each of `commits` with
+  their `collection` and `address`, `steps` with `commit` and `step` for each,
+  `earlier_commits`, and `draft`. An entry with a status of its kind that the adapter
+  does not know still stops its answer.
 - `qory-github-server serve` matches the name of a member of a document from Qory Apiary
   in exact case: the change feed and its entries, the calls to the adapter, the data of
   a change request, the connect and setup passes, the answers to the grants and to the

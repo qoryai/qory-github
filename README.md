@@ -262,7 +262,7 @@ target is that `ref` and, as optional data, the address of the repository: `syst
 `github.com` and `path` `owner/name`. After a rename, the next listing has the new `path`
 under the same `ref`. Each issue is an item whose target has the same `ref` and address.
 
-### Draft pull requests of a change request
+### Pull requests of a change request
 
 `qory-github-server serve` opens or updates the pull request for each
 `change_request` entry of the kind `pull-request` that Qory Apiary writes to its change
@@ -302,8 +302,8 @@ For each entry, the adapter:
   `https://github.com/owner/name/commit/<commit>`, in the `data` of the reply.
 - Looks for the pull request to update. When the entry has `previous.address` and its
   `ref` is a pull request number (decimal digits, no sign, no leading zero, at most
-  9223372036854775807), the adapter asks GitHub for that pull request of the repository,
-  and uses it when it is from the entry's branch in that repository itself. Otherwise,
+  9223372036854775807), the adapter requests that pull request of the repository from
+  GitHub, and uses it when it is from the entry's branch in that repository. Otherwise,
   and when GitHub has no such pull request, it looks by the head branch of the entry in
   that repository, of any state. It never looks by the base branch: a pull request from a
   fork is not that pull request, and a pull request into another base branch is. When
@@ -373,8 +373,8 @@ handled as before.
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
 (`created`, `updated` or `kept`). The `data` of the reply has the commit addresses and the
-pull request's `number`, `title` and `state` (`draft`, `open`, `closed` or `merged`). An entry that fails for good gets a failure report, as below, and no
-reply. While an entry fails and may succeed on a retry, for example after a 5xx status,
+pull request's `number`, `title` and `state` (`draft`, `open`, `closed` or `merged`). An
+entry that fails for good gets a failure report, as below, and no reply. While an entry fails and may succeed on a retry, for example after a 5xx status,
 the adapter applies the entry again, and the entries after it for the same repository
 wait. When the retries end, after a day of failures, it reports the entry as
 `unreachable`. If Qory Apiary does not take the reply for a day more, the adapter reports

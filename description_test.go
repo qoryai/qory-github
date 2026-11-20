@@ -17,7 +17,7 @@ func descriptionFile(t *testing.T, name string) string {
 	return string(b)
 }
 
-// TestTheDescriptionIsMarkedAsTheContractsFixturesWriteIt: markedDescription gives the
+// TestTheDescriptionIsMarkedAsTheContractsFixturesWriteIt: markedDescription returns the
 // result of every case of the contract's fixtures/description, and a second write of the
 // same text changes nothing.
 func TestTheDescriptionIsMarkedAsTheContractsFixturesWriteIt(t *testing.T) {
