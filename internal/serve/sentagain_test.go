@@ -50,7 +50,11 @@ func TestAGrantReportAnsweredWithoutACodeIsSentAgain(t *testing.T) {
 		if w := clock.waited(); !slices.Equal(w, []time.Duration{2 * time.Second}) {
 			t.Errorf("%s: waited %v", tc.name, w)
 		}
-		rig.linked(t, 42, testConnection, linkLive)
+		// The first listing, sent at the same time, makes the link live.
+		eventually(t, tc.name+": the link live", func() bool {
+			l, ok, _ := linkOf(rig.st, 42)
+			return ok && l.Connection == testConnection && l.State == linkLive
+		})
 		if strings.Contains(rig.log.String(), "so serve drops its link") {
 			t.Errorf("%s: the log says the link is dropped: %s", tc.name, rig.log.String())
 		}
