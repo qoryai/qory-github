@@ -239,7 +239,7 @@ func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
 // concern.
 func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 	for _, p := range []string{
-		"/data", "/title", "/data/title", "/data/text", "/data/target", "/data/branch", "/data/base_branch", "/data/base",
+		"/data", "/title", "/data/title", "/data/text", "/data/target", "/data/target/collection", "/data/target/address/path", "/data/branch", "/data/base_branch", "/data/base",
 		"/data/base/collection", "/data/base/address", "/data/base/address/path", "/data/head/address/system",
 		"/data/commits", "/data/commits/0", "/data/commits/12/address/path", "/data/steps/0/step", "/data/steps/3/commit",
 		"/data/earlier_commits", "/data/draft",

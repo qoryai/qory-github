@@ -16,7 +16,7 @@ import (
 // text of a refusal and the detail of its failure report, ends with a period and fits in
 // 100 characters.
 func TestEveryFixLineIsOneSentenceOfAtMost100Characters(t *testing.T) {
-	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, FixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixRunDescription, fixRunTitle, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused, FixGone, FixChangeKind, FixChangeData} {
+	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, FixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixRunDescription, fixRunTitle, fixTitleStopped, fixTitleBlank, fixMarkerLine, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused, FixGone, FixChangeKind, FixChangeData} {
 		if n := utf8.RuneCountInString(fix); n > 100 || !strings.HasSuffix(fix, ".") || strings.Contains(fix, "\n") {
 			t.Errorf("%d characters: %q", n, fix)
 		}
