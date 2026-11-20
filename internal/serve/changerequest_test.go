@@ -1646,6 +1646,31 @@ func TestAnUpdateKeepsWhetherThePullRequestIsADraft(t *testing.T) {
 	}
 }
 
+// TestTheReplyHasTheAddressesOfTheCommitsListNotOfHeadOrEarlierCommits: an entry whose head
+// is another commit than the last of commits, and that has earlier_commits, is applied;
+// the reply has the address of the base commit and of each commit of commits, in order.
+func TestTheReplyHasTheAddressesOfTheCommitsListNotOfHeadOrEarlierCommits(t *testing.T) {
+	w := newChangeWired(t)
+	target := targetOf("acme/widgets", 3, openDraft)
+	ch := changeOf(testChangeID, testTitle, "Text.", target)
+	var data map[string]any
+	if err := json.Unmarshal(ch.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	data["head"], data["earlier_commits"] = target.commitRef(sha(99)), 7
+	ch.Data, _ = json.Marshal(data)
+	w.apiary.add(ch)
+	w.stepOK(t)
+	replies := w.apiary.replies()
+	if len(replies) != 1 || len(w.apiary.changeReports()) != 0 {
+		t.Fatalf("replies %+v, reports %v", replies, w.apiary.changeReports())
+	}
+	r := replyData(replies[0])
+	if r.Base.Commit != sha(1) || len(r.Commits) != 3 || r.Commits[0].Commit != sha(2) || r.Commits[2].Commit != sha(4) {
+		t.Errorf("the reply is %+v", r)
+	}
+}
+
 // failAt makes the stand-in GitHub answer the request method path with status and body.
 func failAt(method, path string, status int, body string) func(f *fakeGitHub) {
 	return func(f *fakeGitHub) {

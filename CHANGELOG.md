@@ -30,8 +30,8 @@ change what the program does, and notes it under Upgrading.
   members of the `pull-request` artifact type (its schema in the Qory harness is the
   source): `branch`, `base_branch`, `head`, `base`, `commits`, `steps`,
   `earlier_commits` and `draft`, and checks each: a branch name that git accepts, a full
-  commit id as the address path of each commit, 1 to 100 commits that end in `head`, a
-  `step` of 1 to 128 characters, and `draft` as `true` or `false`; data that breaks a
+  commit id as the address path of each commit, at least 1 commit and no upper limit, a
+  `step` of 1 to 128 characters, `earlier_commits` as a whole number from 1, and `draft` as `true` or `false`; data that breaks a
   rule is reported as `refused`. A title that has a control character, U+2028, U+2029 or
   a format character other than U+200C and U+200D, or no character that is not a space,
   U+200C or U+200D, is reported as `refused` before any request to GitHub, with a `detail`

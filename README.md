@@ -285,10 +285,9 @@ For each entry, the adapter:
 - Checks the entry's `data`, which has the members of the `pull-request` artifact type
   (the type's schema in the Qory harness is the source of the members): `branch` and
   `base_branch`, names that git accepts; `head`, `base` and each of `commits`, a commit
-  whose `address.path` is a full commit id; 1 to 100 `commits` that end in `head`;
-  `steps`, each with a full commit id and a `step` of 1 to 128 characters;
-  `earlier_commits`, a whole number from 1, only with exactly 100 `commits`; and
-  `draft`, `true` or `false`. The `target`, `title` and `text` of the data are ignored:
+  whose `address.path` is a full commit id; at least 1 of `commits`, with no upper
+  limit; `steps`, each with a full commit id and a `step` of 1 to 128 characters;
+  `earlier_commits`, a whole number from 1; and `draft`, `true` or `false`. The `target`, `title` and `text` of the data are ignored:
   the adapter uses those of the entry. Data that breaks a rule gets a failure report with
   the reason `refused`.
 - Checks the entry's `title` and `text` before it sends anything to GitHub. A title that

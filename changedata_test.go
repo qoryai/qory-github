@@ -76,12 +76,29 @@ func TestParsePullRequestDataReadsTheMembers(t *testing.T) {
 	if err != nil || d.Draft {
 		t.Errorf("no draft wanted: %+v, %v", d, err)
 	}
-	d, err = ParsePullRequestData(pullData(func(m map[string]any) {
-		m["commits"], m["steps"] = commitsTo(101), stepsOf(101)
-		m["head"], m["earlier_commits"] = commitRef(sha(101)), json.RawMessage("3.4e1")
-	}))
-	if err != nil || len(d.Commits) != 100 {
-		t.Errorf("100 commits and earlier_commits: %+v, %v", d, err)
+}
+
+// TestParsePullRequestDataHasNoRuleThatTheSchemaLacks: the schema of the type states no
+// upper limit of commits, no relation between head and the last commit, and no relation
+// between earlier_commits and the number of commits, so the adapter accepts each. The
+// commits that it reads are those of commits, in order: head and earlier_commits do not
+// change them.
+func TestParsePullRequestDataHasNoRuleThatTheSchemaLacks(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(m map[string]any)
+		want int
+	}{
+		{"a head that is not the last commit", func(m map[string]any) { m["head"] = commitRef(sha(9)) }, 2},
+		{"earlier_commits 5 with 2 commits", func(m map[string]any) { m["earlier_commits"] = 5 }, 2},
+		{"earlier_commits 5.0 with 2 commits", func(m map[string]any) { m["earlier_commits"] = json.RawMessage("5.0") }, 2},
+		{"101 commits", func(m map[string]any) { m["commits"], m["steps"] = commitsTo(102), stepsOf(102) }, 101},
+		{"3000 commits", func(m map[string]any) { m["commits"], m["steps"] = commitsTo(3001), stepsOf(3001) }, 3000},
+	} {
+		d, err := ParsePullRequestData(pullData(tc.edit))
+		if err != nil || len(d.Commits) != tc.want || d.Commits[0] != sha(2) || d.Commits[tc.want-1] != sha(tc.want+1) {
+			t.Errorf("%s: %d commits, %v", tc.name, len(d.Commits), err)
+		}
 	}
 }
 
@@ -156,9 +173,7 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"no base", set("base", nil), "", "data.base is not a commit"},
 		{"a head that is not a commit", set("head", commitRef(secret)), "", "data.head is not a commit"},
 		{"no head", set("head", nil), "", "data.head is not a commit"},
-		{"a head that is not the last commit", set("head", commitRef(sha(9))), "", "does not end in data.head"},
-		{"no commits", func(m map[string]any) { m["commits"] = []any{} }, "", "not 1 to 100"},
-		{"101 commits", many(101, nil), "", "not 1 to 100"},
+		{"no commits", func(m map[string]any) { m["commits"] = []any{} }, "", "data.commits has no commit"},
 		{"a commit in upper case", set("commits", []any{commitRef(strings.ToUpper(sha(10)))}), "", "a commit of data.commits"},
 		{"a commit that is a string", nil, `{"branch":"qory/wi_42","commits":["` + sha(3) + `"]}`, "not a JSON object"},
 		{"a step of 129 characters", set("steps", []any{map[string]any{"commit": sha(3), "step": strings.Repeat("s", 129)}}), "", "the step"},
@@ -169,7 +184,6 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"earlier_commits as a string", many(100, set("earlier_commits", "3")), "", "data.earlier_commits"},
 		{"earlier_commits null", many(100, set("earlier_commits", nil)), "", "data.earlier_commits"},
 		{"earlier_commits past int64", many(100, set("earlier_commits", json.RawMessage("9223372036854775808"))), "", "data.earlier_commits"},
-		{"earlier_commits with 99 commits", many(99, set("earlier_commits", 5)), "", "exactly 100"},
 		{"no draft", set("draft", nil), "", "data.draft is not true or false"},
 		{"a draft that is a string", set("draft", "true"), "", "not a JSON object"},
 		{"a draft that is an object", set("draft", map[string]any{"action": "open"}), "", "not a JSON object"},

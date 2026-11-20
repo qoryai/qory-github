@@ -25,9 +25,8 @@ const FixUndefinedData = "List only members that the pull-request kind defines i
 
 // The limits of the data of a pull-request change request.
 const (
-	maxBranch  = 255
-	maxCommits = 100
-	maxStep    = 128
+	maxBranch = 255
+	maxStep   = 128
 )
 
 var (
@@ -136,9 +135,10 @@ func UndefinedDataPointer(pointers []string) string {
 // ParsePullRequestData reads the data of a change request of the kind pull-request, as
 // the pull-request artifact type writes it, and checks these rules: the branch and the
 // base branch are names git accepts, the head, the base and each commit have a full
-// commit id as address.path, 1 to 100 commits that end in the head, each step of steps
-// has a full commit id and 1 to 128 characters, earlier_commits from 1, only with exactly
-// 100 commits, and draft is true or false. A number that is whole, such as 34.0 or 3.4e1,
+// commit id as address.path, at least 1 commit, each step of steps has a full commit id
+// and 1 to 128 characters, earlier_commits is a whole number from 1, and draft is true or
+// false. The adapter reads only what the type's schema states: it does not cap the number
+// of commits, and head and earlier_commits have no further rule. A number that is whole, such as 34.0 or 3.4e1,
 // is read as the integer it equals. The error is a [*SubmitRefused] with the reason
 // refused, the fix [FixChangeData] and the broken rule as its message; the text states
 // the rule, never the value.
@@ -163,8 +163,8 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	if !commitShape.MatchString(raw.Head.commitID()) {
 		return refuse("data.head is not a commit with a full commit id as its address path")
 	}
-	if len(raw.Commits) == 0 || len(raw.Commits) > maxCommits {
-		return refuse("data.commits has %d commits, not 1 to %d", len(raw.Commits), maxCommits)
+	if len(raw.Commits) == 0 {
+		return refuse("data.commits has no commit")
 	}
 	out := PullRequestData{Branch: raw.Branch, BaseBranch: raw.BaseBranch, BaseCommit: raw.Base.commitID()}
 	for _, c := range raw.Commits {
@@ -172,9 +172,6 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 			return refuse("a commit of data.commits has no full commit id as its address path")
 		}
 		out.Commits = append(out.Commits, c.commitID())
-	}
-	if out.Commits[len(out.Commits)-1] != raw.Head.commitID() {
-		return refuse("data.commits does not end in data.head")
 	}
 	for _, s := range raw.Steps {
 		if !commitShape.MatchString(s.Commit) {
@@ -187,9 +184,6 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	if raw.EarlierCommits != nil {
 		if n, ok := wholeNumber(raw.EarlierCommits); !ok || n < 1 {
 			return refuse("data.earlier_commits is not a whole number from 1 to %d", int64(math.MaxInt64))
-		}
-		if len(raw.Commits) != maxCommits {
-			return refuse("data.earlier_commits is set, and data.commits does not have exactly %d commits", maxCommits)
 		}
 	}
 	if raw.Draft == nil {
