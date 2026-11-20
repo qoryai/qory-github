@@ -104,7 +104,7 @@ func stopped(name, s string) string {
 
 // refusalOfCommit is the refusal text for a commit of the data, or "" when it is valid
 // by the type's schema: a reference whose collection is a line of 1 to 200 characters and
-// whose address has a full commit id as its path. The text states the rule, never the
+// whose address has a full commit id as its path. The text has the rule, never the
 // value. name is how the text calls the commit.
 func refusalOfCommit(name string, r *reference) string {
 	if r == nil || r.Address == nil || !commitShape.MatchString(r.Address.Path) {
@@ -159,9 +159,9 @@ func UndefinedDataPointer(pointers []string) string {
 }
 
 // ParsePullRequestData reads the data of a change request of the kind pull-request, as
-// the pull-request artifact type writes it (the schema of commit ecc59e02 of the Qory
-// harness, branch 544-h-66), and checks these rules for the members it reads: the branch
-// and the base branch are names git accepts, of at most 255 characters, and a line; the
+// the pull-request artifact type writes it (the pull-request schema of the Qory harness,
+// copied to testdata/pull-request.schema.json, which is copied again when the schema
+// changes), and checks these rules for the members it reads: the branch and the base branch are names git accepts, of at most 255 characters, and a line; the
 // head, the base and each commit have a full commit id as address.path and a collection
 // of 1 to 200 characters that is a line; there is at least 1 commit; steps is a list, and
 // each step has a full commit id and a step of 1 to 128 characters that is a line;
@@ -170,10 +170,13 @@ func UndefinedDataPointer(pointers []string) string {
 // states: it sets no limit on the number of commits (the contract bounds the data), and
 // head and earlier_commits have no further rule. A member that the schema does not
 // define is ignored, and so is one that the adapter does not read. earlier_commits has
-// no upper limit, and a whole number such as 34.0 or 3.4e1 counts. The error is a
-// [*SubmitRefused] with the reason refused, the fix [FixChangeData] and the broken rule
-// as its message; the text states the rule and the code point of a stopped character,
-// never the value.
+// no upper limit, and a whole number such as 34.0 or 3.4e1 counts. A repeated member, a
+// lone surrogate escape and an invalid UTF-8 byte are refused although a JSON Schema
+// validator accepts them, since the data is read by [exactjson]; the refusal text is the
+// generic "data is not a JSON object whose members have the types of the pull-request
+// kind", which has no cause. The error is a [*SubmitRefused] with the reason refused, the
+// fix [FixChangeData] and the broken rule as its message; the text has the rule and the
+// code point of a stopped character, never the value.
 func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	refuse := func(format string, args ...any) (PullRequestData, error) {
 		err := fmt.Errorf(format, args...)
@@ -239,9 +242,9 @@ func validBranch(name string) bool {
 }
 
 // wholeFrom1 is whether the JSON number raw is a whole number of 1 or more, of any size:
-// the type's schema says integer with minimum 1, and a writer may write 34.0 or 3.4e1 for
-// 34. It reads the digits, the number of digits after the point and the exponent, so no
-// number is built and no value is rounded or capped. A missing member, a string, null,
+// the type's schema has `integer` with `minimum` 1, and a writer may write 34.0 or 3.4e1
+// for 34. It reads the digits, the number of digits after the point and the exponent, so
+// the value is never built, rounded or capped; only the exponent is read into a big.Int. A missing member, a string, null,
 // zero, a negative number and a number with a fraction that is not zero give false.
 func wholeFrom1(raw json.RawMessage) bool {
 	m := numberShape.FindStringSubmatch(string(raw))

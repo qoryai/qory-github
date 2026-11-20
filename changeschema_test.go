@@ -12,9 +12,9 @@ import (
 )
 
 // pullRequestSchema is testdata/pull-request.schema.json compiled: the schema of the
-// pull-request artifact type, a copy of
-// modules/software-factory/skills/running-a-software-workflow/schemas/pull-request.schema.json
-// of qoryai/harness at commit ecc59e02 (branch 544-h-66).
+// pull-request artifact type, a copy of the pull-request schema of the Qory harness
+// (modules/software-factory/skills/running-a-software-workflow/schemas/). Copy it again
+// when the schema changes.
 func pullRequestSchema(t *testing.T) *jsonschema.Schema {
 	t.Helper()
 	b, err := os.ReadFile("testdata/pull-request.schema.json")

@@ -110,16 +110,16 @@ func (f *feed) unknownLog() *throttle {
 // entry is never skipped by a stop or a restart, and one may be applied again. A repeat
 // finds a comment's post done, see [github.Client.PostComment], and finds a pull request
 // that is still open and updates it. A pull request that a person closed or merged after
-// the first application is not found by the branch, so a change_request entry that is
-// applied again, because Qory Apiary never received its reply, opens a new pull request.
-// An entry that fails, not for good, is applied
-// again after the wait, while the entries after it that do not wait for it apply, see
-// [feed.step]; it is passed and logged once its retries end, see [retriesEnded], so no
-// entry stops the feed for ever; a comment entry is reported as not posted first, see
-// [feed.report], and a change_request entry that is not done is reported as not put on
-// GitHub, see [feed.changeRequestEnded]. A response that contains an entry
-// with a status serve does not know is rejected whole, see [feed.step], and read again
-// after the wait.
+// the first application is not found by the branch, so a change_request entry with no
+// usable address that is applied again, because Qory Apiary never received its reply,
+// opens a new pull request; an entry whose usable address is the pull request that
+// created it replies kept. An entry that fails, not for good, is applied again after the
+// wait, while the entries after it that do not wait for it apply, see [feed.step]; it is
+// passed and logged once its retries end, see [retriesEnded], so no entry stops the feed
+// for ever; a comment entry is reported as not posted first, see [feed.report], and a
+// change_request entry that is not done is reported as not put on GitHub, see
+// [feed.changeRequestEnded]. A response that contains an entry with a status serve does
+// not know is rejected whole, see [feed.step], and read again after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
 	backoff := feedFirstBackoff

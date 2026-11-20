@@ -294,9 +294,8 @@ For each entry, the adapter:
   whole number from 1; and `draft`, `true` or `false`. One line has no control character,
   no U+2028 or U+2029, and no format character other than U+200C and U+200D. The `target`,
   `title` and `text` of the data are ignored: the adapter uses those of the entry. Data
-  that breaks a
-  rule gets a failure report with the reason `refused`, and a `detail` that has the
-  member and, for a stopped character, its code point.
+  that breaks a rule gets a failure report with the reason `refused`, and a `detail` that
+  has the member and, for a stopped character, its code point.
 - Checks the entry's `title` and `text` before it sends anything to GitHub. A title that
   has a control character, U+2028, U+2029, or a format character other than U+200C and
   U+200D, or has no character that is not a space, U+200C or U+200D, gets a failure report
@@ -389,11 +388,12 @@ fails and may succeed on a retry, for example after a 5xx status, the adapter ap
 entry again, and the entries after it for the same repository wait. When the retries end,
 after a day of failures, it reports the entry as `unreachable`. If Qory Apiary does not
 take the reply for a day more, the adapter reports the entry as `unreachable`, with a
-`detail` that states that the pull request exists. The adapter keeps the state of the feed
-in memory, so after a restart of `qory-github-server serve` it applies the entries of the
-page again: an entry whose pull request it created, whose reply Qory Apiary never
-received, and whose pull request a person then closed, opens a new pull request when the
-adapter applies it again.
+`detail` that states that the pull request exists. The cursor of the feed is in the store;
+only which entries of the current page are done is in memory. An entry whose reply fails
+is applied again after the wait, and a restart of `qory-github-server serve` applies the
+entries of the page again. If an entry has no usable `previous.address`, and a person
+closes or merges its pull request before the entry is applied again, the repeat opens a
+new pull request.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
