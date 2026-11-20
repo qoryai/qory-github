@@ -1160,11 +1160,12 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 			if route != routeCollections {
 				return 0, ""
 			}
-			if n == 3 {
-				// The new connection's first listing waits until the test has looked.
+			if n == 2 {
+				// The first request lists the connection that the link names. The second is
+				// the new connection's first listing, which waits until the test has looked.
 				<-listing
 			}
-			if n <= 2 {
+			if n == 1 {
 				return tc.status, tc.body
 			}
 			return 403, `{"error":"connection_unknown"}`
