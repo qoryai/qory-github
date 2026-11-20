@@ -2,6 +2,7 @@ package serve
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +119,7 @@ func TestAMemberRepeatedInADocumentIsNoDocument(t *testing.T) {
 			t.Errorf("%d %s: err %v, ended %v", tc.status, tc.body, err, ended)
 		}
 	}
-	// The feed: a page that repeats a member of its own, of an entry or of a member of an
+	// The feed: a page that repeats a member of the page, of an entry or of a member of an
 	// entry stops the whole page, as a body that is not UTF-8 does.
 	const head = `{"version":1,"revision":1,"cursor":"c_1",`
 	for _, body := range []string{
@@ -134,7 +135,15 @@ func TestAMemberRepeatedInADocumentIsNoDocument(t *testing.T) {
 			t.Errorf("%s: %+v, %v", body, page, err)
 		}
 	}
-	// A call: a time repeated, and a member of the call repeated.
+	// The error of such a page is short: it does not quote the member's name, which can
+	// be as long as the page.
+	long := strings.Repeat("m", 100000)
+	_, err := checkChanges([]byte(head + `"changes":[],"` + long + `":1,"` + long + `":2}`))
+	if err == nil || !strings.Contains(err.Error(), "not the feed's document") || len(err.Error()) > 200 {
+		t.Errorf("a page that repeats a long member: %.300v (%d characters)", err, len(fmt.Sprint(err)))
+	}
+	// A call: a time repeated, and a member of the call repeated. Only the callTime row is
+	// new: regression guard: calls already stopped on a repeated member.
 	at := contracts.FormatTime(time.Now())
 	if _, ok := callTime([]byte(`{"time":"` + at + `","time":"` + at + `"}`)); ok {
 		t.Error("a repeated time is the call's time")

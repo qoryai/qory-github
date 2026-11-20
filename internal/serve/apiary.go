@@ -507,6 +507,13 @@ type changesPage struct {
 	unmet   []error
 }
 
+// errNotTheFeedsDocument is the error of a page that exactjson refuses. It carries no
+// text of exactjson's error, which quotes a member's name in full, and a page can be
+// 16 MiB.
+func errNotTheFeedsDocument(what string) error {
+	return fmt.Errorf("%s: the answer is not the feed's document: it is not one JSON object, repeats a member or has text that is not UTF-8", what)
+}
+
 // checkChanges reads a page of the change feed, whose signature is checked already,
 // and refuses one that is not of the version and the revision serve implements, or
 // whose cursor is not one: a cursor is never taken from a page refused. The revision
@@ -524,7 +531,7 @@ func checkChanges(body []byte) (changesPage, error) {
 		Changes  []json.RawMessage `json:"changes"`
 	}
 	if err := exactjson.Unmarshal(body, &doc); err != nil {
-		return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+		return changesPage{}, errNotTheFeedsDocument(what)
 	}
 	switch {
 	case doc.Version != contracts.Version:
@@ -557,7 +564,7 @@ func checkChanges(body []byte) (changesPage, error) {
 				MustUnderstand json.RawMessage `json:"must_understand"`
 			}
 			if err := exactjson.Unmarshal(raw, &entry); err != nil {
-				return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+				return changesPage{}, errNotTheFeedsDocument(what)
 			}
 			ch = contracts.Change(entry.change)
 			// An error here means that unmet has the error already.
