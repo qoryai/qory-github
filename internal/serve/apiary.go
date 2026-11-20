@@ -541,13 +541,11 @@ func checkChanges(body []byte) (changesPage, error) {
 		}
 		unmet := contracts.CheckChangeMustUnderstand(raw)
 		ch := contracts.Change{Kind: head.Kind}
-		switch {
-		case knownKind(head.Kind):
-			if err := json.Unmarshal(raw, &ch); err != nil {
-				return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
-			}
-		case unmet == nil:
+		if !knownKind(head.Kind) {
+			// The pin's error quotes the whole kind, so it is replaced here.
 			unmet = fmt.Errorf("skip the entry and acknowledge it: qory-github applies no entry of the kind %q", prefixOf(head.Kind, maxLogged))
+		} else if err := json.Unmarshal(raw, &ch); err != nil {
+			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
 		}
 		page.Changes = append(page.Changes, ch)
 		page.unmet = append(page.unmet, unmet)

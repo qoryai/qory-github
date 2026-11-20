@@ -3249,7 +3249,7 @@ func TestAnUnknownEntrysKindAndStatusAreCut(t *testing.T) {
 	}
 	w = newWired(t, filepath.Join(t.TempDir(), "state"))
 	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100)})
-	if err := w.feed.step(context.Background()); err != nil || !strings.Contains(w.log.String(), `"kind":"`+strings.Repeat("ü", 64)+`"`) {
+	if err := w.feed.step(context.Background()); err != nil || !strings.Contains(w.log.String(), `"kind":"`+strings.Repeat("ü", 64)+`"`) || strings.Contains(w.log.String(), strings.Repeat("ü", 65)) {
 		t.Errorf("err %v, log %s", err, w.log.String())
 	}
 }

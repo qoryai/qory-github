@@ -152,7 +152,7 @@ func TestTheDetailOfARefusedPointerIsOneShortLine(t *testing.T) {
 }
 
 // TestAPreviousWithOnlyAnUnknownMemberReadsAsEmpty has a change request whose previous is
-// {"zz":1}: it has no title, so the entry opens a new draft with its own title.
+// {"zz":1}: it has no title, so the entry opens a new draft with the entry's title.
 func TestAPreviousWithOnlyAnUnknownMemberReadsAsEmpty(t *testing.T) {
 	w := newChangeWired(t)
 	entry := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 2, openDraft))
@@ -181,7 +181,12 @@ func TestTheFeedReadsAPageWithMembersItDoesNotDefine(t *testing.T) {
 	if page.unmet[0] != nil || page.unmet[1] == nil || page.unmet[2] == nil || page.Changes[1].Kind != "label" || page.Changes[1].Status != "" || page.Changes[1].Interval != nil {
 		t.Errorf("%+v", page)
 	}
-	for _, body := range []string{`"changes":[{"status":"added"}]`, `"changes":[null]`, `"changes":["sync"]`, `"changes":[{"kind":"sync","interval":"soon"}]`} {
+	// A must_understand that is no list is a member of the wrong type, so the page is
+	// refused; null is no list either, and the entry is skipped.
+	if page, err := checkChanges([]byte(head + `"changes":[{"kind":"sync","must_understand":null}]}`)); err != nil || len(page.unmet) != 1 || page.unmet[0] == nil {
+		t.Errorf("%+v %v", page, err)
+	}
+	for _, body := range []string{`"changes":[{"status":"added"}]`, `"changes":[null]`, `"changes":["sync"]`, `"changes":[{"kind":"sync","interval":"soon"}]`, `"changes":[{"kind":"sync","must_understand":"/zz"}]`} {
 		if _, err := checkChanges([]byte(head + body + `}`)); err == nil || !strings.Contains(err.Error(), "not the feed's document") {
 			t.Errorf("%s: err %v", body, err)
 		}

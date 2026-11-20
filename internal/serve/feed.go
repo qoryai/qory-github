@@ -115,7 +115,8 @@ func (f *feed) unknownLog() *throttle {
 // entry stops the feed for ever; a comment entry is reported as not posted first, see
 // [feed.report], and a change_request entry that is not done is reported as not put on
 // GitHub, see [feed.changeRequestEnded]. A response that contains an entry
-// serve cannot apply is rejected whole, see [feed.step], and read again after the wait.
+// with a status serve does not know is rejected whole, see [feed.step], and read again
+// after the wait.
 func (f *feed) run(ctx context.Context) {
 	defer f.unknownLog().stop()
 	backoff := feedFirstBackoff
