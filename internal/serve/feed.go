@@ -107,9 +107,12 @@ func (f *feed) unknownLog() *throttle {
 // as feedFloor has passed since the last request for the feed was sent; an error waits
 // longer, a wait that doubles. The cursor is kept in the store, and moves only once
 // every entry of the page it ends is applied, or failed for good and logged, so an
-// entry is never skipped by a stop or a restart, and one may be applied again, which
-// does no harm: every entry's action is one a repeat finds done, a comment's post among
-// them, see [github.Client.PostComment]. An entry that fails, not for good, is applied
+// entry is never skipped by a stop or a restart, and one may be applied again. A repeat
+// finds a comment's post done, see [github.Client.PostComment], and finds a pull request
+// that is still open and updates it. A pull request that a person closed or merged after
+// the first application is not found by the branch, so a change_request entry that is
+// applied again, because Qory Apiary never received its reply, opens a new pull request.
+// An entry that fails, not for good, is applied
 // again after the wait, while the entries after it that do not wait for it apply, see
 // [feed.step]; it is passed and logged once its retries end, see [retriesEnded], so no
 // entry stops the feed for ever; a comment entry is reported as not posted first, see
@@ -251,7 +254,7 @@ func known(ch contracts.Change) bool {
 // forgets them all when the cursor moves. The page read again contains the entries
 // Qory Apiary has added to the feed since, up to the page's limit, so they apply too.
 // A step stops when ctx is done, before the next entry. A restart applies the done
-// entries again, which does no harm, see [feed.run].
+// entries again, see [feed.run] for what a repeat does.
 //
 // An entry that fails, not for good, is timed from its first failure: once its retries
 // end, after stuckFor of failures or 2*stuckFor since the first failure, see
