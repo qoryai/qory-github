@@ -743,13 +743,15 @@ func retryWait(err error) (time.Duration, bool) {
 //   - a signed answer to a request that names a connection, connection, is told to
 //     [Apiary.Answered], with the refusal's code, or "" when the body of the refusal
 //     cannot be read or lists a must_understand pointer that the adapter does not define:
-//     such a refusal has no code, and the status decides;
+//     such a refusal has no code;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
 //     nothing, and the periodic check sends the request again. Each is [Permanent],
 //     and so are 400, 403, 409 and 413, each a [*refusedError]; what a 409
 //     collection_not_linked does is for the request's sender to say, see
-//     [Apiary.Items] and [Apiary.Comments];
+//     [Apiary.Items] and [Apiary.Comments]. A 409 with no code, because the body cannot
+//     be read, is an error that may pass instead: it is no known refusal, so nothing
+//     changes and the sender sends the request again, with its backoff;
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.
@@ -788,6 +790,11 @@ func (a *Apiary) judge(what string, ans *answer, connection, of string) error {
 	case http.StatusConflict:
 		if refusal.Error == codeConnectionEnded && of != "" && a.Ended != nil {
 			a.Ended(of)
+		}
+		if refusal.Error == "" {
+			// A body the adapter cannot read has no code, so it is not known to be final:
+			// nothing changes and the caller sends the request again, with its backoff.
+			return err
 		}
 		return Permanent(err)
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge:

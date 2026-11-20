@@ -189,15 +189,15 @@ func TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne(t *testing.T) {
 	}
 }
 
-// TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone gives signed 403 and 409
-// answers whose body is a refusal. A refusal with an unknown member that is not listed is
-// read: its code reaches Answered, connection_ended ends the connection, and a 403
-// connection_unknown is lasting. A body that the adapter does not read has no code, and
-// the status decides: one that lists a pointer it does not define, a must_understand that
-// is no list or null, a space or a byte order mark before the object, data after the
-// object, no JSON and an empty body. Such a 409 ends nothing, and such a 403 is not
-// lasting, so it does not count toward the end of a connection.
-func TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone(t *testing.T) {
+// TestARefusalWithAnUnmetMustUnderstandHasNoCode gives signed 403 and 409 answers whose
+// body is a refusal. A refusal with an unknown member that is not listed is read: its code
+// reaches Answered, connection_ended ends the connection, and a 403 connection_unknown is
+// lasting. A body that the adapter does not read has no code: one that lists a pointer it
+// does not define, a must_understand that is no list or null, a space or a byte order
+// mark before the object, data after the object, no JSON and an empty body. A 409 of it
+// ends nothing and may pass, so the request is sent again; a 403 of it is a refusal for
+// good, and not lasting, so it does not count toward the end of a connection.
+func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 	const ended, unknown = `"error":"connection_ended"`, `"error":"connection_unknown"`
 	for _, tc := range []struct {
 		name   string
@@ -225,7 +225,7 @@ func TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone(t *testing.T)
 		}
 		err := a.judge("reading", &answer{status: tc.status, signed: true, body: []byte(tc.body)}, testConnection, testConnection)
 		var refused *refusedError
-		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || !IsPermanent(err) {
+		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || IsPermanent(err) != (tc.status != 409 || tc.code != "") {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
 		if want := tc.status == 409 && tc.code == codeConnectionEnded; (len(endedBy) == 1) != want {

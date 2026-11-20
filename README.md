@@ -330,7 +330,9 @@ is malformed: it logs a line that starts with the fix (`use a reader that define
 does not read a document that is not one JSON object, that has data after the object, or
 that has anything, such as a space or a byte order mark, before the opening brace.
 The body of a refusal is read the same way: when the adapter does not read it, the answer
-has no refusal code, and the adapter acts on the status alone.
+has no refusal code. A 409 without a code changes nothing, and the adapter sends the
+request again after a wait; a connection ends only on a `connection_ended` that the
+adapter reads. A 400, 403 or 413 without a code is still a refusal for good.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`

@@ -4816,18 +4816,88 @@ func TestATakeInOfAnArchivedRepositoryIsPassedAtOnce(t *testing.T) {
 // suspendedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref
 // 409 connection_suspended, and any other with the signed 204.
 func suspendedDisconnect(w *wired, ref string) {
+	refusedDisconnect(w, ref, `{"error":"connection_suspended"}`)
+}
+
+// refusedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref 409
+// with the signed body, and any other with the signed 204.
+func refusedDisconnect(w *wired, ref, body string) {
 	refuse := func(route string, n int) (int, string) {
 		if route != routeDisconnect {
 			return 0, ""
 		}
 		if sent := w.apiary.sent(routeDisconnect); n <= len(sent) && sent[n-1].body["collection_ref"] == ref {
-			return 409, `{"error":"connection_suspended"}`
+			return 409, body
 		}
 		return 0, ""
 	}
 	w.apiary.mu.Lock()
 	defer w.apiary.mu.Unlock()
 	w.apiary.refuse = refuse
+}
+
+// TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords has Qory Apiary answer
+// the disconnect of a repository, deleted or removed from its installation, with a signed
+// 409 whose body the adapter cannot read: a must_understand pointer it does not define, no
+// JSON, and a space before the object. Nothing is known to be final, so the records stay
+// and the worker sends the request again, with its backoff, up to its attempts (3 in the
+// test), then marks the delivery failed. A readable connection_suspended is sent once and
+// keeps the records, and a readable code that is final, collection_not_linked, is logged
+// and the records are dropped.
+func TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name, body               string
+		kept                     bool
+		state                    store.State
+		deletedSent, removedSent int
+		retried                  bool
+		logged                   bool
+	}{
+		{"an unmet pointer", `{"error":"connection_suspended","zz":1,"must_understand":["/zz"]}`, true, store.Failed, 3, 3, true, false},
+		{"no JSON", `<html>`, true, store.Failed, 3, 3, true, false},
+		{"a space before the object", ` {"error":"connection_suspended"}`, true, store.Failed, 3, 3, true, false},
+		{"connection_suspended", `{"error":"connection_suspended"}`, true, store.Failed, 1, 2, false, false},
+		{"collection_not_linked", `{"error":"collection_not_linked"}`, false, store.Done, 1, 2, false, true},
+	} {
+		for _, site := range []string{"deleted", "removed"} {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			for _, ref := range refsOf("acme/old", "acme/gone") {
+				setReach(w.st, ref, 42)
+				linkCollection(w.st, ref)
+			}
+			refusedDisconnect(w, refOf("acme/old"), tc.body)
+			sent := tc.deletedSent
+			if site == "deleted" {
+				w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/old", "deleted"))
+			} else {
+				sent = tc.removedSent
+				w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{
+					map[string]any{"id": oldID, "full_name": "acme/old"}, map[string]any{"id": repoID("acme/gone"), "full_name": "acme/gone"},
+				}})
+			}
+			if s := state(w.st, guid1); s != tc.state {
+				t.Errorf("%s, %s: the delivery is %s, want %s", tc.name, site, s, tc.state)
+			}
+			if n := len(w.apiary.sent(routeDisconnect)); n != sent {
+				t.Errorf("%s, %s: %d disconnects, want %d", tc.name, site, n, sent)
+			}
+			if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok != tc.kept {
+				t.Errorf("%s, %s: the repository's installation kept %v", tc.name, site, ok)
+			}
+			if ok, _ := collectionLinked(w.st, refOf("acme/old")); ok != tc.kept {
+				t.Errorf("%s, %s: the collection linked %v", tc.name, site, ok)
+			}
+			// The other repository of a removal is disconnected only when the loop
+			// reaches it: not while the first one's request is sent again.
+			if _, ok, _ := reachOf(w.st, refOf("acme/gone")); site == "removed" && ok != (tc.retried) {
+				t.Errorf("%s, %s: the other repository's installation kept %v", tc.name, site, ok)
+			}
+			if logged := strings.Contains(w.log.String(), `"msg":"the disconnect is refused"`); logged != tc.logged {
+				t.Errorf("%s, %s: logged %v", tc.name, site, logged)
+			}
+		}
+	}
 }
 
 // TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords has Qory Apiary answer
