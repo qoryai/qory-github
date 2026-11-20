@@ -412,8 +412,9 @@ func (a *Apiary) unlinkOn(err error, collection string, began uint64) error {
 // grants the connection access. Qory Apiary answers 403 for a connection not made yet,
 // and for one whose linked connect return is being saved, so a 403 is sent again, built
 // anew, up to [disconnectTries] in all, see [disconnectWait]; a 403 that lasts is the
-// error. A 409 connection_ended is the connection ended, as the signed 204 is, so it is
-// no error.
+// error, [Permanent] for a 403 with a code, and an error that may pass for a 403 with no
+// code, see [sentAgain]. A 409 connection_ended is the connection ended, as the signed
+// 204 is, so it is no error.
 func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.ConnectionsDisconnect) error {
 	wait := disconnectWait
 	for try := 1; ; try++ {
@@ -747,13 +748,13 @@ func retryWait(err error) (time.Duration, bool) {
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
 //     nothing, and the periodic check sends the request again. Each is [Permanent], and
-//     so are any other 409 with a code, 400, 403 and 413, each a [*refusedError]; what a
-//     409 collection_not_linked does is for the request's sender to say, see
-//     [Apiary.Items] and [Apiary.Comments]. A 409 with no code, because the body cannot
-//     be read, is no known refusal: it does not call [Apiary.Ended], and it is an error
-//     that may pass, so the worker, the feed and the pull round, which decide by
-//     [IsPermanent], send the request again with their backoff. A caller that decides by
-//     the refusal's status alone does not;
+//     so are any other 409 or 403 with a code, 400 and 413, each a [*refusedError]; what
+//     a 409 collection_not_linked does is for the request's sender to say, see
+//     [Apiary.Items] and [Apiary.Comments]. A 409 or a 403 with no code, because the
+//     body cannot be read, is no known refusal: it does not call [Apiary.Ended], and it
+//     is an error that may pass, so the worker, the feed, the pull round and the
+//     callers that test [sentAgain] send the request again with their backoff, and none
+//     takes it for the end of a connection, see [noteAnswer];
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.
@@ -788,15 +789,16 @@ func (a *Apiary) judge(what string, ans *answer, connection, of string) error {
 		return nil
 	}
 	var err error = &refusedError{what: what, status: ans.status, code: refusal.Error}
+	if refusal.Error == "" && (ans.status == http.StatusConflict || ans.status == http.StatusForbidden) {
+		// A 409 or a 403 whose body the adapter cannot read has no code, so it is not
+		// known to be final: nothing changes, and the caller sends the request again,
+		// with its backoff, see [sentAgain].
+		return err
+	}
 	switch ans.status {
 	case http.StatusConflict:
 		if refusal.Error == codeConnectionEnded && of != "" && a.Ended != nil {
 			a.Ended(of)
-		}
-		if refusal.Error == "" {
-			// A body the adapter cannot read has no code, so it is not known to be final:
-			// nothing changes and the caller sends the request again, with its backoff.
-			return err
 		}
 		return Permanent(err)
 	case http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge:
@@ -824,6 +826,20 @@ func (e *refusedError) Error() string {
 		return fmt.Sprintf("%s: Qory Apiary answered %d", e.what, e.status)
 	}
 	return fmt.Sprintf("%s: Qory Apiary answered %d %s", e.what, e.status, e.code)
+}
+
+// sentAgain is whether err is a signed refusal of Qory Apiary's that changes nothing and
+// is sent again, with the caller's backoff: a 409 or a 403 with no code, as the body
+// cannot be read, see [Apiary.judge], or a 409 connection_suspended, which the contract
+// says changes no state. A caller that decides by the refusal's status, not by
+// [IsPermanent], tests it before its other cases; a 403 with a code is not one.
+func sentAgain(err error) bool {
+	var refused *refusedError
+	if !errors.As(err, &refused) {
+		return false
+	}
+	return refused.code == "" && (refused.status == http.StatusConflict || refused.status == http.StatusForbidden) ||
+		refused.status == http.StatusConflict && refused.code == codeConnectionSuspended
 }
 
 // refusedAs is whether err, or an error it wraps or joins, is Qory Apiary's signed

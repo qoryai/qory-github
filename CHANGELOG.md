@@ -191,13 +191,15 @@ change what the program does, and notes it under Upgrading.
   byte order mark. Before, the adapter did not read a document with any member that it
   does not define. The body of a refusal that Qory Apiary sends is read the same way:
   when the adapter does not read it, the answer has no refusal code. A 409
-  `connection_ended` that the adapter reads ends the connection; a 409 without a code
-  does not. When the worker, the change feed or a pull round sends a disconnect, an
-  item, a comment or a listing and gets a 409 without a code, nothing changes and the
-  request is sent again after a wait. A 400, 403 or 413 without a code is still a
-  refusal for good. Before, a 409 without a code was a refusal for good, so a disconnect
-  that met one dropped the repository's records. The stored App entry, which
-  `qory-github-server` writes, stays strict.
+  `connection_ended` that the adapter reads ends the connection; a 409 or a 403 without
+  a code does not. When the adapter sends a disconnect, an item, a comment, a listing, a
+  grant report or a grant end and gets a 409 or a 403 without a code, or a 409
+  `connection_suspended`, nothing changes and the request is sent again after a wait. A
+  403 without a code never counts toward the end of a connection. A 403 that the adapter
+  reads, and a 400 or 413, are handled as before. Before, a 409 or
+  a 403 without a code was a refusal for good, so a disconnect that met one dropped the
+  repository's records, and a grant report or a first listing that met one gave up. The
+  stored App entry, which `qory-github-server` writes, stays strict.
 
 ### Upgrading
 

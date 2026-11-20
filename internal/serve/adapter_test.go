@@ -3869,7 +3869,8 @@ func TestTheWireMatchesTheContractsSignedFixtures(t *testing.T) {
 // TestA403ConnectionUnknownForADayEndsALiveConnection notes Qory Apiary's answers about
 // a connection: one 403 connection_unknown ends nothing, and its time survives in the
 // store; 403s that run for a day end it; a 2xx between them starts the day again; a 403
-// with another code never counts; and a pending connection is never ended by them.
+// with another code, or with no code because its body cannot be read, never counts and
+// neither starts the day again; and a pending connection is never ended by them.
 func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	st := openStore(t, dir)
@@ -3922,7 +3923,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 		code   string
 		d      time.Duration
 		end    bool
-	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
+	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, "", 3 * time.Hour, false}, {409, "", 4 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
 		if end, err := noteAnswer(st5, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
 			t.Errorf("after a 403 forbidden and a 409 collection_not_linked, answer %d: %v, %v", i, end, err)
 		}
@@ -3930,13 +3931,15 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	// Another code never counts.
 	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
 	grantedLink(st2, 42, testConnection, linkLive)
-	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
-		if end, err := noteAnswer(st2, testConnection, 403, "forbidden", at.Add(d)); end || err != nil {
-			t.Errorf("a 403 forbidden counts: %v, %v", end, err)
+	for _, code := range []string{"forbidden", ""} {
+		for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+			if end, err := noteAnswer(st2, testConnection, 403, code, at.Add(d)); end || err != nil {
+				t.Errorf("a 403 with the code %q counts: %v, %v", code, end, err)
+			}
 		}
-	}
-	if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
-		t.Error("a 403 forbidden is kept")
+		if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
+			t.Errorf("a 403 with the code %q is kept", code)
+		}
 	}
 	// A pending connection is never ended.
 	st3 := openStore(t, filepath.Join(t.TempDir(), "state"))

@@ -384,7 +384,8 @@ func unlinkedGrant(st *store.Store, installation int64, connection string) (bool
 // [Apiary.ReportGrant].
 // While Qory Apiary answers 409 pass_unknown or 403 connection_unknown, as it does until
 // the person's browser brings the linked connect return, or the report fails as a
-// request that may pass, it is sent again after a wait that doubles from
+// request that may pass, or as a 409 or a 403 with no code or a 409
+// connection_suspended, see [sentAgain], it is sent again after a wait that doubles from
 // [grantFirstWait] to [grantMaxWait], until expires, the expiry of the linked connect
 // return minted for it. It stops before a try once GitHub has deleted the installation,
 // see [keepDeleted]. A report Qory Apiary takes adds the grant to the copy, and when
@@ -438,7 +439,7 @@ func (c *Connect) reportSoon(installation int64, connection, nonce string, accou
 				}
 				return
 			}
-			again := refusedAs(err, http.StatusConflict, codePassUnknown) || refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || (!IsPermanent(err) && !refusedFor(err))
+			again := refusedAs(err, http.StatusConflict, codePassUnknown) || refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || sentAgain(err) || (!IsPermanent(err) && !refusedFor(err))
 			now := c.Adapter.clock()
 			if !again || !now.Before(expires) {
 				c.reportFailed(installation, connection, err)
@@ -596,8 +597,9 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 //     grant end of [Adapter.endUnlinked] is never stopped by counting 403s either: it
 //     stops once [Apiary.Ended] or [noteAnswer] has dropped the connection's grants from
 //     the copy, see [dropConnection];
-//   - a failure that may pass, no answer, a 5xx or an answer not signed: it returns
-//     true, so the grant end is sent again;
+//   - a failure that may pass, no answer, a 5xx or an answer not signed, a 409 or a 403
+//     with no code because its body cannot be read, or a 409 connection_suspended, see
+//     [sentAgain]: it returns true, so the grant end is sent again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it, keeps its
 //     state, since neither ends a connection or a grant, and sends no more grant end for
 //     the grant, see [Adapter.endRefusedFor].
@@ -644,7 +646,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		}
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
-	case !IsPermanent(err) && !refusedFor(err):
+	case sentAgain(err), !IsPermanent(err) && !refusedFor(err):
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
 	}

@@ -235,8 +235,10 @@ func TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne(t *testing.T) {
 // lasting. A body that the adapter does not read has no code: one that lists a pointer it
 // does not define, a must_understand that is no list or null, a space or a byte order
 // mark before the object, data after the object, no JSON and an empty body. A 409 of it
-// ends nothing and may pass, so the request is sent again; a 403 of it is a refusal for
-// good, and not lasting, so it does not count toward the end of a connection.
+// or a 403 of it ends nothing and may pass, see [sentAgain], so the request is sent
+// again, and a 403 of it is not lasting, so it does not count toward the end of a
+// connection. A 403 with a code, and a 400 or a 413 with or without one, are refusals for
+// good.
 func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 	const ended, unknown = `"error":"connection_ended"`, `"error":"connection_unknown"`
 	for _, tc := range []struct {
@@ -257,6 +259,14 @@ func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 		{"an empty body", 409, ``, ""},
 		{"a 403 that is read", 403, `{` + unknown + `,"zz":1}`, codeConnectionUnknown},
 		{"a 403 with a listed member it does not define", 403, `{` + unknown + `,"zz":1,"must_understand":["/zz"]}`, ""},
+		{"a 403 with a must_understand that is no list", 403, `{` + unknown + `,"must_understand":"/error"}`, ""},
+		{"a 403 with a byte order mark before the object", 403, "\ufeff{" + unknown + `}`, ""},
+		{"a 403 with no JSON", 403, `<html>`, ""},
+		{"a 403 with an empty body", 403, ``, ""},
+		{"a 403 with a code the contract defines", 403, `{"error":"forbidden","zz":1}`, codeForbidden},
+		{"a 400 with no JSON", 400, `<html>`, ""},
+		{"a 413 with no JSON", 413, `<html>`, ""},
+		{"a 400 that is read", 400, `{"error":"invalid_request"}`, "invalid_request"},
 	} {
 		var endedBy, answered []string
 		a := &Apiary{
@@ -265,7 +275,8 @@ func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 		}
 		err := a.judge("reading", &answer{status: tc.status, signed: true, body: []byte(tc.body)}, testConnection, testConnection)
 		var refused *refusedError
-		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || IsPermanent(err) != (tc.status != 409 || tc.code != "") {
+		mayPass := tc.code == "" && (tc.status == 409 || tc.status == 403)
+		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || IsPermanent(err) == mayPass || sentAgain(err) != mayPass {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
 		if want := tc.status == 409 && tc.code == codeConnectionEnded; (len(endedBy) == 1) != want {
