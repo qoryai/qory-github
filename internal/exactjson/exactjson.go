@@ -1,59 +1,18 @@
 // Package exactjson reads a JSON document of another system into a Go value, matching
-// a member's name to a field's name in exact case.
+// a member's name to a field's name in exact case and refusing a repeated member.
 package exactjson
 
-import (
-	"encoding/json/jsontext"
-	"encoding/json/v2"
-
-	"github.com/qoryai/integrations/contracts"
-)
-
-// MustUnderstand returns a document of the object b that has only its must_understand
-// member and its kind member, each spelled exactly and left out when b has none. A
-// check of the result with contracts.CheckMustUnderstand, or CheckChangeMustUnderstand,
-// reads the must_understand member that [Unmarshal] reads. No other member is copied,
-// so no secret value of a document is.
-//
-// shortcut: the pin cf5bf941 of the contracts finds must_understand in any case, so a
-// Must_Understand beside it could replace it, replace this copy once the integrations
-// pin includes the exact-case readers, integrations a0a92400 or later.
-func MustUnderstand(b []byte) ([]byte, error) {
-	var doc struct {
-		MustUnderstand jsontext.Value `json:"must_understand"`
-		Kind           jsontext.Value `json:"kind"`
-	}
-	if err := Unmarshal(b, &doc); err != nil {
-		return nil, err
-	}
-	out := []byte("{")
-	for _, m := range []struct {
-		name  string
-		value jsontext.Value
-	}{{contracts.MustUnderstand, doc.MustUnderstand}, {"kind", doc.Kind}} {
-		if len(m.value) == 0 {
-			continue
-		}
-		if len(out) > 1 {
-			out = append(out, ',')
-		}
-		out = append(out, '"')
-		out = append(out, m.name...)
-		out = append(out, '"', ':')
-		out = append(out, m.value...)
-	}
-	return append(out, '}'), nil
-}
+import "encoding/json/v2"
 
 // Unmarshal reads the one JSON value in b, with nothing but white space after it, into v.
 // A member matches a field only when the names are equal letter for letter, so Token does
-// not fill token, as it does for [encoding/json.Unmarshal]. A member that v has no field
-// for is ignored. A name repeated in an object keeps its last value, as in
-// [encoding/json.Unmarshal].
+// not fill token, as it does for [encoding/json.Unmarshal] in a build with
+// GOEXPERIMENT=nojsonv2. A member that v has no field for is ignored. An object that
+// repeats a name, at any depth, and a string that is not UTF-8 are errors.
 //
-// The contracts' types are read exactly here only because this is encoding/json/v2.
-// Once the integrations pin includes the exact-case readers, integrations a0a92400 or
-// later, encoding/json is exact too, and this package can go.
+// The pinned contracts' types have case:strict on each json tag, which encoding/json
+// reads in the default build of Go 1.27. A build with GOEXPERIMENT=nojsonv2 reads a
+// member in any case through them, and this package does not.
 func Unmarshal(b []byte, v any) error {
-	return json.Unmarshal(b, v, jsontext.AllowDuplicateNames(true))
+	return json.Unmarshal(b, v)
 }

@@ -326,24 +326,28 @@ connect pass, the setup pass, the answer to the grants, the answer to the secret
 request and the secrets that it seals. It ignores a member that it does not define. A
 name matches only in exact case in these documents, in the feed, in a call and in the
 data of a change request: `Token` is not `token`, so it is a member that the adapter
-does not define, whatever its order beside `token`. It does not read a document whose
-`must_understand` lists a pointer to a member that it does not define, or is malformed:
-it logs a line that starts with the fix (`use a reader that defines "/zz"`), and for a
-pass the adapter shows the page for a link that is not valid. It also does not read a
-document that is not one JSON object, that has data after the object, or that has
-anything, such as a space or a byte order mark, before the opening brace. The body of a
-refusal is read the same way: when the adapter does not read it, the answer has no
-refusal code. A 409 `connection_ended` that the adapter reads ends the connection; a 409
-or a 403 without a code does not. The grant report, the grant end and the first listing
-of a connection are sent again after a wait, with a backoff, when the answer is a 409 or
-a 403 without a code, or a 409 `connection_suspended`, and nothing changes. A
-disconnect, an item or a comment that gets a 409 or a 403 without a code is sent again
-by the worker, with its backoff, or by the next pull round. A disconnect, an item or a
-comment that gets a 409 `connection_suspended` is not sent again after a wait: the
-adapter keeps the repository's records and the next pull round sends it on its periodic
-check. A 403 without a code never counts toward the end of a connection. A 403 with a
-code, such as `connection_unknown` or `forbidden`, and a 400 or 413, with or without a
-code, are handled as before.
+does not define, whatever its order beside `token`. A member that appears twice in an
+object, at any depth, stops the reading of the document: a page of the feed stops and is
+read again after the feed's backoff, with its cursor where it was; a call is answered as
+a call that is not valid; a refusal has no code, so its status decides, as for a refusal
+that the adapter cannot read; and a pass or an answer is not read. It does not read a
+document whose `must_understand` lists a pointer to a member that it does not define, or
+is malformed: it logs a line that starts with the fix (`use a reader that defines
+"/zz"`), and for a pass the adapter shows the page for a link that is not valid. It also
+does not read a document that is not one JSON object, that has data after the object, or
+that has anything, such as a space or a byte order mark, before the opening brace. The
+body of a refusal is read the same way: when the adapter does not read it, the answer
+has no refusal code. A 409 `connection_ended` that the adapter reads ends the
+connection; a 409 or a 403 without a code does not. The grant report, the grant end and
+the first listing of a connection are sent again after a wait, with a backoff, when the
+answer is a 409 or a 403 without a code, or a 409 `connection_suspended`, and nothing
+changes. A disconnect, an item or a comment that gets a 409 or a 403 without a code is
+sent again by the worker, with its backoff, or by the next pull round. A disconnect, an
+item or a comment that gets a 409 `connection_suspended` is not sent again after a wait:
+the adapter keeps the repository's records and the next pull round sends it on its
+periodic check. A 403 without a code never counts toward the end of a connection. A 403
+with a code, such as `connection_unknown` or `forbidden`, and a 400 or 413, with or
+without a code, are handled as before.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`

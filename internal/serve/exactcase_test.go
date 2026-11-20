@@ -2,6 +2,7 @@ package serve
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,6 @@ func TestReadObjectMatchesMemberNamesInExactCase(t *testing.T) {
 		{`{"ERROR":"connection_ended"}`, ""},
 		{`{"error":"connection_suspended","Error":"connection_ended"}`, "connection_suspended"},
 		{`{"Error":"connection_ended","error":"connection_suspended"}`, "connection_suspended"},
-		{`{"error":"connection_suspended","error":"connection_ended"}`, "connection_ended"},
 	} {
 		var doc struct {
 			Error string `json:"error"`
@@ -79,5 +79,70 @@ func TestACallIsReadInExactCase(t *testing.T) {
 	}
 	if _, ok := callTime([]byte(callBodyAt(time.Now(), members))); !ok {
 		t.Error("a time is not the call's time")
+	}
+}
+
+// TestAMemberRepeatedInADocumentIsNoDocument has each reader of a document from Qory
+// Apiary read a body that repeats a member, with the same value, another value and a
+// repeated must_understand: the body is not read.
+func TestAMemberRepeatedInADocumentIsNoDocument(t *testing.T) {
+	// readObject: the connect pass, the setup pass, the grants and the secrets share it.
+	for _, body := range []string{
+		`{"error":"connection_ended","error":"connection_ended"}`,
+		`{"error":"connection_ended","error":"connection_suspended"}`,
+		`{"error":"x","must_understand":[],"must_understand":[]}`,
+		`{"error":"x","must_understand":["/error"],"must_understand":["/error"]}`,
+	} {
+		var doc struct {
+			Error string `json:"error"`
+		}
+		if err := readObject([]byte(body), &doc, contracts.Refusal{}); !errors.Is(err, errNotObject) {
+			t.Errorf("readObject %s: %v", body, err)
+		}
+	}
+	// A refusal that repeats a member is unreadable: the answer is judged by its status,
+	// so a 409 and a 403 have no code, end nothing and may pass.
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{409, `{"error":"connection_ended","error":"connection_ended"}`},
+		{409, `{"error":"connection_ended","must_understand":[],"must_understand":[]}`},
+		{403, `{"error":"connection_unknown","error":"forbidden"}`},
+	} {
+		ended := false
+		a := &Apiary{Ended: func(string) { ended = true }}
+		err := a.judge("reading", &answer{status: tc.status, signed: true, body: []byte(tc.body)}, testConnection, testConnection)
+		var refused *refusedError
+		if !errors.As(err, &refused) || refused.code != "" || IsPermanent(err) || ended {
+			t.Errorf("%d %s: err %v, ended %v", tc.status, tc.body, err, ended)
+		}
+	}
+	// The feed: a page that repeats a member of its own, of an entry or of a member of an
+	// entry stops the whole page, as a body that is not UTF-8 does.
+	const head = `{"version":1,"revision":1,"cursor":"c_1",`
+	for _, body := range []string{
+		`{"version":1,"revision":1,"cursor":"c_1","cursor":"c_1","changes":[]}`,
+		head + `"changes":[],"changes":[]}`,
+		head + `"changes":[{"kind":"sync","kind":"sync"}]}`,
+		head + `"changes":[{"kind":"sync","interval":1,"interval":2}]}`,
+		head + `"changes":[{"kind":"sync","must_understand":[],"must_understand":[]}]}`,
+		head + `"changes":[{"kind":"change_request","target":{"collection":"1","collection":"2"}}]}`,
+		head + `"changes":[{"kind":"zz","a":1,"a":1}]}`,
+	} {
+		if page, err := checkChanges([]byte(body)); err == nil || !strings.Contains(err.Error(), "not the feed's document") || len(page.Changes) != 0 {
+			t.Errorf("%s: %+v, %v", body, page, err)
+		}
+	}
+	// A call: a time repeated, and a member of the call repeated.
+	at := contracts.FormatTime(time.Now())
+	if _, ok := callTime([]byte(`{"time":"` + at + `","time":"` + at + `"}`)); ok {
+		t.Error("a repeated time is the call's time")
+	}
+	var req contracts.ReadPublic
+	for _, extra := range []string{`,"path":"a.md"`, `,"path":"b.md"`, `,"must_understand":[],"must_understand":[]`} {
+		if decodeCall("read-public.schema.json", []byte(callBodyAt(time.Now(), readPublic("github.com/acme/tools", "a.md", devCommit)+extra)), &req) {
+			t.Errorf("a call with %s is read", extra)
+		}
 	}
 }

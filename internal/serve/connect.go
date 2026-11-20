@@ -663,11 +663,7 @@ func readObject(b []byte, doc, v any) error {
 	if !bytes.HasPrefix(b, []byte("{")) || exactjson.Unmarshal(b, doc) != nil {
 		return errNotObject
 	}
-	only, err := exactjson.MustUnderstand(b)
-	if err != nil {
-		return errNotObject
-	}
-	return contracts.CheckMustUnderstand(only, v)
+	return contracts.CheckMustUnderstand(b, v)
 }
 
 // answerRefusal is the error of an answer that [readObject] refused with err: notObject

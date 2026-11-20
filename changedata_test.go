@@ -280,3 +280,22 @@ func TestParsePullRequestDataMatchesMemberNamesInExactCase(t *testing.T) {
 		t.Error("an Action is the action of the draft")
 	}
 }
+
+// TestParsePullRequestDataRefusesARepeatedMember has data that repeats a member, with the
+// same value or another, at the top, below base and in the draft: the data stops at the
+// first reading.
+func TestParsePullRequestDataRefusesARepeatedMember(t *testing.T) {
+	data := string(pullData(`{"action":"open"}`, nil))
+	for name, doc := range map[string]string{
+		"branch":       `{"branch":"other",` + data[1:],
+		"same branch":  `{"branch":"qory/wi_42",` + data[1:],
+		"base":         strings.Replace(data, `"base":{`, `"base":{"commit":"`+sha(9)+`",`, 1),
+		"draft action": strings.Replace(data, `"action":"open"`, `"action":"open","action":"update"`, 1),
+	} {
+		d, err := ParsePullRequestData(json.RawMessage(doc))
+		var refused *SubmitRefused
+		if !errors.As(err, &refused) {
+			t.Errorf("%s: %+v %v", name, d, err)
+		}
+	}
+}
