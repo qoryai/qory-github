@@ -467,7 +467,7 @@ func (a *Apiary) Declare(ctx context.Context, publicURL, setupURL string) error 
 // start when cursor is empty. Qory Apiary holds the request while nothing follows the
 // cursor, so an answer may take up to 25 seconds. The answer is used only once its
 // signature and its revision are checked, see [checkChanges].
-func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes, error) {
+func (a *Apiary) Changes(ctx context.Context, cursor string) (changesPage, error) {
 	const what = "reading the change feed"
 	target := routeChanges
 	if cursor != "" {
@@ -483,43 +483,76 @@ func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes,
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
-				return contracts.Changes{}, fmt.Errorf("%s: %w", what, err)
+				return changesPage{}, fmt.Errorf("%s: %w", what, err)
 			}
 			continue
 		}
 		if err != nil {
-			return contracts.Changes{}, err
+			return changesPage{}, err
 		}
 		return checkChanges(ans.body)
 	}
 }
 
+// changesPage is a page of the change feed: the members of [contracts.Changes], and
+// unmet, which has one element for each entry, in order: nil when the entry is one that
+// serve applies, else why it is not, the error of [contracts.CheckChangeMustUnderstand]
+// or the text that says serve applies no entry of the kind. The error starts with the
+// fix, as the failure report's detail does.
+type changesPage struct {
+	Version, Revision int
+	Cursor            string
+	Changes           []contracts.Change
+	unmet             []error
+}
+
 // checkChanges reads a page of the change feed, whose signature is checked already,
 // and refuses one that is not of the version and the revision serve implements, or
 // whose cursor is not one: a cursor is never taken from a page refused. The revision
-// is checked here alone.
-func checkChanges(body []byte) (contracts.Changes, error) {
+// is checked here alone. A member that the page or an entry does not define is ignored,
+// and so is every member of an entry of a kind serve does not apply, but its kind. Each
+// entry is checked with [contracts.CheckChangeMustUnderstand], see [changesPage].
+func checkChanges(body []byte) (changesPage, error) {
 	const what = "reading the change feed"
 	var doc struct {
-		contracts.Changes
-		Revision *int `json:"revision"`
+		Version  int               `json:"version"`
+		Revision *int              `json:"revision"`
+		Cursor   string            `json:"cursor"`
+		Changes  []json.RawMessage `json:"changes"`
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
 	}
-	ch := doc.Changes
 	switch {
-	case ch.Version != contracts.Version:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not of version %d", what, contracts.Version)
+	case doc.Version != contracts.Version:
+		return changesPage{}, fmt.Errorf("%s: the answer is not of version %d", what, contracts.Version)
 	case doc.Revision == nil || *doc.Revision != contracts.Revision:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not of the contract's revision %d", what, contracts.Revision)
-	case ch.Cursor == "" || len(ch.Cursor) > 200:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer's cursor is not 1 to 200 characters", what)
+		return changesPage{}, fmt.Errorf("%s: the answer is not of the contract's revision %d", what, contracts.Revision)
+	case doc.Cursor == "" || len(doc.Cursor) > 200:
+		return changesPage{}, fmt.Errorf("%s: the answer's cursor is not 1 to 200 characters", what)
 	}
-	ch.Revision = *doc.Revision
-	return ch, nil
+	page := changesPage{Version: doc.Version, Revision: *doc.Revision, Cursor: doc.Cursor}
+	for _, raw := range doc.Changes {
+		var head struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(raw, &head); err != nil || head.Kind == "" {
+			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: an entry is not an object with a kind", what)
+		}
+		unmet := contracts.CheckChangeMustUnderstand(raw)
+		ch := contracts.Change{Kind: head.Kind}
+		switch {
+		case knownKind(head.Kind):
+			if err := json.Unmarshal(raw, &ch); err != nil {
+				return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+			}
+		case unmet == nil:
+			unmet = fmt.Errorf("skip the entry and acknowledge it: qory-github applies no entry of the kind %q", prefixOf(head.Kind, maxLogged))
+		}
+		page.Changes = append(page.Changes, ch)
+		page.unmet = append(page.unmet, unmet)
+	}
+	return page, nil
 }
 
 // post sends one POST, its body body with the time set, and judges the answer. A 429 is

@@ -118,8 +118,10 @@ type DraftResult struct {
 // retry would fail the same way. Reason is the failure report's reason, [ReasonNotPermitted],
 // [ReasonUnreachable], [ReasonTargetGone], [ReasonTooLong] or [ReasonRefused]. Fix is
 // the one line that says what a person does, at most 100 characters, ending with a
-// period; each failing case has a different one, see the Fix constants. Err is the cause: GitHub's
-// status and message, or the check that stopped the call. Status and Message are GitHub's
+// period; each failing case has a different one, see the Fix constants, except a pointer
+// of must_understand that the entry's kind does not define, whose Fix is the contract's
+// text. Err is the cause: GitHub's status and message, or the check that stopped the
+// call. Status and Message are GitHub's
 // answer when the refusal comes from one, else 0 and empty; Message is one line with no
 // token, see [OneLine]. The text of the error is Fix, then Err's text.
 type SubmitRefused struct {

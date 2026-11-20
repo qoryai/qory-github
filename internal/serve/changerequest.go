@@ -172,10 +172,11 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // with an installation token for that repository with pull_requests: write alone, from
 // the installation that RepositoryInstallation finds by the repository's current path.
 //
-// The checks come in this order, each before any request: the kind, the target, see
-// [Adapter.checkTarget], the data, see [github.ParsePullRequestData], and the title. A
-// change kind that the adapter does not apply, and data that breaks a rule of the kind,
-// are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot
+// The checks come in this order, each before any request: the kind, the must_understand
+// list, see [mustUnderstandRefusal], the target, see [Adapter.checkTarget], the data, see
+// [github.ParsePullRequestData], and the title. A change kind that the adapter does not
+// apply, a must_understand list with a pointer that the adapter does not define, and data
+// that breaks a rule of the kind, are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot
 // open or update, whose reason is the reason of the failure report, see
 // [feed.changeRequest]: also not_permitted when no installation reaches the repository,
 // or the mint fails permanently, [github.ErrMintRefused], or GitHub returns that the
@@ -184,11 +185,14 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // id, or a title with no visible character, is [Permanent]. Every other error may pass,
 // and the entry is applied again. Every error but the first ends with "(change request
 // {id}, {collection})".
-func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (contracts.ChangesSubmitted, error) {
+func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, unmet error) (contracts.ChangesSubmitted, error) {
 	where := " (change request " + ch.ChangeRequestID + ", " + ch.Target.Collection + ")"
 	if ch.ChangeKind != github.ChangeKindPullRequest {
 		cause := fmt.Sprintf("qory-github applies only the kind %s, and the entry has the kind %q.", github.ChangeKindPullRequest, prefixOf(ch.ChangeKind, maxLogged))
 		return contracts.ChangesSubmitted{}, &github.SubmitRefused{Reason: github.ReasonRefused, Fix: github.FixChangeKind, Err: errors.New(cause + where), Message: github.OneLine(cause, github.MaxDetail)}
+	}
+	if err := mustUnderstandRefusal(ch, unmet, where); err != nil {
+		return contracts.ChangesSubmitted{}, err
 	}
 	id, err := a.checkTarget(ch, where)
 	if err != nil {
@@ -276,6 +280,28 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change) (
 	return withData(reply, result)
 }
 
+// mustUnderstandRefusal is the refusal of a change_request entry whose must_understand
+// lists a pointer that the adapter does not define, or nil when it lists none. unmet is
+// the error of [contracts.CheckChangeMustUnderstand] for the entry, see [changesPage]:
+// its text is the detail, as the contract has it. A pointer below data is checked here
+// against the pull-request kind, see [github.UndefinedDataPointer], since the contract
+// leaves data to the kind's artifact type. Both details start with the fix.
+func mustUnderstandRefusal(ch contracts.Change, unmet error, where string) error {
+	cause := errors.New("the entry's must_understand lists a pointer that qory-github does not define" + where)
+	if unmet != nil {
+		return &github.SubmitRefused{Reason: github.ReasonRefused, Fix: unmet.Error(), Err: cause}
+	}
+	p := github.UndefinedDataPointer(ch.MustUnderstand)
+	if p == "" {
+		return nil
+	}
+	quoted := strconv.Quote(prefixOf(p, maxLogged))
+	if len(prefixOf(p, maxLogged)) < len(p) {
+		quoted = quoted[:len(quoted)-1] + `..."`
+	}
+	return &github.SubmitRefused{Reason: github.ReasonRefused, Fix: github.FixUndefinedData, Err: cause, Message: "The entry lists " + quoted + ", which this adapter does not define."}
+}
+
 // withData is reply with the data result.
 func withData(reply contracts.ChangesSubmitted, result pullRequestReply) (contracts.ChangesSubmitted, error) {
 	b, err := json.Marshal(result)
@@ -329,6 +355,9 @@ type targetState struct {
 	refused *github.SubmitRefused
 	// cause is the error of the last try that failed, not for good.
 	cause error
+	// unmet is why serve cannot meet the entry's must_understand, see [changesPage]; the
+	// feed sets it from the page each step.
+	unmet error
 }
 
 // changeRequest applies a change_request entry, which has one target. A change that is
@@ -371,7 +400,7 @@ func (f *feed) changeRequest(ctx context.Context, state *entryState, ch contract
 // returns the reply once the change is put on GitHub, and nil with a nil error once the
 // change is reported or passed.
 func (f *feed) target(ctx context.Context, ch contracts.Change, ts *targetState) (*contracts.ChangesSubmitted, error) {
-	reply, err := f.adapter.applyChangeRequest(ctx, ch)
+	reply, err := f.adapter.applyChangeRequest(ctx, ch, ts.unmet)
 	var refused *github.SubmitRefused
 	switch {
 	case err == nil:

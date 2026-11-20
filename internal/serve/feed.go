@@ -197,9 +197,9 @@ func prefixOf(s string, n int) string {
 	return s
 }
 
-// unknownChange is an answer of the feed that holds an entry of a kind, or a status of
-// a known kind, that serve does not know: the cursor the answer was read after, and the
-// entry's kind and status as Qory Apiary sent them, maxLogged characters of each.
+// unknownChange is an answer of the feed that holds an entry of a known kind with a
+// status that serve does not know: the cursor the answer was read after, and the entry's
+// kind and status as Qory Apiary sent them, maxLogged characters of each.
 type unknownChange struct {
 	after, kind, status string
 }
@@ -208,19 +208,26 @@ func (e *unknownChange) Error() string {
 	return "reading the change feed: an answer holds an entry serve does not know, so none of it is applied"
 }
 
-// known is whether serve knows the entry's kind, and its status for a kind that has one.
+// knownKind is whether serve applies the entries of the kind.
+func knownKind(kind string) bool {
+	switch kind {
+	case contracts.ChangeWorkItem, contracts.ChangeComment, contracts.ChangeCollection, contracts.ChangeGrant,
+		contracts.ChangeSync, contracts.ChangeWatch, contracts.ChangeRequest:
+		return true
+	}
+	return false
+}
+
+// known is whether serve knows the entry's status, for a kind that has one, and its
+// kind.
 func known(ch contracts.Change) bool {
 	switch ch.Kind {
 	case contracts.ChangeWorkItem:
 		return ch.Status == github.StatusTakenIn || ch.Status == github.StatusUndone
-	case contracts.ChangeComment:
-		return true
 	case contracts.ChangeCollection, contracts.ChangeGrant:
 		return ch.Status == "linked" || ch.Status == "unlinked"
-	case contracts.ChangeSync, contracts.ChangeWatch, contracts.ChangeRequest:
-		return true
 	}
-	return false
+	return knownKind(ch.Kind)
 }
 
 // step reads one page of the feed after the cursor kept, applies its entries in order,
@@ -263,11 +270,17 @@ func known(ch contracts.Change) bool {
 // one entry failed, or an entry applied, counts toward both. All this is kept in
 // memory alone, so a restart times the entries from their next failures again.
 //
-// A page that holds an entry serve does not know is refused whole, an
-// [*unknownChange], before any of its entries is applied, and its cursor is not kept:
-// Qory Apiary sends only the kinds and statuses of the contract's revision, which serve
-// implements, so such an entry is Qory Apiary's defect, and passing it could lose what
-// it says.
+// A page that holds an entry of a known kind with a status serve does not know is
+// refused whole, an [*unknownChange], before any of its entries is applied, and its
+// cursor is not kept: Qory Apiary sends only the statuses of the contract's revision,
+// which serve implements, so such an entry is Qory Apiary's defect, and passing it could
+// lose what it says.
+//
+// An entry that serve cannot apply is skipped and acknowledged: it applies nothing, no
+// entry waits for it, and the cursor moves past it, as past an applied entry. These are
+// an entry of a kind serve does not apply, and an entry whose must_understand lists a
+// pointer serve does not define, see [changesPage]. A change_request entry with such a
+// pointer is the exception: it is reported as refused, see [Adapter.applyChangeRequest].
 //
 // watch entries are dropped: a watch entry changes nothing, waits for no entry, and no
 // entry waits for it. The cursor moves past it as past an applied entry.
@@ -281,8 +294,8 @@ func (f *feed) step(ctx context.Context) error {
 		f.feedDown()
 		return err
 	}
-	for _, ch := range page.Changes {
-		if !known(ch) {
+	for i, ch := range page.Changes {
+		if page.unmet[i] == nil && !known(ch) {
 			f.feedDown()
 			return &unknownChange{after: string(cursor), kind: prefixOf(ch.Kind, maxLogged), status: prefixOf(ch.Status, maxLogged)}
 		}
@@ -302,6 +315,14 @@ func (f *feed) step(ctx context.Context) error {
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		switch unmet := page.unmet[i]; {
+		case ch.Kind == contracts.ChangeRequest:
+			state.applied.unmet = unmet
+		case unmet != nil:
+			f.log.Warn("an entry of the change feed is skipped", slog.String("kind", prefixOf(ch.Kind, maxLogged)), slog.String("reason", unmet.Error()))
+			state.done = true
+			continue
 		}
 		if open.waits(ch) {
 			open.add(ch)

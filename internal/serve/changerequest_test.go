@@ -99,8 +99,10 @@ func previously(ch contracts.Change, title string) contracts.Change {
 	return ch
 }
 
+// entrySchema is the closed copy of changes.schema.json, which a writer of entries, as the
+// fake is, is tested against.
 var entrySchema = func() *jsonschema.Schema {
-	s, err := contracts.Compile("changes.schema.json")
+	s, err := contracts.CompileClosed("changes.schema.json")
 	if err != nil {
 		panic(err)
 	}

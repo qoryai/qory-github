@@ -2519,11 +2519,11 @@ func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
 // TestACommentEntryIsKnownAndDecodes reads a page of the feed with a comment entry, as
 // Qory Apiary writes it, which passes the contract's schema and which serve accepts and
 // decodes with no member left over, and one with a member the comment entry does not
-// define, which serve rejects.
+// define, which serve ignores.
 func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	body := `{"version":1,"revision":` + strconv.Itoa(contracts.Revision) + `,"cursor":"c_1","changes":[` +
 		`{"kind":"comment","comment_id":"sc_0123456789abcdef","ref":"1296269#7","author_name":"Dana Example","body":"Please check the steps."}]}`
-	schema, err := contracts.Compile("changes.schema.json")
+	schema, err := contracts.CompileClosed("changes.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2546,8 +2546,9 @@ func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	if err != nil || !strings.Contains(body, string(b)) {
 		t.Errorf("the entry marshals as %s, %v", b, err)
 	}
-	if _, err := checkChanges([]byte(strings.Replace(body, `"body":`, `"url":"https://apiary.example.com/","extra":1,"body":`, 1))); err == nil {
-		t.Error("an entry with a member the contract does not define is decoded")
+	more, err := checkChanges([]byte(strings.Replace(body, `"body":`, `"extra":{"zz":1},"body":`, 1)))
+	if err != nil || len(more.Changes) != 1 || !reflect.DeepEqual(more.Changes[0], want) {
+		t.Errorf("an entry with a member the contract does not define is not ignored: %+v, %v", more, err)
 	}
 }
 
@@ -2563,7 +2564,7 @@ func checkPageSchema(t *testing.T, f *fakeApiary) {
 	f.mu.Lock()
 	body := f.page("")
 	f.mu.Unlock()
-	schema, err := contracts.Compile("changes.schema.json")
+	schema, err := contracts.CompileClosed("changes.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3166,13 +3167,12 @@ func TestAFeedEntryThatMayPassKeepsTheCursor(t *testing.T) {
 }
 
 // TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole serves a page whose last entry
-// has a kind, or a status, serve does not know, and checks none of the page is
+// has a status of its kind that serve does not know, and checks none of the page is
 // applied, its cursor is not kept, and the refusal is logged with the cursor it was
 // read after and the entry's kind and status; then serves a page serve knows, which
 // moves the feed on.
 func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
 	for _, bad := range []contracts.Change{
-		{Kind: "label", Status: "added"},
 		{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "shelved", URL: "https://apiary.example.com/work-items/wi_42"},
 		{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "archived"},
 	} {
@@ -3237,14 +3237,20 @@ func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
 	}
 }
 
-// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose kind and status are long,
-// and checks the refusal keeps 64 characters of each.
+// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose status is long, and checks
+// the refusal keeps 64 characters of it, and an entry whose kind is long, which the log of
+// its skip keeps 64 characters of.
 func TestAnUnknownEntrysKindAndStatusAreCut(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100), Status: strings.Repeat("s", 100)})
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, Status: strings.Repeat("s", 100)})
 	var u *unknownChange
-	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != strings.Repeat("ü", 64) || u.status != strings.Repeat("s", 64) {
+	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != contracts.ChangeCollection || u.status != strings.Repeat("s", 64) {
 		t.Errorf("err %v", err)
+	}
+	w = newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100)})
+	if err := w.feed.step(context.Background()); err != nil || !strings.Contains(w.log.String(), `"kind":"`+strings.Repeat("ü", 64)+`"`) {
+		t.Errorf("err %v, log %s", err, w.log.String())
 	}
 }
 
@@ -3574,11 +3580,10 @@ func TestTheFeedRefusesAnotherRevision(t *testing.T) {
 		t.Errorf("the cursor is kept: %v", err)
 	}
 	for body, want := range map[string]string{
-		`{"version":1,"cursor":"c_1","changes":[]}`:                                                   "revision 1",
-		`{"version":1,"revision":1,"cursor":"c_1","changes":[],"more":true}`:                          "not the feed's document",
-		`{"version":2,"revision":1,"cursor":"c_1","changes":[]}`:                                      "version 1",
-		`{"version":1,"revision":1,"cursor":"","changes":[]}`:                                         "cursor",
-		`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null,"x":1}]}`: "not the feed's document",
+		`{"version":1,"cursor":"c_1","changes":[]}`:                                            "revision 1",
+		`{"version":2,"revision":1,"cursor":"c_1","changes":[]}`:                               "version 1",
+		`{"version":1,"revision":1,"cursor":"","changes":[]}`:                                  "cursor",
+		`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":"x"}]}`: "not the feed's document",
 	} {
 		if _, err := checkChanges([]byte(body)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: err %v", body, err)

@@ -189,3 +189,33 @@ func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
 		t.Error("a missing number is read")
 	}
 }
+
+// TestUndefinedDataPointerKnowsTheMembersTheAdapterReads: a pointer to each member that
+// ParsePullRequestData reads, and to each member below it, is defined; a pointer to
+// another member, to a member below a scalar, or to an index that is no number, is the
+// pointer returned, and a pointer that is not below data is not its concern.
+func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
+	for _, p := range []string{
+		"/data", "/title", "/data/branch", "/data/base", "/data/base/commit", "/data/base/branch", "/data/commit",
+		"/data/commits", "/data/commits/0", "/data/commits/12/commit", "/data/commits/0/step", "/data/earlier_commits",
+		"/data/draft", "/data/draft/action", "/data/draft/number",
+	} {
+		if got := UndefinedDataPointer([]string{p}); got != "" {
+			t.Errorf("%s is read, and %q is returned", p, got)
+		}
+	}
+	for _, p := range []string{
+		"/data/", "/data/zz", "/data/base/zz", "/data/branch/zz", "/data/commits/-", "/data/commits/01", "/data/commits/zz",
+		"/data/commits/0/zz", "/data/earlier_commits/0", "/data/draft/zz", "/data/draft/number/0", "/data/Branch", "/data/a~2",
+	} {
+		if got := UndefinedDataPointer([]string{"/data/branch", p, "/data/zz2"}); got != p {
+			t.Errorf("%s is not read, and %q is returned", p, got)
+		}
+	}
+	if got := UndefinedDataPointer([]string{"/database/zz"}); got != "" {
+		t.Errorf("%q is returned for a pointer that is not below data", got)
+	}
+	if got := UndefinedDataPointer(nil); got != "" {
+		t.Errorf("%q is returned for no pointer", got)
+	}
+}

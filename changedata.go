@@ -9,12 +9,18 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/qoryai/integrations/contracts"
 )
 
 // FixChangeData is the fix line for a change request whose data breaks a rule of the
 // pull-request kind. The contract lists no member of data, so [ParsePullRequestData]
 // checks each member it reads.
 const FixChangeData = "Fix the data of the pull-request artifact type in the process, then submit again."
+
+// FixUndefinedData is the fix line for a change request whose must_understand lists a
+// pointer below data that [UndefinedDataPointer] returns.
+const FixUndefinedData = "List only members that the pull-request kind defines in must_understand, or use another adapter."
 
 // The limits of the data of a pull-request change request.
 const (
@@ -70,6 +76,48 @@ type rawData struct {
 	} `json:"commits"`
 	EarlierCommits json.RawMessage `json:"earlier_commits"`
 	Draft          json.RawMessage `json:"draft"`
+}
+
+// dataMembers are the members of the data that [ParsePullRequestData] reads, with the
+// members below them, as types whose json tags [contracts.CheckMustUnderstand] resolves a
+// pointer through. A scalar has no member below it. Keep it in step with rawData and
+// rawDraft.
+type dataMembers struct {
+	Branch string `json:"branch"`
+	Base   *struct {
+		Commit string `json:"commit"`
+		Branch string `json:"branch"`
+	} `json:"base"`
+	Commit  string `json:"commit"`
+	Commits []struct {
+		Commit string `json:"commit"`
+		Step   string `json:"step"`
+	} `json:"commits"`
+	EarlierCommits int64 `json:"earlier_commits"`
+	Draft          *struct {
+		Action string `json:"action"`
+		Number int64  `json:"number"`
+	} `json:"draft"`
+}
+
+// UndefinedDataPointer returns the first of pointers, JSON Pointers counted from a
+// change request entry, that points below data and not to a member of the data of the
+// pull-request kind that [ParsePullRequestData] reads, or "" when there is none. The
+// contract leaves every member of data to the artifact type of the kind, so the check
+// is the adapter's. A pointer to data itself, and a pointer that does not point below
+// data, are not its concern.
+func UndefinedDataPointer(pointers []string) string {
+	for _, p := range pointers {
+		below, ok := strings.CutPrefix(p, "/data/")
+		if !ok {
+			continue
+		}
+		doc, err := json.Marshal(map[string][]string{contracts.MustUnderstand: {"/" + below}})
+		if err != nil || contracts.CheckMustUnderstand(doc, dataMembers{}) != nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // rawDraft is the wire form of the draft member of the data.
