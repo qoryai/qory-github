@@ -104,10 +104,10 @@ which emoji sequences need. The program keeps U+200C and U+200D in the title, an
 of nothing but spaces, U+200C and U+200D counts as empty. When the title is empty, it is
 `QORY_SUBMIT_TITLE`, cleaned the same way.
 
-The program has the removed characters as 24 ranges in `FORBIDDEN_RANGES`, the format
-characters of Unicode 17.0.0. The tests compare the ranges with the rule of
-`qory-github-server` for every code point, so a later Unicode version fails them until
-you update the ranges.
+The program has the removed characters as 24 ranges in `FORBIDDEN_RANGES`: the controls,
+U+2028, U+2029, and the format characters of Unicode 17.0.0 except U+200C and U+200D. The
+tests compare the ranges with the rule of `qory-github-server` for every code point, so a
+later Unicode version fails them until you update the ranges.
 
 | Exit | Meaning |
 |---|---|

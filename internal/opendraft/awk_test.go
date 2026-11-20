@@ -228,8 +228,8 @@ func jqExpression(t *testing.T, sh string) string {
 
 // TestTheJqExpressionRemovesExactlyWhatTheAdapterStops runs the --jq expression of the
 // program with jq over the controls and [ruleChars], in two titles: the code point
-// between two letters, and the code point alone. Planes 1 to 13 hold no character that
-// the rule stops, and TestTheForbiddenRangesAreTheAdaptersRule compares the ranges with
+// between two letters, and the code point alone. No character that the rule stops is in
+// planes 1 to 13, and TestTheForbiddenRangesAreTheAdaptersRule compares the ranges with
 // the rule for every code point. The title that the program prints is the one that the
 // adapter's rule makes of it: without the characters of [github.LineStopped], and empty
 // when [github.HasVisible] is false. It fails when the rule or the program changes alone.

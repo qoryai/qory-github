@@ -34,26 +34,28 @@ change what the program does, and notes it under Upgrading.
   `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits` and
   `draft`, and checks each: a branch name that git accepts and that is one line, a full
   commit id as the address path of each commit and a collection of one line of 1 to 200
-  characters, at least 1 commit and no limit of the adapter, a list of steps, each with
-  a `step` of 1 to 128 characters on one line, `earlier_commits` as a whole number from
-  1, and `draft` as `true` or `false`; data that breaks a rule is reported as `refused`,
-  with the code point of a stopped character in the `detail`. A title that has a control
-  character, U+2028, U+2029 or a format character other than U+200C and U+200D, or no
-  character that is not a space, U+200C or U+200D, is reported as `refused` before any
-  request to GitHub, with a `detail` that starts with the fix; so is a `text` that has a
-  line that is `<!-- qory:start -->` or `<!-- qory:end -->`, since the adapter writes the
-  text between those lines. The same rule for characters applies to the failure `detail`,
-  the account title of a grant and the author name of a comment. An entry of another
-  `change_kind` is reported as `refused`, with a `detail` that starts with the fix. An
-  entry that GitHub refuses for good is reported to Qory Apiary with the reason
-  `not_permitted`, `target_gone`, `too_long` or `refused`, and a `detail` with the fix and
-  GitHub's status and message; one that still fails when the retries end, after a day, is
-  reported with the reason of the last error of its tries: `unreachable` for a failure to
-  reach GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer
-  such as a 404 or a 401 that kept coming. A 404, 410, 301 or 308 on the read of the
-  repository by its id is `target_gone`, with the fix to check that the repository exists
-  and the App's installation reaches it. A 301 or 308 on the lookup of the installation or
-  on a pull request call is `target_gone` too, with the fix to link the repository by its
+  characters, at least 1 commit and no limit from the adapter on their number (the
+  contract limits an array in `data` to 1024 items, so the reply has at most 1024 commit
+  addresses), a list of steps, each with a `step` of 1 to 128 characters on one line,
+  `earlier_commits` as a whole number from 1, and `draft` as `true` or `false`; data that
+  breaks a rule is reported as `refused`, with the code point of a stopped character in
+  the `detail`. A title that has a control character, U+2028, U+2029 or a format character
+  other than U+200C and U+200D, or no character that is not a space, U+200C or U+200D, is
+  reported as `refused` before any request to GitHub, with a `detail` that starts with the
+  fix; so is a `text` that has a line that is `<!-- qory:start -->` or
+  `<!-- qory:end -->`, since the adapter writes the text between those lines. The same
+  rule for characters applies to the failure `detail`, the account title of a grant and
+  the author name of a comment. An entry of another `change_kind` is reported as
+  `refused`, with a `detail` that starts with the fix. An entry that GitHub refuses for
+  good is reported to Qory Apiary with the reason `not_permitted`, `target_gone`,
+  `too_long` or `refused`, and a `detail` with the fix and GitHub's status and message;
+  one that still fails when the retries end, after a day, is reported with the reason of
+  the last error of its tries: `unreachable` for a failure to reach GitHub, a rate limit,
+  a 408 or a 5xx, and the reason of the refusal for an answer such as a 404 or a 401 that
+  kept coming. A 404, 410, 301 or 308 on the read of the repository by its id is
+  `target_gone`, with the fix to check that the repository exists and the App's
+  installation reaches it. A 301 or 308 on the lookup of the installation or on a pull
+  request call is `target_gone` too, with the fix to link the repository by its
   new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App needs the
   permission Pull requests: read and write. The title in the reply has none of the
   characters that the title rule stops.

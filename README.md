@@ -286,12 +286,15 @@ For each entry, the adapter:
   (the type's schema in the Qory harness is the source of the members): `branch` and
   `base_branch`, names that git accepts, each one line; `head`, `base` and each of
   `commits`, a commit whose `address.path` is a full commit id and whose `collection` is
-  one line of 1 to 200 characters; at least 1 of `commits`, with no limit of the adapter
-  (the contract's limits of the data apply); `steps`, a list, each with a full commit id
-  and a `step` of 1 to 128 characters on one line; `earlier_commits`, a whole number from
-  1; and `draft`, `true` or `false`. One line has no control character, no U+2028 or
-  U+2029, and no format character other than U+200C and U+200D. The `target`, `title` and
-  `text` of the data are ignored: the adapter uses those of the entry. Data that breaks a
+  one line of 1 to 200 characters; at least 1 of `commits`, and no limit from the adapter
+  on their number (the contract limits an array in `data` to 1024 items, so an entry has
+  at most 1024 commits and the reply to Qory Apiary at most 1024 commit addresses; a reply
+  of more than 1 MiB is not sent, and the log has the error); `steps`, a list, each with a
+  full commit id and a `step` of 1 to 128 characters on one line; `earlier_commits`, a
+  whole number from 1; and `draft`, `true` or `false`. One line has no control character,
+  no U+2028 or U+2029, and no format character other than U+200C and U+200D. The `target`,
+  `title` and `text` of the data are ignored: the adapter uses those of the entry. Data
+  that breaks a
   rule gets a failure report with the reason `refused`, and a `detail` that has the
   member and, for a stopped character, its code point.
 - Checks the entry's `title` and `text` before it sends anything to GitHub. A title that
@@ -315,7 +318,8 @@ For each entry, the adapter:
   or with one that is unusable or gone, makes the change at the target, so a branch with
   only closed or merged pull requests gets a new pull request, with the action `created`.
   If GitHub refuses the new pull request because the branch has no commits that the base
-  lacks (422), the entry gets a failure report with the reason `refused`.
+  lacks (422), the entry gets a failure report with the reason `refused` and the fix "Push
+  a commit that the base branch lacks, then submit again."
 - Opens a pull request from the branch into the entry's `base_branch` when it finds none,
   as a draft when `draft` is `true`. It never changes the base branch of an existing pull
   request, so a later entry with another `base_branch` edits the same pull request and

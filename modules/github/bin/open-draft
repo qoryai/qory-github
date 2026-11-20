@@ -139,7 +139,7 @@ has_control() {
 }
 
 # utf8_seq sets _seq to the printf escapes of the UTF-8 bytes of the code point $1, a
-# decimal number from 128 up, such as \\302\\255 for U+00AD. printf escapes are POSIX, so
+# decimal number from 128 up, such as \302\255 for U+00AD. printf escapes are POSIX, so
 # no awk has to read an escape.
 utf8_seq() {
 	if [ "$1" -lt 2048 ]; then
