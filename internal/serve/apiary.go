@@ -494,16 +494,15 @@ func (a *Apiary) Changes(ctx context.Context, cursor string) (changesPage, error
 	}
 }
 
-// changesPage is a page of the change feed: the members of [contracts.Changes], and
-// unmet, which has one element for each entry, in order: nil when the entry is one that
-// serve applies, else why it is not, the error of [contracts.CheckChangeMustUnderstand]
-// or the text that says serve applies no entry of the kind. The error starts with the
-// fix, as the failure report's detail does.
+// changesPage is a page of the change feed: its cursor and its entries, and unmet, which
+// has one element for each entry, in order: nil when the entry is one that serve applies,
+// else why it is not. That is the error of [contracts.CheckChangeMustUnderstand], or, for
+// an entry of a kind serve does not apply, an error that asks to skip the entry. The
+// error starts with the fix, as the failure report's detail does.
 type changesPage struct {
-	Version, Revision int
-	Cursor            string
-	Changes           []contracts.Change
-	unmet             []error
+	Cursor  string
+	Changes []contracts.Change
+	unmet   []error
 }
 
 // checkChanges reads a page of the change feed, whose signature is checked already,
@@ -511,7 +510,9 @@ type changesPage struct {
 // whose cursor is not one: a cursor is never taken from a page refused. The revision
 // is checked here alone. A member that the page or an entry does not define is ignored,
 // and so is every member of an entry of a kind serve does not apply, but its kind. Each
-// entry is checked with [contracts.CheckChangeMustUnderstand], see [changesPage].
+// entry is checked with [contracts.CheckChangeMustUnderstand], see [changesPage]. An
+// entry whose must_understand is no list reaches that check too, and is not a reason to
+// refuse the page; any other member of a known kind that has the wrong type is.
 func checkChanges(body []byte) (changesPage, error) {
 	const what = "reading the change feed"
 	var doc struct {
@@ -531,7 +532,7 @@ func checkChanges(body []byte) (changesPage, error) {
 	case doc.Cursor == "" || len(doc.Cursor) > 200:
 		return changesPage{}, fmt.Errorf("%s: the answer's cursor is not 1 to 200 characters", what)
 	}
-	page := changesPage{Version: doc.Version, Revision: *doc.Revision, Cursor: doc.Cursor}
+	page := changesPage{Cursor: doc.Cursor}
 	for _, raw := range doc.Changes {
 		var head struct {
 			Kind string `json:"kind"`
@@ -544,8 +545,18 @@ func checkChanges(body []byte) (changesPage, error) {
 		if !knownKind(head.Kind) {
 			// The pin's error quotes the whole kind, so it is replaced here.
 			unmet = fmt.Errorf("skip the entry and acknowledge it: qory-github applies no entry of the kind %q", prefixOf(head.Kind, maxLogged))
-		} else if err := json.Unmarshal(raw, &ch); err != nil {
-			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+		} else {
+			// must_understand is read as raw JSON, so a value that is no list ends in unmet.
+			var entry struct {
+				contracts.Change
+				MustUnderstand json.RawMessage `json:"must_understand"`
+			}
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+			}
+			ch = entry.Change
+			// An error here means that unmet has the error already.
+			_ = json.Unmarshal(entry.MustUnderstand, &ch.MustUnderstand)
 		}
 		page.Changes = append(page.Changes, ch)
 		page.unmet = append(page.unmet, unmet)

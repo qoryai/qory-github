@@ -279,7 +279,9 @@ For each entry, the adapter:
   GitHub, and reads its current name, so a repository that was renamed still gets its
   draft. The target's address, where it has one, is checked only for its `system`, which
   must be the host of the GitHub the adapter reaches (`github.com`), and for a `path` of
-  the shape `owner/name`; an entry with any other address is logged and passed.
+  the shape `owner/name`; an entry with any other address is logged and passed. An
+  entry whose `must_understand` the adapter cannot meet (see below) is reported as
+  `refused` before the adapter checks its address.
 - Checks the entry's `data`: the branch name, the base, the commit ids, and the `draft`
   member. Data that breaks a rule gets a failure report with the reason `refused`.
 - Sends Qory Apiary the address of the base commit and of each listed commit,
@@ -307,17 +309,17 @@ For each entry, the adapter:
 The adapter reads the change feed as a reader that may be older than Qory Apiary:
 
 - It skips an entry of a kind it does not apply, and an entry whose `must_understand`
-  lists a pointer that it does not define. It moves its cursor past the entry and logs
-  one line for it.
+  lists a pointer that it does not define or is not a list of JSON Pointers. It moves
+  its cursor past the entry and logs one line for it.
 - It ignores a member that it does not define, in the feed's answer, in an entry, in
   `target` and in `previous`. A `previous` with only such members is empty: the entry
   has no previous title.
 - It reports a `change_request` entry whose `must_understand` lists a pointer that it
-  does not define as `refused`, with a `detail` that starts with the fix. A pointer
-  below `data` is defined when it points to a member of the pull-request data that the
-  adapter reads: `branch`, `base` with `commit` and `branch`, `commit`, `commits` with
-  `commit` and `step` for each, `earlier_commits`, and `draft` with `action` and
-  `number`.
+  does not define, or is not a list of JSON Pointers, as `refused`, with a `detail` that
+  starts with the fix. A pointer below `data` is defined when it points to a member of
+  the pull-request data that the adapter reads: `branch`, `base` with `commit` and
+  `branch`, `commit`, `commits` with `commit` and `step` for each, `earlier_commits`, and
+  `draft` with `action` and `number`.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`

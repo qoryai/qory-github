@@ -175,16 +175,17 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // The checks come in this order, each before any request: the kind, the must_understand
 // list, see [mustUnderstandRefusal], the target, see [Adapter.checkTarget], the data, see
 // [github.ParsePullRequestData], and the title. A change kind that the adapter does not
-// apply, a must_understand list with a pointer that the adapter does not define, and data
-// that breaks a rule of the kind, are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot
-// open or update, whose reason is the reason of the failure report, see
-// [feed.changeRequest]: also not_permitted when no installation reaches the repository,
-// or the mint fails permanently, [github.ErrMintRefused], or GitHub returns that the
-// installation is suspended, [github.ErrSuspended]. A target whose address is of another
-// system or has a path that is not owner/name, a collection that is not a repository's
-// id, or a title with no visible character, is [Permanent]. Every other error may pass,
-// and the entry is applied again. Every error but the first ends with "(change request
-// {id}, {collection})".
+// apply, a must_understand list that is no list or has a pointer that the adapter does
+// not define, and data that breaks a rule of the kind, are a [*github.SubmitRefused] with
+// the reason refused. So is a draft that a retry cannot open or update, whose reason is
+// the reason of the failure report, see [feed.changeRequest]: also not_permitted when no
+// installation reaches the repository, or the mint fails permanently,
+// [github.ErrMintRefused], or GitHub returns that the installation is suspended,
+// [github.ErrSuspended]. A target whose address is of another system or has a path that
+// is not owner/name, a collection that is not a repository's id, or a title with no
+// visible character, is [Permanent]. Every other error may pass, and the entry is
+// applied again. Every error but the first ends with "(change request {id},
+// {collection})".
 func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, unmet error) (contracts.ChangesSubmitted, error) {
 	where := " (change request " + ch.ChangeRequestID + ", " + ch.Target.Collection + ")"
 	if ch.ChangeKind != github.ChangeKindPullRequest {
@@ -281,13 +282,13 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 }
 
 // mustUnderstandRefusal is the refusal of a change_request entry whose must_understand
-// lists a pointer that the adapter does not define, or nil when it lists none. unmet is
-// the error of [contracts.CheckChangeMustUnderstand] for the entry, see [changesPage]:
-// its text is the detail, as the contract has it. A pointer below data is checked here
-// against the pull-request kind, see [github.UndefinedDataPointer], since the contract
-// leaves data to the kind's artifact type. Both details start with the fix.
+// lists a pointer that the adapter does not define or is no valid list, or nil when it
+// is neither. unmet is the error of [contracts.CheckChangeMustUnderstand] for the entry,
+// see [changesPage]: its text is the detail, as the contract has it. A pointer below data
+// is checked here against the pull-request kind, see [github.UndefinedDataPointer], since
+// the contract leaves data to the kind's artifact type. Both details start with the fix.
 func mustUnderstandRefusal(ch contracts.Change, unmet error, where string) error {
-	cause := errors.New("the entry's must_understand lists a pointer that qory-github does not define" + where)
+	cause := errors.New("the entry's must_understand is no valid list, or lists a pointer that qory-github does not define" + where)
 	if unmet != nil {
 		return &github.SubmitRefused{Reason: github.ReasonRefused, Fix: unmet.Error(), Err: cause}
 	}

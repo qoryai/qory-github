@@ -3589,7 +3589,7 @@ func TestTheFeedRefusesAnotherRevision(t *testing.T) {
 			t.Errorf("%s: err %v", body, err)
 		}
 	}
-	if ch, err := checkChanges([]byte(`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null}]}`)); err != nil || ch.Revision != 1 || len(ch.Changes) != 1 {
+	if ch, err := checkChanges([]byte(`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null}]}`)); err != nil || ch.Cursor != "c_1" || len(ch.Changes) != 1 {
 		t.Errorf("%+v %v", ch, err)
 	}
 }

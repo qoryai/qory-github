@@ -280,7 +280,7 @@ func known(ch contracts.Change) bool {
 // An entry that serve cannot apply is skipped and acknowledged: it applies nothing, no
 // entry waits for it, and the cursor moves past it, as past an applied entry. These are
 // an entry of a kind serve does not apply, and an entry whose must_understand lists a
-// pointer serve does not define, see [changesPage]. A change_request entry with such a
+// pointer serve does not define or is no valid list, see [changesPage]. A change_request entry with such a
 // pointer is the exception: it is reported as refused, see [Adapter.applyChangeRequest].
 //
 // watch entries are dropped: a watch entry changes nothing, waits for no entry, and no
