@@ -650,9 +650,9 @@ func strictObject(b []byte, doc any) bool {
 var errNotObject = errors.New("the document is not one JSON object of the contract's shape")
 
 // readObject reads the payload b of a document of the contract, from another system, into
-// doc, a struct of pointers: one JSON object and nothing after it. It ignores a member
-// that doc does not name, and nothing but [errNotObject] comes from a payload that breaks
-// that. It then checks the document's must_understand with [contracts.CheckMustUnderstand]
+// doc, a pointer to a struct: one JSON object that starts at the first byte, with nothing
+// after it. It ignores a member that doc does not name, and nothing but [errNotObject]
+// comes from a payload that breaks that, or a member of doc with the wrong type. It then checks the document's must_understand with [contracts.CheckMustUnderstand]
 // against v, the contract's type of the document, and returns its error, which starts
 // with the fix, when the document lists a pointer that the type does not define or the
 // list is malformed.

@@ -327,7 +327,8 @@ secrets that it seals. It ignores a member that it does not define. It does not 
 document whose `must_understand` lists a pointer to a member that it does not define, or
 is malformed: it logs a line that starts with the fix (`use a reader that defines
 "/zz"`), and for a pass the adapter shows the page for a link that is not valid. It also
-does not read a document that is not one JSON object, or has data after the object.
+does not read a document that is not one JSON object, that has data after the object, or
+that has anything, such as a space or a byte order mark, before the opening brace.
 The body of a refusal is read the same way: when the adapter does not read it, the answer
 has no refusal code, and the adapter acts on the status alone.
 

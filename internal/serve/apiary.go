@@ -741,7 +741,9 @@ func retryWait(err error) (time.Duration, bool) {
 //   - an answer whose signature does not verify under the pin is an [Outage], and its
 //     body is never parsed;
 //   - a signed answer to a request that names a connection, connection, is told to
-//     [Apiary.Answered];
+//     [Apiary.Answered], with the refusal's code, or "" when the body of the refusal
+//     cannot be read or lists a must_understand pointer that the adapter does not define:
+//     such a refusal has no code, and the status decides;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
 //     nothing, and the periodic check sends the request again. Each is [Permanent],

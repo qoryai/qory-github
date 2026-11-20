@@ -187,11 +187,12 @@ change what the program does, and notes it under Upgrading.
   the secrets that it seals. It does not read such a document when its `must_understand`
   lists a pointer to a member that the adapter does not define, or is malformed, and the
   reason in the log starts with the fix. It does not read a document that has data after
-  the JSON object, as before. Before, the adapter did not read a document with any
-  member that it does not define. The body of a refusal that Qory Apiary sends is read
-  the same way: when the adapter does not read it, the answer has no refusal code, and
-  the adapter acts on the status alone. The stored App entry, which `qory-github-server`
-  writes, stays strict.
+  the JSON object, as before, or anything before the opening brace, such as a space or a
+  byte order mark. Before, the adapter did not read a document with any member that it
+  does not define. The body of a refusal that Qory Apiary sends is read the same way:
+  when the adapter does not read it, the answer has no refusal code, and the adapter
+  acts on the status alone. The stored App entry, which `qory-github-server` writes,
+  stays strict.
 
 ### Upgrading
 
