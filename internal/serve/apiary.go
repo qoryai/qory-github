@@ -751,7 +751,9 @@ func retryWait(err error) (time.Duration, bool) {
 //     such a refusal has no code;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
-//     nothing, and the periodic check sends the request again. Each is [Permanent], and
+//     nothing, and the periodic check sends the request again, but for a grant report,
+//     which [Connect.reportSoon] sends again with its backoff until the connect return
+//     expires. Each is [Permanent], and
 //     so are any other 409 or 403 with a code, 400 and 413, each a [*refusedError]; what
 //     a 409 collection_not_linked does is for the request's sender to say, see
 //     [Apiary.Items] and [Apiary.Comments]. A 409 or a 403 with no code, because the
@@ -832,11 +834,13 @@ func (e *refusedError) Error() string {
 	return fmt.Sprintf("%s: Qory Apiary answered %d %s", e.what, e.status, e.code)
 }
 
-// sentAgain is whether err is a signed refusal of Qory Apiary's that changes nothing and
-// is sent again, with the caller's backoff: a 409 or a 403 with no code, as the body
-// cannot be read, see [Apiary.judge], or a 409 connection_suspended, which the contract
-// says changes no state. A caller that decides by the refusal's status, not by
-// [IsPermanent], tests it before its other cases; a 403 with a code is not one.
+// sentAgain is whether err is a signed refusal of Qory Apiary's that changes nothing
+// and is sent again, with the caller's backoff: a 409 or a 403 with no code, as the
+// body cannot be read, see [Apiary.judge], or a 409 connection_suspended, which the
+// contract says changes no state. A grant report is sent again after each of them,
+// until the connect return expires, also while the connection is suspended. A caller
+// that decides by the refusal's status, not by [IsPermanent], tests it before its
+// other cases; a 403 with a code is not one.
 func sentAgain(err error) bool {
 	var refused *refusedError
 	if !errors.As(err, &refused) {

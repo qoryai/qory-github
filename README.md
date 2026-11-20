@@ -339,10 +339,11 @@ that has anything, such as a space or a byte order mark, before the opening brac
 body of a refusal is read the same way: when the adapter does not read it, the answer
 has no refusal code. A 409 `connection_ended` that the adapter reads ends the
 connection; a 409 or a 403 without a code does not. The grant report is sent again after
-a wait that doubles from 2 to 60 seconds, until the connect return expires, 300 seconds
-after the connect, when the answer is a 409 or a 403 without a code, or a 409
-`connection_suspended`; nothing changes until then. When the connect return expires, the
-adapter stops the report and drops the installation's link and the records of its
+every answer that is not final: a 409 `pass_unknown`, a 403 `connection_unknown`, a 409
+`connection_suspended`, and a 403 or a 409 without a code. The waits double from 2 to 60
+seconds, also while the connection is suspended, until the connect return expires, 300
+seconds after the connect; nothing changes until then. When the connect return expires,
+the adapter stops the report and drops the installation's link and the records of its
 repositories, unless Qory Apiary's copy of the grants holds the grant, and the person
 connects again. The grant end and the first listing are sent again after a wait, with a
 backoff, on the same answers, and nothing changes. A disconnect, an item or a comment
