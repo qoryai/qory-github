@@ -70,11 +70,11 @@ change what the program does, and notes it under Upgrading.
   opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the one that exists,
   with the login of `gh`. The title it prints has none of the characters that the contract
   refuses; when nothing is left, it prints `QORY_SUBMIT_TITLE`, cleaned the same way. It
-  finds the pull request by its head branch and repository alone, in any state. Of several
-  it takes the highest number that is not closed and not merged, otherwise the highest
-  number. It replaces only the text between the lines `<!-- qory:start -->` and
-  `<!-- qory:end -->` of the description, keeps the title, and changes nothing in a closed or
-  merged pull request. It prints the result as lines (`draft_number`, `draft_url`,
+  finds the open pull request by its head branch and repository alone, and of several it
+  takes the highest number, as the adapter does. When the branch has only closed or merged
+  pull requests, it opens a new draft and never reuses them. It replaces only the text
+  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description and
+  keeps the title. It prints the result as lines (`draft_number`, `draft_url`,
   `draft_title`, `draft_state`, `draft_action`, `commit_url`). Exit 1 means a call to `gh`
   failed or did not finish within 110 seconds, exit 2 an input it cannot use, and exit 3 a
   missing login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first

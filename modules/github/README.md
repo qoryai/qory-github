@@ -59,17 +59,16 @@ empty.
    status 2, after the commit lines. With `none`, it ends here and runs no `gh`.
 4. It runs `gh auth token --hostname github.com`, which reads the login from the credential
    store of `gh` and calls no server. It discards the token.
-5. It searches for the pull requests of the repository with the head branch, in any
-   state (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and
-   `state=all`). It ignores the base branch, the branch of a fork with the same name,
-   and a pull request whose head repository is gone. Of several it takes the one
-   with the highest number that is not closed and not merged, otherwise the one with the
-   highest number.
-6. With none, it runs `gh pr create --draft` with the branch, the base branch, the title
-   and the description. The description is the block alone.
-7. With one that is closed or merged, it changes nothing and prints its state with the
-   action `kept`.
-8. With one that is open or a draft, it keeps the title and replaces the text between
+5. It searches for the open pull requests of the repository with the head branch
+   (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and `state=open`).
+   It ignores the base branch, the branch of a fork with the same name, and a pull
+   request whose head repository is gone. Of several it takes the one with the highest
+   number. A closed or merged pull request is never reused, as in the adapter.
+6. With none, including when the branch has only closed or merged pull requests, it
+   runs `gh pr create --draft` with the branch, the base branch, the title and the
+   description, and prints the new draft with the action `opened`. The description is
+   the block alone.
+7. With one that is open or a draft, it keeps the title and replaces the text between
    the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description with the
    text of the file, through `gh api` with the method `PATCH`. It sends nothing when the
    description stays the same, and prints the action `kept`.

@@ -55,6 +55,7 @@ prev=
 method=GET
 endpoint=
 jq=
+state=
 for a in "$@"; do
 	case $prev in
 	--body-file) cp "$a" "$d/call.$n.file" ;;
@@ -63,6 +64,7 @@ for a in "$@"; do
 	esac
 	case $a in
 	body=@*) cp "${a#body=@}" "$d/call.$n.file" ;;
+	state=*) state=${a#state=} ;;
 	repos/*) endpoint=$a ;;
 	esac
 	prev=$a
@@ -87,7 +89,13 @@ fi
 k=$(cat "$d/k.$key" 2>/dev/null || echo 0)
 k=$((k + 1))
 echo "$k" >"$d/k.$key"
-pick() { if [ -f "$d/$key.$k.$1" ]; then echo "$d/$key.$k.$1"; else echo "$d/$key.$1"; fi; }
+# A search that passes state=X reads list.X.out and list.X.json, as GitHub returns only
+# the pull requests of that state.
+pick() {
+	if [ -f "$d/$key.$k.$1" ]; then echo "$d/$key.$k.$1"
+	elif [ -n "$state" ] && [ -f "$d/$key.$state.$1" ]; then echo "$d/$key.$state.$1"
+	else echo "$d/$key.$1"; fi
+}
 if [ -f "$(pick err)" ]; then cat "$(pick err)" >&2; fi
 if [ -n "$jq" ] && [ -n "${FAKE_GH_JQ:-}" ]; then
 	jq -r "$jq" "$(pick json)"
@@ -254,21 +262,30 @@ func (f *fake) setText(text string) {
 	f.input["QORY_SUBMIT_DESCRIPTION_FILE"] = p
 }
 
-// setList sets what the search from the branch returns.
+// setList sets what the search from the branch returns: the pull requests that are open
+// for state=open, and all of them for state=all. A search with another state, or with
+// none, returns nothing.
 func (f *fake) setList(ps ...pull) {
 	f.t.Helper()
-	var text strings.Builder
-	var js []map[string]any
-	for _, p := range ps {
-		text.WriteString(p.text(false))
-		js = append(js, p.json())
+	for state, keep := range map[string]func(pull) bool{
+		"all":  func(pull) bool { return true },
+		"open": func(p pull) bool { return p.norm().State == "open" },
+	} {
+		var text strings.Builder
+		js := []map[string]any{}
+		for _, p := range ps {
+			if keep(p) {
+				text.WriteString(p.text(false))
+				js = append(js, p.json())
+			}
+		}
+		b, err := json.Marshal(js)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		f.set("list."+state+".out", text.String())
+		f.set("list."+state+".json", string(b))
 	}
-	b, err := json.Marshal(js)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	f.set("list.out", text.String())
-	f.set("list.json", string(b))
 }
 
 // setRead sets what the read of one pull request returns.
@@ -466,7 +483,7 @@ func TestAFirstRunOpensOneDraft(t *testing.T) {
 		}
 		list := calls[1]
 		wantList := []string{"api", "-X", "GET", "--hostname", "github.com", "repos/" + repo + "/pulls",
-			"-f", "head=acme-corp:" + branch, "-f", "state=all", "-f", "per_page=100", "--jq"}
+			"-f", "head=acme-corp:" + branch, "-f", "state=open", "-f", "per_page=100", "--jq"}
 		if strings.Join(list[:len(list)-1], "\x00") != strings.Join(wantList, "\x00") {
 			t.Errorf("search call %q, want %q and an expression", list, wantList)
 		}
@@ -528,32 +545,37 @@ func TestARunWhoseTextIsInTheBlockChangesNothing(t *testing.T) {
 	}
 }
 
-func TestAClosedOrMergedPullRequestIsNotEdited(t *testing.T) {
+// A closed or merged pull request is never reused: with only such pull requests on the
+// branch, the program opens a new draft, as the adapter does, and reads, edits and
+// prints only the new one.
+func TestAClosedOrMergedPullRequestIsNeverReused(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		for _, c := range []struct {
-			name  string
-			p     pull
-			state string
+			name string
+			ps   []pull
 		}{
-			{"closed", pull{Number: 4, State: "closed", Title: "Closed one", Body: "Text."}, "closed"},
-			{"merged", pull{Number: 5, State: "closed", Merged: true, Title: "Merged one", Body: "Text."}, "merged"},
-			{"a draft that was closed", pull{Number: 6, State: "closed", Draft: true, Title: "Closed draft", Body: "Text."}, "closed"},
+			{"closed", []pull{{Number: 4, State: "closed", Title: "Closed one", Body: "Text."}}},
+			{"merged", []pull{{Number: 5, State: "closed", Merged: true, Title: "Merged one", Body: "Text."}}},
+			{"a draft that was closed", []pull{{Number: 6, State: "closed", Draft: true, Title: "Closed draft", Body: "Text."}}},
+			{"closed and merged", []pull{{Number: 4, State: "closed", Title: "Four"}, {Number: 5, State: "closed", Merged: true, Title: "Five"}}},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
-				f.have(c.p)
-				wantResult(t, f.run(), 0, commitLines()+draftLines(c.p.Number, c.p.Title, c.state, "kept"))
-				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
-					t.Errorf("calls %s: it changes nothing and opens nothing", got)
+				f.have(c.ps...)
+				f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+				f.setRead(pull{Number: 12, Draft: true, Title: title})
+				wantResult(t, f.run(), 0, commitLines()+draftLines(12, title, "draft", "opened"))
+				if got := strings.Join(f.kinds(), " "); got != "auth list create read" {
+					t.Errorf("calls %s: it opens a draft and reads only that one", got)
 				}
 			})
 		}
 	})
 }
 
-// The draft among several: the highest number that is not closed and not merged, else
-// the highest number.
+// The draft among several: the highest number of the open ones, as findPull of the
+// adapter takes it. A closed or merged pull request does not count, whatever its number.
 func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		closed := pull{Number: 5, State: "closed", Title: "Five"}
@@ -566,27 +588,23 @@ func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 		otherBranch := pull{Number: 22, Ref: "other", Title: "Other branch"}
 		upper := pull{Number: 23, Repo: "Acme-Corp/Widgets-App", Title: "Upper case", Draft: true, Body: "Text."}
 		for _, c := range []struct {
-			name   string
-			ps     []pull
-			want   pull
-			state  string
-			action string
+			name string
+			ps   []pull
+			want pull
 		}{
-			{"the highest that is not closed or merged", []pull{open7, closed, open9, merged11, closed12}, open9, "draft", "updated"},
-			{"none is open, so the highest number", []pull{closed, merged11, closed12}, closed12, "closed", "kept"},
-			{"none is open and the highest is merged", []pull{closed, closed12, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}}, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}, "merged", "kept"},
-			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7, "draft", "updated"},
-			{"the repository is compared without regard to case", []pull{open7, upper}, upper, "draft", "updated"},
+			{"the highest that is open", []pull{open7, closed, open9, merged11, closed12}, open9},
+			{"an open one below a closed one is the one", []pull{closed12, open7}, open7},
+			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7},
+			{"the repository is compared without regard to case", []pull{open7, upper}, upper},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
 				f.setText("New text.")
 				f.have(c.ps...)
-				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, c.state, c.action))
-				kinds := strings.Join(f.kinds(), " ")
-				if want := map[string]string{"updated": "auth list read patch", "kept": "auth list read"}[c.action]; kinds != want {
-					t.Errorf("calls %s, want %s", kinds, want)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, "draft", "updated"))
+				if kinds := strings.Join(f.kinds(), " "); kinds != "auth list read patch" {
+					t.Errorf("calls %s, want auth list read patch", kinds)
 				}
 			})
 		}
@@ -1125,11 +1143,6 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 				parsed(t, r.stdout)
 			}
 		})
-		t.Run("a closed pull request is cleaned too", func(t *testing.T) {
-			f := newFake(t, mode)
-			f.have(pull{Number: 4, State: "closed", Title: "Old\u200f\nname"})
-			wantResult(t, f.run(), 0, commitLines()+draftLines(4, "Oldname", "closed", "kept"))
-		})
 		t.Run("a new draft shows the title that GitHub has, cleaned", func(t *testing.T) {
 			f := newFake(t, mode)
 			f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
@@ -1161,7 +1174,7 @@ func TestEveryRunOfTheProgramIsRecordedByQory(t *testing.T) {
 			f.setRead(pull{Number: 12, Draft: true, Title: title})
 		}},
 		{"updated", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: "x"}) }},
-		{"kept merged", func(f *fake) { f.have(pull{Number: 8, State: "closed", Merged: true, Title: "Mine"}) }},
+		{"kept", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: block("Show the delivery date.")}) }},
 	} {
 		f := newFake(t, "text")
 		c.set(f)

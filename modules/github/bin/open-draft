@@ -399,12 +399,13 @@ read_pull() {
 	fi
 }
 
-# find_pull sets number to the pull request from the branch, or to nothing. It looks
-# at the head branch and the repository alone, in any state. Of several it takes the
-# highest number that is not closed and not merged, else the highest number.
+# find_pull sets number to the open pull request from the branch, or to nothing. It looks
+# at the head branch and the repository alone, as findPull of the adapter does: only an
+# open pull request counts, and of several it takes the highest number. A closed or
+# merged pull request is never reused.
 find_pull() {
 	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
-		-f "head=$owner:$branch" -f state=all -f per_page=100 --jq "$LIST_JQ" \
+		-f "head=$owner:$branch" -f state=open -f per_page=100 --jq "$LIST_JQ" \
 		>"$tmp/list" 2>"$tmp/gh.err" </dev/null; then
 		gh_fail 'the search for the pull request of the branch'
 	fi
@@ -414,13 +415,11 @@ find_pull() {
 			v[f] = $0
 			if (f == 8 && v[2] == ENVIRON["QORY_SUBMIT_BRANCH"] && tolower(v[3]) == tolower(want_repo)) {
 				n = v[1] + 0
-				if (v[4] == "open" && v[5] == "false" && n > best_open) best_open = n
-				if (n > best_any) best_any = n
+				if (v[4] == "open" && v[5] == "false" && n > best) best = n
 			}
 		}
 		END {
-			if (best_open > 0) print best_open
-			else if (best_any > 0) print best_any
+			if (best > 0) print best
 		}
 	' "$tmp/list")
 }
