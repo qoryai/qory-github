@@ -235,3 +235,55 @@ func TestADisconnectOfAConnectionAnswered403WithoutACodeIsTriedAgain(t *testing.
 		mu.Unlock()
 	}
 }
+
+// TestAReplacedConnectionWhoseEndAnswers403WithoutACodeIsListedAgain has Qory Apiary take
+// the empty listing of a replaced connection, and answer its disconnect 403 with a body the
+// adapter cannot read, as many times as one call sends it (disconnectTries). The end is an
+// error that may pass: the replaced record stays, the first listing's loop waits a second
+// and sends the listing and the disconnect again, and the second disconnect, the signed 204,
+// forgets the record.
+func TestAReplacedConnectionWhoseEndAnswers403WithoutACodeIsListedAgain(t *testing.T) {
+	rig := newConnectRig(t)
+	rig.client.Sleep = func(context.Context, time.Duration) error { return nil }
+	rig.apiary.refuse = func(route string, n int) (int, string) {
+		if route == routeConnectionsDisconnect && n <= disconnectTries {
+			return 403, `<html>`
+		}
+		return 0, ""
+	}
+	grantedPutLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	keepReplaced(rig.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+	var mu sync.Mutex
+	type moment struct {
+		kept               bool
+		listings, disconns int
+	}
+	var first *moment
+	orig := rig.c.sleep
+	rig.c.sleep = func(ctx context.Context, d time.Duration) error {
+		mu.Lock()
+		if first == nil {
+			_, kept, _ := replacedOf(rig.st, otherConnection)
+			first = &moment{kept, len(rig.apiary.sent(routeCollections)), len(rig.apiary.sent(routeConnectionsDisconnect))}
+		}
+		mu.Unlock()
+		return orig(ctx, d)
+	}
+	rig.c.listSoon(42, otherConnection, false)
+	eventually(t, "the replaced connection forgotten", func() bool { _, ok, _ := replacedOf(rig.st, otherConnection); return !ok })
+	rig.c.stop()
+	mu.Lock()
+	defer mu.Unlock()
+	if first == nil || *first != (moment{true, 1, disconnectTries}) {
+		t.Errorf("at the first wait: %+v", first)
+	}
+	if n, m := len(rig.apiary.sent(routeCollections)), len(rig.apiary.sent(routeConnectionsDisconnect)); n != 2 || m != disconnectTries+1 {
+		t.Errorf("%d listings and %d disconnects", n, m)
+	}
+	rig.mu.Lock()
+	defer rig.mu.Unlock()
+	if !slices.Equal(rig.waits, []time.Duration{time.Second}) {
+		t.Errorf("waited %v", rig.waits)
+	}
+	rig.linked(t, 42, testConnection, linkPending)
+}

@@ -4906,13 +4906,16 @@ func suspendedDisconnect(w *wired, ref string) {
 
 // refusedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref 409
 // with the signed body, and any other with the signed 204.
-func refusedDisconnect(w *wired, ref, body string) {
+func refusedDisconnect(w *wired, ref, body string) { answeredDisconnect(w, ref, 409, body) }
+
+// answeredDisconnect is [refusedDisconnect] with the signed status.
+func answeredDisconnect(w *wired, ref string, status int, body string) {
 	refuse := func(route string, n int) (int, string) {
 		if route != routeDisconnect {
 			return 0, ""
 		}
 		if sent := w.apiary.sent(routeDisconnect); n <= len(sent) && sent[n-1].body["collection_ref"] == ref {
-			return 409, body
+			return status, body
 		}
 		return 0, ""
 	}
@@ -4930,20 +4933,47 @@ func refusedDisconnect(w *wired, ref, body string) {
 // keeps the records, and a readable code that is final, collection_not_linked, is logged
 // and the records are dropped.
 func TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords(t *testing.T) {
-	for _, tc := range []struct {
-		name, body               string
-		kept                     bool
-		state                    store.State
-		deletedSent, removedSent int
-		retried                  bool
-		logged                   bool
-	}{
+	checkDisconnects(t, 409, []disconnectCase{
 		{"an unmet pointer", `{"error":"connection_suspended","zz":1,"must_understand":["/zz"]}`, true, store.Failed, 3, 3, true, false},
 		{"no JSON", `<html>`, true, store.Failed, 3, 3, true, false},
 		{"a space before the object", ` {"error":"connection_suspended"}`, true, store.Failed, 3, 3, true, false},
 		{"connection_suspended", `{"error":"connection_suspended"}`, true, store.Failed, 1, 2, false, false},
 		{"collection_not_linked", `{"error":"collection_not_linked"}`, false, store.Done, 1, 2, false, true},
-	} {
+	})
+}
+
+// TestADisconnectWithAnUnreadable403IsSentAgainAndKeepsTheRecords is the same for a signed
+// 403: one whose body the adapter cannot read, or whose must_understand it cannot meet,
+// has no code, so the records stay and the worker sends the request again, up to its
+// attempts. A 403 with a code, forbidden, is final: it is logged and the records are
+// dropped.
+func TestADisconnectWithAnUnreadable403IsSentAgainAndKeepsTheRecords(t *testing.T) {
+	checkDisconnects(t, 403, []disconnectCase{
+		{"an unmet pointer", `{"error":"forbidden","zz":1,"must_understand":["/zz"]}`, true, store.Failed, 3, 3, true, false},
+		{"no JSON", `<html>`, true, store.Failed, 3, 3, true, false},
+		{"forbidden", `{"error":"forbidden"}`, false, store.Done, 1, 2, false, true},
+	})
+}
+
+// disconnectCase is a body that Qory Apiary answers the disconnect of a repository with, and
+// what follows: whether the repository's records are kept, the delivery's state, the
+// disconnects sent for a deleted and for a removed repository, whether the worker sent the
+// first removed repository's request again so the other waits, and whether the refusal is
+// logged.
+type disconnectCase struct {
+	name, body               string
+	kept                     bool
+	state                    store.State
+	deletedSent, removedSent int
+	retried                  bool
+	logged                   bool
+}
+
+// checkDisconnects has Qory Apiary answer the disconnect of acme/old with status and the
+// body of each case, for a deleted repository and for a removed one.
+func checkDisconnects(t *testing.T, status int, cases []disconnectCase) {
+	t.Helper()
+	for _, tc := range cases {
 		for _, site := range []string{"deleted", "removed"} {
 			w := newWired(t, filepath.Join(t.TempDir(), "state"))
 			grantedLink(w.st, 42, testConnection, linkLive)
@@ -4951,7 +4981,7 @@ func TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords(t *testing.
 				setReach(w.st, ref, 42)
 				linkCollection(w.st, ref)
 			}
-			refusedDisconnect(w, refOf("acme/old"), tc.body)
+			answeredDisconnect(w, refOf("acme/old"), status, tc.body)
 			sent := tc.deletedSent
 			if site == "deleted" {
 				w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/old", "deleted"))
