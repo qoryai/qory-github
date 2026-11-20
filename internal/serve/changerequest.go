@@ -418,9 +418,10 @@ func (f *feed) target(ctx context.Context, ch contracts.Change, ts *targetState)
 
 // reply sends Qory Apiary the reply for the entry that state is the state of, when its
 // change waits for it. It sends nothing otherwise, as when the change is reported or
-// passed. Once the reply is sent, or fails permanently, as with Qory Apiary's 400 or 403,
-// the entry is done; the draft exists, and the reply is not sent again. Any other
-// failure leaves the change waiting, and the next step sends the reply again.
+// passed. Once the reply is sent, or fails permanently, as with Qory Apiary's 400 or a
+// 403 with a code, the entry is done; the draft exists, and the reply is not sent
+// again. Any other failure leaves the change waiting, and the next step sends the
+// reply again.
 func (f *feed) reply(ctx context.Context, state *entryState) error {
 	ts := &state.applied
 	if ts.reply == nil || ts.done {
@@ -438,12 +439,13 @@ func (f *feed) reply(ctx context.Context, state *entryState) error {
 	return nil
 }
 
-// reportTarget sends Qory Apiary the failure report of the change_request entry ch, with
-// the reason and the detail of refused, after cause, see [Apiary.ChangeRequestFailed], and
-// logs it. It returns nil once the report is sent, or failed permanently, as with Qory
-// Apiary's 400 or 403; the change is then passed. A report that fails otherwise is a
-// [*reportPending], and the change is applied again, until each limit of the entry's
-// retries has passed by one more stuckFor, see [feed.entry].
+// reportTarget sends Qory Apiary the failure report of the change_request entry ch,
+// with the reason and the detail of refused, after cause, see
+// [Apiary.ChangeRequestFailed], and logs it. It returns nil once the report is sent,
+// or failed permanently, as with Qory Apiary's 400 or a 403 with a code; the change is
+// then passed. A report that fails otherwise is a [*reportPending], and the change is
+// applied again, until each limit of the entry's retries has passed by one more
+// stuckFor, see [feed.entry].
 func (f *feed) reportTarget(ctx context.Context, ch contracts.Change, refused *github.SubmitRefused, cause error) error {
 	reason := refused.Reason
 	err := f.apiary.ChangeRequestFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, ChangeRequestID: ch.ChangeRequestID, Target: ch.Target, Reason: reason}, refused.Detail())

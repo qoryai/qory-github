@@ -381,20 +381,20 @@ func unlinkedGrant(st *store.Store, installation int64, connection string) (bool
 
 // reportSoon reports the installation's grant for account to Qory Apiary, linked to
 // connection under the pass whose nonce is nonce, beside the connect's answer, see
-// [Apiary.ReportGrant].
-// While Qory Apiary answers 409 pass_unknown or 403 connection_unknown, as it does until
-// the person's browser brings the linked connect return, or the report fails as a
-// request that may pass, or as a 409 or a 403 with no code or a 409
-// connection_suspended, see [sentAgain], it is sent again after a wait that doubles from
-// [grantFirstWait] to [grantMaxWait], until expires, the expiry of the linked connect
-// return minted for it. It stops before a try once GitHub has deleted the installation,
-// see [keepDeleted]. A report Qory Apiary takes adds the grant to the copy, and when
-// a listing of the installation left its collections out meanwhile, since the copy did
-// not have the grant, see [reachSink], the installation's repositories are listed again
-// with them, see [Adapter.listFor]; a listing that fails is logged. Once
-// expires has passed, or Qory Apiary refuses the report for good, the installation's
-// link to connection is dropped unless the copy holds the grant. A 409 connection_ended
-// drops the link at once, as it does for any request, see [Apiary.Ended].
+// [Apiary.ReportGrant]. While Qory Apiary answers 409 pass_unknown or 403
+// connection_unknown, as it does until the person's browser brings the linked connect
+// return, or the report fails as a request that may pass, or as a 409 or a 403 with no
+// code or a 409 connection_suspended, see [sentAgain], it is sent again after a wait
+// that doubles from [grantFirstWait] to [grantMaxWait], until expires, the expiry of
+// the linked connect return minted for it. It stops before a try once GitHub has
+// deleted the installation, see [keepDeleted]. A report Qory Apiary takes adds the
+// grant to the copy, and when a listing of the installation left its collections out
+// meanwhile, since the copy did not have the grant, see [reachSink], the
+// installation's repositories are listed again with them, see [Adapter.listFor]; a
+// listing that fails is logged. Once expires has passed, or Qory Apiary refuses the
+// report for good, the installation's link to connection is dropped unless the copy
+// holds the grant. A 409 connection_ended drops the link at once, as it does for any
+// request, see [Apiary.Ended].
 func (c *Connect) reportSoon(installation int64, connection, nonce string, account contracts.Account, expires time.Time) {
 	c.init()
 	gs, ok := c.Adapter.Sink.(grantSink)

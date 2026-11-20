@@ -691,10 +691,10 @@ func (f *feed) comment(ctx context.Context, ch contracts.Change) error {
 
 // report sends Qory Apiary the failure report of the comment entry with commentID, for
 // reason, after cause, the post's failure, see [Apiary.ChangesFailed]. Sent, or failed
-// permanently, as with Qory Apiary's 400 or 403, it is a [Permanent] error, so the feed
-// logs the entry and passes it. A report that fails otherwise is a [*reportPending],
-// which may pass, so the page stays and the entry is posted again, until each limit of
-// its retries has passed by one more stuckFor, see [feed.step].
+// permanently, as with Qory Apiary's 400 or a 403 with a code, it is a [Permanent]
+// error, so the feed logs the entry and passes it. A report that fails otherwise is a
+// [*reportPending], which may pass, so the page stays and the entry is posted again,
+// until each limit of its retries has passed by one more stuckFor, see [feed.step].
 func (f *feed) report(ctx context.Context, commentID, reason string, cause error) error {
 	err := f.apiary.ChangesFailed(ctx, contracts.ChangesFailed{Version: contracts.Version, CommentID: commentID, Reason: reason})
 	switch {

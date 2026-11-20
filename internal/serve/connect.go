@@ -650,14 +650,15 @@ func strictObject(b []byte, doc any) bool {
 // that decodes into doc.
 var errNotObject = errors.New("the document is not one JSON object of the contract's shape")
 
-// readObject reads the payload b of a document of the contract, from another system, into
-// doc, a pointer to a struct: one JSON object that starts at the first byte, with nothing
-// after it. It ignores a member that doc does not name, and matches a name in exact
-// case, see [exactjson.Unmarshal]. Nothing but [errNotObject] comes from a payload that
-// breaks that, or a member of doc with the wrong type. It then checks the document's
-// must_understand with [contracts.CheckMustUnderstand] against v, the contract's type of the document, and returns its error, which starts
-// with the fix, when the document lists a pointer that the type does not define or the
-// list is malformed.
+// readObject reads the payload b of a document of the contract, from another system,
+// into doc, a pointer to a struct: one JSON object that starts at the first byte, with
+// nothing after it. It ignores a member that doc does not name, and matches a name in
+// exact case, see [exactjson.Unmarshal]. Nothing but [errNotObject] comes from a
+// payload that breaks that, or a member of doc with the wrong type. It then checks the
+// document's must_understand with [contracts.CheckMustUnderstand] against v, the
+// contract's type of the document, and returns its error, which starts with the fix,
+// when the document lists a pointer that the type does not define or the list is
+// malformed.
 func readObject(b []byte, doc, v any) error {
 	if !bytes.HasPrefix(b, []byte("{")) || exactjson.Unmarshal(b, doc) != nil {
 		return errNotObject
@@ -1133,24 +1134,23 @@ func (c *Connect) listFailed(installation int64, connection string, err error) {
 // installation, while the browser carries the linked connect return to Qory Apiary,
 // which answers the listing 403 connection_unknown until it has taken the return. That
 // 403, and a failure that passes, no answer, a 429, a 5xx, an answer not signed, a 403
-// forbidden, which is logged, or a 409 or a 403 with no code or a 409 connection_suspended,
-// see [sentAgain], is sent again, the waits doubling from
-// [firstListingWait] up to [firstListingMaxWait], until the moment of the last listing:
-// the expiry of the return the link keeps, or the replaced record keeps, and
+// forbidden, which is logged, or a 409 or a 403 with no code or a 409
+// connection_suspended, see [sentAgain], is sent again, the waits doubling from
+// [firstListingWait] up to [firstListingMaxWait], until the moment of the last
+// listing: the expiry of the return the link keeps, or the replaced record keeps, and
 // [returnSkew] more, on the adapter's clock. Until then each try is
 // [Adapter.listFirst]'s, which reads GitHub once and sends the parts it keeps again,
 // with the same listing's id and started_at, see [Adapter.sendFirst]. Then the parts
 // kept are forgotten, and the link's last listing settles it, see [Adapter.listFor],
 // which reads GitHub again, sent again past failures that pass, the waits doubling up
-// to [lastListingMaxWait]. A signed 204 makes the link live, and a 409 connection_ended
-// to any try drops it at once. Once a connect for another connection has replaced the
-// link, each listing is the replaced connection's, empty, see [Adapter.listReplaced].
-// It stops once the link is live or settled, once Qory Apiary refuses otherwise, which
-// keeps the link, is logged and is taken up again by the round's listing, and once
-// [Connect.stop] has run; as it stops, for
-// any reason, it forgets the parts kept, see [Adapter.dropFirsts]. again, a
-// re-connect, fills the linked collections again once the listing is taken, see
-// [Connect.refill].
+// to [lastListingMaxWait]. A signed 204 makes the link live, and a 409
+// connection_ended to any try drops it at once. Once a connect for another connection
+// has replaced the link, each listing is the replaced connection's, empty, see
+// [Adapter.listReplaced]. It stops once the link is live or settled, once Qory Apiary
+// refuses otherwise, which keeps the link, is logged and is taken up again by the
+// round's listing, and once [Connect.stop] has run; as it stops, for any reason, it
+// forgets the parts kept, see [Adapter.dropFirsts]. again, a re-connect, fills the
+// linked collections again once the listing is taken, see [Connect.refill].
 func (c *Connect) listSoon(installation int64, connection string, again bool) {
 	c.init()
 	c.fillMu.Lock()

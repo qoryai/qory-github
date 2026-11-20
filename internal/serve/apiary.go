@@ -362,8 +362,8 @@ func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments)
 // post the comment of the comment entry with the comment_id in req, for req's reason.
 // Qory Apiary returns the signed 204 for a comment_id that has
 // no comment entry, and for one whose comment it matched to a posted comment already, so
-// a repeated report is no error. Its 400 and 403 are [Permanent], as every request's
-// are: the report is not sent again.
+// a repeated report is no error. Its 400, 413 and 403 with a code are [Permanent], as
+// every request's are: the report is not sent again.
 func (a *Apiary) ChangesFailed(ctx context.Context, req contracts.ChangesFailed) error {
 	what := "sending the failure report of the comment " + req.CommentID
 	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
@@ -382,8 +382,8 @@ func (a *Apiary) ChangeRequestFailed(ctx context.Context, req contracts.ChangesF
 // ChangesSubmitted sends POST /v1/work-items/changes/submitted: what the adapter put on
 // GitHub for the change_request entry with the change_request_id and target in req.
 // Qory Apiary keeps the first reply for the entry and answers the signed 204 to a later
-// one, so a repeated reply is no error. Its 400 and 403 are [Permanent], as every
-// request's are: the reply is not sent again.
+// one, so a repeated reply is no error. Its 400, 413 and 403 with a code are
+// [Permanent], as every request's are: the reply is not sent again.
 func (a *Apiary) ChangesSubmitted(ctx context.Context, req contracts.ChangesSubmitted) error {
 	return a.post(ctx, "sending the reply for the change request "+req.ChangeRequestID, routeChangesSubmitted, "", "", func(t string) any { req.Time = t; return req })
 }
