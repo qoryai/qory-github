@@ -172,41 +172,44 @@ change what the program does, and notes it under Upgrading.
   its cursor past the entry; it logs one line for each. It ignores a member of the
   feed's answer, of an entry, of `target` and of `previous` that the schemas do not
   define. A `previous` with only such members reads as empty, so an entry with
-  `previous` of `{"zz": 1}` opens a new draft. Before, the adapter refused the whole
-  answer for such a member, and an entry of an unknown kind stopped the feed. The calls
-  to the adapter that the schemas check (`resolve`, `read`, `read-public` and the run
-  credential) ignore such a member too. A `change_request` entry whose `must_understand`
-  lists a pointer that the adapter does not define, or is not a list, is reported as
-  `refused`, with a `detail` that starts with the fix. A pointer below `data` is defined
-  when it points to a member of the pull-request data that the adapter reads: `branch`,
-  `base` with `commit` and `branch`, `commit`, `commits` with `commit` and `step` for
-  each, `earlier_commits`, and `draft` with `action` and `number`. An entry with a
-  status of its kind that the adapter does not know still stops its answer.
+  `previous` of `{"zz": 1}` opens a new draft. Until this change, the adapter refused
+  the whole answer for such a member, and an entry of an unknown kind stopped the feed.
+  The calls to the adapter that the schemas check (`resolve`, `read`, `read-public` and
+  the run credential) ignore such a member too. A `change_request` entry whose
+  `must_understand` lists a pointer that the adapter does not define, or is not a list,
+  is reported as `refused`, with a `detail` that starts with the fix. A pointer below
+  `data` is defined when it points to a member of the pull-request data that the adapter
+  reads: `branch`, `base` with `commit` and `branch`, `commit`, `commits` with `commit`
+  and `step` for each, `earlier_commits`, and `draft` with `action` and `number`. An
+  entry with a status of its kind that the adapter does not know still stops its answer.
 - `qory-github-server serve` matches the name of a member of a document from Qory Apiary
   in exact case: the change feed and its entries, the calls to the adapter, the data of
   a change request, the connect and setup passes, the answers to the grants and to the
-  secrets request, the secrets that it seals and the body of a refusal. Before, `Token`
-  beside `token` could replace it, and a `Must_Understand` could replace the list that
-  `must_understand` wrote. `Token` alone now counts as a member that the adapter does not
-  define.
+  secrets request, the secrets that it seals and the body of a refusal. Until this
+  change, `Token` beside `token` could replace it, and a `Must_Understand` could replace
+  the `must_understand` list that the document has. `Token` alone now counts as a member
+  that the adapter does not define.
 - `qory-github-server serve` ignores a member that it does not define in the connect
   pass, the setup pass, the answer to the grants, the answer to the secrets request and
   the secrets that it seals. It does not read such a document when its `must_understand`
   lists a pointer to a member that the adapter does not define, or is malformed, and the
   reason in the log starts with the fix. It does not read a document that has data after
   the JSON object, as before, or anything before the opening brace, such as a space or a
-  byte order mark. Before, the adapter did not read a document with any member that it
-  does not define. The body of a refusal that Qory Apiary sends is read the same way:
-  when the adapter does not read it, the answer has no refusal code. A 409
+  byte order mark. Until this change, the adapter did not read a document with any
+  member that it does not define. The body of a refusal that Qory Apiary sends is read
+  the same way: when the adapter does not read it, the answer has no refusal code. A 409
   `connection_ended` that the adapter reads ends the connection; a 409 or a 403 without
-  a code does not. When the adapter sends a disconnect, an item, a comment, a listing, a
-  grant report or a grant end and gets a 409 or a 403 without a code, or a 409
-  `connection_suspended`, nothing changes and the request is sent again after a wait. A
-  403 without a code never counts toward the end of a connection. A 403 that the adapter
-  reads, and a 400 or 413, are handled as before. Before, a 409 or
-  a 403 without a code was a refusal for good, so a disconnect that met one dropped the
-  repository's records, and a grant report or a first listing that met one gave up. The
-  stored App entry, which `qory-github-server` writes, stays strict.
+  a code does not. The grant report, the grant end and the first listing are sent again
+  after a wait, with a backoff, when the answer is a 409 or a 403 without a code, or a
+  409 `connection_suspended`, and nothing changes. A disconnect, an item or a comment
+  that gets a 409 or a 403 without a code is sent again by the worker, with its backoff,
+  or by the next pull round; on a 409 `connection_suspended` it keeps the repository's
+  records and the next pull round sends it. A 403 without a code never counts toward the
+  end of a connection. A 403 with a code, and a 400 or 413, are handled as before. Until
+  this change, a 409 or a 403 without a code was a refusal for good, so a disconnect
+  that met one dropped the repository's records, and a grant report or a first listing
+  that met one gave up. The stored App entry, which `qory-github-server` writes, stays
+  strict.
 
 ### Upgrading
 
