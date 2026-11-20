@@ -233,7 +233,7 @@ func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
 				t.Errorf("%s: %q has %q", tc.name, got, part)
 			}
 		}
-		if !strings.Contains(got, "[removed]") || LineForbidden.MatchString(got) {
+		if !strings.Contains(got, "[removed]") || strings.ContainsFunc(got, LineStopped) {
 			t.Errorf("%s: %q", tc.name, got)
 		}
 	}

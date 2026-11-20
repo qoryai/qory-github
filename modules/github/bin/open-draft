@@ -31,6 +31,9 @@ LOGIN_LINE='Run `gh auth login`, then `qory run` again.'
 # paragraph separators, bidirectional and invisible format characters), so it stays on
 # one line, and is empty when nothing but spaces is left. Every character of the
 # expression is a constant: no input is put into it.
+# shortcut: the lists are those of the contract's earlier line rule. They miss the format
+# characters added since (U+206A-U+206F, U+E0001, U+E0020-U+E007F) and keep U+200C and U+200D
+# visible; awk reads byte lists, so a category rule needs a generated table: replace the lists then.
 FORBIDDEN='[\\x{0000}-\\x{001f}\\x{007f}-\\x{009f}\\x{00ad}\\x{061c}\\x{180e}\\x{200b}\\x{200e}\\x{200f}\\x{2028}\\x{2029}\\x{202a}-\\x{202e}\\x{2060}-\\x{2064}\\x{2066}-\\x{2069}\\x{feff}\\x{fff9}-\\x{fffb}]'
 NOT_SPACE='[^ \\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}]'
 FIELDS='(.number | tostring), .head.ref, (.head.repo.full_name // "-"), .state, ((.merged_at != null) | tostring), ((.draft == true) | tostring), (.title | gsub("'"$FORBIDDEN"'"; "") | if test("'"$NOT_SPACE"'") then . else "" end), .html_url'

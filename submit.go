@@ -161,6 +161,8 @@ const (
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
+	fixTitleStopped   = "Remove control and invisible format characters from the title, then submit again."
+	fixTitleBlank     = "Give the title a character that is not a space, then submit again."
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
 	fixPullTitle      = "Shorten the title of the pull request on GitHub to 256 characters or fewer."
 	fixPullText       = "Shorten the title or the description of the pull request on GitHub."
@@ -322,6 +324,23 @@ func CheckDraftText(title, description string) error {
 	}
 	if n := utf8.RuneCountInString(title); n > MaxDraftTitle {
 		return &SubmitRefused{Reason: ReasonTooLong, Fix: fixRunTitle, Err: fmt.Errorf("the title of the run is %d characters; the limit is %d", n, MaxDraftTitle)}
+	}
+	return nil
+}
+
+// CheckTitle returns a [*SubmitRefused] with the reason refused for a title that the
+// contract's change_title stops: a character that [LineStopped] stops, or no character
+// that is not a space, see [HasVisible]. It is nil otherwise. The message has the code
+// point of the first stopped character, never the title.
+func CheckTitle(title string) error {
+	if i := strings.IndexFunc(title, LineStopped); i >= 0 {
+		r, _ := utf8.DecodeRuneInString(title[i:])
+		cause := fmt.Sprintf("the title of the run has U+%04X, which a title may not have", r)
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixTitleStopped, Err: errors.New(cause), Message: cause + "."}
+	}
+	if !HasVisible(title) {
+		cause := "the title of the run has no character that is not a space"
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixTitleBlank, Err: errors.New(cause), Message: cause + "."}
 	}
 	return nil
 }

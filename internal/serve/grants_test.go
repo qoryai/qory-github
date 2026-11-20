@@ -433,6 +433,9 @@ func TestAnAccountIsItsIDAndLogin(t *testing.T) {
 		"two\nlines":              "500",
 		"right\u202eleft":         "500",
 		"zero\u200bwidth":         "500",
+		"tag\U000E0041letter":     "500",
+		"deprecated\u206fformat":  "500",
+		"zwj\u200dkept":           "zwj\u200dkept",
 		"\xff":                    "500",
 	} {
 		got := accountOf(github.Account{Login: login, ID: 500, Type: "Organization"})

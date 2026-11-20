@@ -59,31 +59,16 @@ const maxAccountTitle = 1024
 
 // accountOf is the account of an installation's grant, as the grant's report sends it:
 // ref, the GitHub account's id in decimal, and title, its login. A login that is not
-// one line of 1 to [maxAccountTitle] characters with none of the characters the
-// contract does not allow in a line, see [lineRune], is sent as the ref instead, so the
+// one line of 1 to [maxAccountTitle] characters with none of the characters
+// that [github.LineStopped] stops, is sent as the ref instead, so the
 // report never breaks the contract.
 func accountOf(a github.Account) contracts.Account {
 	ref := strconv.FormatInt(a.ID, 10)
 	title := a.Login
-	if n := utf8.RuneCountInString(title); n == 0 || n > maxAccountTitle || !utf8.ValidString(title) || strings.IndexFunc(title, func(r rune) bool { return !lineRune(r) }) >= 0 {
+	if n := utf8.RuneCountInString(title); n == 0 || n > maxAccountTitle || !utf8.ValidString(title) || strings.ContainsFunc(title, github.LineStopped) {
 		title = ref
 	}
 	return contracts.Account{Ref: ref, Title: title}
-}
-
-// lineRune is whether r may be in a line of the contract, grant.schema.json's account
-// title: no control character, no bidirectional control and none of the format
-// characters that are usually not shown.
-func lineRune(r rune) bool {
-	switch {
-	case r <= 0x1f, r >= 0x7f && r <= 0x9f:
-		return false
-	case r == 0xad, r == 0x61c, r == 0x180e, r == 0x200b, r == 0x200e, r == 0x200f, r == 0x2028, r == 0x2029, r == 0xfeff:
-		return false
-	case r >= 0x202a && r <= 0x202e, r >= 0x2060 && r <= 0x2064, r >= 0x2066 && r <= 0x2069, r >= 0xfff9 && r <= 0xfffb:
-		return false
-	}
-	return true
 }
 
 // grantEntry is the store's value of a grant in nsGrants.

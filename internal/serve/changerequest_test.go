@@ -1402,28 +1402,62 @@ func TestAReplyThatQoryApiaryRefusesIsLoggedAndTheEntryIsDone(t *testing.T) {
 	}
 }
 
-// TestTheRunsTitleInTheReplyIsCleanedToo: a pull request whose title is nothing but
-// invisible characters gets the run's title in the reply, without the forbidden characters
-// the run's title has; a run's title with no usable character is Qory Apiary's defect, so
-// it is logged and passed before any request, with no reply and no report.
-func TestTheRunsTitleInTheReplyIsCleanedToo(t *testing.T) {
+// TestTheTitleOfThePullRequestInTheReplyIsCleaned: a pull request on GitHub whose title is
+// nothing but invisible characters gets the run's title in the reply, and one whose title a
+// person gave a stopped character gets the title without it. The pull request is not changed.
+func TestTheTitleOfThePullRequestInTheReplyIsCleaned(t *testing.T) {
+	for _, tc := range []struct{ name, onGitHub, want string }{
+		{"invisible characters only", "\u200b\u2060", testTitle},
+		{"a stopped character", "Fix\u200b the widget\U000E0041", "Fix the widget"},
+		{"a ZWJ sequence stays", "Fix \U0001F468\u200d\U0001F469", "Fix \U0001F468\u200d\U0001F469"},
+	} {
+		w := newChangeWired(t)
+		setGitHub(w.gh, func(f *fakeGitHub) {
+			f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 1, title: tc.onGitHub, draft: true})
+		})
+		w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		w.stepOK(t)
+		if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Title != tc.want {
+			t.Errorf("%s: the draft is %+v", tc.name, d)
+		}
+		if pulls := w.gh.pullRequests("acme/widgets"); len(pulls) != 1 || pulls[0].title != tc.onGitHub {
+			t.Errorf("%s: pull requests %+v", tc.name, pulls)
+		}
+	}
+}
+
+// TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest: a title with a stopped
+// character, or none that is not a space, ZWNJ or ZWJ, gets a failure report with the reason
+// refused whose detail starts with the fix. Nothing is sent to GitHub, and no pull request
+// is made. A title with a ZWJ emoji sequence is put on GitHub as it is.
+func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
+	for _, tc := range []struct{ name, title, fix string }{
+		{"a right-to-left override", "Fix \u202e the widget", "Remove control and invisible format characters"},
+		{"a tag letter", "Fix \U000E0041 the widget", "Remove control and invisible format characters"},
+		{"a line break", "Fix\nthe widget", "Remove control and invisible format characters"},
+		{"spaces only", "   ", "Give the title a character that is not a space"},
+		{"ZWJ and ZWNJ only", "\u200d\u200c", "Give the title a character that is not a space"},
+	} {
+		w := newChangeWired(t)
+		w.apiary.add(changeOf(testChangeID, tc.title, "Text.", targetOf("acme/widgets", 1, openDraft)))
+		w.stepOK(t)
+		if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets refused"}) || !cursorIs(w, "c_1") {
+			t.Errorf("%s: reports %v", tc.name, r)
+			continue
+		}
+		if d := detailOf(w, 0); !strings.HasPrefix(d, tc.fix) || strings.ContainsFunc(d, github.LineStopped) || len([]rune(strings.SplitN(d, ".", 2)[0]))+1 > 100 {
+			t.Errorf("%s: the detail is %q", tc.name, d)
+		}
+		if calls := w.gh.pullCalls(); len(calls) != 0 || len(w.gh.pullRequests("acme/widgets")) != 0 || len(w.apiary.replies()) != 0 {
+			t.Errorf("%s: GitHub calls %v, replies %v", tc.name, calls, w.apiary.replies())
+		}
+	}
+	const emoji = "Fix \U0001F468\u200d\U0001F469 the widget"
 	w := newChangeWired(t)
-	setGitHub(w.gh, func(f *fakeGitHub) {
-		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 1, title: "\u200b\u2060", draft: true})
-	})
-	w.apiary.add(changeOf(testChangeID, "Fix\u200b the widget", "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.apiary.add(changeOf(testChangeID, emoji, "Text.", targetOf("acme/widgets", 1, openDraft)))
 	w.stepOK(t)
-	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Title != "Fix the widget" {
-		t.Errorf("the draft is %+v", d)
-	}
-	w2 := newChangeWired(t)
-	w2.apiary.add(changeOf(testChangeID, "\u200b \u202e", "Text.", targetOf("acme/widgets", 1, openDraft)))
-	w2.stepOK(t)
-	if len(w2.gh.pullCalls()) != 0 || len(w2.apiary.replies()) != 0 || len(w2.apiary.sent(routeChangesFailed)) != 0 || !cursorIs(w2, "c_1") {
-		t.Errorf("the entry was not passed quietly")
-	}
-	if !strings.Contains(w2.log.String(), "the entry's title has no character") {
-		t.Errorf("the log %s", w2.log.String())
+	if pulls := w.gh.pullRequests("acme/widgets"); len(pulls) != 1 || pulls[0].title != emoji || len(w.apiary.changeReports()) != 0 {
+		t.Errorf("pull requests %+v, reports %v", pulls, w.apiary.changeReports())
 	}
 }
 

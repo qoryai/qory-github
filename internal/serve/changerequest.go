@@ -176,14 +176,13 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // list, see [mustUnderstandRefusal], the target, see [Adapter.checkTarget], the data, see
 // [github.ParsePullRequestData], and the title. A change kind that the adapter does not
 // apply, a must_understand list that is no list or has a pointer that the adapter does
-// not define, and data that breaks a rule of the kind, are a [*github.SubmitRefused] with
-// the reason refused. So is a draft that a retry cannot open or update, whose reason is
+// not define, data that breaks a rule of the kind, and a title that [github.CheckTitle]
+// stops, are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot open or update, whose reason is
 // the reason of the failure report, see [feed.changeRequest]: also not_permitted when no
 // installation reaches the repository, or the mint fails permanently,
 // [github.ErrMintRefused], or GitHub returns that the installation is suspended,
 // [github.ErrSuspended]. A target whose address is of another system or has a path that
-// is not owner/name, a collection that is not a repository's id, or a title with no
-// visible character, is [Permanent]. Every other error may pass, and the entry is
+// is not owner/name, or a collection that is not a repository's id, is [Permanent]. Every other error may pass, and the entry is
 // applied again. Every error but the first ends with "(change request {id},
 // {collection})".
 func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, unmet error) (contracts.ChangesSubmitted, error) {
@@ -203,15 +202,11 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	if err != nil {
 		return contracts.ChangesSubmitted{}, within(err, where)
 	}
-	// The run's title, cleaned, is what the reply has when the pull request's title is
-	// left with nothing. The contract requires a title with a character that is not a
-	// space, so an entry without one is Qory Apiary's defect. Both checks come before any
-	// request.
-	var fallback string
+	// A title that the contract's change_title stops is refused before any request, so the
+	// title that goes to GitHub, and the reply's fallback title, have no stopped character.
 	if data.Draft != nil {
-		var ok bool
-		if fallback, ok = cleanTitle(ch.Title); !ok {
-			return contracts.ChangesSubmitted{}, Permanent(errors.New("report this Qory Apiary defect: the entry's title has no character that is not a space or forbidden" + where))
+		if err := github.CheckTitle(ch.Title); err != nil {
+			return contracts.ChangesSubmitted{}, within(err, where)
 		}
 		if err := github.CheckDraftText(ch.Title, ch.Text); err != nil {
 			return contracts.ChangesSubmitted{}, within(err, where)
@@ -275,7 +270,7 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	default:
 		return contracts.ChangesSubmitted{}, fmt.Errorf("%w%s", err, where)
 	}
-	result.Draft = &replyDraft{Number: int64(got.Number), Title: replyTitle(got.Title, fallback), State: got.State}
+	result.Draft = &replyDraft{Number: int64(got.Number), Title: replyTitle(got.Title, ch.Title), State: got.State}
 	reply.Action = actions[got.Action]
 	reply.Address = &contracts.ChangeAddress{URL: got.URL, Ref: strconv.Itoa(got.Number)}
 	return withData(reply, result)
@@ -323,22 +318,22 @@ func within(err error, where string) error {
 	return &r
 }
 
-// titleForbidden matches the characters that a draft's title in a reply may not have, as
-// the contract's rule of a prose line lists them, see [github.LineForbidden].
-var titleForbidden = github.LineForbidden
-
-// cleanTitle is title without the characters in [titleForbidden], and whether it has a
-// character that is not a space, as the contract's draft_title needs.
+// cleanTitle is title without the characters that [github.LineStopped] stops, and whether
+// it has a character that is not a space, see [github.HasVisible].
 func cleanTitle(title string) (string, bool) {
-	shown := titleForbidden.ReplaceAllString(strings.ToValidUTF8(title, ""), "")
-	return shown, strings.Trim(shown, "                　") != ""
+	shown := strings.Map(func(r rune) rune {
+		if github.LineStopped(r) {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(title, ""))
+	return shown, github.HasVisible(shown)
 }
 
-// replyTitle is the title of the pull request on GitHub as the reply sends it, without
-// the characters in [titleForbidden], which a person may have put in it: Qory Apiary
-// refuses a reply that has one. The pull request is not changed. A title left with
-// nothing but spaces is replaced by fallback, the run's title, which [cleanTitle] made
-// valid.
+// replyTitle is the title of the pull request on GitHub as the reply sends it, without the
+// characters that [github.LineStopped] stops, which a person may have put in it on GitHub.
+// The pull request is not changed. A title left with nothing but spaces is replaced by
+// fallback, the run's title, which [github.CheckTitle] checked.
 func replyTitle(current, fallback string) string {
 	if shown, ok := cleanTitle(current); ok {
 		return shown
