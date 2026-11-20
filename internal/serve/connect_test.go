@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -397,7 +398,7 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 		"not JSON, signed by others": {signPass(other, "not JSON {"), &refuseSignature},
 		"not JSON":                   {signPass(rig.signer, "not JSON {"), &refusePayload},
 		"version 2":                  {signPass(rig.signer, strings.Replace(good, `"version":1`, `"version":2`, 1)), &refusePayload},
-		"an unknown member":          {signPass(rig.signer, strings.TrimSuffix(good, "}")+`,"apiary_url":"https://elsewhere.example.com"}`), &refusePayload},
+		"an unknown member":          {signPass(rig.signer, strings.TrimSuffix(good, "}")+`,"apiary_url":"https://elsewhere.example.com"}`), nil},
 		"no connection":              {signPass(rig.signer, `{"version":1,"adapter_id":"`+testAdapterID+`","nonce":"`+newNonce()+`","expires_at":"`+contracts.FormatTime(now.Add(time.Minute))+`"}`), &refusePayload},
 		"a connection not one":       {signPass(rig.signer, payload(testAdapterID, "ac_0123456789ABCDEF", newNonce(), now.Add(time.Minute))), &refusePayload},
 		"an adapter's id as one":     {signPass(rig.signer, payload(testAdapterID, testAdapterID, newNonce(), now.Add(time.Minute))), &refusePayload},
@@ -452,6 +453,53 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 		t.Errorf("a pin of two keys refuses the pass: %s", rf.why)
 	}
 	rig.noLeak(t)
+}
+
+// TestAPassWithMustUnderstandIsReadOrRefused has a connect pass whose must_understand lists
+// a member the contract defines, which is taken with its unknown member, and one that lists
+// the unknown member, a pointer that is no pointer, or a list twice: each is refused with
+// the page of a link that is not valid, and a reason that starts with the fix. The shared
+// refusal keeps its reason.
+func TestAPassWithMustUnderstandIsReadOrRefused(t *testing.T) {
+	rig := newConnectRig(t)
+	now := time.Now().Truncate(time.Second)
+	good := payload(testAdapterID, testConnection, newNonce(), now.Add(10*time.Minute))
+	with := func(members string) string {
+		return signPass(rig.signer, strings.TrimSuffix(good, "}")+","+members+"}")
+	}
+	if _, _, rf := rig.c.checkPass(with(`"zz":1,"must_understand":["/nonce"]`), now, rig.c.enrolment()); rf != nil {
+		t.Errorf("a pass that lists a defined member is refused: %s", rf.why)
+	}
+	for name, tc := range map[string]struct{ members, why string }{
+		"an unknown member": {`"zz":1,"must_understand":["/zz"]`, `use a reader that defines "/zz": the document lists it in must_understand, and this reader has no such member`},
+		"no pointer":        {`"must_understand":["zz"]`, `write "zz" in must_understand as a JSON Pointer that starts with /`},
+		"a pointer twice":   {`"must_understand":["/nonce","/nonce"]`, `list "/nonce" once in must_understand`},
+	} {
+		_, _, rf := rig.c.checkPass(with(tc.members), now, rig.c.enrolment())
+		if rf == nil || rf == &refusePayload || rf.why != tc.why || rf.status != refusePayload.status || rf.page != refusePayload.page || rf.name != refusePayload.name {
+			t.Errorf("%s: refused as %+v", name, rf)
+		}
+	}
+	if refusePayload.why != "the pass's payload is not the contract's" {
+		t.Errorf("the shared refusal changed: %s", refusePayload.why)
+	}
+}
+
+// TestReadObjectRefusesWhatIsNotOneObject checks the guard of the readers of documents
+// from another system: an unknown member is ignored, and data after the object, a list, a
+// scalar and nothing are refused.
+func TestReadObjectRefusesWhatIsNotOneObject(t *testing.T) {
+	var doc struct {
+		A *int `json:"a"`
+	}
+	if err := readObject([]byte(`{"a":1,"b":{"c":2}} `), &doc, contracts.Grants{}); err != nil || doc.A == nil || *doc.A != 1 {
+		t.Errorf("an object with an unknown member: %v", err)
+	}
+	for _, body := range []string{`{"a":1}{}`, `{"a":1} x`, `{"a":1}{"a":2}`, `[{"a":1}]`, `1`, ``, `{"a":"x"}`} {
+		if err := readObject([]byte(body), &doc, contracts.Grants{}); !errors.Is(err, errNotObject) {
+			t.Errorf("%q: err %v", body, err)
+		}
+	}
 }
 
 // TestTheContractsSignedPassVerifies checks the contract's signed pass, under its

@@ -642,15 +642,16 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 		page   string
 		reason string
 	}{
-		"forged":                               {signSetupPass(other, setupPayload(testAdapterID, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
-		"malformed":                            {"not a pass", 400, invalid, "pass"},
-		"two dots":                             {"a.b.c", 400, invalid, "pass"},
-		"connect pass":                         {signPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
-		"connect payload under setup's domain": {signSetupPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "payload"},
-		"version 2":                            {signSetupPass(rig.server, strings.Replace(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"version":1`, `"version":2`, 1)), 400, invalid, "payload"},
-		"another adapter":                      {signSetupPass(rig.server, setupPayload("na_fedcba9876543210", newNonce(), now.Add(time.Minute))), 403, "This set-up link is for another adapter. Press Set up on the GitHub adapter's page in Qory Apiary.", "adapter"},
-		"expired":                              {signSetupPass(rig.server, setupPayload(testAdapterID, expiredNonce, now.Add(-time.Second))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
-		"too far ahead":                        {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(16*time.Minute))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
+		"forged":       {signSetupPass(other, setupPayload(testAdapterID, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
+		"malformed":    {"not a pass", 400, invalid, "pass"},
+		"two dots":     {"a.b.c", 400, invalid, "pass"},
+		"connect pass": {signPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
+		"must_understand lists a member it does not define": {signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"zz":1,"must_understand":["/zz"]`)), 400, invalid, `use a reader that defines \"/zz\": the document lists it in must_understand, and this reader has no such member`},
+		"data after the payload":                            {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(time.Minute))+"{}"), 400, invalid, "payload"},
+		"version 2":                                         {signSetupPass(rig.server, strings.Replace(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"version":1`, `"version":2`, 1)), 400, invalid, "payload"},
+		"another adapter":                                   {signSetupPass(rig.server, setupPayload("na_fedcba9876543210", newNonce(), now.Add(time.Minute))), 403, "This set-up link is for another adapter. Press Set up on the GitHub adapter's page in Qory Apiary.", "adapter"},
+		"expired":                                           {signSetupPass(rig.server, setupPayload(testAdapterID, expiredNonce, now.Add(-time.Second))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
+		"too far ahead":                                     {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(16*time.Minute))), 400, "This set-up link has expired. Press Set up in Qory Apiary again.", "expired"},
 	} {
 		j := jar{}
 		w := rig.do(j, http.MethodGet, "/setup?state="+url.QueryEscape(tc.pass), nil)
@@ -732,8 +733,8 @@ func TestTheContractsSignedSetupPassVerifies(t *testing.T) {
 
 // TestASetupPassMayHaveTheOrganisationSlug pins that a setup pass is taken with
 // organisation_slug of the contract's shape, 1 to 40 characters, and refused, with the
-// page for a link that is not valid, when the slug has another shape or type, or when
-// the pass has any other member the contract does not define.
+// page for a link that is not valid, when the slug has another shape or type; a member
+// the contract does not define is ignored.
 func TestASetupPassMayHaveTheOrganisationSlug(t *testing.T) {
 	rig := newSetupRig(t, true)
 	now := time.Now()
@@ -743,20 +744,26 @@ func TestASetupPassMayHaveTheOrganisationSlug(t *testing.T) {
 			t.Errorf("%s: %+v %v", slug, p, rf)
 		}
 	}
+	// A member the contract does not define is ignored, also next to a slug, and one that
+	// must_understand lists but defines is read.
+	for _, members := range []string{`"organisation_name":"acme"`, `"organisation_slug":"acme","extra":1`, `"extra":{"a":[1]},"must_understand":["/version","/organisation_slug"],"organisation_slug":"acme"`} {
+		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), members))
+		if _, _, rf := checkSetupPass(pass, now, rig.setup.creds.get()); rf != nil {
+			t.Errorf("%s: refused as %s", members, rf.why)
+		}
+	}
 	invalid := "This set-up link is not valid. Press Set up in Qory Apiary again."
 	for name, member := range map[string]string{
-		"upper case":         `"organisation_slug":"Acme-Org"`,
-		"41 characters":      `"organisation_slug":"` + strings.Repeat("a", 41) + `"`,
-		"leading hyphen":     `"organisation_slug":"-acme"`,
-		"trailing hyphen":    `"organisation_slug":"acme-"`,
-		"line feed":          `"organisation_slug":"acme\n"`,
-		"empty":              `"organisation_slug":""`,
-		"space":              `"organisation_slug":"acme org"`,
-		"null":               `"organisation_slug":null`,
-		"number":             `"organisation_slug":5`,
-		"array":              `"organisation_slug":["acme"]`,
-		"unknown member":     `"organisation_name":"acme"`,
-		"another member too": `"organisation_slug":"acme","extra":1`,
+		"upper case":      `"organisation_slug":"Acme-Org"`,
+		"41 characters":   `"organisation_slug":"` + strings.Repeat("a", 41) + `"`,
+		"leading hyphen":  `"organisation_slug":"-acme"`,
+		"trailing hyphen": `"organisation_slug":"acme-"`,
+		"line feed":       `"organisation_slug":"acme\n"`,
+		"empty":           `"organisation_slug":""`,
+		"space":           `"organisation_slug":"acme org"`,
+		"null":            `"organisation_slug":null`,
+		"number":          `"organisation_slug":5`,
+		"array":           `"organisation_slug":["acme"]`,
 	} {
 		pass := signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), member))
 		j := jar{}
@@ -767,8 +774,8 @@ func TestASetupPassMayHaveTheOrganisationSlug(t *testing.T) {
 		}
 		refusalShown(t, rig.do(j, http.MethodGet, "/setup/refused", nil), 400, "This set-up link cannot be used", invalid, "https://apiary.example.com")
 	}
-	if n := strings.Count(rig.log.String(), `"reason":"payload"`); n != 12 {
-		t.Errorf("%d refusals for the payload, want 12: %s", n, rig.log.String())
+	if n := strings.Count(rig.log.String(), `"reason":"payload"`); n != 10 {
+		t.Errorf("%d refusals for the payload, want 10: %s", n, rig.log.String())
 	}
 }
 

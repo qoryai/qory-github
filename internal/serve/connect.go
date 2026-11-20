@@ -547,8 +547,9 @@ func (c *Connect) showPage(w http.ResponseWriter, r *http.Request, _ url.Values)
 //     without padding, decoded strictly;
 //  2. the signature verifies under a key of the pin over [contracts.ConnectDomain], a
 //     line feed and the payload's bytes, before the payload is parsed;
-//  3. the payload is one JSON object with the contract's five members and no other,
-//     each of the contract's shape, and version 1;
+//  3. the payload is one JSON object with the contract's five members, each of the
+//     contract's shape, and version 1; another member is ignored, unless must_understand
+//     lists it, see [readObject];
 //  4. adapter_id is the adapter's;
 //  5. expires_at has not passed on serve's clock, and is at most 15 minutes ahead,
 //     or the refusal is [passExpired], returned with the payload, which verified.
@@ -572,8 +573,8 @@ func (c *Connect) checkPass(pass string, now time.Time, en enrolment) (contracts
 		Nonce        *string `json:"nonce"`
 		ExpiresAt    *string `json:"expires_at"`
 	}
-	if !strictObject(payload, &doc) {
-		return contracts.ConnectPass{}, time.Time{}, invalid
+	if err := readObject(payload, &doc, contracts.ConnectPass{}); err != nil {
+		return contracts.ConnectPass{}, time.Time{}, refusedBy(invalid, err)
 	}
 	if doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
 		doc.ConnectionID == nil || !connectionShape.MatchString(*doc.ConnectionID) ||
@@ -636,10 +637,51 @@ func signedPayload(pass, domain string, max int, pin accesskey.Pin) ([]byte, pas
 
 // strictObject decodes the payload b, one JSON object and nothing after it, into doc,
 // a struct of pointers, refusing a member doc does not name, and says whether it did.
+// The stored app entry, see [parseAppEntry], is read so, since serve writes it. A document
+// from another system is read with [readObject], which ignores such a member.
 func strictObject(b []byte, doc any) bool {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	return bytes.HasPrefix(b, []byte("{")) && dec.Decode(doc) == nil && dec.Decode(&struct{}{}) == io.EOF
+}
+
+// errNotObject is the error of [readObject] for a payload that is not one JSON object
+// that decodes into doc.
+var errNotObject = errors.New("the document is not one JSON object of the contract's shape")
+
+// readObject reads the payload b of a document of the contract, from another system, into
+// doc, a struct of pointers: one JSON object and nothing after it. It ignores a member
+// that doc does not name, and nothing but [errNotObject] comes from a payload that breaks
+// that. It then checks the document's must_understand with [contracts.CheckMustUnderstand]
+// against v, the contract's type of the document, and returns its error, which starts
+// with the fix, when the document lists a pointer that the type does not define or the
+// list is malformed.
+func readObject(b []byte, doc, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if !bytes.HasPrefix(b, []byte("{")) || dec.Decode(doc) != nil || dec.Decode(&struct{}{}) != io.EOF {
+		return errNotObject
+	}
+	return contracts.CheckMustUnderstand(b, v)
+}
+
+// answerRefusal is the error of an answer that [readObject] refused with err: notObject
+// when err is [errNotObject], else err, which starts with the fix.
+func answerRefusal(err error, notObject string) error {
+	if errors.Is(err, errNotObject) {
+		return errors.New(notObject)
+	}
+	return err
+}
+
+// refusedBy is r when err is [errNotObject], else a copy of r whose reason is the text of
+// err, a refusal of [contracts.CheckMustUnderstand], so the log has the fix first.
+func refusedBy(r *refusal, err error) *refusal {
+	if errors.Is(err, errNotObject) {
+		return r
+	}
+	c := *r
+	c.why = err.Error()
+	return &c
 }
 
 // passExpiry is a pass's expires_at, which is [contracts.TimeLayout] and written back

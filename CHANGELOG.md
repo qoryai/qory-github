@@ -182,6 +182,13 @@ change what the program does, and notes it under Upgrading.
   `base` with `commit` and `branch`, `commit`, `commits` with `commit` and `step` for
   each, `earlier_commits`, and `draft` with `action` and `number`. An entry with a
   status of its kind that the adapter does not know still stops its answer.
+- `qory-github-server serve` ignores a member that it does not define in the connect
+  pass, the setup pass, the answer to the grants, the answer to the secrets and the
+  secrets in it. It refuses such a document when its `must_understand` lists a pointer
+  to a member that the adapter does not define, or is malformed, and the reason in the
+  log starts with the fix. It still refuses data after the JSON object. Before, the
+  adapter refused a document with any member that it does not define. The stored App
+  entry, which `qory-github-server` writes, stays strict.
 
 ### Upgrading
 

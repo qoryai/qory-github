@@ -231,7 +231,10 @@ func checkGrants(body []byte) (map[int64]string, error) {
 			GrantRef     *string `json:"grant_ref"`
 		} `json:"grants"`
 	}
-	if !strictObject(body, &doc) || doc.Version == nil || doc.Revision == nil || doc.Grants == nil {
+	if err := readObject(body, &doc, contracts.Grants{}); err != nil {
+		return nil, answerRefusal(err, "the answer is not the grants' document")
+	}
+	if doc.Version == nil || doc.Revision == nil || doc.Grants == nil {
 		return nil, errors.New("the answer is not the grants' document")
 	}
 	switch {

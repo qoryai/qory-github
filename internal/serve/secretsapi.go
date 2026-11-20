@@ -207,7 +207,10 @@ func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, e
 			CT          *string `json:"ct"`
 		} `json:"sealed"`
 	}
-	if !strictObject(body, &doc) || doc.Version == nil || doc.Revision == nil || doc.Sealed == nil || doc.Sealed.Suite == nil ||
+	if err := readObject(body, &doc, contracts.AdapterSecretsAnswer{}); err != nil {
+		return contracts.AdapterSecretsPlaintext{}, answerRefusal(err, "the answer is not the secrets' document")
+	}
+	if doc.Version == nil || doc.Revision == nil || doc.Sealed == nil || doc.Sealed.Suite == nil ||
 		doc.Sealed.AccessKeyID == nil || doc.Sealed.Enc == nil || doc.Sealed.CT == nil {
 		return contracts.AdapterSecretsPlaintext{}, errors.New("the answer is not the secrets' document")
 	}
@@ -234,7 +237,10 @@ func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, e
 			Value *string `json:"value"`
 		} `json:"secrets"`
 	}
-	if !strictObject(pt, &plain) || plain.Version == nil || *plain.Version != contracts.Version || plain.Secrets == nil || len(*plain.Secrets) > contracts.SecretsMax {
+	if err := readObject(pt, &plain, contracts.AdapterSecretsPlaintext{}); err != nil {
+		return contracts.AdapterSecretsPlaintext{}, answerRefusal(err, "the opened secrets are not the plaintext's document")
+	}
+	if plain.Version == nil || *plain.Version != contracts.Version || plain.Secrets == nil || len(*plain.Secrets) > contracts.SecretsMax {
 		return contracts.AdapterSecretsPlaintext{}, errors.New("the opened secrets are not the plaintext's document")
 	}
 	p := contracts.AdapterSecretsPlaintext{Version: *plain.Version}

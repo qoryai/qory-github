@@ -321,6 +321,14 @@ The adapter reads the change feed as a reader that may be older than Qory Apiary
   `branch`, `commit`, `commits` with `commit` and `step` for each, `earlier_commits`, and
   `draft` with `action` and `number`.
 
+The adapter reads the other documents that Qory Apiary sends it the same way: the connect
+pass, the setup pass, the answer to the grants, the answer to the secrets and the
+secrets in it. It ignores a member that it does not define. It refuses a document whose
+`must_understand` lists a pointer to a member that it does not define, or is malformed:
+the log line starts with the fix (`use a reader that defines "/zz"`), and a pass shows
+the page for a link that is not valid. It also refuses a document that is not one JSON
+object, or has data after the object.
+
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
 (`created`, `updated` or `kept`) when the entry has a `draft`, and neither when it has

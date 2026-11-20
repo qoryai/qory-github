@@ -323,13 +323,19 @@ func TestAGrantEntryReadsTheCopyOncePerPage(t *testing.T) {
 // TestAWrongGrantsAnswerIsRefused pins the refusals of an answer to GET /v1/grants.
 func TestAWrongGrantsAnswerIsRefused(t *testing.T) {
 	for body, want := range map[string]string{
-		`{"version":1,"revision":1,"grants":[]}`:          "",
-		`{"version":1,"revision":2,"grants":[]}`:          "the answer is not of the contract's revision 1",
-		`{"version":2,"revision":1,"grants":[]}`:          "the answer is not of version 1",
-		`{"version":1,"revision":1}`:                      "the answer is not the grants' document",
-		`{"version":1,"revision":1,"grants":[],"more":1}`: "the answer is not the grants' document",
-		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"acme"}]}`:                                                      "the answer has a grant whose grant_ref is not an installation's id",
-		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_x","grant_ref":"7"}]}`:                                                                        "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[]}`:                                                                 "",
+		`{"version":1,"revision":2,"grants":[]}`:                                                                 "the answer is not of the contract's revision 1",
+		`{"version":2,"revision":1,"grants":[]}`:                                                                 "the answer is not of version 1",
+		`{"version":1,"revision":1}`:                                                                             "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[],"more":{"a":1}}`:                                                  "",
+		`{"version":1,"revision":1,"grants":[],"must_understand":["/grants"]}`:                                   "",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"7","more":1}]}`: "",
+		`{"version":1,"revision":1,"grants":[],"more":1,"must_understand":["/more"]}`:                            `use a reader that defines "/more": the document lists it in must_understand, and this reader has no such member`,
+		`{"version":1,"revision":1,"grants":[],"must_understand":"/grants"}`:                                     "set must_understand to a list of JSON Pointers, or leave it out: json: cannot unmarshal string into Go value of type []string",
+		`{"version":1,"revision":1,"grants":[]}{}`:                                                               "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[]} 1`:                                                               "the answer is not the grants' document",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"acme"}]}`:       "the answer has a grant whose grant_ref is not an installation's id",
+		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_x","grant_ref":"7"}]}`:                         "the answer is not the grants' document",
 		`{"version":1,"revision":1,"grants":[{"connection_id":"ac_0000000000000001","grant_ref":"7"},{"connection_id":"ac_0000000000000002","grant_ref":"7"}]}`: "the answer has two grants for one installation",
 	} {
 		_, err := checkGrants([]byte(body))
