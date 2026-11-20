@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,50 +36,57 @@ var testHost = github.Client{API: "http://127.0.0.1:1"}.WebHost()
 // sha is the commit id the tests give commit n: 40 hexadecimal digits.
 func sha(n int) string { return fmt.Sprintf("%040x", n) }
 
-// draftAsk is the draft member of the data of a pull-request change request.
+// draftAsk is what the test asks of the pull request: Number 0 for an entry that has no
+// previous address, or the number in the ref of the previous version's address.
 type draftAsk struct {
-	Action string `json:"action"`
-	Number int64  `json:"number,omitempty"`
+	Number int64
 }
 
 var (
-	openDraft = &draftAsk{Action: "open"}
-	update    = func(n int64) *draftAsk { return &draftAsk{Action: "update", Number: n} }
+	openDraft = &draftAsk{}
+	update    = func(n int64) *draftAsk { return &draftAsk{Number: n} }
 )
 
 // crTarget is the target of a change request entry for the repository path on system:
 // the branch the run pushed, a base at sha(1) on the branch base, and commits commits,
-// sha(2) on; with draft, the data asks for it.
+// sha(2) on; with draft, the entry has a previous address with the number of draft, and
+// ready makes the data ask for a pull request that is no draft.
 type crTarget struct {
 	path, system, base string
 	commits            int
 	draft              *draftAsk
+	ready              bool
 }
 
 func targetOf(path string, commits int, draft *draftAsk) crTarget {
 	return crTarget{path: path, system: testHost, base: "main", commits: commits, draft: draft}
 }
 
-// data is the data of the pull-request change request for t.
+// commitRef is a commit as the pull-request type writes it: the repository as collection,
+// and the commit id as the path of the address.
+func (t crTarget) commitRef(id string) map[string]any {
+	return map[string]any{"collection": refOf(t.path), "address": map[string]any{"system": t.system, "path": id}}
+}
+
+// data is the data of the pull-request change request for t, in the form of the
+// pull-request artifact type.
 func (t crTarget) data() json.RawMessage {
-	type commit struct {
-		Commit string `json:"commit"`
-		Step   string `json:"step"`
+	d := map[string]any{
+		"target":      map[string]any{"collection": refOf(t.path), "address": map[string]any{"system": t.system, "path": t.path}},
+		"title":       testTitle,
+		"text":        "Text.",
+		"branch":      testBranch,
+		"base_branch": t.base,
+		"base":        t.commitRef(sha(1)),
+		"head":        t.commitRef(sha(1 + t.commits)),
+		"draft":       !t.ready,
 	}
-	d := struct {
-		Branch string `json:"branch"`
-		Base   struct {
-			Commit string `json:"commit"`
-			Branch string `json:"branch"`
-		} `json:"base"`
-		Commit  string    `json:"commit"`
-		Commits []commit  `json:"commits"`
-		Draft   *draftAsk `json:"draft,omitempty"`
-	}{Branch: testBranch, Commit: sha(1 + t.commits), Draft: t.draft}
-	d.Base.Commit, d.Base.Branch = sha(1), t.base
+	var commits, steps []any
 	for i := range t.commits {
-		d.Commits = append(d.Commits, commit{sha(2 + i), "deliverable:d-" + fmt.Sprint(i+1)})
+		commits = append(commits, t.commitRef(sha(2+i)))
+		steps = append(steps, map[string]any{"commit": sha(2 + i), "step": "deliverable:d-" + fmt.Sprint(i+1)})
 	}
+	d["commits"], d["steps"] = commits, steps
 	b, err := json.Marshal(d)
 	if err != nil {
 		panic(err)
@@ -89,16 +97,24 @@ func (t crTarget) data() json.RawMessage {
 // changeOf is a change_request entry of the kind pull-request with the id id, the title
 // and text, for the target t.
 func changeOf(id, title, text string, t crTarget) contracts.Change {
-	return contracts.Change{
+	ch := contracts.Change{
 		Kind: contracts.ChangeRequest, ChangeRequestID: id, ChangeKind: github.ChangeKindPullRequest,
 		Target: &contracts.Target{Collection: refOf(t.path), Address: &contracts.TargetAddress{System: t.system, Path: t.path}},
 		Title:  title, Text: text, Data: t.data(),
 	}
+	if t.draft != nil && t.draft.Number > 0 {
+		n := strconv.FormatInt(t.draft.Number, 10)
+		ch.Previous = &contracts.ChangePrevious{Address: &contracts.ChangeAddress{URL: "https://" + t.system + "/" + t.path + "/pull/" + n, Ref: n}}
+	}
+	return ch
 }
 
 // previously is ch with the previous version's title.
 func previously(ch contracts.Change, title string) contracts.Change {
-	ch.Previous = &contracts.ChangePrevious{Title: title}
+	if ch.Previous == nil {
+		ch.Previous = &contracts.ChangePrevious{}
+	}
+	ch.Previous.Title = title
 	return ch
 }
 
@@ -438,26 +454,25 @@ func TestAClosedOrMergedPullRequestIsNotEdited(t *testing.T) {
 	}
 }
 
-// TestAnEntryWithNoDraftGetsOnlyAddresses: an entry with no draft, as after a session
-// that did not pass, asks GitHub only for the repository's name by its id, mints no token
-// for pull requests, and its reply has the address of each of four commits, no draft, and
-// neither address nor action.
-func TestAnEntryWithNoDraftGetsOnlyAddresses(t *testing.T) {
+// TestAnEntryThatWantsNoDraftOpensAReadyPullRequest: an entry whose data has draft false
+// opens a pull request that is no draft, from the branch into the base branch, with the
+// block as its description; the reply has the pull request's address, the action created,
+// the state open, and the address of each of four commits.
+func TestAnEntryThatWantsNoDraftOpensAReadyPullRequest(t *testing.T) {
 	w := newChangeWired(t)
-	entry := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 4, nil))
+	target := targetOf("acme/widgets", 4, openDraft)
+	target.ready = true
+	entry := changeOf(testChangeID, testTitle, "Text.", target)
 	checkEntries(t, entry)
 	w.apiary.add(entry)
 	w.stepOK(t)
-	if calls, mints := w.gh.pullCalls(), w.pullMints(); len(calls) != 0 || len(mints) != 0 {
-		t.Errorf("GitHub was asked for pull requests %v, %d mints", calls, len(mints))
+	pulls := w.gh.pullRequests("acme/widgets")
+	if len(pulls) != 1 || pulls[0].draft || pulls[0].head != testBranch || pulls[0].base != "main" || pulls[0].body != blockOf("Text.") {
+		t.Fatalf("pull requests %+v", pulls)
 	}
 	replies := w.apiary.replies()
-	if len(replies) != 1 || replies[0].Address != nil || replies[0].Action != "" || replyData(replies[0]).Draft != nil || len(replyData(replies[0]).Commits) != 4 {
+	if len(replies) != 1 || replies[0].Action != "created" || replies[0].Address == nil || replyData(replies[0]).Draft == nil || replyData(replies[0]).Draft.State != "open" || len(replyData(replies[0]).Commits) != 4 {
 		t.Fatalf("replies %+v", replies)
-	}
-	sent := w.apiary.sent(routeChangesSubmitted)[0]
-	if _, has := sent.body["address"]; has || bytes.Contains(sent.raw, []byte(`"draft"`)) || sent.body["action"] != nil {
-		t.Errorf("the reply has a draft, an address or an action: %s", sent.raw)
 	}
 	if !cursorIs(w, "c_1") {
 		t.Error("the cursor did not move")
@@ -1489,6 +1504,144 @@ func TestThePullRequestBodyHasOneBlockOfMarkerLines(t *testing.T) {
 	pulls := w.gh.pullRequests("acme/widgets")
 	if len(pulls) != 1 || pulls[0].body != "<!-- qory:start -->\nText.\n<!-- qory:end -->" {
 		t.Fatalf("pull requests %+v", pulls)
+	}
+}
+
+// pullCallsOf are the requests for pull requests that w made since from, each as METHOD and
+// the path, with the listing of the branch's pull requests written as LIST.
+func pullCallsOf(w *wired, from int) []string {
+	var out []string
+	for _, c := range w.gh.pullCalls()[from:] {
+		method, uri, _ := strings.Cut(c, " ")
+		if strings.Contains(uri, "?head=") {
+			out = append(out, "LIST")
+			continue
+		}
+		out = append(out, method+" "+strings.TrimPrefix(uri, "/repos/acme/widgets/pulls"))
+	}
+	return out
+}
+
+// withAddress is the entry ch with a previous version whose address has the ref ref, and
+// no title.
+func withAddress(ch contracts.Change, ref string) contracts.Change {
+	ch.Previous = &contracts.ChangePrevious{Address: &contracts.ChangeAddress{URL: "https://" + testHost + "/acme/widgets/pull/" + ref, Ref: ref}}
+	return ch
+}
+
+// TestTheDraftIsFoundAtThePreviousAddress: an update entry whose previous address has the
+// ref "7" edits pull request 7, whatever other pull requests the branch has: GitHub is
+// asked for pull request 7, and for no listing, and one request writes it. The reply has
+// the address of pull request 7 and the action updated.
+func TestTheDraftIsFoundAtThePreviousAddress(t *testing.T) {
+	w := newChangeWired(t)
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = append(f.pulls,
+			&ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 3, title: "Three", draft: true},
+			&ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 7, title: "Seven", draft: true},
+			&ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 9, title: "Nine", draft: true})
+	})
+	w.apiary.add(changeOf(testChangeID, "Seven", "New text.", targetOf("acme/widgets", 1, update(7))))
+	w.stepOK(t)
+	if got, want := pullCallsOf(w, 0)[len(pullCallsOf(w, 0))-2:], []string{"GET /7", "PATCH /7"}; !slices.Equal(got, want) || slices.Contains(pullCallsOf(w, 0), "LIST") {
+		t.Errorf("the calls are %v", pullCallsOf(w, 0))
+	}
+	d := w.apiary.draftsReplied()["acme/widgets"]
+	if d == nil || d.Number != 7 || d.Action != "updated" || d.URL != "https://github.com/acme/widgets/pull/7" {
+		t.Errorf("the draft is %+v", d)
+	}
+	if pulls := w.gh.pullRequests("acme/widgets"); pulls[1].body != blockOf("New text.") || pulls[0].body != "" || pulls[2].body != "" {
+		t.Errorf("pull requests %+v", pulls)
+	}
+}
+
+// TestADraftWithoutAUsableAddressIsFoundByItsBranch: an entry with no previous address, or
+// whose ref is no pull request number as the reply writes it (empty, 0, 007, +7, a word, a
+// number past int64), finds the pull request by its head branch: GitHub is asked for the
+// listing, and for no pull request by number first, and the open pull request with the
+// highest number is edited.
+func TestADraftWithoutAUsableAddressIsFoundByItsBranch(t *testing.T) {
+	for _, ref := range []string{"-", "", "0", "007", "+7", "seven", "-3", "9223372036854775808", "1.0", " 7"} {
+		w := newChangeWired(t)
+		setGitHub(w.gh, func(f *fakeGitHub) {
+			f.pulls = append(f.pulls,
+				&ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 7, title: "Seven", draft: true},
+				&ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 8, title: "Eight", draft: true})
+		})
+		ch := changeOf(testChangeID, "Eight", "New text.", targetOf("acme/widgets", 1, openDraft))
+		if ref != "-" {
+			ch = withAddress(ch, ref)
+		}
+		w.apiary.add(ch)
+		w.stepOK(t)
+		calls := pullCallsOf(w, 0)
+		if i := slices.Index(calls, "LIST"); i < 0 || slices.Contains(calls, "GET /7") || slices.Contains(calls, "POST ") || len(w.apiary.changeReports()) != 0 {
+			t.Errorf("ref %q: the calls are %v, reports %v", ref, calls, w.apiary.changeReports())
+		}
+		if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Number != 8 || d.Action != "updated" {
+			t.Errorf("ref %q: the draft is %+v", ref, d)
+		}
+	}
+}
+
+// TestAPullRequestThatIsGoneOpensANewOne: the previous address has the ref "7", and GitHub
+// has no pull request 7 and none from the branch: GitHub is asked for pull request 7, then
+// for the listing, and a pull request is opened. With no address, and none from the branch,
+// the listing and the opening are the only requests.
+func TestAPullRequestThatIsGoneOpensANewOne(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		draft *draftAsk
+		calls []string
+	}{
+		{"a pull request 7 that is gone", update(7), []string{"GET /7", "LIST", "POST "}},
+		{"no address and no pull request from the branch", openDraft, []string{"LIST", "POST "}},
+	} {
+		w := newChangeWired(t)
+		w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, tc.draft)))
+		w.stepOK(t)
+		calls := pullCallsOf(w, 0)
+		if got := calls[len(calls)-len(tc.calls):]; !slices.Equal(got, tc.calls) {
+			t.Errorf("%s: the calls are %v", tc.name, calls)
+		}
+		if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Number != 1 || d.Action != "created" || len(w.apiary.changeReports()) != 0 {
+			t.Errorf("%s: the draft is %+v", tc.name, d)
+		}
+	}
+}
+
+// TestAPullRequestAtTheAddressThatAPersonFinishedIsKept: the previous address has the ref
+// "7", and pull request 7 is closed on GitHub: nothing is written, GitHub is asked for pull
+// request 7 alone, and the reply has the action kept and the state closed.
+func TestAPullRequestAtTheAddressThatAPersonFinishedIsKept(t *testing.T) {
+	w := newChangeWired(t)
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 7, title: "Seven", closed: true})
+	})
+	w.apiary.add(changeOf(testChangeID, "Seven", "New text.", targetOf("acme/widgets", 1, update(7))))
+	w.stepOK(t)
+	calls := pullCallsOf(w, 0)
+	if slices.Contains(calls, "PATCH /7") || slices.Contains(calls, "LIST") || slices.Contains(calls, "POST ") {
+		t.Errorf("the calls are %v", calls)
+	}
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Number != 7 || d.Action != "kept" || d.State != "closed" {
+		t.Errorf("the draft is %+v", d)
+	}
+}
+
+// TestAnUpdateKeepsWhetherThePullRequestIsADraft: the data of an update says draft false,
+// and pull request 7 is a draft: the update changes the text and leaves it a draft.
+func TestAnUpdateKeepsWhetherThePullRequestIsADraft(t *testing.T) {
+	w := newChangeWired(t)
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = append(f.pulls, &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: 7, title: "Seven", draft: true})
+	})
+	target := targetOf("acme/widgets", 1, update(7))
+	target.ready = true
+	w.apiary.add(changeOf(testChangeID, "Seven", "New text.", target))
+	w.stepOK(t)
+	if pulls := w.gh.pullRequests("acme/widgets"); len(pulls) != 1 || !pulls[0].draft || pulls[0].body != blockOf("New text.") {
+		t.Errorf("pull requests %+v", pulls)
 	}
 }
 

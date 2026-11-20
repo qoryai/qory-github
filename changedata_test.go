@@ -4,28 +4,55 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/qoryai/integrations/contracts"
 )
 
 func sha(n int) string { return fmt.Sprintf("%040x", n) }
 
-// pullData is the data of a change request with two commits, the draft draft (a JSON
-// object, or "" for none), and the members of extra set after it.
-func pullData(draft string, mutate func(m map[string]any)) json.RawMessage {
-	m := map[string]any{
-		"branch": "qory/wi_42",
-		"base":   map[string]any{"commit": sha(1), "branch": "main"},
-		"commit": sha(3),
-		"commits": []any{
-			map[string]any{"commit": sha(2), "step": "deliverable:d-1"},
-			map[string]any{"commit": sha(3), "step": "fix:f1"},
-		},
+// commitRef is the commit id as the pull-request type writes a commit: a reference whose
+// address path is the id.
+func commitRef(id string) map[string]any {
+	return map[string]any{"collection": "R_1001", "address": map[string]any{"system": "code.example.com", "path": id}}
+}
+
+// steps are the steps of the commits sha(2) to sha(n), in the form of the type.
+func stepsOf(n int) []any {
+	var out []any
+	for i := 2; i <= n; i++ {
+		out = append(out, map[string]any{"commit": sha(i), "step": "deliverable:d-" + fmt.Sprint(i-1)})
 	}
-	if draft != "" {
-		m["draft"] = json.RawMessage(draft)
+	return out
+}
+
+// commitsTo are the commits sha(2) to sha(n).
+func commitsTo(n int) []any {
+	var out []any
+	for i := 2; i <= n; i++ {
+		out = append(out, commitRef(sha(i)))
+	}
+	return out
+}
+
+// pullData is the data of a change request with two commits, as the pull-request type
+// writes it, a draft wanted, and mutate applied.
+func pullData(mutate func(m map[string]any)) json.RawMessage {
+	m := map[string]any{
+		"target":      map[string]any{"collection": "R_1001"},
+		"title":       "Show delivery dates",
+		"text":        "Text.",
+		"branch":      "qory/wi_42",
+		"base_branch": "main",
+		"base":        commitRef(sha(1)),
+		"head":        commitRef(sha(3)),
+		"commits":     commitsTo(3),
+		"steps":       stepsOf(3),
+		"draft":       true,
 	}
 	if mutate != nil {
 		mutate(m)
@@ -35,112 +62,125 @@ func pullData(draft string, mutate func(m map[string]any)) json.RawMessage {
 }
 
 // TestParsePullRequestDataReadsTheMembers: the branch, the base, the commits and the
-// draft are read; a draft's number is read from a whole number in any JSON form.
+// draft are read from the members of the pull-request type; the members of the envelope
+// that the data repeats are ignored.
 func TestParsePullRequestDataReadsTheMembers(t *testing.T) {
-	d, err := ParsePullRequestData(pullData(`{"action":"update","number":34.0}`, nil))
+	d, err := ParsePullRequestData(pullData(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Branch != "qory/wi_42" || d.BaseBranch != "main" || d.BaseCommit != sha(1) || len(d.Commits) != 2 || d.Commits[1] != sha(3) || d.Draft == nil || d.Draft.Number != 34 {
+	if d.Branch != "qory/wi_42" || d.BaseBranch != "main" || d.BaseCommit != sha(1) || len(d.Commits) != 2 || d.Commits[0] != sha(2) || d.Commits[1] != sha(3) || !d.Draft {
 		t.Errorf("%+v", d)
 	}
-	d, err = ParsePullRequestData(pullData(`{"action":"open"}`, nil))
-	if err != nil || d.Draft == nil || d.Draft.Number != 0 {
-		t.Errorf("open: %+v, %v", d, err)
+	d, err = ParsePullRequestData(pullData(func(m map[string]any) { m["draft"] = false }))
+	if err != nil || d.Draft {
+		t.Errorf("no draft wanted: %+v, %v", d, err)
 	}
-	d, err = ParsePullRequestData(pullData("", func(m map[string]any) { m["base"] = map[string]any{"commit": sha(1)} }))
-	if err != nil || d.Draft != nil || d.BaseBranch != "" {
-		t.Errorf("no draft, no base branch: %+v, %v", d, err)
+	d, err = ParsePullRequestData(pullData(func(m map[string]any) {
+		m["commits"], m["steps"] = commitsTo(101), stepsOf(101)
+		m["head"], m["earlier_commits"] = commitRef(sha(101)), json.RawMessage("3.4e1")
+	}))
+	if err != nil || len(d.Commits) != 100 {
+		t.Errorf("100 commits and earlier_commits: %+v, %v", d, err)
 	}
-	d, err = ParsePullRequestData(pullData(`{"action":"update","number":9223372036854775807}`, nil))
-	if err != nil || d.Draft.Number != 9223372036854775807 {
-		t.Errorf("the largest number: %+v, %v", d, err)
+}
+
+// TestParsePullRequestDataReadsTheContractsFixtures: the data of every change request of
+// the kind pull-request in the contract's fixtures is read, and each fixture's draft is
+// what the entry has.
+func TestParsePullRequestDataReadsTheContractsFixtures(t *testing.T) {
+	names, err := fs.Glob(contracts.FS, "fixtures/adapter/changes/change-request-pull-request*.json")
+	if err != nil || len(names) < 5 {
+		t.Fatalf("%d fixtures, %v", len(names), err)
 	}
-	d, err = ParsePullRequestData(pullData(`{"action":"update","number":3.4e1}`, nil))
-	if err != nil || d.Draft.Number != 34 {
-		t.Errorf("an exponent: %+v, %v", d, err)
-	}
-	d, err = ParsePullRequestData(pullData(`{"action":"update","number":9007199254740993.0}`, nil))
-	if err != nil || d.Draft.Number != 9007199254740993 {
-		t.Errorf("a number past 2^53: %+v, %v", d, err)
+	for _, name := range names {
+		b, err := fs.ReadFile(contracts.FS, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var page struct {
+			Changes []struct {
+				Kind string          `json:"kind"`
+				Data json.RawMessage `json:"data"`
+			} `json:"changes"`
+		}
+		if err := json.Unmarshal(b, &page); err != nil {
+			t.Fatal(err)
+		}
+		for i, c := range page.Changes {
+			if c.Kind != "change_request" {
+				continue
+			}
+			var want struct {
+				Draft bool `json:"draft"`
+			}
+			json.Unmarshal(c.Data, &want)
+			d, err := ParsePullRequestData(c.Data)
+			if err != nil || d.Draft != want.Draft || len(d.Commits) == 0 {
+				t.Errorf("%s, entry %d: %+v, %v", name, i, d, err)
+			}
+		}
 	}
 }
 
 // TestParsePullRequestDataRefusesEachBrokenRule: each rule of the data is refused, as
 // refused, with the fix first and no value in the text.
 func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
-	many := func(n int) []any {
-		var out []any
-		for i := range n {
-			out = append(out, map[string]any{"commit": sha(2 + i), "step": "s"})
-		}
-		return out
-	}
 	set := func(k string, v any) func(m map[string]any) { return func(m map[string]any) { m[k] = v } }
 	secret := "SECRET-VALUE"
+	many := func(n int, mutate func(m map[string]any)) func(m map[string]any) {
+		return func(m map[string]any) {
+			m["commits"], m["steps"], m["head"] = commitsTo(n+1), stepsOf(n+1), commitRef(sha(n+1))
+			if mutate != nil {
+				mutate(m)
+			}
+		}
+	}
 	for _, tc := range []struct {
-		name  string
-		draft string
-		edit  func(m map[string]any)
-		raw   string
-		want  string
+		name string
+		edit func(m map[string]any)
+		raw  string
+		want string
 	}{
-		{"a branch with a space", "", set("branch", "qory/wi 42"), "", "data.branch"},
-		{"a branch with two dots", "", set("branch", "a..b"), "", "data.branch"},
-		{"a branch that ends in .lock", "", set("branch", "a.lock"), "", "data.branch"},
-		{"a branch of 256 characters", "", set("branch", strings.Repeat("a", 256)), "", "data.branch"},
-		{"a branch that is @", "", set("branch", "@"), "", "data.branch"},
-		{"a base branch with a colon", "", set("base", map[string]any{"commit": sha(1), "branch": "a:b"}), "", "data.base.branch"},
-		{"an empty base branch", "", set("base", map[string]any{"commit": sha(1), "branch": ""}), "", "data.base.branch"},
-		{"a null base branch", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":null},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}]}`, "data.base.branch"},
-		{"a short base commit", "", set("base", map[string]any{"commit": "abc", "branch": "main"}), "", "data.base.commit"},
-		{"no base", "", set("base", nil), "", "data.base.commit"},
-		{"a head that is not a commit", "", set("commit", secret), "", "data.commit"},
-		{"a head that is not the last commit", "", set("commit", sha(9)), "", "does not end in"},
-		{"no commits", "", set("commits", []any{}), "", "not 1 to 100"},
-		{"101 commits", "", func(m map[string]any) { m["commits"] = many(101); m["commit"] = sha(102) }, "", "not 1 to 100"},
-		{"a commit in upper case", "", func(m map[string]any) {
-			m["commits"] = []any{map[string]any{"commit": strings.ToUpper(sha(10)), "step": "s"}}
-			m["commit"] = sha(10)
-		}, "", "a commit of data.commits"},
-		{"a step of 129 characters", "", set("commits", []any{map[string]any{"commit": sha(3), "step": strings.Repeat("s", 129)}}), "", "the step"},
-		{"an empty step", "", set("commits", []any{map[string]any{"commit": sha(3), "step": ""}}), "", "the step"},
-		{"a step with U+0000", "", set("commits", []any{map[string]any{"commit": sha(3), "step": "a\u0000b"}}), "", "the step"},
-		{"earlier_commits 0", "", func(m map[string]any) { m["commits"] = many(100); m["commit"] = sha(101); m["earlier_commits"] = 0 }, "", "data.earlier_commits"},
-		{"earlier_commits as a string", "", func(m map[string]any) { m["commits"] = many(100); m["commit"] = sha(101); m["earlier_commits"] = "3" }, "", "data.earlier_commits"},
-		{"earlier_commits past int64", "", func(m map[string]any) {
-			m["commits"] = many(100)
-			m["commit"] = sha(101)
-			m["earlier_commits"] = json.RawMessage("9223372036854775808")
-		}, "", "data.earlier_commits"},
-		{"earlier_commits with 99 commits", "", func(m map[string]any) {
-			m["commits"] = many(99)
-			m["commit"] = sha(100)
-			m["earlier_commits"] = 5
-		}, "", "exactly 100"},
-		{"a draft without a base branch", `{"action":"open"}`, set("base", map[string]any{"commit": sha(1)}), "", "data.base.branch"},
-		{"an open draft with a number", `{"action":"open","number":3}`, nil, "", "data.draft.number is set"},
-		{"an update without a number", `{"action":"update"}`, nil, "", "data.draft.number is not"},
-		{"an update of number 0", `{"action":"update","number":0}`, nil, "", "data.draft.number is not"},
-		{"an update with a fraction", `{"action":"update","number":1.5}`, nil, "", "data.draft.number is not"},
-		{"an update past int64", `{"action":"update","number":9223372036854775808}`, nil, "", "data.draft.number is not"},
-		{"an update of a string number", `{"action":"update","number":"4"}`, nil, "", "data.draft.number is not"},
-		{"an open draft with a null number", `{"action":"open","number":null}`, nil, "", "data.draft.number is set"},
-		{"an update of 1.00000000000000000001", `{"action":"update","number":1.00000000000000000001}`, nil, "", "data.draft.number is not"},
-		{"an update of 1E400", `{"action":"update","number":1E400}`, nil, "", "data.draft.number is not"},
-		{"an update of -0", `{"action":"update","number":-0}`, nil, "", "data.draft.number is not"},
-		{"an update of 9223372036854775808.0", `{"action":"update","number":9223372036854775808.0}`, nil, "", "data.draft.number is not"},
-		{"a draft of the action close", `{"action":"close"}`, nil, "", "data.draft.action"},
-		{"a null draft", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":"main"},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}],"draft":null}`, "data.draft is not an object"},
-		{"a draft that is a number", "", nil, `{"branch":"qory/wi_42","base":{"commit":"` + sha(1) + `","branch":"main"},"commit":"` + sha(3) + `","commits":[{"commit":"` + sha(3) + `","step":"s"}],"draft":5}`, "data.draft is not an object"},
-		{"data that is an array", "", nil, `[]`, "not a JSON object"},
-		{"data that is null", "", nil, `null`, "not a JSON object"},
-		{"a branch that is a number", "", nil, `{"branch": 5}`, "not a JSON object"},
+		{"a branch with a space", set("branch", "qory/wi 42"), "", "data.branch"},
+		{"a branch with two dots", set("branch", "a..b"), "", "data.branch"},
+		{"a branch that ends in .lock", set("branch", "a.lock"), "", "data.branch"},
+		{"a branch of 256 characters", set("branch", strings.Repeat("a", 256)), "", "data.branch"},
+		{"a branch that is @", set("branch", "@"), "", "data.branch"},
+		{"no branch", set("branch", nil), "", "data.branch"},
+		{"a base branch with a colon", set("base_branch", "a:b"), "", "data.base_branch"},
+		{"an empty base branch", set("base_branch", ""), "", "data.base_branch"},
+		{"no base branch", set("base_branch", nil), "", "data.base_branch"},
+		{"a short base commit", set("base", commitRef("abc")), "", "data.base is not a commit"},
+		{"a base without an address", set("base", map[string]any{"collection": "R_1001"}), "", "data.base is not a commit"},
+		{"no base", set("base", nil), "", "data.base is not a commit"},
+		{"a head that is not a commit", set("head", commitRef(secret)), "", "data.head is not a commit"},
+		{"no head", set("head", nil), "", "data.head is not a commit"},
+		{"a head that is not the last commit", set("head", commitRef(sha(9))), "", "does not end in data.head"},
+		{"no commits", func(m map[string]any) { m["commits"] = []any{} }, "", "not 1 to 100"},
+		{"101 commits", many(101, nil), "", "not 1 to 100"},
+		{"a commit in upper case", set("commits", []any{commitRef(strings.ToUpper(sha(10)))}), "", "a commit of data.commits"},
+		{"a commit that is a string", nil, `{"branch":"qory/wi_42","commits":["` + sha(3) + `"]}`, "not a JSON object"},
+		{"a step of 129 characters", set("steps", []any{map[string]any{"commit": sha(3), "step": strings.Repeat("s", 129)}}), "", "the step"},
+		{"an empty step", set("steps", []any{map[string]any{"commit": sha(3), "step": ""}}), "", "the step"},
+		{"a step with U+0000", set("steps", []any{map[string]any{"commit": sha(3), "step": "a\u0000b"}}), "", "the step"},
+		{"a step with a short commit", set("steps", []any{map[string]any{"commit": "abc", "step": "s"}}), "", "a step of data.steps"},
+		{"earlier_commits 0", many(100, set("earlier_commits", 0)), "", "data.earlier_commits"},
+		{"earlier_commits as a string", many(100, set("earlier_commits", "3")), "", "data.earlier_commits"},
+		{"earlier_commits null", many(100, set("earlier_commits", nil)), "", "data.earlier_commits"},
+		{"earlier_commits past int64", many(100, set("earlier_commits", json.RawMessage("9223372036854775808"))), "", "data.earlier_commits"},
+		{"earlier_commits with 99 commits", many(99, set("earlier_commits", 5)), "", "exactly 100"},
+		{"no draft", set("draft", nil), "", "data.draft is not true or false"},
+		{"a draft that is a string", set("draft", "true"), "", "not a JSON object"},
+		{"a draft that is an object", set("draft", map[string]any{"action": "open"}), "", "not a JSON object"},
+		{"data that is an array", nil, `[]`, "not a JSON object"},
+		{"data that is null", nil, `null`, "not a JSON object"},
+		{"a branch that is a number", nil, `{"branch": 5}`, "not a JSON object"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := json.RawMessage(tc.raw)
 			if tc.raw == "" {
-				data = pullData(tc.draft, tc.edit)
+				data = pullData(tc.edit)
 			}
 			_, err := ParsePullRequestData(data)
 			var refused *SubmitRefused
@@ -154,7 +194,7 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 	}
 }
 
-// TestAWholeNumberIsReadExactlyOrRefused: a draft number written with a zero fraction or an
+// TestAWholeNumberIsReadExactlyOrRefused: a number written with a zero fraction or an
 // exponent is the integer it equals, with no digit rounded, as 2^53+1 shows; a number that
 // is not whole, or past the int64 range, is refused.
 func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
@@ -193,14 +233,16 @@ func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
 }
 
 // TestUndefinedDataPointerKnowsTheMembersTheAdapterReads: a pointer to each member that
-// ParsePullRequestData reads, and to each member below it, is defined; a pointer to
-// another member, to a member below a scalar, or to an index that is no number, is the
-// pointer returned, and a pointer that is not below data is not its concern.
+// the pull-request type defines and the adapter understands, and to each member below it,
+// is defined; a pointer to another member, to a member below a scalar, or to an index that
+// is no number, is the pointer returned, and a pointer that is not below data is not its
+// concern.
 func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 	for _, p := range []string{
-		"/data", "/title", "/data/branch", "/data/base", "/data/base/commit", "/data/base/branch", "/data/commit",
-		"/data/commits", "/data/commits/0", "/data/commits/12/commit", "/data/commits/0/step", "/data/earlier_commits",
-		"/data/draft", "/data/draft/action", "/data/draft/number",
+		"/data", "/title", "/data/title", "/data/text", "/data/target", "/data/branch", "/data/base_branch", "/data/base",
+		"/data/base/collection", "/data/base/address", "/data/base/address/path", "/data/head/address/system",
+		"/data/commits", "/data/commits/0", "/data/commits/12/address/path", "/data/steps/0/step", "/data/steps/3/commit",
+		"/data/earlier_commits", "/data/draft",
 	} {
 		if got := UndefinedDataPointer([]string{p}); got != "" {
 			t.Errorf("%s is read, and %q is returned", p, got)
@@ -208,7 +250,8 @@ func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 	}
 	for _, p := range []string{
 		"/data/", "/data/zz", "/data/base/zz", "/data/branch/zz", "/data/commits/-", "/data/commits/01", "/data/commits/zz",
-		"/data/commits/0/zz", "/data/earlier_commits/0", "/data/draft/zz", "/data/draft/number/0", "/data/Branch", "/data/a~2",
+		"/data/commits/0/zz", "/data/earlier_commits/0", "/data/draft/zz", "/data/draft/action", "/data/draft/number",
+		"/data/commit", "/data/base/commit", "/data/base/branch", "/data/commits/0/step", "/data/Branch", "/data/a~2",
 	} {
 		if got := UndefinedDataPointer([]string{"/data/branch", p, "/data/zz2"}); got != p {
 			t.Errorf("%s is not read, and %q is returned", p, got)
@@ -223,8 +266,8 @@ func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 }
 
 // memberPaths are the JSON Pointers of the members of t, below t, through structs,
-// pointers and slices. A path has no index for a slice: "/commits/step" stands for
-// "/commits/1/step".
+// pointers and slices. A path has no index for a slice: "/steps/step" stands for
+// "/steps/1/step".
 func memberPaths(t reflect.Type, prefix string) []string {
 	for t.Kind() == reflect.Pointer || (t.Kind() == reflect.Slice && t.Elem().Kind() != reflect.Uint8) {
 		t = t.Elem()
@@ -241,56 +284,53 @@ func memberPaths(t reflect.Type, prefix string) []string {
 }
 
 // TestDataMembersMatchTheMembersParsePullRequestDataReads ties dataMembers, which
-// UndefinedDataPointer resolves a pointer through, to rawData and rawDraft by their json
-// tags: a member added to one and not the others fails the test. The draft member of
-// rawData is raw JSON that rawDraft reads.
+// UndefinedDataPointer resolves a pointer through, to rawData by their json tags: a member
+// added to one and not the other fails the test. dataMembers also has target, title and
+// text, which the type defines and the envelope has too, so the adapter ignores them.
 func TestDataMembersMatchTheMembersParsePullRequestDataReads(t *testing.T) {
-	read := memberPaths(reflect.TypeFor[rawData](), "")
-	i := slices.Index(read, "/draft")
-	if i < 0 {
-		t.Fatalf("rawData has no draft member: %v", read)
-	}
-	read = slices.Replace(read, i, i+1, memberPaths(reflect.TypeFor[rawDraft](), "/draft")...)
+	read := append(memberPaths(reflect.TypeFor[rawData](), ""), "/target", "/title", "/text")
 	defined := memberPaths(reflect.TypeFor[dataMembers](), "")
 	slices.Sort(read)
 	slices.Sort(defined)
 	if !slices.Equal(read, defined) {
-		t.Errorf("rawData and rawDraft have the members %v, and dataMembers has %v", read, defined)
+		t.Errorf("rawData and the envelope's members are %v, and dataMembers has %v", read, defined)
 	}
 }
 
 // TestParsePullRequestDataMatchesMemberNamesInExactCase has data with Branch beside
-// branch, and Number beside number in the draft: the member in other case is ignored,
-// whichever comes first, and a name in other case alone is a member that is missing.
+// branch: the member in other case is ignored, whichever comes first, and a name in other
+// case alone is a member that is missing.
 func TestParsePullRequestDataMatchesMemberNamesInExactCase(t *testing.T) {
-	data := string(pullData(`{"action":"open","Number":5}`, nil))
+	data := string(pullData(nil))
 	for name, doc := range map[string]string{
 		"before": `{"Branch":"other",` + data[1:],
 		"after":  data[:len(data)-1] + `,"Branch":"other"}`,
 	} {
 		d, err := ParsePullRequestData(json.RawMessage(doc))
-		if err != nil || d.Branch != "qory/wi_42" || d.Draft == nil || d.Draft.Number != 0 {
+		if err != nil || d.Branch != "qory/wi_42" {
 			t.Errorf("%s: %+v %v", name, d, err)
 		}
 	}
-	if _, err := ParsePullRequestData(pullData("", func(m map[string]any) { m["Branch"] = m["branch"]; delete(m, "branch") })); err == nil {
-		t.Error("a Branch is the branch")
-	}
-	if _, err := ParsePullRequestData(pullData(`{"Action":"open"}`, nil)); err == nil {
-		t.Error("an Action is the action of the draft")
+	for _, mutate := range []func(m map[string]any){
+		func(m map[string]any) { m["Branch"] = m["branch"]; delete(m, "branch") },
+		func(m map[string]any) { m["Draft"] = m["draft"]; delete(m, "draft") },
+		func(m map[string]any) { m["base_Branch"] = m["base_branch"]; delete(m, "base_branch") },
+	} {
+		if _, err := ParsePullRequestData(pullData(mutate)); err == nil {
+			t.Error("a name in other case is the member")
+		}
 	}
 }
 
 // TestParsePullRequestDataRefusesARepeatedMember has data that repeats a member, with the
-// same value or another, at the top, below base and in the draft: the data stops at the
-// first reading.
+// same value or another, at the top and below head: the data stops at the first reading.
 func TestParsePullRequestDataRefusesARepeatedMember(t *testing.T) {
-	data := string(pullData(`{"action":"open"}`, nil))
+	data := string(pullData(nil))
 	for name, doc := range map[string]string{
-		"branch":       `{"branch":"other",` + data[1:],
-		"same branch":  `{"branch":"qory/wi_42",` + data[1:],
-		"base":         strings.Replace(data, `"base":{`, `"base":{"commit":"`+sha(9)+`",`, 1),
-		"draft action": strings.Replace(data, `"action":"open"`, `"action":"update","action":"open"`, 1),
+		"branch":      `{"branch":"other",` + data[1:],
+		"same branch": `{"branch":"qory/wi_42",` + data[1:],
+		"draft":       `{"draft":false,` + data[1:],
+		"head":        strings.Replace(data, `"head":{`, `"head":{"collection":"R_9",`, 1),
 	} {
 		d, err := ParsePullRequestData(json.RawMessage(doc))
 		var refused *SubmitRefused

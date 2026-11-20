@@ -173,9 +173,9 @@ func CheckChangeRequestID(id string) error {
 	return nil
 }
 
-// Draft is what a change request entry asks for one repository: the draft pull request
-// from Branch into Base, with the run's text. Number is the number of the pull request
-// of an earlier version's reply, a hint, or 0 for an entry that asks to open one.
+// Draft is what a change request entry asks for one repository: the pull request from
+// Branch into Base, with the run's text, a draft when AsDraft. Number is the number of the
+// pull request at the previous version's address, a hint, or 0 for an entry with none.
 // Description is the content of the marked block of the description, see
 // [markedDescription]. PreviousTitle is the title of the previous version, see
 // [nextTitle].
@@ -183,6 +183,7 @@ type Draft struct {
 	Repository         Repository
 	Branch, Base       string
 	Number             int
+	AsDraft            bool
 	Title, Description string
 	PreviousTitle      string
 }
@@ -335,7 +336,7 @@ func (p ghPull) body() string {
 	return *p.Body
 }
 
-// SubmitDraft puts the draft pull request of a change request on GitHub, as the App, with
+// SubmitDraft puts the pull request of a change request on GitHub, as the App, with
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
@@ -345,16 +346,16 @@ func (p ghPull) body() string {
 // number d.Number, else the open one with the highest number, else the closed or merged
 // one with the highest number. It never changes the base branch of a pull request.
 //
-//   - None found: it opens a draft pull request from d.Branch into d.Base, with d.Title
-//     and the description [markedDescription] writes for no earlier one;
-//     the action is [DraftOpened].
+//   - None found: it opens a pull request, a draft when d.AsDraft, from d.Branch into
+//     d.Base, with d.Title and the description [markedDescription] writes for no earlier
+//     one; the action is [DraftOpened].
 //   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
 //     the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
 //     [markedDescription] writes for the description it has, which is the block
 //     alone for an empty description, and the title to the one [nextTitle]
 //     gives, and sends only what changes; the action is [DraftUpdated], or [DraftKept]
-//     when nothing changes.
+//     when nothing changes. It never changes whether the pull request is a draft.
 //
 // A description of more than [MaxDraftDescription] characters, or a title of more than
 // [MaxDraftTitle], is refused as too_long before any request, and so is a description
@@ -533,10 +534,10 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	return &got, nil
 }
 
-// openPull opens the draft pull request.
+// openPull opens the pull request, as a draft when d.AsDraft.
 func (c Client) openPull(ctx context.Context, p *Pacer, tok string, d Draft) (DraftResult, error) {
-	const opening = "opening the draft pull request"
-	req := map[string]any{"title": d.Title, "body": markedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": true}
+	const opening = "opening the pull request"
+	req := map[string]any{"title": d.Title, "body": markedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": d.AsDraft}
 	a, err := c.send(ctx, p, false, opening, http.MethodPost, pullsPath(d.Repository), tok, req)
 	if err != nil {
 		return DraftResult{}, err

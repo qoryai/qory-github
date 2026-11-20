@@ -25,10 +25,9 @@ const FixUndefinedData = "List only members that the pull-request kind defines i
 
 // The limits of the data of a pull-request change request.
 const (
-	maxBranch      = 255
-	maxCommits     = 100
-	maxStep        = 128
-	maxDraftNumber = math.MaxInt64
+	maxBranch  = 255
+	maxCommits = 100
+	maxStep    = 128
 )
 
 var (
@@ -45,60 +44,73 @@ var (
 )
 
 // PullRequestData is the data of a change request of the kind pull-request, as the
-// members it has that the adapter reads: Branch, the branch the run pushed, the
-// base branch and commit it started at, Commits, the commit ids of the run, oldest
-// first, and Draft, nil when the entry asks for no draft.
+// members it has that the adapter reads: Branch, the branch the run pushed, BaseBranch
+// and BaseCommit, the branch and the commit it started at, Commits, the commit ids of the
+// run, oldest first, and Draft, whether the pull request is opened as a draft.
 type PullRequestData struct {
 	Branch     string
 	BaseBranch string
 	BaseCommit string
 	Commits    []string
-	Draft      *DraftAsk
+	Draft      bool
 }
 
-// DraftAsk is what the data asks for the repository: a draft to open, or, with Number
-// above 0, the draft to update, whose number is a hint.
-type DraftAsk struct {
-	Number int64
+// reference is an object in a system, as the pull-request type writes it: the collection,
+// the repository, and its address. A commit is a reference whose address.path is the commit
+// id.
+type reference struct {
+	Collection string `json:"collection"`
+	Address    *struct {
+		System string `json:"system"`
+		Path   string `json:"path"`
+	} `json:"address"`
 }
 
-// rawData is the wire form of the data of a pull-request change request. A member the
-// adapter does not read is ignored.
+// commitID is the commit id of the reference r, "" when it has no address.
+func (r *reference) commitID() string {
+	if r == nil || r.Address == nil {
+		return ""
+	}
+	return r.Address.Path
+}
+
+// rawData is the wire form of the data of a pull-request change request: the type's
+// members that the adapter reads. A member the adapter does not read is ignored, the
+// title and the text of the envelope's among them.
 type rawData struct {
-	Branch string `json:"branch"`
-	Base   *struct {
-		Commit string          `json:"commit"`
-		Branch json.RawMessage `json:"branch"`
-	} `json:"base"`
-	Commit  string `json:"commit"`
-	Commits []struct {
+	Branch         string          `json:"branch"`
+	BaseBranch     string          `json:"base_branch"`
+	Head           *reference      `json:"head"`
+	Base           *reference      `json:"base"`
+	Commits        []reference     `json:"commits"`
+	EarlierCommits json.RawMessage `json:"earlier_commits"`
+	Steps          []struct {
 		Commit string `json:"commit"`
 		Step   string `json:"step"`
-	} `json:"commits"`
-	EarlierCommits json.RawMessage `json:"earlier_commits"`
-	Draft          json.RawMessage `json:"draft"`
+	} `json:"steps"`
+	Draft *bool `json:"draft"`
 }
 
-// dataMembers are the members of the data that [ParsePullRequestData] reads, with the
-// members below them, as types whose json tags [contracts.CheckMustUnderstand] resolves a
-// pointer through. A scalar has no member below it. Keep it in step with rawData and
-// rawDraft.
+// dataMembers are the members of the data that the pull-request type defines and that the
+// adapter understands, as types whose json tags [contracts.CheckMustUnderstand] resolves a
+// pointer through. A scalar has no member below it. The adapter reads the members of
+// rawData and ignores target, title and text, which the envelope has too. Keep it in step
+// with rawData.
 type dataMembers struct {
-	Branch string `json:"branch"`
-	Base   *struct {
-		Commit string `json:"commit"`
-		Branch string `json:"branch"`
-	} `json:"base"`
-	Commit  string `json:"commit"`
-	Commits []struct {
+	Target         json.RawMessage `json:"target"`
+	Title          json.RawMessage `json:"title"`
+	Text           json.RawMessage `json:"text"`
+	Branch         string          `json:"branch"`
+	BaseBranch     string          `json:"base_branch"`
+	Head           *reference      `json:"head"`
+	Base           *reference      `json:"base"`
+	Commits        []reference     `json:"commits"`
+	EarlierCommits int64           `json:"earlier_commits"`
+	Steps          []struct {
 		Commit string `json:"commit"`
 		Step   string `json:"step"`
-	} `json:"commits"`
-	EarlierCommits int64 `json:"earlier_commits"`
-	Draft          *struct {
-		Action string `json:"action"`
-		Number int64  `json:"number"`
-	} `json:"draft"`
+	} `json:"steps"`
+	Draft bool `json:"draft"`
 }
 
 // UndefinedDataPointer returns the first of pointers, JSON Pointers counted from a
@@ -121,21 +133,15 @@ func UndefinedDataPointer(pointers []string) string {
 	return ""
 }
 
-// rawDraft is the wire form of the draft member of the data.
-type rawDraft struct {
-	Action string          `json:"action"`
-	Number json.RawMessage `json:"number"`
-}
-
-// ParsePullRequestData reads the data of a change request of the kind pull-request, and
-// checks these rules: the branch names git accepts (an empty base.branch is not one), full
-// commit ids, 1 to 100 commits that end in the head commit, each with a step of 1 to 128
-// characters, earlier_commits from 1, only with exactly 100 commits, a draft that is an
-// object of the action open without a number, or update with one from 1 to
-// 9223372036854775807, and a base branch when the entry asks for a draft. A number that
-// is whole, such as 34.0 or 3.4e1, is read as the integer it equals. The error is a
-// [*SubmitRefused] with the reason refused, the fix [FixChangeData] and the broken rule as
-// its message; the text states the rule, never the value.
+// ParsePullRequestData reads the data of a change request of the kind pull-request, as
+// the pull-request artifact type writes it, and checks these rules: the branch and the
+// base branch are names git accepts, the head, the base and each commit have a full commit
+// id as address.path, 1 to 100 commits that end in the head, each step of steps has a full
+// commit id and 1 to 128 characters, earlier_commits from 1, only with exactly 100 commits,
+// and draft is true or false. A number that is whole, such as 34.0 or 3.4e1, is read as
+// the integer it equals. The error is a [*SubmitRefused] with the reason refused, the fix
+// [FixChangeData] and the broken rule as its message; the text states the rule, never the
+// value.
 func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	refuse := func(format string, args ...any) (PullRequestData, error) {
 		err := fmt.Errorf(format, args...)
@@ -148,67 +154,48 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	if !validBranch(raw.Branch) {
 		return refuse("data.branch is not a branch name that git accepts")
 	}
-	if raw.Base == nil || !commitShape.MatchString(raw.Base.Commit) {
-		return refuse("data.base.commit is not a full commit id")
+	if !validBranch(raw.BaseBranch) {
+		return refuse("data.base_branch is not a branch name that git accepts")
 	}
-	var baseBranch string
-	if raw.Base.Branch != nil {
-		if json.Unmarshal(raw.Base.Branch, &baseBranch) != nil || !validBranch(baseBranch) {
-			return refuse("data.base.branch is not a branch name that git accepts")
-		}
+	if !commitShape.MatchString(raw.Base.commitID()) {
+		return refuse("data.base is not a commit with a full commit id as its address path")
 	}
-	if !commitShape.MatchString(raw.Commit) {
-		return refuse("data.commit is not a full commit id")
+	if !commitShape.MatchString(raw.Head.commitID()) {
+		return refuse("data.head is not a commit with a full commit id as its address path")
 	}
 	if len(raw.Commits) == 0 || len(raw.Commits) > maxCommits {
 		return refuse("data.commits has %d commits, not 1 to %d", len(raw.Commits), maxCommits)
 	}
-	out := PullRequestData{Branch: raw.Branch, BaseBranch: baseBranch, BaseCommit: raw.Base.Commit}
+	out := PullRequestData{Branch: raw.Branch, BaseBranch: raw.BaseBranch, BaseCommit: raw.Base.commitID()}
 	for _, c := range raw.Commits {
-		if !commitShape.MatchString(c.Commit) {
-			return refuse("a commit of data.commits is not a full commit id")
+		if !commitShape.MatchString(c.commitID()) {
+			return refuse("a commit of data.commits has no full commit id as its address path")
 		}
-		if n := utf8.RuneCountInString(c.Step); n < 1 || n > maxStep || strings.ContainsRune(c.Step, 0) {
-			return refuse("the step of a commit of data.commits is not 1 to %d characters without U+0000", maxStep)
-		}
-		out.Commits = append(out.Commits, c.Commit)
+		out.Commits = append(out.Commits, c.commitID())
 	}
-	if out.Commits[len(out.Commits)-1] != raw.Commit {
-		return refuse("data.commits does not end in data.commit")
+	if out.Commits[len(out.Commits)-1] != raw.Head.commitID() {
+		return refuse("data.commits does not end in data.head")
+	}
+	for _, s := range raw.Steps {
+		if !commitShape.MatchString(s.Commit) {
+			return refuse("a step of data.steps has no full commit id")
+		}
+		if n := utf8.RuneCountInString(s.Step); n < 1 || n > maxStep || strings.ContainsRune(s.Step, 0) {
+			return refuse("the step of a step of data.steps is not 1 to %d characters without U+0000", maxStep)
+		}
 	}
 	if raw.EarlierCommits != nil {
 		if n, ok := wholeNumber(raw.EarlierCommits); !ok || n < 1 {
-			return refuse("data.earlier_commits is not a whole number from 1 to %d", int64(maxDraftNumber))
+			return refuse("data.earlier_commits is not a whole number from 1 to %d", int64(math.MaxInt64))
 		}
 		if len(raw.Commits) != maxCommits {
 			return refuse("data.earlier_commits is set, and data.commits does not have exactly %d commits", maxCommits)
 		}
 	}
-	if raw.Draft != nil {
-		var draft rawDraft
-		if string(raw.Draft) == "null" || exactjson.Unmarshal(raw.Draft, &draft) != nil {
-			return refuse("data.draft is not an object")
-		}
-		if out.BaseBranch == "" {
-			return refuse("data.draft is set, and data.base.branch is not")
-		}
-		ask := DraftAsk{}
-		switch draft.Action {
-		case "open":
-			if draft.Number != nil {
-				return refuse("data.draft.number is set with the action open")
-			}
-		case "update":
-			n, ok := wholeNumber(draft.Number)
-			if !ok || n < 1 {
-				return refuse("data.draft.number is not a whole number from 1 to %d with the action update", int64(maxDraftNumber))
-			}
-			ask.Number = n
-		default:
-			return refuse("data.draft.action is not open or update")
-		}
-		out.Draft = &ask
+	if raw.Draft == nil {
+		return refuse("data.draft is not true or false")
 	}
+	out.Draft = *raw.Draft
 	return out, nil
 }
 

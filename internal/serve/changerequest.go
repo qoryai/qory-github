@@ -69,8 +69,7 @@ type replyDraft struct {
 }
 
 // pullRequestReply is the data of the reply for a change request of the kind
-// pull-request: the address of the base commit and of each commit, and the draft, nil
-// exactly when the entry asks for none.
+// pull-request: the address of the base commit and of each commit, and the pull request.
 type pullRequestReply struct {
 	Base    commitAddress   `json:"base"`
 	Commits []commitAddress `json:"commits"`
@@ -167,9 +166,9 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 
 // applyChangeRequest puts one change_request entry on GitHub and returns the reply for
 // it, see [github.Client.SubmitDraft]. The reply has the address of the base commit and
-// of each commit in its data, made with no request. It has the address and the action of
-// the draft exactly when the data asks for a draft, which the adapter opens or updates
-// with an installation token for that repository with pull_requests: write alone, from
+// of each commit in its data, made with no request, and the address and the action of the
+// pull request, which the adapter opens as a draft or not, as the data's draft says, or
+// updates, with an installation token for that repository with pull_requests: write alone, from
 // the installation that RepositoryInstallation finds by the repository's current path.
 //
 // The checks come in this order, each before any request: the kind, the must_understand
@@ -206,16 +205,14 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	}
 	// A title that the contract's change_title stops is refused before any request, so the
 	// title that goes to GitHub, and the reply's fallback title, have no stopped character.
-	if data.Draft != nil {
-		if err := github.CheckTitle(ch.Title); err != nil {
-			return contracts.ChangesSubmitted{}, within(err, where)
-		}
-		if err := github.CheckDraftText(ch.Title, ch.Text); err != nil {
-			return contracts.ChangesSubmitted{}, within(err, where)
-		}
-		if err := github.CheckMarkers(ch.Text); err != nil {
-			return contracts.ChangesSubmitted{}, within(err, where)
-		}
+	if err := github.CheckTitle(ch.Title); err != nil {
+		return contracts.ChangesSubmitted{}, within(err, where)
+	}
+	if err := github.CheckDraftText(ch.Title, ch.Text); err != nil {
+		return contracts.ChangesSubmitted{}, within(err, where)
+	}
+	if err := github.CheckMarkers(ch.Text); err != nil {
+		return contracts.ChangesSubmitted{}, within(err, where)
 	}
 	repo, err := a.repositoryOf(ctx, id, ch, where)
 	if err != nil {
@@ -223,9 +220,6 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	}
 	result := addressesOf(repo, data)
 	reply := contracts.ChangesSubmitted{Version: contracts.Version, ChangeRequestID: ch.ChangeRequestID, Target: *ch.Target}
-	if data.Draft == nil {
-		return withData(reply, result)
-	}
 	refuse := func(reason, fix string, err error) error {
 		status, message := github.AnswerOf(err)
 		return &github.SubmitRefused{Reason: reason, Fix: fix, Err: fmt.Errorf("%w%s", err, where), Status: status, Message: message}
@@ -257,11 +251,10 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	case err != nil:
 		return contracts.ChangesSubmitted{}, fmt.Errorf("%w%s", err, where)
 	}
-	// shortcut: int is 64 bits on amd64 and arm64, widen github.Draft.Number for a
-	// 32-bit build.
-	d := github.Draft{Repository: repo, Branch: data.Branch, Base: data.BaseBranch, Title: ch.Title, Description: ch.Text, Number: int(data.Draft.Number)}
+	d := github.Draft{Repository: repo, Branch: data.Branch, Base: data.BaseBranch, Title: ch.Title, Description: ch.Text, AsDraft: data.Draft}
 	if ch.Previous != nil {
 		d.PreviousTitle = ch.Previous.Title
+		d.Number = previousNumber(ch.Previous.Address)
 	}
 	got, err := a.GitHub.SubmitDraft(ctx, a.pacer(installation), tok, d)
 	err = a.forgetOn401(installation, err)
@@ -279,6 +272,25 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	reply.Action = actions[got.Action]
 	reply.Address = &contracts.ChangeAddress{URL: got.URL, Ref: strconv.Itoa(got.Number)}
 	return withData(reply, result)
+}
+
+// previousNumber is the number of the pull request at the address that the adapter
+// reported for the previous version, read from its ref, or 0 when the entry has no address
+// or the ref is no number from 1 to 9223372036854775807 as the reply writes it. The number
+// is a hint: [github.Client.SubmitDraft] uses it only when GitHub has a pull request with
+// that number from the entry's branch, and otherwise finds the pull request by the branch.
+func previousNumber(address *contracts.ChangeAddress) int {
+	// The reply writes the number as decimal digits, with no sign and no leading zero.
+	if address == nil || address.Ref == "" || address.Ref[0] == '0' || strings.Trim(address.Ref, "0123456789") != "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(address.Ref, 10, 64)
+	if err != nil {
+		return 0
+	}
+	// shortcut: int is 64 bits on amd64 and arm64, widen github.Draft.Number for a
+	// 32-bit build.
+	return int(n)
 }
 
 // mustUnderstandRefusal is the refusal of a change_request entry whose must_understand

@@ -111,7 +111,7 @@ func TestAChangeRequestWithAPointerBelowDataIsCheckedAgainstTheKind(t *testing.T
 
 	w = newChangeWired(t)
 	applied := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 2, openDraft))
-	applied.MustUnderstand = []string{"/data/branch", "/data/base/commit", "/data/commits/1/step", "/data/draft/action", "/data/earlier_commits", "/data"}
+	applied.MustUnderstand = []string{"/data/branch", "/data/base/address/path", "/data/commits/1/address/path", "/data/steps/1/step", "/data/draft", "/data/earlier_commits", "/data/title", "/data"}
 	checkEntries(t, applied)
 	w.apiary.add(applied)
 	w.stepOK(t)
