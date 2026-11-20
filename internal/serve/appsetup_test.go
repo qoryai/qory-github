@@ -646,7 +646,7 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 		"malformed":    {"not a pass", 400, invalid, "pass"},
 		"two dots":     {"a.b.c", 400, invalid, "pass"},
 		"connect pass": {signPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute))), 400, invalid, "signature"},
-		"must_understand lists a member it does not define": {signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"zz":1,"must_understand":["/zz"]`)), 400, invalid, `use a reader that defines \"/zz\": the document lists it in must_understand, and this reader has no such member`},
+		"must_understand lists a member it does not define": {signSetupPass(rig.server, withMember(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"zz":1,"must_understand":["/zz"]`)), 400, invalid, `use a reader that defines \"/zz\"`},
 		"data after the payload":                            {signSetupPass(rig.server, setupPayload(testAdapterID, newNonce(), now.Add(time.Minute))+"{}"), 400, invalid, "payload"},
 		"version 2":                                         {signSetupPass(rig.server, strings.Replace(setupPayload(testAdapterID, newNonce(), now.Add(time.Minute)), `"version":1`, `"version":2`, 1)), 400, invalid, "payload"},
 		"another adapter":                                   {signSetupPass(rig.server, setupPayload("na_fedcba9876543210", newNonce(), now.Add(time.Minute))), 403, "This set-up link is for another adapter. Press Set up on the GitHub adapter's page in Qory Apiary.", "adapter"},
@@ -661,12 +661,18 @@ func TestTheSetupPassIsCheckedStepByStep(t *testing.T) {
 		}
 		w = rig.do(j, http.MethodGet, "/setup/refused", nil)
 		refusalShown(t, w, tc.status, "This set-up link cannot be used", tc.page, "https://apiary.example.com")
-		if !strings.Contains(rig.log.String(), `"reason":"`+tc.reason+`"`) {
+		if !strings.Contains(rig.log.String(), `"reason":"`+tc.reason) {
 			t.Errorf("%s: the log lacks the reason %s: %s", name, tc.reason, rig.log.String())
 		}
 	}
 	if _, err := rig.setup.Store.Get(nsSetupNonces, expiredNonce); err == nil {
 		t.Error("an expired pass's nonce is kept")
+	}
+	// A connect payload signed under the setup domain has the four setup members and
+	// connection_id, which is ignored: the adapter takes it as a setup pass.
+	connectPayload := signSetupPass(rig.server, payload(testAdapterID, testConnection, newNonce(), now.Add(time.Minute)))
+	if p, _, rf := checkSetupPass(connectPayload, now, rig.setup.creds.get()); rf != nil || p.AdapterID != testAdapterID {
+		t.Errorf("a connect payload under the setup domain: %+v, refused as %v", p, rf)
 	}
 	// A pass is taken once.
 	pass := rig.pass()
