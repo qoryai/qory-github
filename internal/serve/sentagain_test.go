@@ -290,7 +290,7 @@ func TestAReplacedConnectionWhoseEndAnswers403WithoutACodeIsListedAgain(t *testi
 }
 
 // TestAGrantReportIsBoundedByTheConnectReturn sends the report of the installation 42's
-// grant while the injected clock runs, and has Qory Apiary answer it as the table says.
+// grant while the injected clock runs, and has Qory Apiary answer it as the table lists.
 // An answer that is not final, a 403 or a 409 with no code or a 409 connection_suspended,
 // is sent again after waits that double from 2 seconds to a minute, 10 sends in all, until
 // the clock passes the expiry of the connect return, 300 seconds after the connect: then
@@ -366,12 +366,12 @@ func TestAGrantReportIsBoundedByTheConnectReturn(t *testing.T) {
 // installation's id. A report that is refused until the connect return expires drops that
 // installation's link, its repositories' records and its collections' links, and nothing
 // else, and only when the link names the report's connection B and the copy does not
-// hold B's grant. Each case has the installation 42 with acme/widgets, and the
+// contain B's grant. Each case has the installation 42 with acme/widgets, and the
 // installation 43, linked live to a third connection, with acme/gadgets. The cases:
 //   - the link names another connection A, as when a later connect replaced B's link: the
 //     report drops nothing, and A's records stay;
-//   - the copy holds B's grant: nothing is dropped;
-//   - the copy holds A's grant and the link names B: the link and the records are dropped,
+//   - the copy contains B's grant: nothing is dropped;
+//   - the copy contains A's grant and the link names B: the link and the records are dropped,
 //     and A's grant stays in the copy.
 //
 // The installation 43 is untouched in each.
@@ -384,8 +384,8 @@ func TestAFailedGrantReportDropsOnlyTheLinkItReportedFor(t *testing.T) {
 		dropped bool
 	}{
 		{"the link names another connection", link{Connection: otherConnection, State: linkLive}, otherConnection, false},
-		{"the copy holds the grant of the report", link{Connection: testConnection, State: linkPending}, testConnection, false},
-		{"the copy holds another connection's grant", link{Connection: testConnection, State: linkPending}, otherConnection, true},
+		{"the copy contains the grant of the report", link{Connection: testConnection, State: linkPending}, testConnection, false},
+		{"the copy contains another connection's grant", link{Connection: testConnection, State: linkPending}, otherConnection, true},
 	} {
 		rig, clock := reportRig(t)
 		rig.apiary.refuse = func(route string, _ int) (int, string) {

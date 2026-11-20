@@ -383,7 +383,7 @@ func unlinkedGrant(st *store.Store, installation int64, connection string) (bool
 // connection under the pass whose nonce is nonce, beside the connect's answer, see
 // [Apiary.ReportGrant]. While the answer is not final, it is sent again after a wait
 // that doubles from [grantFirstWait] to [grantMaxWait], until expires, the expiry of
-// the linked connect return minted for it, as grant.schema.json says. Not final are
+// the linked connect return minted for it, see grant.schema.json. Not final are
 // 409 pass_unknown and 403 connection_unknown, as Qory Apiary answers until the
 // person's browser brings the linked connect return, 409 connection_suspended, which
 // does not change the backoff, a 403 or a 409 with no code, see [sentAgain], and a
@@ -393,7 +393,7 @@ func unlinkedGrant(st *store.Store, installation int64, connection string) (bool
 // since the copy did not have the grant, see [reachSink], the installation's
 // repositories are listed again with them, see [Adapter.listFor]; a listing that fails
 // is logged. Once expires has passed, or Qory Apiary refuses the report for good, the
-// installation's link to connection is dropped unless the copy holds the grant. A 409
+// installation's link to connection is dropped unless the copy contains the grant. A 409
 // connection_ended drops the link at once, as it does for any request, see
 // [Apiary.Ended].
 func (c *Connect) reportSoon(installation int64, connection, nonce string, account contracts.Account, expires time.Time) {
@@ -462,7 +462,7 @@ func refusedFor(err error) bool {
 }
 
 // reportFailed ends a grant's report that Qory Apiary did not take: the installation's
-// link to connection is dropped unless the copy holds its grant for connection, with a
+// link to connection is dropped unless the copy contains its grant for connection, with a
 // line that says so.
 func (c *Connect) reportFailed(installation int64, connection string, err error) {
 	installMu.Lock()

@@ -509,9 +509,9 @@ type changesPage struct {
 
 // errNotTheFeedsDocument is the error of a page that exactjson refuses. It carries no
 // text of exactjson's error, which quotes a member's name in full, and a page can be
-// 16 MiB.
+// 16 MiB. The text lists each cause that exactjson reports.
 func errNotTheFeedsDocument(what string) error {
-	return fmt.Errorf("%s: the answer is not the feed's document: it is not one JSON object, repeats a member or has text that is not UTF-8", what)
+	return fmt.Errorf("%s: the answer is not the feed's document: it is not one JSON object, repeats a member, has a member of the wrong type or has text that is not UTF-8", what)
 }
 
 // checkChanges reads a page of the change feed, whose signature is checked already,
@@ -758,16 +758,15 @@ func retryWait(err error) (time.Duration, bool) {
 //     such a refusal has no code;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
-//     nothing, and the periodic check sends the request again, but for a grant report,
-//     which [Connect.reportSoon] sends again with its backoff until the connect return
-//     expires. Each is [Permanent], and
-//     so are any other 409 or 403 with a code, 400 and 413, each a [*refusedError]; what
-//     a 409 collection_not_linked does is for the request's sender to say, see
-//     [Apiary.Items] and [Apiary.Comments]. A 409 or a 403 with no code, because the
-//     body cannot be read, is no known refusal: it does not call [Apiary.Ended], and it
-//     is an error that may pass, so the worker, the feed, the pull round and the
-//     callers that test [sentAgain] send the request again with their backoff, and none
-//     takes it for the end of a connection, see [noteAnswer];
+//     nothing: the callers that test [sentAgain] send the request again with their
+//     backoff, and the others wait for the periodic check. Each of the two is
+//     [Permanent], and so are any other 409 or 403 with a code, 400 and 413, each a
+//     [*refusedError]; what a 409 collection_not_linked does is for the request's
+//     sender to say, see [Apiary.Items] and [Apiary.Comments]. A 409 or a 403 with no
+//     code, because the body cannot be read, is no known refusal: it does not call
+//     [Apiary.Ended], and it is an error that may pass, so the worker, the feed, the
+//     pull round and the callers that test [sentAgain] send the request again with
+//     their backoff, and none takes it for the end of a connection, see [noteAnswer];
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.

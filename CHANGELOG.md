@@ -207,14 +207,15 @@ change what the program does, and notes it under Upgrading.
   the same way: when the adapter does not read it, the answer has no refusal code. A 409
   `connection_ended` that the adapter reads ends the connection; a 409 or a 403 without
   a code does not. The grant report is sent again after every answer that is not final:
-  a 409 `pass_unknown`, a 403 `connection_unknown`, a 409 `connection_suspended`, and a
-  403 or a 409 without a code. The waits double from 2 to 60 seconds, also while the
-  connection is suspended, until the connect return expires, 300 seconds after the
-  connect; nothing changes until then. When the connect return expires, the adapter
-  stops the report and drops the installation's link and the records of its
-  repositories, unless Qory Apiary's copy of the grants holds the grant, and the person
-  connects again. The grant end and the first listing are sent again after a wait, with
-  a backoff, on the same answers, and nothing changes. A disconnect, an item or a
+  a 409 `pass_unknown`, a 403 `connection_unknown`, a 409 `connection_suspended`, a 403
+  or a 409 without a code, and a failure that can pass, such as an outage, a timeout or
+  a 429. The waits double from 2 to 60 seconds, also while the connection is suspended,
+  until the connect return expires, 300 seconds after the connect; nothing changes until
+  then. When the connect return expires, the adapter stops the report and drops the
+  installation's link and the records of its repositories, unless Qory Apiary's copy of
+  the grants contains the grant, and the person connects again. The grant end and the
+  first listing are sent again after a wait, with a backoff, on a 409 or a 403 without a
+  code or a 409 `connection_suspended`, and nothing changes. A disconnect, an item or a
   comment that gets a 409 or a 403 without a code is sent again by the worker, with its
   backoff, or by the next pull round; on a 409 `connection_suspended` it keeps the
   repository's records and the next pull round sends it. A 403 without a code never
