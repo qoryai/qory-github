@@ -193,7 +193,9 @@ change what the program does, and notes it under Upgrading.
   the feed stops and is read again after the feed's backoff, with its cursor where it
   was; a call is answered as a call that is not valid; a refusal has no code, so its
   status decides; and a pass, an answer or the data of a change request is not read.
-  Until this change, the last value was kept.
+  Until this change, the feed, the connect and setup passes, the answers to the grants
+  and to the secrets request, the body of a refusal and the data of a change request kept
+  the last value; a call was already answered as a call that is not valid.
 - `qory-github-server serve` ignores a member that it does not define in the connect
   pass, the setup pass, the answer to the grants, the answer to the secrets request and
   the secrets that it seals. It does not read such a document when its `must_understand`

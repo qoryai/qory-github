@@ -5,14 +5,14 @@ package exactjson
 import "encoding/json/v2"
 
 // Unmarshal reads the one JSON value in b, with nothing but white space after it, into v.
-// A member matches a field only when the names are equal letter for letter, so Token does
-// not fill token, as it does for [encoding/json.Unmarshal] in a build with
-// GOEXPERIMENT=nojsonv2. A member that v has no field for is ignored. An object that
+// A member matches a field only when the names are equal letter for letter, so Token
+// does not fill token. A member that v has no field for is ignored. An object that
 // repeats a name, at any depth, and a string that is not UTF-8 are errors.
 //
-// The pinned contracts' types have case:strict on each json tag, which encoding/json
-// reads in the default build of Go 1.27. A build with GOEXPERIMENT=nojsonv2 reads a
-// member in any case through them, and this package does not.
+// [encoding/json.Unmarshal] matches {"A":"x"} to a field tagged json:"a" in any case, in
+// the default build of Go 1.27 too. The pinned contracts' types tag each field
+// case:strict, which makes encoding/json exact in the default build, but a build with
+// GOEXPERIMENT=nojsonv2 reads a member in any case through them.
 func Unmarshal(b []byte, v any) error {
 	return json.Unmarshal(b, v)
 }

@@ -25,8 +25,9 @@ func TestUnmarshalMatchesNamesInExactCase(t *testing.T) {
 
 // TestUnmarshalRefusesWhatIsNotOneObject has the values that are no object, data after
 // the object, a member of the wrong type, a string that is not UTF-8 and an object that
-// repeats a name at any depth, whatever the values: the same, different or null. A null is read as
-// an object with no member, so the caller checks the first byte, see readObject.
+// repeats a name at any depth, whatever the values: the same, different or null. A null
+// is read as an object with no member, so the caller checks the first byte, see
+// readObject.
 func TestUnmarshalRefusesWhatIsNotOneObject(t *testing.T) {
 	for _, body := range []string{``, `[]`, `"a"`, `5`, `{"a":"x"}{}`, `{"a":"x"} x`, `{"a":1}`, "{\"a\":\"\xff\"}", `{"a"`,
 		`{"a":"x","a":"y"}`, `{"a":"x","a":"x"}`, `{"a":"x","a":null}`, `{"a":null,"a":"x"}`,
