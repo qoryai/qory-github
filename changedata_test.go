@@ -234,9 +234,9 @@ func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
 
 // TestUndefinedDataPointerKnowsTheMembersTheAdapterReads: a pointer to each member that
 // the pull-request type defines and the adapter understands, and to each member below it,
-// is defined; a pointer to another member, to a member below a scalar, or to an index that
-// is no number, is the pointer returned, and a pointer that is not below data is not its
-// concern.
+// is defined; a pointer to another member, to a member below a scalar, or to an index
+// that is no number, is the pointer returned, and a pointer that is not below data is not
+// its concern.
 func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 	for _, p := range []string{
 		"/data", "/title", "/data/title", "/data/text", "/data/target", "/data/target/collection", "/data/target/address/path", "/data/branch", "/data/base_branch", "/data/base",
@@ -284,9 +284,10 @@ func memberPaths(t reflect.Type, prefix string) []string {
 }
 
 // TestDataMembersMatchTheMembersParsePullRequestDataReads ties dataMembers, which
-// UndefinedDataPointer resolves a pointer through, to rawData by their json tags: a member
-// added to one and not the other fails the test. dataMembers also has target, title and
-// text, which the type defines and the envelope has too, so the adapter ignores them.
+// UndefinedDataPointer resolves a pointer through, to rawData by their json tags: a
+// member added to one and not the other fails the test. dataMembers also has target,
+// title and text, which the type defines and the envelope has too, so the adapter ignores
+// them.
 func TestDataMembersMatchTheMembersParsePullRequestDataReads(t *testing.T) {
 	read := append(memberPaths(reflect.TypeFor[rawData](), ""), "/target", "/title", "/text")
 	defined := memberPaths(reflect.TypeFor[dataMembers](), "")

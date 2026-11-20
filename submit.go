@@ -83,16 +83,16 @@ func hasMarkerLine(text string) bool {
 }
 
 // markedDescription is the description of a draft after the run's text is written:
-// existing is the description now, empty for a draft being opened, and text the run's text,
-// the content of the block, which has no marker line, see [CheckMarkers]. The block is the
-// start marker, a line ending, text, a line ending and the end marker; the line ending is
-// CRLF when the first one of existing is, otherwise LF, and only the line endings that
-// this function adds use it. The end line is the first end marker line that has a start
-// marker line before it, and the start line is the last start marker line before it. The
-// block replaces the text from the start of the start line to the end marker, and every
-// other byte of existing stays, the spaces, tabs and carriage return after the end marker
-// included. Without such a pair, as when a person removed a marker, existing stays whole
-// and the block follows it after a blank line.
+// existing is the description now, empty for a draft being opened, and text the run's
+// text, the content of the block, which has no marker line, see [CheckMarkers]. The block
+// is the start marker, a line ending, text, a line ending and the end marker; the line
+// ending is CRLF when the first one of existing is, otherwise LF, and only the line
+// endings that this function adds use it. The end line is the first end marker line that
+// has a start marker line before it, and the start line is the last start marker line
+// before it. The block replaces the text from the start of the start line to the end
+// marker, and every other byte of existing stays, the spaces, tabs and carriage return
+// after the end marker included. Without such a pair, as when a person removed a marker,
+// existing stays whole and the block follows it after a blank line.
 func markedDescription(existing, text string) string {
 	eol := "\n"
 	if i := strings.Index(existing, "\n"); i > 0 && existing[i-1] == '\r' {
@@ -174,9 +174,9 @@ func CheckChangeRequestID(id string) error {
 }
 
 // Draft is what a change request entry asks for one repository: the pull request from
-// Branch into Base, with the run's text, a draft when AsDraft. Number is the number of the
-// pull request at the previous version's address, a hint, or 0 for an entry with none.
-// Description is the content of the marked block of the description, see
+// Branch into Base, with the run's text, a draft when AsDraft. Number is the number of
+// the pull request at the previous version's address, a hint, or 0 for an entry with
+// none. Description is the content of the marked block of the description, see
 // [markedDescription]. PreviousTitle is the title of the previous version, see
 // [nextTitle].
 type Draft struct {

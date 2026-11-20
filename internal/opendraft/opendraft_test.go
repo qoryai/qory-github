@@ -161,8 +161,8 @@ func (p pull) json() map[string]any {
 	return m
 }
 
-// forbidden is the set of characters that the contract's draft_title refuses, as the
-// adapter's cleanTitle removes them.
+// forbidden is the set of characters that the --jq expression of the program removes from
+// a title.
 var forbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
 
 // jqTitle is what the --jq expression of the program prints for a title: the title

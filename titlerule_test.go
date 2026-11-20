@@ -55,8 +55,8 @@ func TestTheTitleRuleStopsWhatTheContractStops(t *testing.T) {
 	}
 }
 
-// TestTheTitleRuleAgreesWithTheContractsPattern compares CheckTitle with the schema of the
-// contract's change_title, so a change of the pinned contract fails here.
+// TestTheTitleRuleAgreesWithTheContractsPattern compares CheckTitle with the schema of
+// the contract's change_title, so a change of the pinned contract fails here.
 func TestTheTitleRuleAgreesWithTheContractsPattern(t *testing.T) {
 	schema, err := contracts.Compile("definitions.schema.json#/$defs/change_title")
 	if err != nil {
@@ -99,8 +99,8 @@ func TestOneLineStopsEveryStoppedCharacter(t *testing.T) {
 	}
 }
 
-// TestACredentialMatchSkipsEveryFormatCharacter: between, which matches the characters that
-// may split a credential, matches every stopped character, U+200C and U+200D.
+// TestACredentialMatchSkipsEveryFormatCharacter: between, which matches the characters
+// that may split a credential, matches every stopped character, U+200C and U+200D.
 func TestACredentialMatchSkipsEveryFormatCharacter(t *testing.T) {
 	skip := regexp.MustCompile("^" + between + "$")
 	for r := rune(0); r <= 0x10ffff; r++ {
@@ -113,9 +113,9 @@ func TestACredentialMatchSkipsEveryFormatCharacter(t *testing.T) {
 	}
 }
 
-// TestAnAuthorNameFollowsTheSameRule: a name has the stopped characters other than controls
-// removed, a line separator made a space, and U+200C and U+200D kept; a name with a control
-// character, or none that is not a space, ZWNJ or ZWJ, is refused.
+// TestAnAuthorNameFollowsTheSameRule: a name has the stopped characters other than
+// controls removed, a line separator made a space, and U+200C and U+200D kept; a name
+// with a control character, or none that is not a space, ZWNJ or ZWJ, is refused.
 func TestAnAuthorNameFollowsTheSameRule(t *testing.T) {
 	if got, want := cleanName("A\U000E0041‮B C‍D"), "AB C‍D"; got != want {
 		t.Errorf("cleanName gives %+q, want %+q", got, want)

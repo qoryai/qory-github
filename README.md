@@ -264,7 +264,7 @@ under the same `ref`. Each issue is an item whose target has the same `ref` and 
 
 ### Draft pull requests of a change request
 
-`qory-github-server serve` opens or updates the draft pull request for each
+`qory-github-server serve` opens or updates the pull request for each
 `change_request` entry of the kind `pull-request` that Qory Apiary writes to its change
 feed, one entry and so one repository at a time. The description of the adapter lists that
 kind in `roles.source.change_kinds`. It calls GitHub's REST API with an installation token

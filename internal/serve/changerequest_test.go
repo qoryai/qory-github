@@ -1417,9 +1417,10 @@ func TestAReplyThatQoryApiaryRefusesIsLoggedAndTheEntryIsDone(t *testing.T) {
 	}
 }
 
-// TestTheTitleOfThePullRequestInTheReplyIsCleaned: a pull request on GitHub whose title is
-// nothing but invisible characters gets the run's title in the reply, and one whose title a
-// person gave a stopped character gets the title without it. The pull request is not changed.
+// TestTheTitleOfThePullRequestInTheReplyIsCleaned: a pull request on GitHub whose title
+// is nothing but invisible characters gets the run's title in the reply, and one whose
+// title a person gave a stopped character gets the title without it. The pull request is
+// not changed.
 func TestTheTitleOfThePullRequestInTheReplyIsCleaned(t *testing.T) {
 	for _, tc := range []struct{ name, onGitHub, want string }{
 		{"invisible characters only", "\u200b\u2060", testTitle},
@@ -1442,9 +1443,9 @@ func TestTheTitleOfThePullRequestInTheReplyIsCleaned(t *testing.T) {
 }
 
 // TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest: a title with a stopped
-// character, or none that is not a space, ZWNJ or ZWJ, gets a failure report with the reason
-// refused whose detail starts with the fix. Nothing is sent to GitHub, and no pull request
-// is made. A title with a ZWJ emoji sequence is put on GitHub as it is.
+// character, or none that is not a space, ZWNJ or ZWJ, gets a failure report with the
+// reason refused whose detail starts with the fix. Nothing is sent to GitHub, and no pull
+// request is made. A title with a ZWJ emoji sequence is put on GitHub as it is.
 func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	for _, tc := range []struct{ name, title, fix string }{
 		{"a right-to-left override", "Fix \u202e the widget", "Remove control and invisible format characters"},
@@ -1477,8 +1478,8 @@ func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 }
 
 // TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest: the adapter writes the text
-// between marker lines, so a text with one gets a failure report with the reason refused and
-// a detail that starts with the fix. Nothing is sent to GitHub.
+// between marker lines, so a text with one gets a failure report with the reason refused
+// and a detail that starts with the fix. Nothing is sent to GitHub.
 func TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	w := newChangeWired(t)
 	w.apiary.add(changeOf(testChangeID, testTitle, "Text.\n<!-- qory:end -->\nMore.", targetOf("acme/widgets", 1, openDraft)))
@@ -1507,8 +1508,8 @@ func TestThePullRequestBodyHasOneBlockOfMarkerLines(t *testing.T) {
 	}
 }
 
-// pullCallsOf are the requests for pull requests that w made since from, each as METHOD and
-// the path, with the listing of the branch's pull requests written as LIST.
+// pullCallsOf are the requests for pull requests that w made since from, each as METHOD
+// and the path, with the listing of the branch's pull requests written as LIST.
 func pullCallsOf(w *wired, from int) []string {
 	var out []string
 	for _, c := range w.gh.pullCalls()[from:] {
@@ -1555,11 +1556,11 @@ func TestTheDraftIsFoundAtThePreviousAddress(t *testing.T) {
 	}
 }
 
-// TestADraftWithoutAUsableAddressIsFoundByItsBranch: an entry with no previous address, or
-// whose ref is no pull request number as the reply writes it (empty, 0, 007, +7, a word, a
-// number past int64), finds the pull request by its head branch: GitHub is asked for the
-// listing, and for no pull request by number first, and the open pull request with the
-// highest number is edited.
+// TestADraftWithoutAUsableAddressIsFoundByItsBranch: an entry with no previous address,
+// or whose ref is no pull request number as the reply writes it (empty, 0, 007, +7, a
+// word, a number past int64), finds the pull request by its head branch: GitHub is asked
+// for the listing, and for no pull request by number first, and the open pull request
+// with the highest number is edited.
 func TestADraftWithoutAUsableAddressIsFoundByItsBranch(t *testing.T) {
 	for _, ref := range []string{"-", "", "0", "007", "+7", "seven", "-3", "9223372036854775808", "1.0", " 7"} {
 		w := newChangeWired(t)
@@ -1584,10 +1585,10 @@ func TestADraftWithoutAUsableAddressIsFoundByItsBranch(t *testing.T) {
 	}
 }
 
-// TestAPullRequestThatIsGoneOpensANewOne: the previous address has the ref "7", and GitHub
-// has no pull request 7 and none from the branch: GitHub is asked for pull request 7, then
-// for the listing, and a pull request is opened. With no address, and none from the branch,
-// the listing and the opening are the only requests.
+// TestAPullRequestThatIsGoneOpensANewOne: the previous address has the ref "7", and
+// GitHub has no pull request 7 and none from the branch: GitHub is asked for pull request
+// 7, then for the listing, and a pull request is opened. With no address, and none from
+// the branch, the listing and the opening are the only requests.
 func TestAPullRequestThatIsGoneOpensANewOne(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1611,8 +1612,8 @@ func TestAPullRequestThatIsGoneOpensANewOne(t *testing.T) {
 }
 
 // TestAPullRequestAtTheAddressThatAPersonFinishedIsKept: the previous address has the ref
-// "7", and pull request 7 is closed on GitHub: nothing is written, GitHub is asked for pull
-// request 7 alone, and the reply has the action kept and the state closed.
+// "7", and pull request 7 is closed on GitHub: nothing is written, GitHub is asked for
+// pull request 7 alone, and the reply has the action kept and the state closed.
 func TestAPullRequestAtTheAddressThatAPersonFinishedIsKept(t *testing.T) {
 	w := newChangeWired(t)
 	setGitHub(w.gh, func(f *fakeGitHub) {

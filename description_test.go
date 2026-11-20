@@ -53,9 +53,9 @@ func TestATitleChangesOnlyWhileItIsThePreviousOne(t *testing.T) {
 	}
 }
 
-// TestATextWithAMarkerLineIsRefused: a line that is a marker, with trailing spaces, tabs or
-// a carriage return, is refused; a marker inside a line, or with other text after it, is
-// not a marker line to markedDescription, so it is allowed.
+// TestATextWithAMarkerLineIsRefused: a line that is a marker, with trailing spaces, tabs
+// or a carriage return, is refused; a marker inside a line, or with other text after it,
+// is not a marker line to markedDescription, so it is allowed.
 func TestATextWithAMarkerLineIsRefused(t *testing.T) {
 	for _, tc := range []struct {
 		name, text string

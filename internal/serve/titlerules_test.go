@@ -68,10 +68,10 @@ func shellClass(t *testing.T, text, name string) string {
 
 // TestTheProgramStopsNoCharacterThatTheAdapterAllows: every character that the program's
 // expression removes from a title is stopped by the adapter's rule, [github.LineStopped],
-// and the program's spaces are those of [github.HasVisible]. The program's lists are older
-// than the rule: the adapter also stops the format characters that the lists miss, such as
-// the tag characters U+E0020 to U+E007F, and the program counts U+200C and U+200D as
-// visible. The test pins those two differences, so the lists change with the rule.
+// and the program's spaces are those of [github.HasVisible]. The program's lists are
+// older than the rule: the adapter also stops the format characters that the lists miss,
+// such as the tag characters U+E0020 to U+E007F, and the program counts U+200C and U+200D
+// as visible. The test pins those two differences, so the lists change with the rule.
 func TestTheProgramStopsNoCharacterThatTheAdapterAllows(t *testing.T) {
 	text := openDraftText(t)
 	forbidden := escapedRunes(t, shellClass(t, text, "FORBIDDEN"))

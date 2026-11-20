@@ -9,7 +9,7 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` opens or updates the draft pull request for each
+- `qory-github-server serve` opens or updates the pull request for each
   `change_request` entry of the kind `pull-request` in Qory Apiary's change feed, in Go,
   over GitHub's REST API, with an installation token of the App for that one repository
   with `pull_requests: write` and no other permission. An entry has one target, so a

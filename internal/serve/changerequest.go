@@ -168,24 +168,24 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 // it, see [github.Client.SubmitDraft]. The reply has the address of the base commit and
 // of each commit in its data, made with no request, and the address and the action of the
 // pull request, which the adapter opens as a draft or not, as the data's draft says, or
-// updates, with an installation token for that repository with pull_requests: write alone, from
-// the installation that RepositoryInstallation finds by the repository's current path.
+// updates, with an installation token for that repository with pull_requests: write
+// alone, from the installation that RepositoryInstallation finds by the repository's
+// current path.
 //
 // The checks come in this order, each before any request: the kind, the must_understand
 // list, see [mustUnderstandRefusal], the target, see [Adapter.checkTarget], the data, see
 // [github.ParsePullRequestData], the title and the text. A change kind that the adapter
-// does not apply, a must_understand list that is no list or has a pointer that the adapter
-// does not define, data that breaks a rule of the kind, a title that [github.CheckTitle]
-// stops, and a text that [github.CheckMarkers] stops, are a [*github.SubmitRefused] with
-// the reason refused. So is a draft that a retry cannot open or update, whose reason is
-// the reason of the failure report, see [feed.changeRequest]: also not_permitted when no
-// installation reaches the repository, or the mint fails permanently,
-// [github.ErrMintRefused], or GitHub returns that the installation is suspended,
-// [github.ErrSuspended]. A target whose address is of another system or has a path that
-// is not owner/name, or a collection that is not a repository's id, is [Permanent]. Every
-// other error may pass, and the entry is
-// applied again. Every error but the first ends with "(change request {id},
-// {collection})".
+// does not apply, a must_understand list that is no list or has a pointer that the
+// adapter does not define, data that breaks a rule of the kind, a title that
+// [github.CheckTitle] stops, and a text that [github.CheckMarkers] stops, are a
+// [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot open
+// or update, whose reason is the reason of the failure report, see [feed.changeRequest]:
+// also not_permitted when no installation reaches the repository, or the mint fails
+// permanently, [github.ErrMintRefused], or GitHub returns that the installation is
+// suspended, [github.ErrSuspended]. A target whose address is of another system or has a
+// path that is not owner/name, or a collection that is not a repository's id, is
+// [Permanent]. Every other error may pass, and the entry is applied again. Every error
+// but the first ends with "(change request {id}, {collection})".
 func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, unmet error) (contracts.ChangesSubmitted, error) {
 	where := " (change request " + ch.ChangeRequestID + ", " + ch.Target.Collection + ")"
 	if ch.ChangeKind != github.ChangeKindPullRequest {
@@ -203,8 +203,9 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 	if err != nil {
 		return contracts.ChangesSubmitted{}, within(err, where)
 	}
-	// A title that the contract's change_title stops is refused before any request, so the
-	// title that goes to GitHub, and the reply's fallback title, have no stopped character.
+	// A title that the contract's change_title stops is refused before any request, so
+	// the title that goes to GitHub, and the reply's fallback title, have no stopped
+	// character.
 	if err := github.CheckTitle(ch.Title); err != nil {
 		return contracts.ChangesSubmitted{}, within(err, where)
 	}
@@ -275,10 +276,11 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 }
 
 // previousNumber is the number of the pull request at the address that the adapter
-// reported for the previous version, read from its ref, or 0 when the entry has no address
-// or the ref is no number from 1 to 9223372036854775807 as the reply writes it. The number
-// is a hint: [github.Client.SubmitDraft] uses it only when GitHub has a pull request with
-// that number from the entry's branch, and otherwise finds the pull request by the branch.
+// reported for the previous version, read from its ref, or 0 when the entry has no
+// address or the ref is no number from 1 to 9223372036854775807 as the reply writes it.
+// The number is a hint: [github.Client.SubmitDraft] uses it only when GitHub has a pull
+// request with that number from the entry's branch, and otherwise finds the pull request
+// by the branch.
 func previousNumber(address *contracts.ChangeAddress) int {
 	// The reply writes the number as decimal digits, with no sign and no leading zero.
 	if address == nil || address.Ref == "" || address.Ref[0] == '0' || strings.Trim(address.Ref, "0123456789") != "" {
@@ -347,10 +349,10 @@ func cleanTitle(title string) (string, bool) {
 	return shown, github.HasVisible(shown)
 }
 
-// replyTitle is the title of the pull request on GitHub as the reply sends it, without the
-// characters that [github.LineStopped] stops, which a person may have put in it on GitHub.
-// The pull request is not changed. A title left with nothing but spaces is replaced by
-// fallback, the run's title, which [github.CheckTitle] checked.
+// replyTitle is the title of the pull request on GitHub as the reply sends it, without
+// the characters that [github.LineStopped] stops, which a person may have put in it on
+// GitHub. The pull request is not changed. A title left with nothing but spaces is
+// replaced by fallback, the run's title, which [github.CheckTitle] checked.
 func replyTitle(current, fallback string) string {
 	if shown, ok := cleanTitle(current); ok {
 		return shown

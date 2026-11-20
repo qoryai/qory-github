@@ -56,8 +56,8 @@ type PullRequestData struct {
 }
 
 // reference is an object in a system, as the pull-request type writes it: the collection,
-// the repository, and its address. A commit is a reference whose address.path is the commit
-// id.
+// the repository, and its address. A commit is a reference whose address.path is the
+// commit id.
 type reference struct {
 	Collection string `json:"collection"`
 	Address    *struct {
@@ -92,8 +92,8 @@ type rawData struct {
 }
 
 // dataMembers are the members of the data that the pull-request type defines and that the
-// adapter understands, as types whose json tags [contracts.CheckMustUnderstand] resolves a
-// pointer through. A scalar has no member below it. The adapter reads the members of
+// adapter understands, as types whose json tags [contracts.CheckMustUnderstand] resolves
+// a pointer through. A scalar has no member below it. The adapter reads the members of
 // rawData and ignores target, title and text, which the envelope has too. Keep it in step
 // with rawData.
 type dataMembers struct {
@@ -135,13 +135,13 @@ func UndefinedDataPointer(pointers []string) string {
 
 // ParsePullRequestData reads the data of a change request of the kind pull-request, as
 // the pull-request artifact type writes it, and checks these rules: the branch and the
-// base branch are names git accepts, the head, the base and each commit have a full commit
-// id as address.path, 1 to 100 commits that end in the head, each step of steps has a full
-// commit id and 1 to 128 characters, earlier_commits from 1, only with exactly 100 commits,
-// and draft is true or false. A number that is whole, such as 34.0 or 3.4e1, is read as
-// the integer it equals. The error is a [*SubmitRefused] with the reason refused, the fix
-// [FixChangeData] and the broken rule as its message; the text states the rule, never the
-// value.
+// base branch are names git accepts, the head, the base and each commit have a full
+// commit id as address.path, 1 to 100 commits that end in the head, each step of steps
+// has a full commit id and 1 to 128 characters, earlier_commits from 1, only with exactly
+// 100 commits, and draft is true or false. A number that is whole, such as 34.0 or 3.4e1,
+// is read as the integer it equals. The error is a [*SubmitRefused] with the reason
+// refused, the fix [FixChangeData] and the broken rule as its message; the text states
+// the rule, never the value.
 func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	refuse := func(format string, args ...any) (PullRequestData, error) {
 		err := fmt.Errorf(format, args...)
