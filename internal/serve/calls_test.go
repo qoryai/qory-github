@@ -300,7 +300,7 @@ func checkAnswer(t *testing.T, got callAnswer, status int, schema, code string) 
 	if got.status != status || !got.signed {
 		t.Fatalf("answered %d, signed %v, %s; want %d signed", got.status, got.signed, shown(got.body), status)
 	}
-	s, err := contracts.Compile(schema)
+	s, err := contracts.CompileClosed(schema)
 	if err != nil {
 		t.Fatal(err)
 	}

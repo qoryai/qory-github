@@ -282,9 +282,9 @@ func refused(t *testing.T, rec *httptest.ResponseRecorder, rf refusal) {
 	}
 }
 
-// returnSchema is the contract's schema of a connect return's payload.
+// returnSchema is the closed copy of the contract's schema of a connect return's payload.
 var returnSchema = sync.OnceValue(func() *jsonschema.Schema {
-	s, err := contracts.Compile("connect-return.schema.json")
+	s, err := contracts.CompileClosed("connect-return.schema.json")
 	if err != nil {
 		panic(err)
 	}

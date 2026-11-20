@@ -74,7 +74,7 @@ func TestProgramVersionFallsBackToTheModuleVersion(t *testing.T) {
 			t.Errorf("ldflags %q, module %q, build info %v: %q, want %q", tc.ldflags, tc.module, tc.info, got, tc.want)
 		}
 	}
-	schema, err := contracts.Compile("description.schema.json")
+	schema, err := contracts.CompileClosed("description.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
