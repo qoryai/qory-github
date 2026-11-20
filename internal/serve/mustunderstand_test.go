@@ -3,11 +3,11 @@ package serve
 import (
 	"context"
 	"errors"
-	"net/http"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
@@ -189,30 +189,53 @@ func TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne(t *testing.T) {
 	}
 }
 
-// TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone gives a signed 409 whose
-// body is a refusal: with an unknown member that is not listed, its code is read and
-// connection_ended ends the connection; with the unknown member in must_understand, or a
-// must_understand that is no list, the body is as unreadable as a body that is no JSON,
-// so the answer has no code and ends nothing.
+// TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone gives signed 403 and 409
+// answers whose body is a refusal. A refusal with an unknown member that is not listed is
+// read: its code reaches Answered, connection_ended ends the connection, and a 403
+// connection_unknown is lasting. A body that the adapter does not read has no code, and
+// the status decides: one that lists a pointer it does not define, a must_understand that
+// is no list or null, a space or a byte order mark before the object, data after the
+// object, no JSON and an empty body. Such a 409 ends nothing, and such a 403 is not
+// lasting, so it does not count toward the end of a connection.
 func TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone(t *testing.T) {
+	const ended, unknown = `"error":"connection_ended"`, `"error":"connection_unknown"`
 	for _, tc := range []struct {
-		name, body, code string
+		name   string
+		status int
+		body   string
+		code   string
 	}{
-		{"an unknown member", `{"error":"connection_ended","zz":1}`, codeConnectionEnded},
-		{"a listed member it defines", `{"error":"connection_ended","must_understand":["/error"]}`, codeConnectionEnded},
-		{"a listed member it does not define", `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`, ""},
-		{"a must_understand that is no list", `{"error":"connection_ended","must_understand":"/error"}`, ""},
-		{"no JSON", `<html>`, ""},
+		{"an unknown member", 409, `{` + ended + `,"zz":1}`, codeConnectionEnded},
+		{"a listed member it defines", 409, `{` + ended + `,"must_understand":["/error"]}`, codeConnectionEnded},
+		{"a listed member it does not define", 409, `{` + ended + `,"zz":1,"must_understand":["/zz"]}`, ""},
+		{"a must_understand that is no list", 409, `{` + ended + `,"must_understand":"/error"}`, ""},
+		{"a must_understand that is null", 409, `{` + ended + `,"must_understand":null}`, ""},
+		{"a space before the object", 409, ` {` + ended + `}`, ""},
+		{"a byte order mark before the object", 409, "\ufeff{" + ended + `}`, ""},
+		{"data after the object", 409, `{` + ended + `}{}`, ""},
+		{"no JSON", 409, `<html>`, ""},
+		{"an empty body", 409, ``, ""},
+		{"a 403 that is read", 403, `{` + unknown + `,"zz":1}`, codeConnectionUnknown},
+		{"a 403 with a listed member it does not define", 403, `{` + unknown + `,"zz":1,"must_understand":["/zz"]}`, ""},
 	} {
-		var ended []string
-		a := &Apiary{Ended: func(connection string) { ended = append(ended, connection) }}
-		err := a.judge("reading", &answer{status: http.StatusConflict, signed: true, body: []byte(tc.body)}, "", testConnection)
+		var endedBy, answered []string
+		a := &Apiary{
+			Ended:    func(connection string) { endedBy = append(endedBy, connection) },
+			Answered: func(_ string, _ int, code string, _ time.Time) { answered = append(answered, code) },
+		}
+		err := a.judge("reading", &answer{status: tc.status, signed: true, body: []byte(tc.body)}, testConnection, testConnection)
 		var refused *refusedError
-		if !errors.As(err, &refused) || refused.status != http.StatusConflict || refused.code != tc.code || !IsPermanent(err) {
+		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || !IsPermanent(err) {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
-		if got := len(ended) == 1; got != (tc.code == codeConnectionEnded) {
-			t.Errorf("%s: the connection ended %v, want %v", tc.name, ended, tc.code == codeConnectionEnded)
+		if want := tc.status == 409 && tc.code == codeConnectionEnded; (len(endedBy) == 1) != want {
+			t.Errorf("%s: the connection ended %v, want %v", tc.name, endedBy, want)
+		}
+		if len(answered) != 1 || answered[0] != tc.code {
+			t.Errorf("%s: Answered got %q, want %q", tc.name, answered, tc.code)
+		}
+		if tc.status == 403 && lasting(refused.code) != (tc.code == codeConnectionUnknown) {
+			t.Errorf("%s: lasting(%q) is %v", tc.name, refused.code, lasting(refused.code))
 		}
 	}
 }
