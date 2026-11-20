@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -264,4 +265,43 @@ func TestAStoppedCharacterInAMemberIsRefusedWithItsCodePoint(t *testing.T) {
 	if len(FixChangeData) > 100 {
 		t.Errorf("the fix is %d characters", len(FixChangeData))
 	}
+}
+
+// TestLineStoppedAgreesWithTheTypesLinePattern: for every code point that is not a
+// surrogate, [LineStopped] stops it if and only if a string of that code point alone is
+// invalid by the line definition of the pull-request schema. A change of Go's Unicode
+// data, or of the schema, that moves one code point in or out of the rule fails here.
+func TestLineStoppedAgreesWithTheTypesLinePattern(t *testing.T) {
+	b, err := os.ReadFile("testdata/pull-request.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "https://schemas.example/pull-request.schema.json"
+	c := jsonschema.NewCompiler()
+	if err := c.AddResource(id, doc); err != nil {
+		t.Fatal(err)
+	}
+	line, err := c.Compile(id + "#/$defs/line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked, stopped := 0, 0
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		checked++
+		valid := line.Validate(string(r)) == nil
+		if LineStopped(r) {
+			stopped++
+		}
+		if valid == LineStopped(r) {
+			t.Errorf("U+%04X: LineStopped is %v, and the schema's line is valid: %v", r, LineStopped(r), valid)
+		}
+	}
+	t.Logf("%d code points agree, %d of them stopped", checked, stopped)
 }
