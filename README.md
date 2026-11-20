@@ -338,16 +338,21 @@ does not read a document that is not one JSON object, that has data after the ob
 that has anything, such as a space or a byte order mark, before the opening brace. The
 body of a refusal is read the same way: when the adapter does not read it, the answer
 has no refusal code. A 409 `connection_ended` that the adapter reads ends the
-connection; a 409 or a 403 without a code does not. The grant report, the grant end and
-the first listing of a connection are sent again after a wait, with a backoff, when the
-answer is a 409 or a 403 without a code, or a 409 `connection_suspended`, and nothing
-changes. A disconnect, an item or a comment that gets a 409 or a 403 without a code is
-sent again by the worker, with its backoff, or by the next pull round. A disconnect, an
-item or a comment that gets a 409 `connection_suspended` is not sent again after a wait:
-the adapter keeps the repository's records and the next pull round sends it on its
-periodic check. A 403 without a code never counts toward the end of a connection. A 403
-with a code, such as `connection_unknown` or `forbidden`, and a 400 or 413, with or
-without a code, are handled as before.
+connection; a 409 or a 403 without a code does not. The grant report is sent again after
+a wait that doubles from 2 to 60 seconds, until the connect return expires, 300 seconds
+after the connect, when the answer is a 409 or a 403 without a code, or a 409
+`connection_suspended`; nothing changes until then. When the connect return expires, the
+adapter stops the report and drops the installation's link and the records of its
+repositories, unless Qory Apiary's copy of the grants holds the grant, and the person
+connects again. The grant end and the first listing are sent again after a wait, with a
+backoff, on the same answers, and nothing changes. A disconnect, an item or a comment
+that gets a 409 or a 403 without a code is sent again by the worker, with its backoff,
+or by the next pull round. A disconnect, an item or a comment that gets a 409
+`connection_suspended` is not sent again after a wait: the adapter keeps the
+repository's records and the next pull round sends it on its periodic check. A 403
+without a code never counts toward the end of a connection. A 403 with a code, such as
+`connection_unknown` or `forbidden`, and a 400 or 413, with or without a code, are
+handled as before.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`

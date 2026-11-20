@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github/internal/store"
 )
 
@@ -286,4 +287,76 @@ func TestAReplacedConnectionWhoseEndAnswers403WithoutACodeIsListedAgain(t *testi
 		t.Errorf("waited %v", rig.waits)
 	}
 	rig.linked(t, 42, testConnection, linkPending)
+}
+
+// TestAGrantReportIsBoundedByTheConnectReturn sends the report of the installation 42's
+// grant while the injected clock runs, and has Qory Apiary answer it as the table says.
+// An answer that is not final, a 403 or a 409 with no code or a 409 connection_suspended,
+// is sent again after waits that double from 2 seconds to a minute, 10 sends in all, until
+// the clock passes the expiry of the connect return, 300 seconds after the connect: then
+// reportFailed drops the installation's link, its repository's reach, its collection's
+// link and its pull mark, nothing is sent again, and the grant is never in the copy. The
+// signed 204 before the expiry keeps all of it and adds the grant to the copy. A 409
+// grant_taken is final: one send, no wait, and the same drop.
+func TestAGrantReportIsBoundedByTheConnectReturn(t *testing.T) {
+	untilExpiry := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, time.Minute, time.Minute, time.Minute, 58 * time.Second}
+	for _, tc := range []struct {
+		name    string
+		answer  func(n int) (int, string)
+		sends   int
+		waits   []time.Duration
+		dropped bool
+	}{
+		{"a 403 with no code", func(int) (int, string) { return 403, `<html>` }, 10, untilExpiry, true},
+		{"a 409 with no code", func(int) (int, string) { return 409, `<html>` }, 10, untilExpiry, true},
+		{"a 409 connection_suspended", func(int) (int, string) { return 409, `{"error":"connection_suspended"}` }, 10, untilExpiry, true},
+		{"a 204 after three answers", func(n int) (int, string) {
+			if n <= 3 {
+				return 409, `{"error":"connection_suspended"}`
+			}
+			return 0, ""
+		}, 4, untilExpiry[:3], false},
+		{"a 409 grant_taken", func(int) (int, string) { return 409, `{"error":"grant_taken"}` }, 1, nil, true},
+	} {
+		rig, clock := reportRig(t)
+		rig.apiary.refuse = func(route string, n int) (int, string) {
+			if route == routeGrants {
+				return tc.answer(n)
+			}
+			return 0, ""
+		}
+		expires := clock.now().Add(returnFor)
+		ref := refOf("acme/widgets")
+		putLink(rig.st, 42, link{Connection: testConnection, State: linkPending, Return: expires.Unix()})
+		setReach(rig.st, ref, 42)
+		linkCollection(rig.st, ref)
+		keepPulled(rig.st, ref, pullMark{Since: clock.now()})
+		rig.c.reportSoon(42, testConnection, newNonce(), contracts.Account{Ref: "500", Title: "acme"}, expires)
+		eventually(t, tc.name+": the report ends", func() bool {
+			g, _ := grantOf(rig.st, 42)
+			_, linked, _ := linkOf(rig.st, 42)
+			return (g != "") != tc.dropped && linked != tc.dropped
+		})
+		rig.c.stop()
+		if n := len(rig.apiary.sent(routeGrants)); n != tc.sends {
+			t.Errorf("%s: %d sends, want %d", tc.name, n, tc.sends)
+		}
+		if w := clock.waited(); !slices.Equal(w, tc.waits) {
+			t.Errorf("%s: waited %v, want %v", tc.name, w, tc.waits)
+		}
+		if tc.dropped && !clock.now().Equal(expires) && len(tc.waits) > 0 {
+			t.Errorf("%s: the clock is at %v, want the expiry %v", tc.name, clock.now(), expires)
+		}
+		_, linked, _ := linkOf(rig.st, 42)
+		held, _ := grantOf(rig.st, 42)
+		_, reached, _ := reachOf(rig.st, ref)
+		collection, _ := collectionLinked(rig.st, ref)
+		pulled, _ := pulledOf(rig.st, ref)
+		if linked == tc.dropped || reached == tc.dropped || collection == tc.dropped || pulled.Since.IsZero() != tc.dropped || (held == testConnection) == tc.dropped {
+			t.Errorf("%s: link %v, grant %q, reach %v, collection linked %v, pull mark %v", tc.name, linked, held, reached, collection, pulled.Since)
+		}
+		if line := strings.Contains(rig.log.String(), "so serve drops its link: connect it again"); line != tc.dropped {
+			t.Errorf("%s: the drop line is %v: %s", tc.name, line, rig.log.String())
+		}
+	}
 }
