@@ -487,8 +487,8 @@ func TestAPassWithMustUnderstandIsReadOrRefused(t *testing.T) {
 }
 
 // TestReadObjectRefusesWhatIsNotOneObject checks the guard of the readers of documents
-// from another system: an unknown member is ignored, and data after the object, a list, a
-// scalar and nothing are refused.
+// from another system: an unknown member is ignored, and data after the object, a member
+// repeated at any depth, a list, a scalar and nothing are refused.
 func TestReadObjectRefusesWhatIsNotOneObject(t *testing.T) {
 	var doc struct {
 		A *int `json:"a"`
@@ -496,10 +496,7 @@ func TestReadObjectRefusesWhatIsNotOneObject(t *testing.T) {
 	if err := readObject([]byte(`{"a":1,"b":{"c":2}} `), &doc, contracts.Grants{}); err != nil || doc.A == nil || *doc.A != 1 {
 		t.Errorf("an object with an unknown member: %v", err)
 	}
-	if err := readObject([]byte(`{"a":1,"a":2}`), &doc, contracts.Grants{}); err != nil || *doc.A != 2 {
-		t.Errorf("a repeated member: err %v, a %v", err, doc.A)
-	}
-	for _, body := range []string{`{"a":1}{}`, `{"a":1} x`, `{"a":1}{"a":2}`, `[{"a":1}]`, `1`, ``, `{"a":"x"}`} {
+	for _, body := range []string{`{"a":1}{}`, `{"a":1,"a":2}`, `{"a":1,"a":1}`, `{"a":1,"b":{"c":2,"c":3}}`, `{"a":1,"must_understand":[],"must_understand":[]}`, `{"a":1} x`, `{"a":1}{"a":2}`, `[{"a":1}]`, `1`, ``, `{"a":"x"}`} {
 		if err := readObject([]byte(body), &doc, contracts.Grants{}); !errors.Is(err, errNotObject) {
 			t.Errorf("%q: err %v", body, err)
 		}
@@ -1129,7 +1126,9 @@ func TestALiveLinkIsNotTakenByAnotherConnection(t *testing.T) {
 // grant_taken; 403 connection_unknown, the link is replaced by the new connection,
 // pending; 409 connection_ended, likewise; 409 connection_suspended, refused,
 // source_unavailable; any other answer, refused, source_unavailable, a 403 not signed
-// under the pin and a 403 forbidden among them.
+// under the pin, a 403 forbidden, and a 403 or a 409 with no code among them, whether the
+// body is no JSON or lists a pointer the adapter does not define: the link stays and
+// nothing is dropped.
 func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status     int
@@ -1146,6 +1145,10 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 		"500":                  {500, `oops`, otherConnection, linkPending, reasonSourceUnavailable, false},
 		"403 not signed":       {403, `{"error":"connection_unknown"}`, otherConnection, linkPending, reasonSourceUnavailable, true},
 		"403 forbidden":        {403, `{"error":"forbidden"}`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"403 with no code":     {403, `<html>`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"409 with no code":     {409, `<html>`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"403 unmet pointer":    {403, `{"error":"connection_unknown","zz":1,"must_understand":["/zz"]}`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"409 unmet pointer":    {409, `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`, otherConnection, linkPending, reasonSourceUnavailable, false},
 	} {
 		rig := newConnectRig(t)
 		if tc.unsigned {
