@@ -361,17 +361,17 @@ func TestAGrantReportIsBoundedByTheConnectReturn(t *testing.T) {
 	}
 }
 
-// TestAFailedGrantReportDropsOnlyTheLinkItReportedFor pins what one installation is: it
-// has one link, to one connection, and one grant in the copy. A report that is refused
-// until the connect return expires drops the installation's link, its repositories'
-// records and its collections' links, and nothing else, and only when the link names the
-// report's connection and the copy does not hold that connection's grant. Each case
-// has the installation 42, with its repository acme/widgets, and the installation 43,
-// linked live to another connection, with acme/gadgets; the report is for connection B.
-//   - The link names A: a connect for B cannot link a live A, so a report for B finds
-//     the link of A and drops nothing; the installation 42's records stay.
-//   - The copy holds B's grant: nothing is dropped.
-//   - The copy holds A's grant and the link names B: the link and the records are dropped,
+// TestAFailedGrantReportDropsOnlyTheLinkItReportedFor pins what one installation is: the
+// store keeps one link for it, to one connection, and one grant, whose grant_ref is the
+// installation's id. A report that is refused until the connect return expires drops that
+// installation's link, its repositories' records and its collections' links, and nothing
+// else, and only when the link names the report's connection B and the copy does not
+// hold B's grant. Each case has the installation 42 with acme/widgets, and the
+// installation 43, linked live to a third connection, with acme/gadgets. The cases:
+//   - the link names another connection A, as when a later connect replaced B's link: the
+//     report drops nothing, and A's records stay;
+//   - the copy holds B's grant: nothing is dropped;
+//   - the copy holds A's grant and the link names B: the link and the records are dropped,
 //     and A's grant stays in the copy.
 //
 // The installation 43 is untouched in each.
