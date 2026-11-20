@@ -66,11 +66,14 @@ func (t crTarget) data() json.RawMessage {
 		Step   string `json:"step"`
 	}
 	d := struct {
-		Branch  string                          `json:"branch"`
-		Base    struct{ Commit, Branch string } `json:"base"`
-		Commit  string                          `json:"commit"`
-		Commits []commit                        `json:"commits"`
-		Draft   *draftAsk                       `json:"draft,omitempty"`
+		Branch string `json:"branch"`
+		Base   struct {
+			Commit string `json:"commit"`
+			Branch string `json:"branch"`
+		} `json:"base"`
+		Commit  string    `json:"commit"`
+		Commits []commit  `json:"commits"`
+		Draft   *draftAsk `json:"draft,omitempty"`
 	}{Branch: testBranch, Commit: sha(1 + t.commits), Draft: t.draft}
 	d.Base.Commit, d.Base.Branch = sha(1), t.base
 	for i := range t.commits {
