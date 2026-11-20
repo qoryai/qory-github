@@ -1461,6 +1461,37 @@ func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	}
 }
 
+// TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest: the adapter writes the text
+// between marker lines, so a text with one gets a failure report with the reason refused and
+// a detail that starts with the fix. Nothing is sent to GitHub.
+func TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest(t *testing.T) {
+	w := newChangeWired(t)
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.\n<!-- qory:end -->\nMore.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets refused"}) || !cursorIs(w, "c_1") {
+		t.Fatalf("reports %v", r)
+	}
+	if d := detailOf(w, 0); !strings.HasPrefix(d, "Remove the lines <!-- qory:start --> and <!-- qory:end --> from the text") {
+		t.Errorf("the detail is %q", d)
+	}
+	if calls := w.gh.pullCalls(); len(calls) != 0 || len(w.gh.pullRequests("acme/widgets")) != 0 {
+		t.Errorf("GitHub calls %v", calls)
+	}
+}
+
+// TestThePullRequestBodyHasOneBlockOfMarkerLines: the body of a pull request that the
+// adapter opens is the start marker, the text, and the end marker, so a text without a
+// marker line makes the one block.
+func TestThePullRequestBodyHasOneBlockOfMarkerLines(t *testing.T) {
+	w := newChangeWired(t)
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	pulls := w.gh.pullRequests("acme/widgets")
+	if len(pulls) != 1 || pulls[0].body != "<!-- qory:start -->\nText.\n<!-- qory:end -->" {
+		t.Fatalf("pull requests %+v", pulls)
+	}
+}
+
 // failAt makes the stand-in GitHub answer the request method path with status and body.
 func failAt(method, path string, status int, body string) func(f *fakeGitHub) {
 	return func(f *fakeGitHub) {

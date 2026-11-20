@@ -174,15 +174,17 @@ func (a *Adapter) repositoryOf(ctx context.Context, id int64, ch contracts.Chang
 //
 // The checks come in this order, each before any request: the kind, the must_understand
 // list, see [mustUnderstandRefusal], the target, see [Adapter.checkTarget], the data, see
-// [github.ParsePullRequestData], and the title. A change kind that the adapter does not
-// apply, a must_understand list that is no list or has a pointer that the adapter does
-// not define, data that breaks a rule of the kind, and a title that [github.CheckTitle]
-// stops, are a [*github.SubmitRefused] with the reason refused. So is a draft that a retry cannot open or update, whose reason is
+// [github.ParsePullRequestData], the title and the text. A change kind that the adapter
+// does not apply, a must_understand list that is no list or has a pointer that the adapter
+// does not define, data that breaks a rule of the kind, a title that [github.CheckTitle]
+// stops, and a text that [github.CheckMarkers] stops, are a [*github.SubmitRefused] with
+// the reason refused. So is a draft that a retry cannot open or update, whose reason is
 // the reason of the failure report, see [feed.changeRequest]: also not_permitted when no
 // installation reaches the repository, or the mint fails permanently,
 // [github.ErrMintRefused], or GitHub returns that the installation is suspended,
 // [github.ErrSuspended]. A target whose address is of another system or has a path that
-// is not owner/name, or a collection that is not a repository's id, is [Permanent]. Every other error may pass, and the entry is
+// is not owner/name, or a collection that is not a repository's id, is [Permanent]. Every
+// other error may pass, and the entry is
 // applied again. Every error but the first ends with "(change request {id},
 // {collection})".
 func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, unmet error) (contracts.ChangesSubmitted, error) {
@@ -209,6 +211,9 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 			return contracts.ChangesSubmitted{}, within(err, where)
 		}
 		if err := github.CheckDraftText(ch.Title, ch.Text); err != nil {
+			return contracts.ChangesSubmitted{}, within(err, where)
+		}
+		if err := github.CheckMarkers(ch.Text); err != nil {
 			return contracts.ChangesSubmitted{}, within(err, where)
 		}
 	}

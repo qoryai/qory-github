@@ -12,24 +12,22 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/qoryai/integrations/contracts"
 )
 
-// The names of the change request entry's contract that [Client.SubmitDraft] and its callers
-// use, in one place. The states are those of a pull request in the data of the reply for a
-// pull-request change request: draft, open, closed and merged, the last two for a pull
-// request that GitHub closed or merged, which SubmitDraft never edits. The actions are
-// those of [Client.SubmitDraft]: opened, updated and kept.
+// The names that [Client.SubmitDraft] and its callers use, in one place. The states are
+// those of a pull request in the data of the reply for a pull-request change request:
+// draft, open, closed and merged, the last two for a pull request that GitHub closed or
+// merged, which SubmitDraft never edits. The actions are those of [Client.SubmitDraft]:
+// opened, updated and kept.
 const (
-	DraftStateDraft  = contracts.DraftStateDraft
-	DraftStateOpen   = contracts.DraftStateOpen
-	DraftStateClosed = contracts.DraftStateClosed
-	DraftStateMerged = contracts.DraftStateMerged
+	DraftStateDraft  = "draft"
+	DraftStateOpen   = "open"
+	DraftStateClosed = "closed"
+	DraftStateMerged = "merged"
 
-	DraftOpened  = contracts.DraftOpened
-	DraftUpdated = contracts.DraftUpdated
-	DraftKept    = contracts.DraftKept
+	DraftOpened  = "opened"
+	DraftUpdated = "updated"
+	DraftKept    = "kept"
 
 	// ReasonTargetGone is the failure report's reason for a repository that GitHub
 	// returns as moved: the address of the change request's target does not exist any
@@ -61,9 +59,92 @@ const (
 	MaxDetail = 1000
 )
 
-// forgeTitlePrefix is the text GitHub puts before the title of a draft that is not ready:
-// none, as GitHub's API returns the title as it was written, see [contracts.NextTitle].
-const forgeTitlePrefix = ""
+// The lines that begin and end the block of the description that the adapter writes. A
+// line is a marker line when it is the marker followed by nothing but spaces, tabs or a
+// carriage return.
+const (
+	markerStart = "<!-- qory:start -->"
+	markerEnd   = "<!-- qory:end -->"
+)
+
+// isMarker is whether line is marker, alone on its line.
+func isMarker(line, marker string) bool {
+	return strings.TrimRight(line, " \t\r") == marker
+}
+
+// hasMarkerLine is whether a line of text is a marker line.
+func hasMarkerLine(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if isMarker(line, markerStart) || isMarker(line, markerEnd) {
+			return true
+		}
+	}
+	return false
+}
+
+// markedDescription is the description of a draft after the run's text is written:
+// existing is the description now, empty for a draft being opened, and text the run's text,
+// the content of the block, which has no marker line, see [CheckMarkers]. The block is the
+// start marker, a line ending, text, a line ending and the end marker; the line ending is
+// CRLF when the first one of existing is, otherwise LF, and only the line endings that
+// this function adds use it. The end line is the first end marker line that has a start
+// marker line before it, and the start line is the last start marker line before it. The
+// block replaces the text from the start of the start line to the end marker, and every
+// other byte of existing stays, the spaces, tabs and carriage return after the end marker
+// included. Without such a pair, as when a person removed a marker, existing stays whole
+// and the block follows it after a blank line.
+func markedDescription(existing, text string) string {
+	eol := "\n"
+	if i := strings.Index(existing, "\n"); i > 0 && existing[i-1] == '\r' {
+		eol = "\r\n"
+	}
+	block := markerStart + eol + text + eol + markerEnd
+	if existing == "" {
+		return block
+	}
+	lines := strings.Split(existing, "\n")
+	start := -1
+	for i, line := range lines {
+		switch {
+		case isMarker(line, markerStart):
+			start = i
+		case start >= 0 && isMarker(line, markerEnd):
+			head := strings.Join(lines[:start], "\n")
+			if start > 0 {
+				head += "\n"
+			}
+			tail := strings.Join(lines[i+1:], "\n")
+			if i+1 < len(lines) {
+				tail = "\n" + tail
+			}
+			return head + block + lines[i][len(strings.TrimRight(lines[i], " \t\r")):] + tail
+		}
+	}
+	rest, endings := existing, 0
+	for endings < 2 {
+		switch {
+		case strings.HasSuffix(rest, "\r\n"):
+			rest = rest[:len(rest)-2]
+		case strings.HasSuffix(rest, "\n"):
+			rest = rest[:len(rest)-1]
+		default:
+			return existing + strings.Repeat(eol, 2-endings) + block
+		}
+		endings++
+	}
+	return existing + block
+}
+
+// nextTitle is the title of a pull request after an update: next, the title of the new
+// version, while current, the title on GitHub, equals previous, the title of the previous
+// version; otherwise current, which a person edited. With an empty previous the title
+// stays as it is.
+func nextTitle(current, previous, next string) string {
+	if previous != "" && current == previous {
+		return next
+	}
+	return current
+}
 
 // commitAddress is the address of a commit of the repository on GitHub's site.
 func commitAddress(repo Repository, commit string) string {
@@ -96,8 +177,8 @@ func CheckChangeRequestID(id string) error {
 // from Branch into Base, with the run's text. Number is the number of the pull request
 // of an earlier version's reply, a hint, or 0 for an entry that asks to open one.
 // Description is the content of the marked block of the description, see
-// [contracts.MarkedDescription]. PreviousTitle is the title of the previous version, see
-// [contracts.NextTitle].
+// [markedDescription]. PreviousTitle is the title of the previous version, see
+// [nextTitle].
 type Draft struct {
 	Repository         Repository
 	Branch, Base       string
@@ -161,6 +242,7 @@ const (
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
+	fixMarkerLine     = "Remove the lines <!-- qory:start --> and <!-- qory:end --> from the text, then submit again."
 	fixTitleStopped   = "Remove control and invisible format characters from the title, then submit again."
 	fixTitleBlank     = "Give the title a character that is not a space, then submit again."
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
@@ -264,13 +346,13 @@ func (p ghPull) body() string {
 // one with the highest number. It never changes the base branch of a pull request.
 //
 //   - None found: it opens a draft pull request from d.Branch into d.Base, with d.Title
-//     and the description [contracts.MarkedDescription] writes for no earlier one;
+//     and the description [markedDescription] writes for no earlier one;
 //     the action is [DraftOpened].
 //   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
 //     the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
-//     [contracts.MarkedDescription] writes for the description it has, which is the block
-//     alone for an empty description, and the title to the one [contracts.NextTitle]
+//     [markedDescription] writes for the description it has, which is the block
+//     alone for an empty description, and the title to the one [nextTitle]
 //     gives, and sends only what changes; the action is [DraftUpdated], or [DraftKept]
 //     when nothing changes.
 //
@@ -294,6 +376,9 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 		return DraftResult{}, invalidChange("report this Qory Apiary defect: the entry has no branch, base branch or title")
 	}
 	if err := CheckDraftText(d.Title, d.Description); err != nil {
+		return DraftResult{}, err
+	}
+	if err := CheckMarkers(d.Description); err != nil {
 		return DraftResult{}, err
 	}
 	if err := CheckAPIURL(c.base()); err != nil {
@@ -324,6 +409,18 @@ func CheckDraftText(title, description string) error {
 	}
 	if n := utf8.RuneCountInString(title); n > MaxDraftTitle {
 		return &SubmitRefused{Reason: ReasonTooLong, Fix: fixRunTitle, Err: fmt.Errorf("the title of the run is %d characters; the limit is %d", n, MaxDraftTitle)}
+	}
+	return nil
+}
+
+// CheckMarkers returns a [*SubmitRefused] with the reason refused for a text that has a
+// marker line, a line that is the start or the end marker of the description's block, and
+// nil otherwise: the adapter writes the text between those lines, and a marker line in it
+// would end the block early on the next update.
+func CheckMarkers(text string) error {
+	if hasMarkerLine(text) {
+		cause := "the text of the run has a line that is a qory marker"
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixMarkerLine, Err: errors.New(cause), Message: cause + "."}
 	}
 	return nil
 }
@@ -439,7 +536,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 // openPull opens the draft pull request.
 func (c Client) openPull(ctx context.Context, p *Pacer, tok string, d Draft) (DraftResult, error) {
 	const opening = "opening the draft pull request"
-	req := map[string]any{"title": d.Title, "body": contracts.MarkedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": true}
+	req := map[string]any{"title": d.Title, "body": markedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": true}
 	a, err := c.send(ctx, p, false, opening, http.MethodPost, pullsPath(d.Repository), tok, req)
 	if err != nil {
 		return DraftResult{}, err
@@ -457,8 +554,8 @@ func (c Client) updatePull(ctx context.Context, p *Pacer, tok string, d Draft, f
 	if kept.State == DraftStateClosed || kept.State == DraftStateMerged {
 		return kept, nil
 	}
-	body := contracts.MarkedDescription(found.body(), d.Description)
-	title := contracts.NextTitle(found.Title, d.PreviousTitle, d.Title, forgeTitlePrefix)
+	body := markedDescription(found.body(), d.Description)
+	title := nextTitle(found.Title, d.PreviousTitle, d.Title)
 	patch := map[string]string{}
 	// GitHub may store a description with CRLF line breaks, which is the same text.
 	if lineFeeds(body) != lineFeeds(found.body()) {
