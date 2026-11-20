@@ -168,6 +168,26 @@ func TestAPreviousWithOnlyAnUnknownMemberReadsAsEmpty(t *testing.T) {
 	}
 }
 
+// TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne has an update whose previous
+// is {"title":"<the title of the pull request>","zz":1}: the unknown member is ignored and
+// the title is read, so the title of the pull request changes to the entry's title, as it
+// does while it equals previous.title.
+func TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne(t *testing.T) {
+	w := newChangeWired(t)
+	w.apiary.add(changeOf(testChangeID, testTitle, "First text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	w.apiary.add(changeOf(testChangeID2, "Fix the widget well", "Second text.", targetOf("acme/widgets", 2, update(1))))
+	w.apiary.withMembers(1, map[string]any{"previous": map[string]any{"title": testTitle, "zz": 1}})
+	w.stepOK(t)
+	pulls := w.gh.pullRequests("acme/widgets")
+	if len(pulls) != 1 || pulls[0].title != "Fix the widget well" || !pulls[0].draft {
+		t.Fatalf("pull requests %+v", pulls)
+	}
+	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "updated" || d.Title != "Fix the widget well" || len(w.apiary.changeReports()) != 0 {
+		t.Errorf("the reply %+v, reports %v", d, w.apiary.changeReports())
+	}
+}
+
 // TestTheFeedReadsAPageWithMembersItDoesNotDefine reads pages as Qory Apiary may write
 // them: a member of the answer and of an entry that the contract does not define is
 // ignored; an entry of an unknown kind is read as its kind alone; a must_understand that
