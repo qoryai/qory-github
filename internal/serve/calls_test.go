@@ -395,19 +395,20 @@ func TestACallIsCheckedBeforeItIsAnswered(t *testing.T) {
 		})
 	}
 	for name, body := range map[string]string{
-		"a member the schema does not define": rig.callBody(widgetsAddress + `,"extra":1`),
-		"a member twice":                      rig.callBody(widgetsAddress + `,` + widgetsAddress),
-		"the version twice":                   rig.callBody(widgetsAddress + `,"version":1`),
-		"a version with a fraction":           strings.Replace(rig.callBody(widgetsAddress), `"version":1`, `"version":1.0`, 1),
-		"no time":                             `{"version":1,` + widgetsAddress + `}`,
-		"a time with a fraction of a second":  `{"version":1,"time":"` + time.Now().UTC().Format("2006-01-02T15:04:05.000Z") + `",` + widgetsAddress + `}`,
-		"no addresses":                        rig.callBody(`"addresses":[]`),
-		"a value after the body":              rig.callBody(widgetsAddress) + `{}`,
+		"a member twice":                     rig.callBody(widgetsAddress + `,` + widgetsAddress),
+		"the version twice":                  rig.callBody(widgetsAddress + `,"version":1`),
+		"a version with a fraction":          strings.Replace(rig.callBody(widgetsAddress), `"version":1`, `"version":1.0`, 1),
+		"no time":                            `{"version":1,` + widgetsAddress + `}`,
+		"a time with a fraction of a second": `{"version":1,"time":"` + time.Now().UTC().Format("2006-01-02T15:04:05.000Z") + `",` + widgetsAddress + `}`,
+		"no addresses":                       rig.callBody(`"addresses":[]`),
+		"a value after the body":             rig.callBody(widgetsAddress) + `{}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			checkAnswer(t, rig.send(t, resolve, body), http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
 		})
 	}
+	// A member the schema does not define is ignored.
+	checkAnswer(t, rig.send(t, resolve, rig.callBody(widgetsAddress+`,"extra":1`)), 200, "resolve-answer.schema.json", "")
 	checkAnswer(t, rig.send(t, signedCall{path: "credentials"}, rig.callBody(widgetsAddress)), http.StatusNotFound, "refusal.schema.json", codeNotFound)
 	if !strings.Contains(rig.log.String(), `"msg":"call answered without a signature","call":"resolve","status":401`) {
 		t.Errorf("no line for a 401: %s", rig.log.String())
