@@ -1279,6 +1279,88 @@ func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
 	}
 }
 
+// TestA409WithoutACodeChangesNothingAndMayPass has Qory Apiary answer a comments request,
+// an items request, a delivered comment and the end of a replaced connection with a
+// signed 409 whose body the adapter cannot read, no JSON or a must_understand pointer it
+// does not define. The error is no refusal for good and has no code, so no link, record
+// or collection is dropped, Unlinked is not called and no line says the comments are
+// dropped; the delivery is sent again, up to the worker's 3 attempts, then fails; and the
+// replaced connection's record stays, so the next round lists it again.
+func TestA409WithoutACodeChangesNothingAndMayPass(t *testing.T) {
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, body := range []string{`<html>`, `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`} {
+		unreadable := func(string, int) (int, string) { return 409, body }
+		linked := func() *wired {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			setReach(w.st, widgetsRef, 42)
+			linkCollection(w.st, widgetsRef)
+			w.apiary.refuse = unreadable
+			return w
+		}
+		kept := func(w *wired, what string) {
+			t.Helper()
+			if ok, _ := Linked(w.st, 42); !ok {
+				t.Errorf("%s, %q: the installation is unlinked", what, body)
+			}
+			if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+				t.Errorf("%s, %q: the collection is unlinked", what, body)
+			}
+			if _, ok, _ := reachOf(w.st, widgetsRef); !ok {
+				t.Errorf("%s, %q: the repository's installation is dropped", what, body)
+			}
+			if strings.Contains(w.log.String(), "so they are dropped") {
+				t.Errorf("%s, %q: the log says the comments are dropped: %s", what, body, w.log.String())
+			}
+		}
+		noCode := func(err error, what string) {
+			t.Helper()
+			var refused *refusedError
+			if !errors.As(err, &refused) || refused.status != http.StatusConflict || refused.code != "" || IsPermanent(err) {
+				t.Errorf("%s, %q: err %v", what, body, err)
+			}
+		}
+		w := linked()
+		noCode(w.client.Comments(context.Background(), comments), "comments")
+		kept(w, "comments")
+		w = linked()
+		noCode(w.client.Items(context.Background(), widgetsItem()), "items")
+		kept(w, "items")
+		w = linked()
+		ev := issueEvent(42, "acme/widgets", "created")
+		ev["comment"] = map[string]any{"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
+		w.deliver(t, "issue_comment", guid1, ev)
+		if s := state(w.st, guid1); s != store.Failed {
+			t.Errorf("the delivery is %s", s)
+		}
+		if n := len(w.apiary.sent(routeComments)); n != 3 {
+			t.Errorf("%q: %d comments requests, want 3", body, n)
+		}
+		kept(w, "delivered comment")
+		// A replaced connection that Qory Apiary answers suspended is ended; the end
+		// answered 409 with no code stays an error, so the record is kept to be listed again.
+		w = newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		keepReplaced(w.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		w.apiary.refuse = func(route string, _ int) (int, string) {
+			switch route {
+			case routeCollections:
+				return 409, `{"error":"connection_suspended"}`
+			case routeConnectionsDisconnect:
+				return 409, body
+			}
+			return 0, ""
+		}
+		noCode(w.adapter.listFor(context.Background(), 42, otherConnection), "replaced connection")
+		if _, ok, _ := replacedOf(w.st, otherConnection); !ok {
+			t.Errorf("%q: the replaced connection is forgotten", body)
+		}
+	}
+}
+
 // TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
 // answer a listing and an item 409 connection_ended or connection_suspended, and a
 // disconnect 409 connection_suspended: ended drops the link of the installation linked
