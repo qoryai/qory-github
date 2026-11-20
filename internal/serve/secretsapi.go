@@ -195,7 +195,9 @@ func (a *Apiary) Secrets(ctx context.Context) (contracts.AdapterSecretsPlaintext
 // not adapter-secrets-answer.schema.json, of version 1 and the contract's revision; one
 // of another suite; one sealed to another access key than e's; one whose seal does not
 // open; and a plaintext that is not adapter-secrets-plaintext.schema.json, see
-// [contracts.AdapterSecretsPlaintext.Check]. An error never contains a value.
+// [contracts.AdapterSecretsPlaintext.Check]. An error has no secret's value. It may quote a
+// must_understand pointer, up to 256 characters, from the opened plaintext: a pointer is
+// a path, and a writer that follows the contract puts no secret in it.
 func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, error) {
 	var doc struct {
 		Version  *int `json:"version"`

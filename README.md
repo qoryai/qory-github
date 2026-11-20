@@ -322,12 +322,12 @@ The adapter reads the change feed as a reader that may be older than Qory Apiary
   `draft` with `action` and `number`.
 
 The adapter reads the other documents that Qory Apiary sends it the same way: the connect
-pass, the setup pass, the answer to the grants, the answer to the secrets and the
-secrets in it. It ignores a member that it does not define. It refuses a document whose
-`must_understand` lists a pointer to a member that it does not define, or is malformed:
-the log line starts with the fix (`use a reader that defines "/zz"`), and a pass shows
-the page for a link that is not valid. It also refuses a document that is not one JSON
-object, or has data after the object.
+pass, the setup pass, the answer to the grants, the answer to the secrets request and the
+secrets that it seals. It ignores a member that it does not define. It does not read a
+document whose `must_understand` lists a pointer to a member that it does not define, or
+is malformed: it logs a line that starts with the fix (`use a reader that defines
+"/zz"`), and for a pass the adapter shows the page for a link that is not valid. It also
+does not read a document that is not one JSON object, or has data after the object.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
@@ -374,7 +374,7 @@ header and no address with a password.
 | `not_permitted` | GitHub returned 404 for a request about the pull request, or 302 or 307 to the lookup of the installation, or 403 for something other than a rate limit, or the App has no installation on the repository, or the installation is suspended, or GitHub returned 401 until the retries ended, also for the token of the installation. The fix is to give the App the Pull requests permission and access to the repository. |
 | `target_gone` | GitHub returned 404, 410, 301 or 308 for the read of the repository by its id, or 301 or 308 for the lookup of its installation or for a pull request call. The fix for the read by id is to check that the repository exists and the App's installation reaches it. The fix for the lookup or a pull request call is to link the repository by its new name. |
 | `too_long` | The run's title or description is over 256 or 20000 characters, or the description of the pull request would pass 65536 characters, or GitHub's 422 says a text is too long. The fix names the text to shorten. |
-| `refused` | The entry's `change_kind` is not `pull-request`, or its `must_understand` lists a pointer that the adapter does not define or is not a list of JSON Pointers, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix is to push the branch again, or to create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message, except for a `must_understand` that the adapter cannot meet: that `detail` starts with the fix, has the pointer when there is one, and has no status. |
+| `refused` | The entry's `change_kind` is not `pull-request`, or its `must_understand` lists a pointer that the adapter does not define or is not a list of JSON Pointers, or its `data` breaks a rule of the kind, or GitHub's 422 says the head branch or the base branch does not exist (the fix is to push the branch again, or to create the base branch), or GitHub returned 400, or 422 for any other cause than a length limit, or another 4xx status that a retry does not change, also from the lookup of the installation, or an answer that arrived but cannot be used (it is no JSON of the documented shape, or it is larger than the limit), or an error that is neither an answer nor a failure to reach GitHub, or a 422 that says a pull request exists when none is found, after the retries ended: the same request fails again. The `detail` has GitHub's status and message, except for a `must_understand` that the adapter cannot meet: that `detail` starts with the fix, has the pointer when there is one, and has no GitHub status or message. |
 | `unreachable` | GitHub timed out, did not connect, closed the connection while its answer was read, was busy, rate limited or returned 5xx for a day. Each entry is reported by the last error of its tries. |
 
 ### Token expiry
