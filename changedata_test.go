@@ -258,3 +258,25 @@ func TestDataMembersMatchTheMembersParsePullRequestDataReads(t *testing.T) {
 		t.Errorf("rawData and rawDraft have the members %v, and dataMembers has %v", read, defined)
 	}
 }
+
+// TestParsePullRequestDataMatchesMemberNamesInExactCase has data with Branch beside
+// branch, and Number beside number in the draft: the member in other case is ignored,
+// whichever comes first, and a name in other case alone is a member that is missing.
+func TestParsePullRequestDataMatchesMemberNamesInExactCase(t *testing.T) {
+	data := string(pullData(`{"action":"open","Number":5}`, nil))
+	for name, doc := range map[string]string{
+		"before": `{"Branch":"other",` + data[1:],
+		"after":  data[:len(data)-1] + `,"Branch":"other"}`,
+	} {
+		d, err := ParsePullRequestData(json.RawMessage(doc))
+		if err != nil || d.Branch != "qory/wi_42" || d.Draft == nil || d.Draft.Number != 0 {
+			t.Errorf("%s: %+v %v", name, d, err)
+		}
+	}
+	if _, err := ParsePullRequestData(pullData("", func(m map[string]any) { m["Branch"] = m["branch"]; delete(m, "branch") })); err == nil {
+		t.Error("a Branch is the branch")
+	}
+	if _, err := ParsePullRequestData(pullData(`{"Action":"open"}`, nil)); err == nil {
+		t.Error("an Action is the action of the draft")
+	}
+}

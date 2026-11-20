@@ -182,6 +182,13 @@ change what the program does, and notes it under Upgrading.
   `base` with `commit` and `branch`, `commit`, `commits` with `commit` and `step` for
   each, `earlier_commits`, and `draft` with `action` and `number`. An entry with a
   status of its kind that the adapter does not know still stops its answer.
+- `qory-github-server serve` matches the name of a member of a document from Qory Apiary
+  in exact case: the change feed and its entries, the calls to the adapter, the data of
+  a change request, the connect and setup passes, the answers to the grants and to the
+  secrets request, the secrets that it seals and the body of a refusal. Before, `Token`
+  beside `token` could replace it, and a `Must_Understand` could replace the list that
+  `must_understand` wrote. `Token` alone now counts as a member that the adapter does not
+  define.
 - `qory-github-server serve` ignores a member that it does not define in the connect
   pass, the setup pass, the answer to the grants, the answer to the secrets request and
   the secrets that it seals. It does not read such a document when its `must_understand`

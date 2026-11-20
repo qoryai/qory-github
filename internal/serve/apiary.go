@@ -19,6 +19,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/exactjson"
 	"github.com/qoryai/qory-github/internal/store"
 )
 
@@ -522,7 +523,7 @@ func checkChanges(body []byte) (changesPage, error) {
 		Cursor   string            `json:"cursor"`
 		Changes  []json.RawMessage `json:"changes"`
 	}
-	if err := json.Unmarshal(body, &doc); err != nil {
+	if err := exactjson.Unmarshal(body, &doc); err != nil {
 		return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
 	}
 	switch {
@@ -538,24 +539,31 @@ func checkChanges(body []byte) (changesPage, error) {
 		var head struct {
 			Kind string `json:"kind"`
 		}
-		if err := json.Unmarshal(raw, &head); err != nil || head.Kind == "" {
+		if err := exactjson.Unmarshal(raw, &head); err != nil || head.Kind == "" {
 			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: an entry is not an object with a kind", what)
 		}
-		unmet := contracts.CheckChangeMustUnderstand(raw)
+		only, err := exactjson.MustUnderstand(raw, "kind")
+		if err != nil {
+			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+		}
+		unmet := contracts.CheckChangeMustUnderstand(only)
 		ch := contracts.Change{Kind: head.Kind}
 		if !knownKind(head.Kind) {
 			// The pin's error quotes the whole kind, so it is replaced here.
 			unmet = fmt.Errorf("skip the entry and acknowledge it: qory-github applies no entry of the kind %q", prefixOf(head.Kind, maxLogged))
 		} else {
 			// must_understand is read as raw JSON, so a value that is no list ends in unmet.
+			// change has no MarshalJSON, which a struct that embeds a type with one cannot
+			// be read with.
+			type change contracts.Change
 			var entry struct {
-				contracts.Change
+				change
 				MustUnderstand json.RawMessage `json:"must_understand"`
 			}
-			if err := json.Unmarshal(raw, &entry); err != nil {
+			if err := exactjson.Unmarshal(raw, &entry); err != nil {
 				return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
 			}
-			ch = entry.Change
+			ch = contracts.Change(entry.change)
 			// An error here means that unmet has the error already.
 			_ = json.Unmarshal(entry.MustUnderstand, &ch.MustUnderstand)
 		}

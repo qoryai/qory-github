@@ -323,7 +323,10 @@ The adapter reads the change feed as a reader that may be older than Qory Apiary
 
 The adapter reads the other documents that Qory Apiary sends it the same way: the connect
 pass, the setup pass, the answer to the grants, the answer to the secrets request and the
-secrets that it seals. It ignores a member that it does not define. It does not read a
+secrets that it seals. It ignores a member that it does not define. A name matches only
+in exact case, in these documents, in the feed, in a call and in the data of a change
+request: `Token` is not `token`, so it is a member that the adapter does not define,
+whatever its order beside `token`. It does not read a
 document whose `must_understand` lists a pointer to a member that it does not define, or
 is malformed: it logs a line that starts with the fix (`use a reader that defines
 "/zz"`), and for a pass the adapter shows the page for a link that is not valid. It also

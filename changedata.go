@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github/internal/exactjson"
 )
 
 // FixChangeData is the fix line for a change request whose data breaks a rule of the
@@ -141,8 +142,7 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 		return PullRequestData{}, &SubmitRefused{Reason: ReasonRefused, Fix: FixChangeData, Err: err, Message: OneLine(err.Error(), MaxDetail)}
 	}
 	var raw rawData
-	dec := json.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&raw); err != nil || bytes.TrimSpace(data)[0] != '{' {
+	if err := exactjson.Unmarshal(data, &raw); err != nil || bytes.TrimSpace(data)[0] != '{' {
 		return refuse("data is not a JSON object whose members have the types of the pull-request kind")
 	}
 	if !validBranch(raw.Branch) {
@@ -186,7 +186,7 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	}
 	if raw.Draft != nil {
 		var draft rawDraft
-		if string(raw.Draft) == "null" || json.Unmarshal(raw.Draft, &draft) != nil {
+		if string(raw.Draft) == "null" || exactjson.Unmarshal(raw.Draft, &draft) != nil {
 			return refuse("data.draft is not an object")
 		}
 		if out.BaseBranch == "" {

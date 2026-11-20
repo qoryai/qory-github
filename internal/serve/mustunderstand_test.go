@@ -259,6 +259,9 @@ func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 		{"an empty body", 409, ``, ""},
 		{"a 403 that is read", 403, `{` + unknown + `,"zz":1}`, codeConnectionUnknown},
 		{"a 403 with a listed member it does not define", 403, `{` + unknown + `,"zz":1,"must_understand":["/zz"]}`, ""},
+		{"a member of error in other case beside error", 409, `{"error":"connection_suspended","Error":"connection_ended"}`, codeConnectionSuspended},
+		{"a member of error in other case alone", 409, `{"Error":"connection_ended"}`, ""},
+		{"a 403 member of error in other case alone", 403, `{"Error":"connection_unknown"}`, ""},
 		{"a 403 with a must_understand that is no list", 403, `{` + unknown + `,"must_understand":"/error"}`, ""},
 		{"a 403 with a byte order mark before the object", 403, "\ufeff{" + unknown + `}`, ""},
 		{"a 403 with no JSON", 403, `<html>`, ""},
@@ -276,7 +279,7 @@ func TestARefusalWithAnUnmetMustUnderstandHasNoCode(t *testing.T) {
 		err := a.judge("reading", &answer{status: tc.status, signed: true, body: []byte(tc.body)}, testConnection, testConnection)
 		var refused *refusedError
 		mayPass := tc.code == "" && (tc.status == 409 || tc.status == 403)
-		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || IsPermanent(err) == mayPass || sentAgain(err) != mayPass {
+		if !errors.As(err, &refused) || refused.status != tc.status || refused.code != tc.code || IsPermanent(err) == mayPass || sentAgain(err) != (mayPass || tc.code == codeConnectionSuspended) {
 			t.Errorf("%s: err %v", tc.name, err)
 		}
 		if want := tc.status == 409 && tc.code == codeConnectionEnded; (len(endedBy) == 1) != want {

@@ -23,6 +23,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/exactjson"
 	"github.com/qoryai/qory-github/internal/store"
 )
 
@@ -651,17 +652,21 @@ var errNotObject = errors.New("the document is not one JSON object of the contra
 
 // readObject reads the payload b of a document of the contract, from another system, into
 // doc, a pointer to a struct: one JSON object that starts at the first byte, with nothing
-// after it. It ignores a member that doc does not name, and nothing but [errNotObject]
-// comes from a payload that breaks that, or a member of doc with the wrong type. It then checks the document's must_understand with [contracts.CheckMustUnderstand]
-// against v, the contract's type of the document, and returns its error, which starts
+// after it. It ignores a member that doc does not name, and matches a name in exact
+// case, see [exactjson.Unmarshal]. Nothing but [errNotObject] comes from a payload that
+// breaks that, or a member of doc with the wrong type. It then checks the document's
+// must_understand with [contracts.CheckMustUnderstand] against v, the contract's type of the document, and returns its error, which starts
 // with the fix, when the document lists a pointer that the type does not define or the
 // list is malformed.
 func readObject(b []byte, doc, v any) error {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	if !bytes.HasPrefix(b, []byte("{")) || dec.Decode(doc) != nil || dec.Decode(&struct{}{}) != io.EOF {
+	if !bytes.HasPrefix(b, []byte("{")) || exactjson.Unmarshal(b, doc) != nil {
 		return errNotObject
 	}
-	return contracts.CheckMustUnderstand(b, v)
+	only, err := exactjson.MustUnderstand(b)
+	if err != nil {
+		return errNotObject
+	}
+	return contracts.CheckMustUnderstand(only, v)
 }
 
 // answerRefusal is the error of an answer that [readObject] refused with err: notObject
