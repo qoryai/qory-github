@@ -115,15 +115,18 @@ type DraftResult struct {
 }
 
 // SubmitRefused is the error of a draft that a retry cannot open or update, since the
-// retry would fail the same way. Reason is the failure report's reason, [ReasonNotPermitted],
-// [ReasonUnreachable], [ReasonTargetGone], [ReasonTooLong] or [ReasonRefused]. Fix is
-// the one line that says what a person does, at most 100 characters, ending with a
-// period; each failing case has a different one, see the Fix constants, except a pointer
-// of must_understand that the entry's kind does not define, whose Fix is the contract's
-// text. Err is the cause: GitHub's status and message, or the check that stopped the
-// call. Status and Message are GitHub's
-// answer when the refusal comes from one, else 0 and empty; Message is one line with no
-// token, see [OneLine]. The text of the error is Fix, then Err's text.
+// retry would fail the same way. Reason is the failure report's reason,
+// [ReasonNotPermitted], [ReasonUnreachable], [ReasonTargetGone], [ReasonTooLong] or
+// [ReasonRefused]. Fix starts the text of the error, as one line of what a person does.
+// A different Fix goes with each failing case, see the Fix constants: at most 100
+// characters, ending with a period. The exception is a must_understand for which
+// [contracts.CheckChangeMustUnderstand] returns an error, a pointer that the entry's kind
+// does not define or a malformed list: Fix is that error, at most 1000 characters, which
+// ends with a period for the pointer and has no period for a malformed list. Err is the
+// cause: GitHub's status and message, or the check that stopped the call. Status and
+// Message are GitHub's answer when the refusal comes from one, else 0 and empty; Message
+// is one line with no token, see [OneLine]. The text of the error is Fix, then Err's
+// text.
 type SubmitRefused struct {
 	Reason  string
 	Fix     string
