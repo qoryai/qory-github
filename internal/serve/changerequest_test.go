@@ -620,7 +620,10 @@ func TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase(t *testing.T) {
 // TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more pull
 // requests from the head branch, the entry's number is taken when it is among them;
 // otherwise the newest open one, and a closed or merged one only when none is open, then
-// the newest of those, which is kept as it is. No case is reported unreachable.
+// the newest of those, which is kept as it is, for an entry whose address is gone. An entry
+// with no address takes only an open one, see
+// TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is reported
+// unreachable.
 func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *testing.T) {
 	pull := func(n int, base string, closed, merged bool) *ghPullRec {
 		return &ghPullRec{repo: "acme/widgets", head: testBranch, base: base, number: n, title: fmt.Sprint("Pull ", n), draft: !closed, closed: closed, merged: merged}
@@ -636,8 +639,8 @@ func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *test
 		{"the entry's number, though an open one is newer", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", false, false)}, update(1), 1, "updated", "draft"},
 		{"a number that is not among them: the newest open one", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", true, false), pull(3, "main", false, false), pull(4, "main", true, false)}, update(9), 3, "updated", "draft"},
 		{"an open one, with bases that differ", []*ghPullRec{pull(1, "release", true, false), pull(2, "develop", false, false)}, openDraft, 2, "updated", "draft"},
-		{"none open: the newest, which is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true), pull(3, "main", true, false)}, openDraft, 3, "kept", "closed"},
-		{"none open, the newest is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true)}, openDraft, 2, "kept", "merged"},
+		{"none open, a gone address: the newest, which is closed", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true), pull(3, "main", true, false)}, update(9), 3, "kept", "closed"},
+		{"none open, a gone address: the newest, which is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true)}, update(9), 2, "kept", "merged"},
 	} {
 		w := newChangeWired(t)
 		setGitHub(w.gh, func(f *fakeGitHub) { f.pulls = tc.pulls })
@@ -647,6 +650,84 @@ func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *test
 		if d == nil || d.Number != int64(tc.number) || d.Action != tc.action || d.State != tc.state || len(w.apiary.changeReports()) != 0 || len(w.gh.pullRequests("acme/widgets")) != len(tc.pulls) {
 			t.Errorf("%s: the draft is %+v, reports %v", tc.name, d, w.apiary.changeReports())
 		}
+	}
+}
+
+// TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated: an entry with no
+// previous.address makes the change at the target (the contract's README, "Without
+// previous.address, it makes the change at the target"), and "kept" is for what is at an
+// address (changes-submitted.schema.json, action: "kept: it changed nothing, because what
+// is at the address was finished at the target, or already had the entry's text"). So a
+// branch whose pull requests are all closed or merged gets a new pull request, action
+// created, and an open one from the branch is updated, as before. An address that is
+// unusable or gone falls back to the branch of any state, so the closed one is kept.
+func TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testing.T) {
+	pull := func(n int, closed, merged bool) *ghPullRec {
+		return &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: n, title: fmt.Sprint("Pull ", n), draft: !closed, closed: closed, merged: merged}
+	}
+	noRef := func(ch contracts.Change) contracts.Change { return previously(ch, "") }
+	for _, tc := range []struct {
+		name   string
+		pulls  []*ghPullRec
+		entry  func(contracts.Change) contracts.Change
+		calls  []string
+		number int64
+		action string
+		state  string
+	}{
+		{"no address, a closed one", []*ghPullRec{pull(4, true, false)}, nil, []string{"LIST", "POST "}, 5, "created", "draft"},
+		{"no address, a merged one", []*ghPullRec{pull(4, true, true)}, nil, []string{"LIST", "POST "}, 5, "created", "draft"},
+		{"no address, a previous with a title alone, a merged one", []*ghPullRec{pull(4, true, true)}, noRef, []string{"LIST", "POST "}, 5, "created", "draft"},
+		{"no address, a closed one and an open one", []*ghPullRec{pull(4, true, false), pull(2, false, false)}, nil, []string{"LIST", "GET /2", "PATCH /2"}, 2, "updated", "draft"},
+		{"no address, an open one", []*ghPullRec{pull(3, false, false)}, nil, []string{"LIST", "GET /3", "PATCH /3"}, 3, "updated", "draft"},
+		{"an address 0, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "0") }, []string{"LIST", "GET /4"}, 4, "kept", "merged"},
+		{"an address that is no number, a closed one", []*ghPullRec{pull(4, true, false)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "seven") }, []string{"LIST", "GET /4"}, 4, "kept", "closed"},
+		{"a gone address 9, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "9") }, []string{"GET /9", "LIST", "GET /4"}, 4, "kept", "merged"},
+	} {
+		w := newChangeWired(t)
+		setGitHub(w.gh, func(f *fakeGitHub) { f.pulls = tc.pulls })
+		ch := changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft))
+		if tc.entry != nil {
+			ch = tc.entry(ch)
+		}
+		w.apiary.add(ch)
+		w.stepOK(t)
+		if got := pullCallsOf(w, 0); !slices.Equal(got[1:], tc.calls) {
+			t.Errorf("%s: the calls are %v, want %v after the installation lookup", tc.name, got, tc.calls)
+		}
+		d := w.apiary.draftsReplied()["acme/widgets"]
+		if d == nil || d.Number != tc.number || d.Action != tc.action || d.State != tc.state || len(w.apiary.changeReports()) != 0 {
+			t.Errorf("%s: the draft is %+v, reports %v", tc.name, d, w.apiary.changeReports())
+		}
+	}
+}
+
+// TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported: the branch has a
+// merged pull request and no address, so the adapter opens a new one, and GitHub answers
+// 422 "No commits between" for it. The contract's reason for a 422 "for a cause other than
+// a missing place or a length limit" is refused (changes-failed.schema.json, reason), so
+// the entry gets a failure report with the reason refused and the fix first, and no reply.
+func TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported(t *testing.T) {
+	w := newChangeWired(t)
+	setGitHub(w.gh, func(f *fakeGitHub) {
+		f.pulls = []*ghPullRec{{repo: "acme/widgets", head: testBranch, base: "main", number: 4, title: "Four", closed: true, merged: true}}
+		f.pullFail = func(m, p string) (int, string) {
+			if m == "POST" && p == "/repos/acme/widgets/pulls" {
+				return 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and ` + testBranch + `"}]}`
+			}
+			return 0, ""
+		}
+	})
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1, openDraft)))
+	w.stepOK(t)
+	if got, want := pullCallsOf(w, 0), []string{"LIST", "POST "}; !slices.Equal(got[1:], want) {
+		t.Errorf("the calls are %v, want %v after the installation lookup", got, want)
+	}
+	if r := w.apiary.changeReports(); len(r) != 1 || r[0] != "acme/widgets refused" || len(w.apiary.replies()) != 0 {
+		t.Fatalf("reports %v, replies %+v", r, w.apiary.replies())
+	}
+	if d := detailOf(w, 0); !strings.HasPrefix(d, "Change the pull request or the run as GitHub's answer says, then submit again.") || !strings.Contains(d, "No commits between main and "+testBranch) {
+		t.Errorf("the detail is %q", d)
 	}
 }
 

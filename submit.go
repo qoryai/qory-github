@@ -175,14 +175,15 @@ func CheckChangeRequestID(id string) error {
 
 // Draft is the pull request of a change request entry for one repository: from Branch
 // into Base, with the run's text, a draft when AsDraft. Number is the number of
-// the pull request at the previous version's address, a hint, or 0 for an entry with
-// none. Description is the content of the marked block of the description, see
+// the pull request at the previous version's address, a hint, or 0 when the address is
+// absent or unusable. NoAddress is true for an entry with no previous address at all. Description is the content of the marked block of the description, see
 // [markedDescription]. PreviousTitle is the title of the previous version, see
 // [nextTitle].
 type Draft struct {
 	Repository         Repository
 	Branch, Base       string
 	Number             int
+	NoAddress          bool
 	AsDraft            bool
 	Title, Description string
 	PreviousTitle      string
@@ -340,13 +341,14 @@ func (p ghPull) body() string {
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
-// into any base branch, of any state: by the number d.Number when it is above 0, which is a
-// hint, and by the head branch otherwise or when GitHub has no pull request with that
-// number and head. Of several pull requests from the branch it takes the one with the
-// number d.Number, else the open one with the highest number, else the closed or merged
-// one with the highest number. It never changes the base branch of a pull request.
+// into any base branch: by the number d.Number when it is above 0, which is a hint, and by
+// the head branch otherwise or when GitHub has no pull request with that number and head.
+// Of several pull requests from the branch it takes the one with the number d.Number, else
+// the open one with the highest number, else the closed or merged one with the highest
+// number. When d.NoAddress, a closed or merged pull request from the branch is no pull
+// request: only an open one is taken. It never changes the base branch of a pull request.
 //
-//   - None found: it opens a pull request, a draft when d.AsDraft, from d.Branch into
+//   - None found, or d.NoAddress and none open: it opens a pull request, a draft when d.AsDraft, from d.Branch into
 //     d.Base, with d.Title and the description [markedDescription] writes for no earlier
 //     one; the action is [DraftOpened].
 //   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
@@ -478,8 +480,11 @@ func chosenOf(ps []ghPull) ghPull {
 	return ps[best]
 }
 
-// findPull finds the pull request from d.Branch, of any state, and reads it. It is nil
-// when there is none.
+// findPull finds the pull request from d.Branch and reads it. It is nil when there is
+// none. For an entry with an address that is gone or unusable, the pull request is of any
+// state. For an entry with no address (d.NoAddress), a pull request that is closed or
+// merged is no pull request: the contract's "without previous.address, it makes the
+// change at the target" opens a new one, and "kept" is for what is at an address.
 func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*ghPull, error) {
 	if d.Number > 0 {
 		const reading = "reading the pull request of an earlier change request"
@@ -515,7 +520,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var ours []ghPull
 	for _, l := range listed {
-		if l.isDraftOf(d) {
+		if l.isDraftOf(d) && (!d.NoAddress || l.State == "open") {
 			ours = append(ours, l)
 		}
 	}

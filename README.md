@@ -304,18 +304,23 @@ For each entry, the adapter:
   9223372036854775807), the adapter requests that pull request of the repository from
   GitHub, and uses it when it is from the entry's branch in that repository. Otherwise,
   and when GitHub has no such pull request, it looks by the head branch of the entry in
-  that repository, of any state. It never looks by the base branch: a pull request from a
-  fork is not that pull request, and a pull request into another base branch is. When
-  several pull requests have the head branch, it takes the open or draft one with the
-  highest number, and when none is open, the closed or merged one with the highest
-  number.
+  that repository. It never looks by the base branch: a pull request from a fork is not
+  that pull request, and a pull request into another base branch is. When several pull
+  requests have the head branch, it takes the open or draft one with the highest number.
+  When none is open, it takes the closed or merged one with the highest number, unless
+  the entry has no `previous.address` at all: such an entry makes the change at the
+  target, so a branch with only closed or merged pull requests gets a new pull request,
+  with the action `created`. If GitHub refuses the new pull request because the branch
+  has no commits that the base lacks (422), the entry gets a failure report with the
+  reason `refused`.
 - Opens a pull request from the branch into the entry's `base_branch` when it finds none,
   as a draft when `draft` is `true`. It never changes the base branch of an existing pull
   request, so a later entry with another `base_branch` edits the same pull request and
   leaves its base as the person set it. It never changes whether an existing pull request
   is a draft.
-- Changes nothing in a pull request that is closed or merged, and reports its state
-  (`closed` or `merged`) with the action `kept`.
+- Changes nothing in a pull request at `previous.address` or found by the branch after a
+  gone or unusable address that is closed or merged, and reports its state (`closed` or
+  `merged`) with the action `kept`.
 - Changes an open or draft pull request only where something differs, and reports
   `updated`, or `kept` when nothing differs.
 

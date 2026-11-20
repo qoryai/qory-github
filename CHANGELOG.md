@@ -22,7 +22,10 @@ change what the program does, and notes it under Upgrading.
   `kept`, and in `data` the pull request's number, title and state. It updates the pull
   request at the entry's `previous.address` when the `ref` there is a pull request number
   from the entry's branch, and otherwise finds the pull request by its head branch and
-  repository, of any state, and never by its base branch. It opens a pull request when it
+  repository, and never by its base branch. For an entry with no `previous.address`, only
+  an open pull request from the branch counts, so a branch with only closed or merged
+  pull requests gets a new one, with the action `created`; after a gone or unusable
+  address, a closed or merged one counts and is kept. It opens a pull request when it
   finds none, as a draft when `draft` is `true`, and changes only the text between the
   lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and the title
   only while it equals `previous.title`. It never changes whether a pull request is a

@@ -253,6 +253,7 @@ func (a *Adapter) applyChangeRequest(ctx context.Context, ch contracts.Change, u
 		return contracts.ChangesSubmitted{}, fmt.Errorf("%w%s", err, where)
 	}
 	d := github.Draft{Repository: repo, Branch: data.Branch, Base: data.BaseBranch, Title: ch.Title, Description: ch.Text, AsDraft: data.Draft}
+	d.NoAddress = ch.Previous == nil || ch.Previous.Address == nil
 	if ch.Previous != nil {
 		d.PreviousTitle = ch.Previous.Title
 		d.Number = previousNumber(ch.Previous.Address)
