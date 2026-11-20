@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -120,25 +121,32 @@ func TestAChangeRequestWithAPointerBelowDataIsCheckedAgainstTheKind(t *testing.T
 }
 
 // gitHubText matches what the detail of a failure report has for an answer of GitHub: the
-// words "GitHub returned" that [github.SubmitRefused.Detail] writes, or a status number.
-var gitHubText = regexp.MustCompile(`GitHub returned|\bstatus\b|\b[1-5][0-9]{2}\b`)
+// words "GitHub returned" that [github.SubmitRefused.Detail] writes, "HTTP", or a phrase
+// such as "status 404". It does not match a number in a pointer such as /x/404.
+var gitHubText = regexp.MustCompile(`GitHub returned|\bHTTP\b|\bstatus [1-5][0-9]{2}\b`)
 
 // checkMustUnderstandDetail checks the detail of the first failure report of w for an
 // entry whose must_understand the adapter cannot meet: the detail is the fix, then the
-// pointer when there is one, as the contract's check writes it for the entry, and has no
-// GitHub status or message, and no request reached GitHub. A nil entry skips the exact
-// comparison, for a document that the contract's type cannot write.
-func checkMustUnderstandDetail(t *testing.T, w *wired, name string, entry *contracts.Change) {
+// pointer when there is one, as the contract's check writes it for the entry written as
+// the fake sends it, that is with members added or replaced, and has no GitHub status or
+// message, and no request reached GitHub.
+func checkMustUnderstandDetail(t *testing.T, w *wired, name string, entry contracts.Change, members map[string]any) {
 	t.Helper()
 	detail := detailOf(w, 0)
-	if entry != nil {
-		b, err := json.Marshal(entry)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if want := contracts.CheckChangeMustUnderstand(b); want == nil || detail != want.Error() {
-			t.Errorf("%s: detail %q, want the contract's %v", name, detail, want)
-		}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	maps.Copy(doc, members)
+	if b, err = json.Marshal(doc); err != nil {
+		t.Fatal(err)
+	}
+	if want := contracts.CheckChangeMustUnderstand(b); want == nil || detail != want.Error() {
+		t.Errorf("%s: detail %q, want the contract's %v", name, detail, want)
 	}
 	if gitHubText.MatchString(detail) {
 		t.Errorf("%s: the detail has a GitHub status or message: %q", name, detail)
@@ -164,7 +172,7 @@ func TestAChangeRequestWithAPointerOfTheEntryItDoesNotDefineIsRefused(t *testing
 	if len(w.gh.requests) != 0 || len(w.apiary.replies()) != 0 || !cursorIs(w, "c_1") {
 		t.Errorf("GitHub was asked %v, replies %+v", w.gh.requests, w.apiary.replies())
 	}
-	checkMustUnderstandDetail(t, w, "/target/extra", &entry)
+	checkMustUnderstandDetail(t, w, "/target/extra", entry, nil)
 }
 
 // TestTheDetailOfARefusedPointerIsOneShortLine lists a pointer of 250 control characters,
@@ -356,11 +364,7 @@ func TestAChangeRequestWithAMalformedMustUnderstandIsRefused(t *testing.T) {
 		if len(w.gh.requests) != 0 || len(w.apiary.replies()) != 0 || !cursorIs(w, "c_1") {
 			t.Errorf("%s: GitHub was asked %v, replies %+v", tc.name, w.gh.requests, w.apiary.replies())
 		}
-		if tc.members == nil {
-			checkMustUnderstandDetail(t, w, tc.name, &entry)
-		} else {
-			checkMustUnderstandDetail(t, w, tc.name, nil)
-		}
+		checkMustUnderstandDetail(t, w, tc.name, entry, tc.members)
 	}
 }
 
