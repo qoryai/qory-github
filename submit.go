@@ -241,6 +241,7 @@ const (
 	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
 	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
+	fixNoCommits      = "Push a commit that the base branch lacks, then submit again."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
 	fixMarkerLine     = "Remove the lines that mark a qory block (qory:start and qory:end) from the text, then submit again."
@@ -637,6 +638,8 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 				fix = fixBaseGone
 			}
 			return refusedBy(a, ReasonRefused, fix, err)
+		case creating && v.noCommits:
+			return refusedBy(a, ReasonRefused, fixNoCommits, err)
 		}
 		return forgeRefused(a, err)
 	case refusedStatus(a.status):
@@ -780,11 +783,12 @@ var branchInvalid = regexp.MustCompile(`(?i)^(head|base)\s+invalid`)
 
 // validationOf is what GitHub's 422 says: a text too long, in the title or in the
 // description, a head or base that is not a branch of the repository, which of the two,
-// or a pull request that exists already.
+// or a pull request that exists already, or no commit that the head has and the base
+// lacks.
 type validationOf struct {
 	tooLong, titleLong, bodyLong bool
 	branch, head, base           bool
-	exists                       bool
+	exists, noCommits            bool
 }
 
 // validation reads GitHub's 422.
@@ -810,6 +814,8 @@ func (a *apiReply) validation() validationOf {
 			v.bodyLong = v.bodyLong || x.Field == "body" || strings.HasPrefix(text, "body ")
 		case strings.Contains(text, "already exists"):
 			v.exists = true
+		case strings.Contains(text, "no commits between"):
+			v.noCommits = true
 		case (x.Field == "head" || x.Field == "base") && x.Code == "invalid":
 			v.branch = true
 			v.head = v.head || x.Field == "head"

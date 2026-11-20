@@ -726,7 +726,7 @@ func TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported(t *
 	if r := w.apiary.changeReports(); len(r) != 1 || r[0] != "acme/widgets refused" || len(w.apiary.replies()) != 0 {
 		t.Fatalf("reports %v, replies %+v", r, w.apiary.replies())
 	}
-	if d := detailOf(w, 0); !strings.HasPrefix(d, "Change the pull request or the run as GitHub's answer says, then submit again.") || !strings.Contains(d, "No commits between main and "+testBranch) {
+	if d := detailOf(w, 0); !strings.HasPrefix(d, "Push a commit that the base branch lacks, then submit again.") || !strings.Contains(d, "No commits between main and "+testBranch) {
 		t.Errorf("the detail is %q", d)
 	}
 }
@@ -797,7 +797,8 @@ func TestAChangeRequestThatCannotBePutOnGitHubIsReportedWithItsReason(t *testing
 		{"GitHub's 422 for a body too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"body","code":"custom","message":"body is too long (maximum is 65536 characters)"}]}`), "too_long", "Shorten the description of the pull request on GitHub outside the Qory block.", "GitHub returned 422: Validation Failed; PullRequest body custom body is too long (maximum is 65536 characters)", false},
 		{"GitHub's 422 for a title too long", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"title","code":"custom","message":"title is too long (maximum is 256 characters)"}]}`), "too_long", "Shorten the title of the pull request on GitHub to 256 characters or fewer.", "GitHub returned 422: Validation Failed; PullRequest title custom title is too long (maximum is 256 characters)", false},
 		{"400", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 400, `{"message":"Problems parsing JSON"}`), "refused", fixRefused, "GitHub returned 400: Problems parsing JSON", false},
-		{"another 422", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and `+testBranch+`"}]}`), "refused", fixRefused, "GitHub returned 422: Validation Failed; PullRequest custom No commits between main and " + testBranch, false},
+		{"another 422", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"Something else is wrong"}]}`), "refused", fixRefused, "GitHub returned 422: Validation Failed; PullRequest custom Something else is wrong", false},
+		{"GitHub's 422 for no commits between", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and `+testBranch+`"}]}`), "refused", "Push a commit that the base branch lacks, then submit again.", "GitHub returned 422: Validation Failed; PullRequest custom No commits between main and " + testBranch, false},
 		{"a 422 on the list", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 422, `{"message":"Validation Failed"}`), "refused", fixRefused, "GitHub returned 422: Validation Failed", false},
 		{"409", "Text.", forbidden("POST", "/repos/acme/widgets/pulls", 409, `{"message":"Conflict"}`), "refused", fixRefused, "GitHub returned 409: Conflict", false},
 		{"451", "Text.", forbidden("GET", "/repos/acme/widgets/pulls", 451, `{"message":"Unavailable For Legal Reasons"}`), "refused", fixRefused, "GitHub returned 451: Unavailable For Legal Reasons", false},
@@ -1786,9 +1787,10 @@ func TestAnUpdateKeepsWhetherThePullRequestIsADraft(t *testing.T) {
 
 // TestAnEntryWithTheMostCommitsThatTheContractAllowsIsApplied: the contract bounds the
 // data of an entry (README, "data": at most 786432 bytes and arrays of at most 1024
-// items, which the control plane enforces), and the adapter adds no cap of its own. An
-// entry with 1024 commits is applied, and its reply, 1024 commit addresses with the pull
-// request, is smaller than contracts.MaxRequest, the most that the adapter sends.
+// items, which the control plane enforces), and the adapter sets no cap on the number of
+// commits. An entry with 1024 commits is applied, and its reply, 1024 commit addresses
+// with the pull request, is smaller than contracts.MaxRequest, the most that the adapter
+// sends.
 func TestAnEntryWithTheMostCommitsThatTheContractAllowsIsApplied(t *testing.T) {
 	w := newChangeWired(t)
 	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1024, openDraft)))
