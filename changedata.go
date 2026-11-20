@@ -38,8 +38,9 @@ var (
 	branchNever = regexp.MustCompile(`\.\.|//|@\{|(^|/)\.|\.lock(/|$)|[./]$|^@$`)
 	// commitShape is a full commit id: 40 or 64 lower-case hexadecimal digits.
 	commitShape = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
-	// numberShape is a JSON number.
-	numberShape = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+	// numberShape is a JSON number, in the groups sign, integer part, fraction digits and
+	// exponent.
+	numberShape = regexp.MustCompile(`^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$`)
 )
 
 // PullRequestData is the data of a change request of the kind pull-request, as the
@@ -168,8 +169,8 @@ func UndefinedDataPointer(pointers []string) string {
 // of the characters that [LineStopped] stops. The adapter reads only what the schema
 // states: it sets no limit on the number of commits (the contract bounds the data), and
 // head and earlier_commits have no further rule. A member that the schema does not
-// define is ignored, and so is one that the adapter does not read. A number that is
-// whole, such as 34.0 or 3.4e1, is read as the integer it equals. The error is a
+// define is ignored, and so is one that the adapter does not read. earlier_commits has
+// no upper limit, and a whole number such as 34.0 or 3.4e1 counts. The error is a
 // [*SubmitRefused] with the reason refused, the fix [FixChangeData] and the broken rule
 // as its message; the text states the rule and the code point of a stopped character,
 // never the value.
@@ -221,7 +222,7 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 		}
 	}
 	if raw.EarlierCommits != nil {
-		if n, ok := wholeNumber(raw.EarlierCommits); !ok || n.Sign() < 1 {
+		if !wholeFrom1(raw.EarlierCommits) {
 			return refuse("data.earlier_commits is not a whole number from 1")
 		}
 	}
@@ -237,20 +238,30 @@ func validBranch(name string) bool {
 	return utf8.RuneCountInString(name) <= maxBranch && branchShape.MatchString(name) && !branchNever.MatchString(name)
 }
 
-// wholeNumber is the integer that the JSON number raw equals exactly, of any size, or
-// false for anything else: a missing member, a string, null, or a number with a fraction
-// that is not zero. The artifact type of the kind may write 34.0 or 3.4e1 for 34. The
-// value is read as a rational number, so no digit is rounded.
-// shortcut: an exponent over 1000000 is refused, though the schema accepts it, since
-// big.Rat refuses it; replace it when a writer of the type needs such a number.
-func wholeNumber(raw json.RawMessage) (*big.Int, bool) {
-	s := string(raw)
-	if !numberShape.MatchString(s) {
-		return nil, false
+// wholeFrom1 is whether the JSON number raw is a whole number of 1 or more, of any size:
+// the type's schema says integer with minimum 1, and a writer may write 34.0 or 3.4e1 for
+// 34. It reads the digits, the number of digits after the point and the exponent, so no
+// number is built and no value is rounded or capped. A missing member, a string, null,
+// zero, a negative number and a number with a fraction that is not zero give false.
+func wholeFrom1(raw json.RawMessage) bool {
+	m := numberShape.FindStringSubmatch(string(raw))
+	if m == nil || m[1] == "-" {
+		return false
 	}
-	r, ok := new(big.Rat).SetString(s)
-	if !ok || !r.IsInt() {
-		return nil, false
+	digits := strings.TrimLeft(m[2]+m[3], "0")
+	if digits == "" {
+		return false
 	}
-	return r.Num(), true
+	exp, ok := new(big.Int).SetString(m[4], 10)
+	if !ok {
+		exp = new(big.Int)
+	}
+	// The value is digits * 10^scale. It is whole when the scale is not negative, or
+	// when digits ends in at least -scale zeros.
+	scale := exp.Sub(exp, big.NewInt(int64(len(m[3]))))
+	if scale.Sign() >= 0 {
+		return true
+	}
+	zeros := len(digits) - len(strings.TrimRight(digits, "0"))
+	return scale.Neg(scale).IsInt64() && int64(zeros) >= scale.Int64()
 }

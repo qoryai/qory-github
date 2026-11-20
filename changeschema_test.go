@@ -180,7 +180,7 @@ func TestParsePullRequestDataAgreesWithTheTypesSchema(t *testing.T) {
 	add("the collection of a commit is absent", set("commits", 0, "collection", absent))
 	add("a commit has no address", set("commits", 0, "address", absent))
 	add("a commit has no path", set("commits", 0, "address", "path", absent))
-	for _, n := range []json.RawMessage{json.RawMessage("1"), json.RawMessage("0"), json.RawMessage("-1"), json.RawMessage("5.0"), json.RawMessage("5.5"), json.RawMessage("1e2"), json.RawMessage("1E30"), json.RawMessage("9223372036854775808"), json.RawMessage("0.5"), json.RawMessage("1.0e0"), json.RawMessage("-5.0")} {
+	for _, n := range []json.RawMessage{json.RawMessage("1"), json.RawMessage("0"), json.RawMessage("-1"), json.RawMessage("5.0"), json.RawMessage("5.5"), json.RawMessage("1e2"), json.RawMessage("1E30"), json.RawMessage("9223372036854775808"), json.RawMessage("0.5"), json.RawMessage("1.0e0"), json.RawMessage("-5.0"), json.RawMessage("1e400"), json.RawMessage("10e-1"), json.RawMessage("15e-1")} {
 		add("earlier_commits "+string(n), set("earlier_commits", n))
 	}
 	add("earlier_commits null", set("earlier_commits", nil))

@@ -208,41 +208,54 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 	}
 }
 
-// TestAWholeNumberIsReadExactlyOrRefused: a number written with a zero fraction or an
-// exponent is the integer it equals, with no digit rounded, as 2^53+1 shows; a number that
-// is not whole, or past the int64 range, is refused.
-func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
+// TestAWholeNumberFromOneIsAcceptedOfAnySize: a JSON number that is a whole number of 1
+// or more is accepted, written with a zero fraction or an exponent too, with no limit of
+// size, and nothing else is.
+func TestAWholeNumberFromOneIsAcceptedOfAnySize(t *testing.T) {
 	for _, tc := range []struct {
-		in   string
-		want string
-		ok   bool
+		in string
+		ok bool
 	}{
-		{"34", "34", true},
-		{"34.0", "34", true},
-		{"1e2", "100", true},
-		{"0.5e1", "5", true},
-		{"3.4E+1", "34", true},
-		{"9007199254740993", "9007199254740993", true},
-		{"9007199254740993.0", "9007199254740993", true},
-		{"9.007199254740993e15", "9007199254740993", true},
-		{"9223372036854775807.0", "9223372036854775807", true},
-		{"9223372036854775808", "9223372036854775808", true},
-		{"1E30", "1" + strings.Repeat("0", 30), true},
-		{"1.00000000000000000001", "", false},
-		{"1.5", "", false},
-		{"1e1000000000", "", false},
-		{"1e-1", "", false},
-		{`"4"`, "", false},
-		{"null", "", false},
-		{"0x10", "", false},
+		{"1", true},
+		{"34", true},
+		{"34.0", true},
+		{"1e2", true},
+		{"0.5e1", true},
+		{"3.4E+1", true},
+		{"10e-1", true},
+		{"100e-2", true},
+		{"1.50e1", true},
+		{"9007199254740993", true},
+		{"9007199254740993.0", true},
+		{"9.007199254740993e15", true},
+		{"9223372036854775808", true},
+		{"1E30", true},
+		{"1e1000000000", true},
+		{"1e99999999999999999999999999", true},
+		{"0", false},
+		{"0.0", false},
+		{"0e5", false},
+		{"0.0e5", false},
+		{"-1", false},
+		{"-5.0", false},
+		{"1.00000000000000000001", false},
+		{"1.5", false},
+		{"5e-1", false},
+		{"1e-1", false},
+		{"100e-3", false},
+		{"1e-99999999999999999999999999", false},
+		{`"4"`, false},
+		{"null", false},
+		{"true", false},
+		{"0x10", false},
+		{"", false},
 	} {
-		n, ok := wholeNumber(json.RawMessage(tc.in))
-		if ok != tc.ok || ok && n.String() != tc.want {
-			t.Errorf("%s: got %v, %v, want %s, %v", tc.in, n, ok, tc.want, tc.ok)
+		if got := wholeFrom1(json.RawMessage(tc.in)); got != tc.ok {
+			t.Errorf("%q: got %v, want %v", tc.in, got, tc.ok)
 		}
 	}
-	if _, ok := wholeNumber(nil); ok {
-		t.Error("a missing number is read")
+	if wholeFrom1(nil) {
+		t.Error("a missing number is accepted")
 	}
 }
 
