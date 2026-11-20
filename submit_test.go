@@ -36,21 +36,17 @@ func TestOneLineCleansAndCuts(t *testing.T) {
 	}
 }
 
-// TestTheChosenPullRequestIsTheOpenOneWithTheHighestNumber: of pull requests from the
-// branch, an open one is chosen over any closed or merged one, the highest number first;
-// with none open, the closed or merged one with the highest number.
-func TestTheChosenPullRequestIsTheOpenOneWithTheHighestNumber(t *testing.T) {
-	pull := func(n int, state string) ghPull { return ghPull{Number: n, State: state} }
+// TestTheChosenPullRequestIsTheOneWithTheHighestNumber: of the open pull requests from the
+// branch, the one with the highest number is chosen.
+func TestTheChosenPullRequestIsTheOneWithTheHighestNumber(t *testing.T) {
+	pull := func(n int) ghPull { return ghPull{Number: n, State: "open"} }
 	for _, tc := range []struct {
 		pulls []ghPull
 		want  int
 	}{
-		{[]ghPull{pull(1, "open"), pull(2, "open")}, 2},
-		{[]ghPull{pull(3, "open"), pull(2, "open")}, 3},
-		{[]ghPull{pull(1, "open"), pull(5, "closed")}, 1},
-		{[]ghPull{pull(5, "closed"), pull(1, "open"), pull(7, "closed")}, 1},
-		{[]ghPull{pull(4, "closed"), pull(6, "closed"), pull(2, "closed")}, 6},
-		{[]ghPull{pull(9, "closed")}, 9},
+		{[]ghPull{pull(1), pull(2)}, 2},
+		{[]ghPull{pull(3), pull(2)}, 3},
+		{[]ghPull{pull(9)}, 9},
 	} {
 		if got := chosenOf(tc.pulls); got.Number != tc.want {
 			t.Errorf("%v: %d, want %d", tc.pulls, got.Number, tc.want)

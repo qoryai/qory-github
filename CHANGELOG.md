@@ -22,17 +22,17 @@ change what the program does, and notes it under Upgrading.
   `updated` or `kept`, and in `data` the pull request's number, title and state. It
   updates the pull request at the entry's `previous.address` when the `ref` there is a
   pull request number from the entry's branch, and otherwise finds the pull request by its
-  head branch and repository, and never by its base branch. For an entry with no
-  `previous.address`, only an open pull request from the branch counts, so a branch with
-  only closed or merged pull requests gets a new one, with the action `created`; after a
-  gone or unusable address, a closed or merged one counts and is kept. It opens a pull
-  request when it finds none, as a draft when `draft` is `true`, and changes only the text
-  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and
-  the title only while it equals `previous.title`. It never changes whether a pull request
-  is a draft, and does not change a closed or merged pull request. The adapter reads the
-  members of the `pull-request` artifact type (its schema in the Qory harness is the
-  source): `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits`
-  and `draft`, and checks each: a branch name that git accepts, a full commit id as the
+  head branch and repository, and never by its base branch. Found by the branch, only an
+  open pull request counts, so an entry with no `previous.address`, or with one that is
+  unusable or gone, gets a new pull request, with the action `created`, when the branch
+  has only closed or merged ones. It opens a pull request when it finds none, as a draft
+  when `draft` is `true`, and changes only the text between the lines
+  `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and the title only
+  while it equals `previous.title`. It never changes whether a pull request is a draft,
+  and does not change a closed or merged pull request. The adapter reads the members of
+  the `pull-request` artifact type (its schema in the Qory harness is the source):
+  `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits` and
+  `draft`, and checks each: a branch name that git accepts, a full commit id as the
   address path of each commit, at least 1 commit and no limit of the adapter, a `step` of
   1 to 128 characters, `earlier_commits` as a whole number from 1, and `draft` as `true`
   or `false`; data that breaks a rule is reported as `refused`. A title that has a control

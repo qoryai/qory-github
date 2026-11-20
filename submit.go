@@ -176,14 +176,13 @@ func CheckChangeRequestID(id string) error {
 // Draft is the pull request of a change request entry for one repository: from Branch
 // into Base, with the run's text, a draft when AsDraft. Number is the number of the pull
 // request at the previous version's address, a hint, or 0 when the address is absent or
-// unusable. NoAddress is true for an entry with no previous address at all. Description
-// is the content of the marked block of the description, see [markedDescription].
-// PreviousTitle is the title of the previous version, see [nextTitle].
+// unusable. Description is the content of the marked block of the description, see
+// [markedDescription]. PreviousTitle is the title of the previous version, see
+// [nextTitle].
 type Draft struct {
 	Repository         Repository
 	Branch, Base       string
 	Number             int
-	NoAddress          bool
 	AsDraft            bool
 	Title, Description string
 	PreviousTitle      string
@@ -343,17 +342,17 @@ func (p ghPull) body() string {
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
 // into any base branch: by the number d.Number when it is above 0, which is a hint, and
 // by the head branch otherwise or when GitHub has no pull request with that number and
-// head. Of several pull requests from the branch it takes the one with the number
-// d.Number, else the open one with the highest number, else the closed or merged one with
-// the highest number. When d.NoAddress, a closed or merged pull request from the branch
-// is no pull request: only an open one is taken. It never changes the base branch of a
-// pull request.
+// head. Of several open pull requests from the branch it takes the one with the highest
+// number. A closed or merged pull request from the branch counts only when it has the
+// number d.Number: a pull request that a person finished is no pull request of the
+// branch, and the contract's "without previous.address, it makes the change at the
+// target" opens a new one. It never changes the base branch of a pull request.
 //
-//   - None found, or d.NoAddress and none open: it opens a pull request, a draft when
-//     d.AsDraft, from d.Branch into d.Base, with d.Title and the description
-//     [markedDescription] writes for no earlier one; the action is [DraftOpened].
-//   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
-//     the state is closed or merged.
+//   - None found: it opens a pull request, a draft when d.AsDraft, from d.Branch into
+//     d.Base, with d.Title and the description [markedDescription] writes for no earlier
+//     one; the action is [DraftOpened].
+//   - One found with the number d.Number, closed or merged: it changes nothing; the
+//     action is [DraftKept], and the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
 //     [markedDescription] writes for the description it has, which is the block
 //     alone for an empty description, and the title to the one [nextTitle]
@@ -461,32 +460,25 @@ func (p ghPull) isDraftOf(d Draft) bool {
 	return p.Head.Ref == d.Branch && p.Head.Repo != nil && strings.EqualFold(p.Head.Repo.FullName, d.Repository.String())
 }
 
-// chosenOf is the pull request of ps, which all have the head branch of the draft, that
-// the draft belongs to: the open one with the highest number, else, when none is open,
-// the closed or merged one with the highest number. The pull request with the entry's
-// number is not among ps: [Client.findPull] reads it first. ps has at least one.
+// chosenOf is the pull request of ps, which are all open and have the head branch of the
+// draft, that the draft belongs to: the one with the highest number. The pull request
+// with the entry's number is not among ps: [Client.findPull] reads it first. ps has at
+// least one.
 func chosenOf(ps []ghPull) ghPull {
-	best := -1
-	for i, p := range ps {
-		switch {
-		case best < 0:
-			best = i
-		case (p.State == "open") != (ps[best].State == "open"):
-			if p.State == "open" {
-				best = i
-			}
-		case p.Number > ps[best].Number:
-			best = i
+	best := ps[0]
+	for _, p := range ps[1:] {
+		if p.Number > best.Number {
+			best = p
 		}
 	}
-	return ps[best]
+	return best
 }
 
-// findPull finds the pull request from d.Branch and reads it. It is nil when there is
-// none. For an entry with an address that is gone or unusable, the pull request is of any
-// state. For an entry with no address (d.NoAddress), a pull request that is closed or
-// merged is no pull request: the contract's "without previous.address, it makes the
-// change at the target" opens a new one, and "kept" is for what is at an address.
+// findPull finds the pull request of d and reads it, or returns nil when there is none.
+// It reads the pull request with the number d.Number first, whatever its state, since
+// "kept" is for what is at an address. Otherwise, and when GitHub has no such pull
+// request from the branch, it lists the open pull requests from d.Branch: this is the
+// path for an entry with no address, an unusable one and a gone one alike.
 func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*ghPull, error) {
 	if d.Number > 0 {
 		const reading = "reading the pull request of an earlier change request"
@@ -508,7 +500,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 		}
 	}
 	const listing = "looking for the pull request from the branch"
-	query := url.Values{"head": {d.Repository.Owner + ":" + d.Branch}, "state": {"all"}, "per_page": {"100"}}
+	query := url.Values{"head": {d.Repository.Owner + ":" + d.Branch}, "state": {"open"}, "per_page": {"100"}}
 	a, err := c.send(ctx, p, false, listing, http.MethodGet, pullsPath(d.Repository)+"?"+query.Encode(), tok, nil)
 	if err != nil {
 		return nil, err
@@ -522,7 +514,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	}
 	var ours []ghPull
 	for _, l := range listed {
-		if l.isDraftOf(d) && (!d.NoAddress || l.State == "open") {
+		if l.isDraftOf(d) {
 			ours = append(ours, l)
 		}
 	}

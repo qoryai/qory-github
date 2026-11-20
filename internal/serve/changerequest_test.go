@@ -619,10 +619,8 @@ func TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase(t *testing.T) {
 
 // TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more
 // pull requests from the head branch, the entry's number is taken when it is among them;
-// otherwise the newest open one, and a closed or merged one only when none is open, then
-// the newest of those, which is kept as it is, for an entry whose address is gone. An
-// entry with no address takes only an open one, see
-// TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is reported
+// otherwise the newest open one. A closed or merged one is never chosen by the branch, see
+// TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is reported
 // unreachable.
 func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *testing.T) {
 	pull := func(n int, base string, closed, merged bool) *ghPullRec {
@@ -639,8 +637,6 @@ func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *test
 		{"the entry's number, though an open one is newer", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", false, false)}, update(1), 1, "updated", "draft"},
 		{"a number that is not among them: the newest open one", []*ghPullRec{pull(1, "main", false, false), pull(2, "main", true, false), pull(3, "main", false, false), pull(4, "main", true, false)}, update(9), 3, "updated", "draft"},
 		{"an open one, with bases that differ", []*ghPullRec{pull(1, "release", true, false), pull(2, "develop", false, false)}, openDraft, 2, "updated", "draft"},
-		{"none open, a gone address: the newest, which is closed", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true), pull(3, "main", true, false)}, update(9), 3, "kept", "closed"},
-		{"none open, a gone address: the newest, which is merged", []*ghPullRec{pull(1, "main", true, false), pull(2, "main", true, true)}, update(9), 2, "kept", "merged"},
 	} {
 		w := newChangeWired(t)
 		setGitHub(w.gh, func(f *fakeGitHub) { f.pulls = tc.pulls })
@@ -653,15 +649,15 @@ func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *test
 	}
 }
 
-// TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated: an entry with no
-// previous.address makes the change at the target (the contract's README, "Without
-// previous.address, it makes the change at the target"), and "kept" is for what is at an
-// address (changes-submitted.schema.json, action: "kept: it changed nothing, because what
-// is at the address was finished at the target, or already had the entry's text"). So a
-// branch whose pull requests are all closed or merged gets a new pull request, action
-// created, and an open one from the branch is updated, as before. An address that is
-// unusable or gone falls back to the branch of any state, so the closed one is kept.
-func TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testing.T) {
+// TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated: an entry with no
+// previous.address, or one that is unusable or gone, makes the change at the target (the
+// contract's README, "Without previous.address, it makes the change at the target"), and
+// "kept" is for what is at an address (changes-submitted.schema.json, action: "kept: it
+// changed nothing, because what is at the address was finished at the target, or already
+// had the entry's text"). So a branch whose pull requests are all closed or merged gets a
+// new pull request, action created, and an open one from the branch is updated. A usable
+// address whose pull request is closed or merged is kept.
+func TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testing.T) {
 	pull := func(n int, closed, merged bool) *ghPullRec {
 		return &ghPullRec{repo: "acme/widgets", head: testBranch, base: "main", number: n, title: fmt.Sprint("Pull ", n), draft: !closed, closed: closed, merged: merged}
 	}
@@ -680,9 +676,12 @@ func TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testing.T) 
 		{"no address, a previous with a title alone, a merged one", []*ghPullRec{pull(4, true, true)}, noRef, []string{"LIST", "POST "}, 5, "created", "draft"},
 		{"no address, a closed one and an open one", []*ghPullRec{pull(4, true, false), pull(2, false, false)}, nil, []string{"LIST", "GET /2", "PATCH /2"}, 2, "updated", "draft"},
 		{"no address, an open one", []*ghPullRec{pull(3, false, false)}, nil, []string{"LIST", "GET /3", "PATCH /3"}, 3, "updated", "draft"},
-		{"an address 0, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "0") }, []string{"LIST", "GET /4"}, 4, "kept", "merged"},
-		{"an address that is no number, a closed one", []*ghPullRec{pull(4, true, false)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "seven") }, []string{"LIST", "GET /4"}, 4, "kept", "closed"},
-		{"a gone address 9, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "9") }, []string{"GET /9", "LIST", "GET /4"}, 4, "kept", "merged"},
+		{"an address 0, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "0") }, []string{"LIST", "POST "}, 5, "created", "draft"},
+		{"an address that is no number, a closed one", []*ghPullRec{pull(4, true, false)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "seven") }, []string{"LIST", "POST "}, 5, "created", "draft"},
+		{"a gone address 9, a merged one", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "9") }, []string{"GET /9", "LIST", "POST "}, 5, "created", "draft"},
+		{"a gone address 9, a closed one and an open one", []*ghPullRec{pull(4, true, false), pull(2, false, false)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "9") }, []string{"GET /9", "LIST", "GET /2", "PATCH /2"}, 2, "updated", "draft"},
+		{"an address 4 that is merged", []*ghPullRec{pull(4, true, true)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "4") }, []string{"GET /4"}, 4, "kept", "merged"},
+		{"an address 4 that is closed, an open one on the branch", []*ghPullRec{pull(4, true, false), pull(6, false, false)}, func(ch contracts.Change) contracts.Change { return withAddress(ch, "4") }, []string{"GET /4"}, 4, "kept", "closed"},
 	} {
 		w := newChangeWired(t)
 		setGitHub(w.gh, func(f *fakeGitHub) { f.pulls = tc.pulls })
