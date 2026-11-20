@@ -611,6 +611,34 @@ func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 	})
 }
 
+// A pull request that the search returns as open and the read returns as closed or
+// merged, because it changed between the two calls, is kept: the program prints its
+// state and changes nothing.
+func TestAPullRequestThatClosesBetweenTheSearchAndTheReadIsKept(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		for _, c := range []struct {
+			name  string
+			read  pull
+			state string
+		}{
+			{"closed", pull{Number: 8, State: "closed", Title: "Eight", Body: "Text."}, "closed"},
+			{"merged", pull{Number: 8, State: "closed", Merged: true, Title: "Eight", Body: "Text."}, "merged"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.setText("New text.")
+				f.setList(pull{Number: 8, Title: "Eight", Body: "Text."})
+				f.setRead(c.read)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Eight", c.state, "kept"))
+				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+					t.Errorf("calls %s, want auth list read and no patch", got)
+				}
+			})
+		}
+	})
+}
+
 func TestADescriptionIsWrittenByTheRuleOfTheContract(t *testing.T) {
 	dirs, err := filepath.Glob("testdata/description/*")
 	if err != nil || len(dirs) < 20 {

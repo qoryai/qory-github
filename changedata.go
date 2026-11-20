@@ -158,25 +158,26 @@ func UndefinedDataPointer(pointers []string) string {
 	return ""
 }
 
-// ParsePullRequestData reads the data of a change request of the kind pull-request, as
-// the pull-request artifact type writes it (the pull-request schema of the Qory harness,
+// ParsePullRequestData reads the data of a change request of the kind pull-request, as the
+// pull-request artifact type writes it (the pull-request schema of the Qory harness,
 // copied to testdata/pull-request.schema.json, which is copied again when the schema
-// changes), and checks these rules for the members it reads: the branch and the base branch are names git accepts, of at most 255 characters, and a line; the
-// head, the base and each commit have a full commit id as address.path and a collection
-// of 1 to 200 characters that is a line; there is at least 1 commit; steps is a list, and
-// each step has a full commit id and a step of 1 to 128 characters that is a line;
-// earlier_commits is a whole number from 1; and draft is true or false. A line has none
-// of the characters that [LineStopped] stops. The adapter reads only what the schema
-// states: it sets no limit on the number of commits (the contract bounds the data), and
-// head and earlier_commits have no further rule. A member that the schema does not
-// define is ignored, and so is one that the adapter does not read. earlier_commits has
-// no upper limit, and a whole number such as 34.0 or 3.4e1 counts. A repeated member, a
-// lone surrogate escape and an invalid UTF-8 byte are refused although a JSON Schema
-// validator accepts them, since the data is read by [exactjson]; the refusal text is the
-// generic "data is not a JSON object whose members have the types of the pull-request
-// kind", which has no cause. The error is a [*SubmitRefused] with the reason refused, the
-// fix [FixChangeData] and the broken rule as its message; the text has the rule and the
-// code point of a stopped character, never the value.
+// changes), and checks these rules for the members it reads: the branch and the base
+// branch are names git accepts, of at most 255 characters, and a line; the head, the base
+// and each commit have a full commit id as address.path and a collection of 1 to 200
+// characters that is a line; there is at least 1 commit; steps is a list, and each step
+// has a full commit id and a step of 1 to 128 characters that is a line; earlier_commits
+// is a whole number from 1; and draft is true or false. A line has none of the characters
+// that [LineStopped] stops. The adapter reads only what the schema states: it sets no
+// limit on the number of commits (the contract bounds the data), and head and
+// earlier_commits have no further rule. A member that the schema does not define is
+// ignored, and so is one that the adapter does not read. earlier_commits has no upper
+// limit, and a whole number such as 34.0 or 3.4e1 counts. A repeated member, a lone
+// surrogate escape and an invalid UTF-8 byte are refused although a JSON Schema validator
+// accepts them, since the data is read by [exactjson]; the refusal text is the generic
+// "data is not a JSON object whose members have the types of the pull-request kind", which
+// has no cause. The error is a [*SubmitRefused] with the reason refused, the fix
+// [FixChangeData] and the broken rule as its message; the text has the rule and the code
+// point of a stopped character, never the value.
 func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	refuse := func(format string, args ...any) (PullRequestData, error) {
 		err := fmt.Errorf(format, args...)
@@ -244,8 +245,9 @@ func validBranch(name string) bool {
 // wholeFrom1 is whether the JSON number raw is a whole number of 1 or more, of any size:
 // the type's schema has `integer` with `minimum` 1, and a writer may write 34.0 or 3.4e1
 // for 34. It reads the digits, the number of digits after the point and the exponent, so
-// the value is never built, rounded or capped; only the exponent is read into a big.Int. A missing member, a string, null,
-// zero, a negative number and a number with a fraction that is not zero give false.
+// the value is never built, rounded or capped; only the exponent is read into a
+// big.Int. A missing member, a string, null, zero, a negative number and a number with a
+// fraction that is not zero give false.
 func wholeFrom1(raw json.RawMessage) bool {
 	m := numberShape.FindStringSubmatch(string(raw))
 	if m == nil || m[1] == "-" {

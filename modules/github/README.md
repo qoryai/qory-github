@@ -63,7 +63,8 @@ empty.
    (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and `state=open`).
    It ignores the base branch, the branch of a fork with the same name, and a pull
    request whose head repository is gone. Of several it takes the one with the highest
-   number. A closed or merged pull request is never reused, as in the adapter.
+   number. When it looks up by branch, the adapter does the same. The program has no
+   address, so it never reuses a closed or merged pull request.
 6. With none, including when the branch has only closed or merged pull requests, it
    runs `gh pr create --draft` with the branch, the base branch, the title and the
    description, and prints the new draft with the action `opened`. The description is

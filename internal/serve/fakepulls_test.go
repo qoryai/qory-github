@@ -84,13 +84,21 @@ func (f *fakeGitHub) pullsAPI(w http.ResponseWriter, r *http.Request, b []byte, 
 		head := r.URL.Query().Get("head")
 		owner, ref, _ := strings.Cut(head, ":")
 		out := []map[string]any{}
-		state := r.URL.Query().Get("state")
-		if state == "" {
-			state = "open" // GitHub's default
+		// The state filter of GitHub: open when absent. A state it does not know returns
+		// nothing.
+		inState := func(p *ghPullRec) bool {
+			switch r.URL.Query().Get("state") {
+			case "", "open":
+				return !p.closed
+			case "closed":
+				return p.closed
+			case "all":
+				return true
+			}
+			return false
 		}
 		for _, p := range f.pulls {
-			if p.repo == repo && p.head == ref && strings.HasPrefix(p.headRepoName(), owner+"/") &&
-				(state == "all" || state == "closed" == p.closed) {
+			if p.repo == repo && p.head == ref && strings.HasPrefix(p.headRepoName(), owner+"/") && inState(p) {
 				out = append(out, p.json(false))
 			}
 		}

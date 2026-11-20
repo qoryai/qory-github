@@ -400,9 +400,9 @@ read_pull() {
 }
 
 # find_pull sets number to the open pull request from the branch, or to nothing. It looks
-# at the head branch and the repository alone, as findPull of the adapter does: only an
-# open pull request counts, and of several it takes the highest number. A closed or
-# merged pull request is never reused.
+# at the head branch and the repository alone, as findPull of the adapter does when it
+# looks up by branch: only an open pull request counts, the highest number of them. The
+# program has no address, so a closed or merged pull request is never reused.
 find_pull() {
 	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
 		-f "head=$owner:$branch" -f state=open -f per_page=100 --jq "$LIST_JQ" \

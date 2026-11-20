@@ -112,8 +112,9 @@ func (f *feed) unknownLog() *throttle {
 // that is still open and updates it. A pull request that a person closed or merged after
 // the first application is not found by the branch, so a change_request entry with no
 // usable address that is applied again, because Qory Apiary never received its reply,
-// opens a new pull request; an entry whose usable address is the pull request that
-// created it replies kept. An entry that fails, not for good, is applied again after the
+// opens a new pull request. An entry whose usable address is a closed or merged pull
+// request replies kept and opens none, on the first application and on a repeat. An
+// entry that fails, not for good, is applied again after the
 // wait, while the entries after it that do not wait for it apply, see [feed.step]; it is
 // passed and logged once its retries end, see [retriesEnded], so no entry stops the feed
 // for ever; a comment entry is reported as not posted first, see [feed.report], and a

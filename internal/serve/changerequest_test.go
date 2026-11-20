@@ -694,6 +694,13 @@ func TestWithNoUsableAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testi
 		if got := pullCallsOf(w, 0); !slices.Equal(got[1:], tc.calls) {
 			t.Errorf("%s: the calls are %v, want %v after the installation lookup", tc.name, got, tc.calls)
 		}
+		for _, call := range w.gh.pullCalls() {
+			if _, uri, _ := strings.Cut(call, " "); strings.Contains(uri, "?head=") {
+				if u, err := url.Parse(uri); err != nil || u.Query().Get("state") != "open" {
+					t.Errorf("%s: the list is %q, want the parameter state=open", tc.name, uri)
+				}
+			}
+		}
 		d := w.apiary.draftsReplied()["acme/widgets"]
 		if d == nil || d.Number != tc.number || d.Action != tc.action || d.State != tc.state || len(w.apiary.changeReports()) != 0 {
 			t.Errorf("%s: the draft is %+v, reports %v", tc.name, d, w.apiary.changeReports())
