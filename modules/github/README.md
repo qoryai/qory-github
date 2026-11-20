@@ -98,13 +98,16 @@ draft_action opened
 
 `draft_state` is `draft`, `open`, `closed` or `merged`, and `draft_action` is `opened`,
 `updated` or `kept`. The title is the one that GitHub has after the call, without the
-characters that the contract refuses for `draft_title`: control characters, line and
-paragraph separators, bidirectional and invisible format characters. When nothing but
-spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
+characters that the contract refuses for `draft_title`: the control characters (category
+Cc), U+2028, U+2029, and the format characters (category Cf) except U+200C and U+200D,
+which emoji sequences need. The program keeps U+200C and U+200D in the title, and a title
+of nothing but spaces, U+200C and U+200D counts as empty. When the title is empty, it is
+`QORY_SUBMIT_TITLE`, cleaned the same way.
 
-The program removes a fixed list of format characters. The title rule of `qory-github-server`
-stops every format character except U+200C and U+200D, so the program keeps U+206A to U+206F,
-U+E0001 and U+E0020 to U+E007F in a title, and counts U+200C and U+200D as visible.
+The program holds the removed characters as 24 ranges in `FORBIDDEN_RANGES`, the format
+characters of Unicode 17.0.0. The tests compare the ranges with the rule of
+`qory-github-server` for every code point, so a later Unicode version fails them until
+you update the ranges.
 
 | Exit | Meaning |
 |---|---|

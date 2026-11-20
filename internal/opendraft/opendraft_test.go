@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
 	"gopkg.in/yaml.v3"
 )
 
@@ -161,15 +161,18 @@ func (p pull) json() map[string]any {
 	return m
 }
 
-// forbidden is the set of characters that the --jq expression of the program removes from
-// a title.
-var forbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
-
-// jqTitle is what the --jq expression of the program prints for a title: the title
-// without the forbidden characters, or nothing when only spaces are left.
+// jqTitle is what the --jq expression of the program prints for a title, by the adapter's
+// rule: the title without the characters that [github.LineStopped] stops, or nothing when
+// it has no character that [github.HasVisible] counts. The mode jq runs the real
+// expression, so a difference between the program and the rule fails there.
 func jqTitle(title string) string {
-	shown := forbidden.ReplaceAllString(title, "")
-	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
+	shown := strings.Map(func(r rune) rune {
+		if github.LineStopped(r) {
+			return -1
+		}
+		return r
+	}, title)
+	if !github.HasVisible(shown) {
 		return ""
 	}
 	return shown
@@ -1024,30 +1027,40 @@ func parsed(t *testing.T, stdout string) *contracts.SubmittedDraft {
 func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		classes := map[string]string{
-			"a C0 control":        "\x01",
-			"a delete":            "\x7f",
-			"a line feed":         "\n",
-			"a carriage return":   "\r",
-			"a tab":               "\t",
-			"a C1 control":        "\u0085",
-			"the highest C1":      "\u009f",
-			"a soft hyphen":       "\u00ad",
-			"an Arabic mark":      "\u061c",
-			"a Mongolian vowel":   "\u180e",
-			"a zero width space":  "\u200b",
-			"a left-to-right":     "\u200e",
-			"a right-to-left":     "\u200f",
-			"a line separator":    "\u2028",
-			"a paragraph sep":     "\u2029",
-			"a bidi embedding":    "\u202a",
-			"a bidi override":     "\u202e",
-			"a word joiner":       "\u2060",
-			"an invisible plus":   "\u2064",
-			"an isolate":          "\u2066",
-			"a pop isolate":       "\u2069",
-			"a byte order mark":   "\ufeff",
-			"an annotation start": "\ufff9",
-			"an annotation end":   "\ufffb",
+			"a C0 control":           "\x01",
+			"a delete":               "\x7f",
+			"a line feed":            "\n",
+			"a carriage return":      "\r",
+			"a tab":                  "\t",
+			"a C1 control":           "\u0085",
+			"the highest C1":         "\u009f",
+			"a soft hyphen":          "\u00ad",
+			"an Arabic mark":         "\u061c",
+			"a Mongolian vowel":      "\u180e",
+			"a zero width space":     "\u200b",
+			"a left-to-right":        "\u200e",
+			"a right-to-left":        "\u200f",
+			"a line separator":       "\u2028",
+			"a paragraph sep":        "\u2029",
+			"a bidi embedding":       "\u202a",
+			"a bidi override":        "\u202e",
+			"a word joiner":          "\u2060",
+			"an invisible plus":      "\u2064",
+			"an isolate":             "\u2066",
+			"a pop isolate":          "\u2069",
+			"a byte order mark":      "\ufeff",
+			"an annotation start":    "\ufff9",
+			"an annotation end":      "\ufffb",
+			"an invisible separator": "\u2063",
+			"a deprecated format":    "\u206a",
+			"the last deprecated":    "\u206f",
+			"an Arabic number sign":  "\u0600",
+			"a tag begin":            "\U000e0001",
+			"a tag space":            "\U000e0020",
+			"a tag letter":           "\U000e0041",
+			"the last tag":           "\U000e007f",
+			"a shorthand format":     "\U0001bca0",
+			"a musical format":       "\U0001d173",
 		}
 		for name, ch := range classes {
 			t.Run(name, func(t *testing.T) {
@@ -1062,7 +1075,7 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 			})
 		}
 		// A character next to the allowed ones stays: the neighbours of each range.
-		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u206a", "﻾", "￸", "￼", "é", "日本語"} {
+		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u0606", "\u06dc", "\u06de", "\u070e", "\u0710", "\u088f", "\u0892", "\u08e1", "\u08e3", "\U000110bc", "\U000110be", "\U000110cc", "\U000110ce", "\U0001342f", "\U00013440", "\U0001bc9f", "\U0001bca4", "\U0001d172", "\U0001d17b", "\U000e0000", "\U000e0080", "\u200c", "\u200d", "\u200d\U0001f468", "﻾", "￸", "￼", "é", "日本語"} {
 			t.Run("keeps "+keep, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
@@ -1070,8 +1083,41 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Show"+keep, "draft", "updated"))
 			})
 		}
+		t.Run("a tag character is removed from the title that GitHub has", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: "Show\U000e0041\U000e0068 dates", Body: "x"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			if d := parsed(t, r.stdout); d.Title != "Show dates" {
+				t.Errorf("recorded title %q", d.Title)
+			}
+		})
+		t.Run("a zero width joiner emoji sequence stays in the title", func(t *testing.T) {
+			const family = "\U0001f468\u200d\U0001f469\u200d\U0001f467 trip"
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: family, Body: "x"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(8, family, "draft", "updated"))
+			if d := parsed(t, r.stdout); d.Title != family {
+				t.Errorf("recorded title %q", d.Title)
+			}
+		})
+		t.Run("a tag character is removed from the title of the run", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: "\u200b", Body: "x"})
+			r := f.run("QORY_SUBMIT_TITLE=Show\U000e0041 dates\U000e007f")
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			parsed(t, r.stdout)
+		})
+		t.Run("a title of zero width joiners and spaces uses the title of the run", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: " \u200d\u200c ", Body: "x"})
+			r := f.run("QORY_SUBMIT_TITLE=Show dates")
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			parsed(t, r.stdout)
+		})
 		t.Run("nothing but forbidden characters and spaces uses the title of the run", func(t *testing.T) {
-			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   "} {
+			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   ", "\U000e0041", "\u200d"} {
 				f := newFake(t, mode)
 				f.have(pull{Number: 8, Draft: true, Title: ghTitle, Body: "x"})
 				r := f.run("QORY_SUBMIT_TITLE=Show\u200b dates\u202e")
@@ -1096,7 +1142,7 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 }
 
 func TestATitleOfTheRunWithNothingToShowIsRefused(t *testing.T) {
-	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e "} {
+	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e ", "\u200d\u200c", " \u200d ", "\U000e0041\U000e007f"} {
 		f := newFake(t, "text")
 		r := f.run("QORY_SUBMIT_TITLE=" + bad)
 		if r.code != 2 || r.stdout != commitLines() || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
