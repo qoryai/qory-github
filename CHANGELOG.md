@@ -9,52 +9,52 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` opens or updates the pull request for each
-  `change_request` entry of the kind `pull-request` in Qory Apiary's change feed, in Go,
-  over GitHub's REST API, with an installation token of the App for that one repository
-  with `pull_requests: write` and no other permission. An entry has one target, so a
-  change request for two repositories is two entries. The adapter finds the repository by
-  the target's `collection`, the repository's id, so a renamed repository still gets its
-  pull request; the address of the target is checked for the host and for the shape
-  `owner/name` and is not what finds the repository. For each entry it sends Qory Apiary one reply
-  with the address of the base commit and of each commit in `data`, the pull request's
-  `address` (its `url`, and its number as `ref`), the action `created`, `updated` or
-  `kept`, and in `data` the pull request's number, title and state. It updates the pull
-  request at the entry's `previous.address` when the `ref` there is a pull request number
-  from the entry's branch, and otherwise finds the pull request by its head branch and
-  repository, and never by its base branch. For an entry with no `previous.address`, only
-  an open pull request from the branch counts, so a branch with only closed or merged
-  pull requests gets a new one, with the action `created`; after a gone or unusable
-  address, a closed or merged one counts and is kept. It opens a pull request when it
-  finds none, as a draft when `draft` is `true`, and changes only the text between the
-  lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and the title
-  only while it equals `previous.title`. It never changes whether a pull request is a
-  draft, and does not change a closed or merged pull request. The adapter reads the
+- `qory-github-server serve` opens or updates the pull request for each `change_request`
+  entry of the kind `pull-request` in Qory Apiary's change feed, in Go, over GitHub's REST
+  API, with an installation token of the App for that one repository with
+  `pull_requests: write` and no other permission. An entry has one target, so a change
+  request for two repositories is two entries. The adapter finds the repository by the
+  target's `collection`, the repository's id, so a renamed repository still gets its pull
+  request; the address of the target is checked for the host and for the shape
+  `owner/name` and is not what finds the repository. For each entry it sends Qory Apiary
+  one reply with the address of the base commit and of each commit in `data`, the pull
+  request's `address` (its `url`, and its number as `ref`), the action `created`,
+  `updated` or `kept`, and in `data` the pull request's number, title and state. It
+  updates the pull request at the entry's `previous.address` when the `ref` there is a
+  pull request number from the entry's branch, and otherwise finds the pull request by its
+  head branch and repository, and never by its base branch. For an entry with no
+  `previous.address`, only an open pull request from the branch counts, so a branch with
+  only closed or merged pull requests gets a new one, with the action `created`; after a
+  gone or unusable address, a closed or merged one counts and is kept. It opens a pull
+  request when it finds none, as a draft when `draft` is `true`, and changes only the text
+  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and
+  the title only while it equals `previous.title`. It never changes whether a pull request
+  is a draft, and does not change a closed or merged pull request. The adapter reads the
   members of the `pull-request` artifact type (its schema in the Qory harness is the
-  source): `branch`, `base_branch`, `head`, `base`, `commits`, `steps`,
-  `earlier_commits` and `draft`, and checks each: a branch name that git accepts, a full
-  commit id as the address path of each commit, at least 1 commit and no upper limit, a
-  `step` of 1 to 128 characters, `earlier_commits` as a whole number from 1, and `draft` as `true` or `false`; data that breaks a
-  rule is reported as `refused`. A title that has a control character, U+2028, U+2029 or
-  a format character other than U+200C and U+200D, or no character that is not a space,
-  U+200C or U+200D, is reported as `refused` before any request to GitHub, with a `detail`
-  that starts with the fix; so is a `text` that has a line that is `<!-- qory:start -->`
-  or `<!-- qory:end -->`, since the adapter writes the text between those lines. The same
-  rule for characters applies to the failure `detail`, the account title of a grant and
-  the author name of a comment. An entry of another `change_kind` is
-  reported as `refused`, with a `detail` that starts with the fix. An entry that GitHub
-  refuses for good is reported to Qory Apiary with the reason `not_permitted`,
-  `target_gone`, `too_long` or `refused`, and a `detail` with the fix and GitHub's status
-  and message; one that still fails when the retries end, after a day, is reported with
-  the reason of the last error of its tries: `unreachable` for a failure to reach GitHub,
-  a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such as a 404
-  or a 401 that kept coming. A 404, 410, 301 or 308 on the read of the repository by its
-  id is `target_gone`, with the fix to check that the repository exists and the App's
-  installation reaches it. A 301 or 308 on the lookup of the installation
-  or on a pull request call is `target_gone` too, with the fix to link the repository by
-  its new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App
-  needs the permission Pull requests: read and write. The title in the reply has none of
-  the characters that the title rule stops.
+  source): `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits`
+  and `draft`, and checks each: a branch name that git accepts, a full commit id as the
+  address path of each commit, at least 1 commit and no limit of the adapter, a `step` of
+  1 to 128 characters, `earlier_commits` as a whole number from 1, and `draft` as `true`
+  or `false`; data that breaks a rule is reported as `refused`. A title that has a control
+  character, U+2028, U+2029 or a format character other than U+200C and U+200D, or no
+  character that is not a space, U+200C or U+200D, is reported as `refused` before any
+  request to GitHub, with a `detail` that starts with the fix; so is a `text` that has a
+  line that is `<!-- qory:start -->` or `<!-- qory:end -->`, since the adapter writes the
+  text between those lines. The same rule for characters applies to the failure `detail`,
+  the account title of a grant and the author name of a comment. An entry of another
+  `change_kind` is reported as `refused`, with a `detail` that starts with the fix. An
+  entry that GitHub refuses for good is reported to Qory Apiary with the reason
+  `not_permitted`, `target_gone`, `too_long` or `refused`, and a `detail` with the fix and
+  GitHub's status and message; one that still fails when the retries end, after a day, is
+  reported with the reason of the last error of its tries: `unreachable` for a failure to
+  reach GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer
+  such as a 404 or a 401 that kept coming. A 404, 410, 301 or 308 on the read of the
+  repository by its id is `target_gone`, with the fix to check that the repository exists
+  and the App's installation reaches it. A 301 or 308 on the lookup of the installation or
+  on a pull request call is `target_gone` too, with the fix to link the repository by its
+  new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App needs the
+  permission Pull requests: read and write. The title in the reply has none of the
+  characters that the title rule stops.
 - The description of the adapter lists the change kind `pull-request` in
   `roles.source.change_kinds`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the

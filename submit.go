@@ -174,11 +174,11 @@ func CheckChangeRequestID(id string) error {
 }
 
 // Draft is the pull request of a change request entry for one repository: from Branch
-// into Base, with the run's text, a draft when AsDraft. Number is the number of
-// the pull request at the previous version's address, a hint, or 0 when the address is
-// absent or unusable. NoAddress is true for an entry with no previous address at all. Description is the content of the marked block of the description, see
-// [markedDescription]. PreviousTitle is the title of the previous version, see
-// [nextTitle].
+// into Base, with the run's text, a draft when AsDraft. Number is the number of the pull
+// request at the previous version's address, a hint, or 0 when the address is absent or
+// unusable. NoAddress is true for an entry with no previous address at all. Description
+// is the content of the marked block of the description, see [markedDescription].
+// PreviousTitle is the title of the previous version, see [nextTitle].
 type Draft struct {
 	Repository         Repository
 	Branch, Base       string
@@ -341,23 +341,25 @@ func (p ghPull) body() string {
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
-// into any base branch: by the number d.Number when it is above 0, which is a hint, and by
-// the head branch otherwise or when GitHub has no pull request with that number and head.
-// Of several pull requests from the branch it takes the one with the number d.Number, else
-// the open one with the highest number, else the closed or merged one with the highest
-// number. When d.NoAddress, a closed or merged pull request from the branch is no pull
-// request: only an open one is taken. It never changes the base branch of a pull request.
+// into any base branch: by the number d.Number when it is above 0, which is a hint, and
+// by the head branch otherwise or when GitHub has no pull request with that number and
+// head. Of several pull requests from the branch it takes the one with the number
+// d.Number, else the open one with the highest number, else the closed or merged one with
+// the highest number. When d.NoAddress, a closed or merged pull request from the branch
+// is no pull request: only an open one is taken. It never changes the base branch of a
+// pull request.
 //
-//   - None found, or d.NoAddress and none open: it opens a pull request, a draft when d.AsDraft, from d.Branch into
-//     d.Base, with d.Title and the description [markedDescription] writes for no earlier
-//     one; the action is [DraftOpened].
+//   - None found, or d.NoAddress and none open: it opens a pull request, a draft when
+//     d.AsDraft, from d.Branch into d.Base, with d.Title and the description
+//     [markedDescription] writes for no earlier one; the action is [DraftOpened].
 //   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
 //     the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
 //     [markedDescription] writes for the description it has, which is the block
 //     alone for an empty description, and the title to the one [nextTitle]
-//     gives, and sends only what changes; the action is [DraftUpdated], or [DraftKept]
-//     when nothing changes. It never changes whether the pull request is a draft.
+//     returns, and sends only what changes; the action is [DraftUpdated], or
+//     [DraftKept] when nothing changes. It never changes whether the pull request is a
+//     draft.
 //
 // A description of more than [MaxDraftDescription] characters, or a title of more than
 // [MaxDraftTitle], is refused as too_long before any request, and so is a description

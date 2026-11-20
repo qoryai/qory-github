@@ -137,8 +137,9 @@ func UndefinedDataPointer(pointers []string) string {
 // base branch are names git accepts, the head, the base and each commit have a full
 // commit id as address.path, at least 1 commit, each step of steps has a full commit id
 // and 1 to 128 characters, earlier_commits is a whole number from 1, and draft is true or
-// false. The adapter reads only what the type's schema states: it does not cap the number
-// of commits, and head and earlier_commits have no further rule. A number that is whole, such as 34.0 or 3.4e1,
+// false. The adapter reads only what the type's schema states: it sets no limit on the
+// number of commits (the contract bounds the data), and head and earlier_commits have no
+// further rule. A number that is whole, such as 34.0 or 3.4e1,
 // is read as the integer it equals. The error is a [*SubmitRefused] with the reason
 // refused, the fix [FixChangeData] and the broken rule as its message; the text states
 // the rule, never the value.

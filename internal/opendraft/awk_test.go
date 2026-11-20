@@ -82,10 +82,10 @@ func programLine(t *testing.T, prefix string) string {
 	return ""
 }
 
-// ruleChars are the code points that a test of the title rules runs the program over: every
-// character from U+0020 to U+FFFF but the surrogates and DEL, U+E0000 to U+E0FFF, every
-// character that the adapter's rule stops with the character before and after each run of
-// them, the characters that the adapter takes for spaces, and a few more.
+// ruleChars are the code points that a test of the title rules runs the program over:
+// every character from U+0020 to U+FFFF but the surrogates and DEL, U+E0000 to U+E0FFF,
+// every character that the adapter's rule stops with the character before and after each
+// run of them, the characters that the adapter takes for spaces, and a few more.
 func ruleChars() []rune {
 	var chars []rune
 	seen := map[rune]bool{}
@@ -230,11 +230,11 @@ func jqExpression(t *testing.T, sh string) string {
 // program with jq over the controls and [ruleChars], in two titles: the code point
 // between two letters, and the code point alone. Planes 1 to 13 hold no character that
 // the rule stops, and TestTheForbiddenRangesAreTheAdaptersRule compares the ranges with
-// the rule for every code point. The title that the program prints is the
-// one that the adapter's rule makes of it: without the characters of [github.LineStopped],
-// and empty when [github.HasVisible] is false. It fails when the rule or the program
-// changes alone. gh uses gojq, whose regular expressions read the same escapes; this test
-// runs jq, which is on the machines that run the tests.
+// the rule for every code point. The title that the program prints is the one that the
+// adapter's rule makes of it: without the characters of [github.LineStopped], and empty
+// when [github.HasVisible] is false. It fails when the rule or the program changes alone.
+// gh uses gojq, whose regular expressions read the same escapes; this test runs jq, which
+// is on the machines that run the tests.
 func TestTheJqExpressionRemovesExactlyWhatTheAdapterStops(t *testing.T) {
 	jq, err := exec.LookPath("jq")
 	if err != nil {

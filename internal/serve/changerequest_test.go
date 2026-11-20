@@ -617,11 +617,11 @@ func TestAPullRequestIntoAnotherBaseIsTheDraftAndKeepsItsBase(t *testing.T) {
 	}
 }
 
-// TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more pull
-// requests from the head branch, the entry's number is taken when it is among them;
+// TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen: of two or more
+// pull requests from the head branch, the entry's number is taken when it is among them;
 // otherwise the newest open one, and a closed or merged one only when none is open, then
-// the newest of those, which is kept as it is, for an entry whose address is gone. An entry
-// with no address takes only an open one, see
+// the newest of those, which is kept as it is, for an entry whose address is gone. An
+// entry with no address takes only an open one, see
 // TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated. No case is reported
 // unreachable.
 func TestSeveralPullRequestsFromTheBranchAreChosenByNumberThenNewestOpen(t *testing.T) {
@@ -702,11 +702,12 @@ func TestWithNoAddressOnlyAnOpenPullRequestFromTheBranchIsUpdated(t *testing.T) 
 	}
 }
 
-// TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported: the branch has a
-// merged pull request and no address, so the adapter opens a new one, and GitHub answers
-// 422 "No commits between" for it. The contract's reason for a 422 "for a cause other than
-// a missing place or a length limit" is refused (changes-failed.schema.json, reason), so
-// the entry gets a failure report with the reason refused and the fix first, and no reply.
+// TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported: the branch has
+// a merged pull request and no address, so the adapter opens a new one, and GitHub
+// answers 422 "No commits between" for it. The contract's reason for a 422 "for a cause
+// other than a missing place or a length limit" is refused (changes-failed.schema.json,
+// reason), so the entry gets a failure report with the reason refused and the fix first,
+// and no reply.
 func TestWithNoAddressANewPullRequestThatGitHubRefusesForNoCommitsIsReported(t *testing.T) {
 	w := newChangeWired(t)
 	setGitHub(w.gh, func(f *fakeGitHub) {
@@ -1727,9 +1728,31 @@ func TestAnUpdateKeepsWhetherThePullRequestIsADraft(t *testing.T) {
 	}
 }
 
-// TestTheReplyHasTheAddressesOfTheCommitsListNotOfHeadOrEarlierCommits: an entry whose head
-// is another commit than the last of commits, and that has earlier_commits, is applied;
-// the reply has the address of the base commit and of each commit of commits, in order.
+// TestAnEntryWithTheMostCommitsThatTheContractAllowsIsApplied: the contract bounds the
+// data of an entry (README, "data": at most 786432 bytes and arrays of at most 1024
+// items, which the control plane enforces), and the adapter adds no cap of its own. An
+// entry with 1024 commits is applied, and its reply, 1024 commit addresses with the pull
+// request, is smaller than contracts.MaxRequest, the most that the adapter sends.
+func TestAnEntryWithTheMostCommitsThatTheContractAllowsIsApplied(t *testing.T) {
+	w := newChangeWired(t)
+	w.apiary.add(changeOf(testChangeID, testTitle, "Text.", targetOf("acme/widgets", 1024, openDraft)))
+	w.stepOK(t)
+	replies := w.apiary.replies()
+	if len(replies) != 1 || len(w.apiary.changeReports()) != 0 {
+		t.Fatalf("replies %d, reports %v", len(replies), w.apiary.changeReports())
+	}
+	if r := replyData(replies[0]); len(r.Commits) != 1024 {
+		t.Errorf("the reply has %d commits", len(r.Commits))
+	}
+	if n := len(w.apiary.sent(routeChangesSubmitted)[0].raw); n >= contracts.MaxRequest {
+		t.Errorf("the reply is %d bytes, over %d", n, contracts.MaxRequest)
+	}
+}
+
+// TestTheReplyHasTheAddressesOfTheCommitsListNotOfHeadOrEarlierCommits: an entry whose
+// head is another commit than the last of commits, and that has earlier_commits, is
+// applied; the reply has the address of the base commit and of each commit of commits, in
+// order.
 func TestTheReplyHasTheAddressesOfTheCommitsListNotOfHeadOrEarlierCommits(t *testing.T) {
 	w := newChangeWired(t)
 	target := targetOf("acme/widgets", 3, openDraft)

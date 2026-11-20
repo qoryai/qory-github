@@ -285,9 +285,10 @@ For each entry, the adapter:
 - Checks the entry's `data`, which has the members of the `pull-request` artifact type
   (the type's schema in the Qory harness is the source of the members): `branch` and
   `base_branch`, names that git accepts; `head`, `base` and each of `commits`, a commit
-  whose `address.path` is a full commit id; at least 1 of `commits`, with no upper
-  limit; `steps`, each with a full commit id and a `step` of 1 to 128 characters;
-  `earlier_commits`, a whole number from 1; and `draft`, `true` or `false`. The `target`, `title` and `text` of the data are ignored:
+  whose `address.path` is a full commit id; at least 1 of `commits`, with no limit of the
+  adapter (the contract's limits of the data apply); `steps`, each with a full commit id
+  and a `step` of 1 to 128 characters; `earlier_commits`, a whole number from 1; and
+  `draft`, `true` or `false`. The `target`, `title` and `text` of the data are ignored:
   the adapter uses those of the entry. Data that breaks a rule gets a failure report with
   the reason `refused`.
 - Checks the entry's `title` and `text` before it sends anything to GitHub. A title that
@@ -378,11 +379,12 @@ The adapter sends Qory Apiary one reply for the entry, with the entry's target, 
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
 (`created`, `updated` or `kept`). The `data` of the reply has the commit addresses and the
 pull request's `number`, `title` and `state` (`draft`, `open`, `closed` or `merged`). An
-entry that fails for good gets a failure report, as below, and no reply. While an entry fails and may succeed on a retry, for example after a 5xx status,
-the adapter applies the entry again, and the entries after it for the same repository
-wait. When the retries end, after a day of failures, it reports the entry as
-`unreachable`. If Qory Apiary does not take the reply for a day more, the adapter reports
-the entry as `unreachable`, with a `detail` that states that the pull request exists.
+entry that fails for good gets a failure report, as below, and no reply. While an entry
+fails and may succeed on a retry, for example after a 5xx status, the adapter applies the
+entry again, and the entries after it for the same repository wait. When the retries end,
+after a day of failures, it reports the entry as `unreachable`. If Qory Apiary does not
+take the reply for a day more, the adapter reports the entry as `unreachable`, with a
+`detail` that states that the pull request exists.
 
 The description has one marked block: the line `<!-- qory:start -->`, the run's text,
 and the line `<!-- qory:end -->`. GitHub does not show the two lines. A marker line may
