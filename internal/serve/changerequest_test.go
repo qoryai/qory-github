@@ -1625,7 +1625,7 @@ func TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets refused"}) || !cursorIs(w, "c_1") {
 		t.Fatalf("reports %v", r)
 	}
-	if d := detailOf(w, 0); !strings.HasPrefix(d, "Remove the marker lines that start with qory:start and qory:end from the text") {
+	if d := detailOf(w, 0); !strings.HasPrefix(d, "Remove the lines that mark a qory block (qory:start and qory:end) from the text") {
 		t.Errorf("the detail is %q", d)
 	}
 	if calls := w.gh.pullCalls(); len(calls) != 0 || len(w.gh.pullRequests("acme/widgets")) != 0 {

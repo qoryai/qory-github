@@ -243,7 +243,7 @@ const (
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
-	fixMarkerLine     = "Remove the marker lines that start with qory:start and qory:end from the text, then submit again."
+	fixMarkerLine     = "Remove the lines that mark a qory block (qory:start and qory:end) from the text, then submit again."
 	fixTitleStopped   = "Remove control, line-break or invisible format characters from the title, then submit again."
 	fixTitleBlank     = "Give the title a character that is not a space, then submit again."
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
