@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -185,6 +186,34 @@ func TestAPreviousWithAKnownAndAnUnknownMemberReadsTheKnownOne(t *testing.T) {
 	}
 	if d := w.apiary.draftsReplied()["acme/widgets"]; d == nil || d.Action != "updated" || d.Title != "Fix the widget well" || len(w.apiary.changeReports()) != 0 {
 		t.Errorf("the reply %+v, reports %v", d, w.apiary.changeReports())
+	}
+}
+
+// TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone gives a signed 409 whose
+// body is a refusal: with an unknown member that is not listed, its code is read and
+// connection_ended ends the connection; with the unknown member in must_understand, or a
+// must_understand that is no list, the body is as unreadable as a body that is no JSON,
+// so the answer has no code and ends nothing.
+func TestARefusalWithAnUnmetMustUnderstandIsJudgedByItsStatusAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, code string
+	}{
+		{"an unknown member", `{"error":"connection_ended","zz":1}`, codeConnectionEnded},
+		{"a listed member it defines", `{"error":"connection_ended","must_understand":["/error"]}`, codeConnectionEnded},
+		{"a listed member it does not define", `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`, ""},
+		{"a must_understand that is no list", `{"error":"connection_ended","must_understand":"/error"}`, ""},
+		{"no JSON", `<html>`, ""},
+	} {
+		var ended []string
+		a := &Apiary{Ended: func(connection string) { ended = append(ended, connection) }}
+		err := a.judge("reading", &answer{status: http.StatusConflict, signed: true, body: []byte(tc.body)}, "", testConnection)
+		var refused *refusedError
+		if !errors.As(err, &refused) || refused.status != http.StatusConflict || refused.code != tc.code || !IsPermanent(err) {
+			t.Errorf("%s: err %v", tc.name, err)
+		}
+		if got := len(ended) == 1; got != (tc.code == codeConnectionEnded) {
+			t.Errorf("%s: the connection ended %v, want %v", tc.name, ended, tc.code == codeConnectionEnded)
+		}
 	}
 }
 

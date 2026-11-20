@@ -769,7 +769,9 @@ func (a *Apiary) judge(what string, ans *answer, connection, of string) error {
 	}
 	var refusal contracts.Refusal
 	if ans.status < 200 || ans.status >= 300 {
-		if json.Unmarshal(ans.body, &refusal) != nil || !refusalShape.MatchString(refusal.Error) {
+		// A body that is no refusal of the contract, or whose must_understand the adapter
+		// cannot meet, has no code: the answer is judged by its status alone.
+		if readObject(ans.body, &refusal, contracts.Refusal{}) != nil || !refusalShape.MatchString(refusal.Error) {
 			refusal.Error = ""
 		}
 	}

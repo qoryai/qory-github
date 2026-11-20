@@ -328,6 +328,8 @@ document whose `must_understand` lists a pointer to a member that it does not de
 is malformed: it logs a line that starts with the fix (`use a reader that defines
 "/zz"`), and for a pass the adapter shows the page for a link that is not valid. It also
 does not read a document that is not one JSON object, or has data after the object.
+The body of a refusal is read the same way: when the adapter does not read it, the answer
+has no refusal code, and the adapter acts on the status alone.
 
 The adapter sends Qory Apiary one reply for the entry, with the entry's target, the
 `address` of the pull request (its `url`, and its number as `ref`) and the `action`
