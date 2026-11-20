@@ -167,6 +167,22 @@ change what the program does, and notes it under Upgrading.
   skipped, with its collection or item, as the contract allows at most 200. An empty path
   is skipped as before.
 
+- `qory-github-server serve` reads the change feed as a reader that may be older than
+  the writer. It skips an entry of a kind it does not apply, and an entry whose
+  `must_understand` lists a pointer that it does not define, and moves its cursor past
+  the entry; it logs one line for each. It ignores a member of the feed's answer, of an
+  entry, of `target` and of `previous` that the schemas do not define. A `previous` with
+  only such members reads as empty, so an entry with `previous` of `{"zz": 1}` opens a
+  new draft. Before, such a member made it refuse the whole answer, and an entry of an
+  unknown kind stopped the feed. The calls to the adapter that the schemas check
+  (`resolve`, `read`, `read-public` and the run credential) ignore such a member too. A `change_request` entry whose
+  `must_understand` lists a pointer that the adapter does not define is reported as
+  `refused`, with a `detail` that starts with the fix. A pointer below `data` is
+  defined when it points to a member of the pull-request data that the adapter reads:
+  `branch`, `base` with `commit` and `branch`, `commit`, `commits` with `commit` and
+  `step` for each, `earlier_commits`, and `draft` with `action` and `number`. An entry
+  with a status of its kind that the adapter does not know still stops its answer.
+
 ### Upgrading
 
 - Deploy this `qory-github-server` together with, or before, a Qory Apiary that sends
