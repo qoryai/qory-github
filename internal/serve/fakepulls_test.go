@@ -84,9 +84,13 @@ func (f *fakeGitHub) pullsAPI(w http.ResponseWriter, r *http.Request, b []byte, 
 		head := r.URL.Query().Get("head")
 		owner, ref, _ := strings.Cut(head, ":")
 		out := []map[string]any{}
+		state := r.URL.Query().Get("state")
+		if state == "" {
+			state = "open" // GitHub's default
+		}
 		for _, p := range f.pulls {
 			if p.repo == repo && p.head == ref && strings.HasPrefix(p.headRepoName(), owner+"/") &&
-				(r.URL.Query().Get("state") != "open" || !p.closed) {
+				(state == "all" || state == "closed" == p.closed) {
 				out = append(out, p.json(false))
 			}
 		}
