@@ -183,7 +183,7 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 		{"earlier_commits 0", many(100, set("earlier_commits", 0)), "", "data.earlier_commits"},
 		{"earlier_commits as a string", many(100, set("earlier_commits", "3")), "", "data.earlier_commits"},
 		{"earlier_commits null", many(100, set("earlier_commits", nil)), "", "data.earlier_commits"},
-		{"earlier_commits past int64", many(100, set("earlier_commits", json.RawMessage("9223372036854775808"))), "", "data.earlier_commits"},
+		{"earlier_commits 0.5", many(100, set("earlier_commits", json.RawMessage("0.5"))), "", "data.earlier_commits"},
 		{"no draft", set("draft", nil), "", "data.draft is not true or false"},
 		{"a draft that is a string", set("draft", "true"), "", "not a JSON object"},
 		{"a draft that is an object", set("draft", map[string]any{"action": "open"}), "", "not a JSON object"},
@@ -214,31 +214,31 @@ func TestParsePullRequestDataRefusesEachBrokenRule(t *testing.T) {
 func TestAWholeNumberIsReadExactlyOrRefused(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
-		want int64
+		want string
 		ok   bool
 	}{
-		{"34", 34, true},
-		{"34.0", 34, true},
-		{"1e2", 100, true},
-		{"0.5e1", 5, true},
-		{"3.4E+1", 34, true},
-		{"9007199254740993", 9007199254740993, true},
-		{"9007199254740993.0", 9007199254740993, true},
-		{"9.007199254740993e15", 9007199254740993, true},
-		{"9223372036854775807.0", 9223372036854775807, true},
-		{"1.00000000000000000001", 0, false},
-		{"1.5", 0, false},
-		{"9223372036854775808", 0, false},
-		{"9223372036854775808.0", 0, false},
-		{"1E400", 0, false},
-		{"1e1000000000", 0, false},
-		{"1e-1", 0, false},
-		{`"4"`, 0, false},
-		{"null", 0, false},
-		{"0x10", 0, false},
+		{"34", "34", true},
+		{"34.0", "34", true},
+		{"1e2", "100", true},
+		{"0.5e1", "5", true},
+		{"3.4E+1", "34", true},
+		{"9007199254740993", "9007199254740993", true},
+		{"9007199254740993.0", "9007199254740993", true},
+		{"9.007199254740993e15", "9007199254740993", true},
+		{"9223372036854775807.0", "9223372036854775807", true},
+		{"9223372036854775808", "9223372036854775808", true},
+		{"1E30", "1" + strings.Repeat("0", 30), true},
+		{"1.00000000000000000001", "", false},
+		{"1.5", "", false},
+		{"1e1000000000", "", false},
+		{"1e-1", "", false},
+		{`"4"`, "", false},
+		{"null", "", false},
+		{"0x10", "", false},
 	} {
-		if n, ok := wholeNumber(json.RawMessage(tc.in)); n != tc.want || ok != tc.ok {
-			t.Errorf("%s: got %d, %v, want %d, %v", tc.in, n, ok, tc.want, tc.ok)
+		n, ok := wholeNumber(json.RawMessage(tc.in))
+		if ok != tc.ok || ok && n.String() != tc.want {
+			t.Errorf("%s: got %v, %v, want %s, %v", tc.in, n, ok, tc.want, tc.ok)
 		}
 	}
 	if _, ok := wholeNumber(nil); ok {

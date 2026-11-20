@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math"
 	"math/big"
 	"regexp"
 	"strings"
@@ -25,8 +24,9 @@ const FixUndefinedData = "List only members that the pull-request kind defines i
 
 // The limits of the data of a pull-request change request.
 const (
-	maxBranch = 255
-	maxStep   = 128
+	maxBranch     = 255
+	maxStep       = 128
+	maxCollection = 200
 )
 
 var (
@@ -90,6 +90,31 @@ type rawData struct {
 	Draft *bool `json:"draft"`
 }
 
+// stopped is the refusal text for a string that has a character that the line rule of the
+// type's schema stops, or "" when it has none. It names the code point, never the value.
+func stopped(name, s string) string {
+	i := strings.IndexFunc(s, LineStopped)
+	if i < 0 {
+		return ""
+	}
+	r, _ := utf8.DecodeRuneInString(s[i:])
+	return fmt.Sprintf("%s has U+%04X, which a line may not have", name, r)
+}
+
+// refusalOfCommit is the refusal text for a commit of the data, or "" when it is valid
+// by the type's schema: a reference whose collection is a line of 1 to 200 characters and
+// whose address has a full commit id as its path. The text states the rule, never the
+// value. name is how the text calls the commit.
+func refusalOfCommit(name string, r *reference) string {
+	if r == nil || r.Address == nil || !commitShape.MatchString(r.Address.Path) {
+		return name + " is not a commit with a full commit id as its address path"
+	}
+	if n := utf8.RuneCountInString(r.Collection); n < 1 || n > maxCollection {
+		return fmt.Sprintf("the collection of %s is not 1 to %d characters", name, maxCollection)
+	}
+	return stopped("the collection of "+name, r.Collection)
+}
+
 // dataMembers are the members of the data that the pull-request type defines and that the
 // adapter understands, as types whose json tags [contracts.CheckMustUnderstand] resolves
 // a pointer through. A scalar has no member below it. The adapter reads the members of
@@ -133,16 +158,21 @@ func UndefinedDataPointer(pointers []string) string {
 }
 
 // ParsePullRequestData reads the data of a change request of the kind pull-request, as
-// the pull-request artifact type writes it, and checks these rules: the branch and the
-// base branch are names git accepts, the head, the base and each commit have a full
-// commit id as address.path, at least 1 commit, each step of steps has a full commit id
-// and 1 to 128 characters, earlier_commits is a whole number from 1, and draft is true or
-// false. The adapter reads only what the type's schema states: it sets no limit on the
-// number of commits (the contract bounds the data), and head and earlier_commits have no
-// further rule. A number that is whole, such as 34.0 or 3.4e1,
-// is read as the integer it equals. The error is a [*SubmitRefused] with the reason
-// refused, the fix [FixChangeData] and the broken rule as its message; the text states
-// the rule, never the value.
+// the pull-request artifact type writes it (the schema of commit ecc59e02 of the Qory
+// harness, branch 544-h-66), and checks these rules for the members it reads: the branch
+// and the base branch are names git accepts, of at most 255 characters, and a line; the
+// head, the base and each commit have a full commit id as address.path and a collection
+// of 1 to 200 characters that is a line; there is at least 1 commit; steps is a list, and
+// each step has a full commit id and a step of 1 to 128 characters that is a line;
+// earlier_commits is a whole number from 1; and draft is true or false. A line has none
+// of the characters that [LineStopped] stops. The adapter reads only what the schema
+// states: it sets no limit on the number of commits (the contract bounds the data), and
+// head and earlier_commits have no further rule. A member that the schema does not
+// define is ignored, and so is one that the adapter does not read. A number that is
+// whole, such as 34.0 or 3.4e1, is read as the integer it equals. The error is a
+// [*SubmitRefused] with the reason refused, the fix [FixChangeData] and the broken rule
+// as its message; the text states the rule and the code point of a stopped character,
+// never the value.
 func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	refuse := func(format string, args ...any) (PullRequestData, error) {
 		err := fmt.Errorf(format, args...)
@@ -152,39 +182,47 @@ func ParsePullRequestData(data json.RawMessage) (PullRequestData, error) {
 	if err := exactjson.Unmarshal(data, &raw); err != nil || bytes.TrimSpace(data)[0] != '{' {
 		return refuse("data is not a JSON object whose members have the types of the pull-request kind")
 	}
-	if !validBranch(raw.Branch) {
-		return refuse("data.branch is not a branch name that git accepts")
+	for _, b := range []struct{ name, value string }{{"data.branch", raw.Branch}, {"data.base_branch", raw.BaseBranch}} {
+		if msg := stopped(b.name, b.value); msg != "" {
+			return refuse("%s", msg)
+		}
+		if !validBranch(b.value) {
+			return refuse("%s is not a branch name that git accepts", b.name)
+		}
 	}
-	if !validBranch(raw.BaseBranch) {
-		return refuse("data.base_branch is not a branch name that git accepts")
+	if msg := refusalOfCommit("data.base", raw.Base); msg != "" {
+		return refuse("%s", msg)
 	}
-	if !commitShape.MatchString(raw.Base.commitID()) {
-		return refuse("data.base is not a commit with a full commit id as its address path")
-	}
-	if !commitShape.MatchString(raw.Head.commitID()) {
-		return refuse("data.head is not a commit with a full commit id as its address path")
+	if msg := refusalOfCommit("data.head", raw.Head); msg != "" {
+		return refuse("%s", msg)
 	}
 	if len(raw.Commits) == 0 {
 		return refuse("data.commits has no commit")
 	}
 	out := PullRequestData{Branch: raw.Branch, BaseBranch: raw.BaseBranch, BaseCommit: raw.Base.commitID()}
-	for _, c := range raw.Commits {
-		if !commitShape.MatchString(c.commitID()) {
-			return refuse("a commit of data.commits has no full commit id as its address path")
+	for i := range raw.Commits {
+		if msg := refusalOfCommit("a commit of data.commits", &raw.Commits[i]); msg != "" {
+			return refuse("%s", msg)
 		}
-		out.Commits = append(out.Commits, c.commitID())
+		out.Commits = append(out.Commits, raw.Commits[i].commitID())
+	}
+	if raw.Steps == nil {
+		return refuse("data.steps is not a list")
 	}
 	for _, s := range raw.Steps {
 		if !commitShape.MatchString(s.Commit) {
 			return refuse("a step of data.steps has no full commit id")
 		}
-		if n := utf8.RuneCountInString(s.Step); n < 1 || n > maxStep || strings.ContainsRune(s.Step, 0) {
-			return refuse("the step of a step of data.steps is not 1 to %d characters without U+0000", maxStep)
+		if n := utf8.RuneCountInString(s.Step); n < 1 || n > maxStep {
+			return refuse("the step of a step of data.steps is not 1 to %d characters", maxStep)
+		}
+		if msg := stopped("the step of a step of data.steps", s.Step); msg != "" {
+			return refuse("%s", msg)
 		}
 	}
 	if raw.EarlierCommits != nil {
-		if n, ok := wholeNumber(raw.EarlierCommits); !ok || n < 1 {
-			return refuse("data.earlier_commits is not a whole number from 1 to %d", int64(math.MaxInt64))
+		if n, ok := wholeNumber(raw.EarlierCommits); !ok || n.Sign() < 1 {
+			return refuse("data.earlier_commits is not a whole number from 1")
 		}
 	}
 	if raw.Draft == nil {
@@ -199,18 +237,20 @@ func validBranch(name string) bool {
 	return utf8.RuneCountInString(name) <= maxBranch && branchShape.MatchString(name) && !branchNever.MatchString(name)
 }
 
-// wholeNumber is the integer that the JSON number raw equals exactly, or false for
-// anything else: a missing member, a string, null, a number with a fraction that is not
-// zero, or a value past the int64 range. The artifact type of the kind may write 34.0 or
-// 3.4e1 for 34. The value is read as a rational number, so no digit is rounded.
-func wholeNumber(raw json.RawMessage) (int64, bool) {
+// wholeNumber is the integer that the JSON number raw equals exactly, of any size, or
+// false for anything else: a missing member, a string, null, or a number with a fraction
+// that is not zero. The artifact type of the kind may write 34.0 or 3.4e1 for 34. The
+// value is read as a rational number, so no digit is rounded.
+// shortcut: an exponent over 1000000 is refused, though the schema accepts it, since
+// big.Rat refuses it; replace it when a writer of the type needs such a number.
+func wholeNumber(raw json.RawMessage) (*big.Int, bool) {
 	s := string(raw)
 	if !numberShape.MatchString(s) {
-		return 0, false
+		return nil, false
 	}
 	r, ok := new(big.Rat).SetString(s)
-	if !ok || !r.IsInt() || !r.Num().IsInt64() {
-		return 0, false
+	if !ok || !r.IsInt() {
+		return nil, false
 	}
-	return r.Num().Int64(), true
+	return r.Num(), true
 }

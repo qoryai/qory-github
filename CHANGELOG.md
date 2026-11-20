@@ -32,10 +32,12 @@ change what the program does, and notes it under Upgrading.
   and does not change a closed or merged pull request. The adapter reads the members of
   the `pull-request` artifact type (its schema in the Qory harness is the source):
   `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits` and
-  `draft`, and checks each: a branch name that git accepts, a full commit id as the
-  address path of each commit, at least 1 commit and no limit of the adapter, a `step` of
-  1 to 128 characters, `earlier_commits` as a whole number from 1, and `draft` as `true`
-  or `false`; data that breaks a rule is reported as `refused`. A title that has a control
+  `draft`, and checks each: a branch name that git accepts and that is one line, a full
+  commit id as the address path of each commit and a collection of one line of 1 to 200
+  characters, at least 1 commit and no limit of the adapter, a list of steps, each with
+  a `step` of 1 to 128 characters on one line, `earlier_commits` as a whole number from
+  1, and `draft` as `true` or `false`; data that breaks a rule is reported as `refused`,
+  with the code point of a stopped character in the `detail`. A title that has a control
   character, U+2028, U+2029 or a format character other than U+200C and U+200D, or no
   character that is not a space, U+200C or U+200D, is reported as `refused` before any
   request to GitHub, with a `detail` that starts with the fix; so is a `text` that has a

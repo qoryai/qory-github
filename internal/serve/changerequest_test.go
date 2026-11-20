@@ -1558,6 +1558,63 @@ func TestATitleThatTheRuleStopsIsReportedRefusedBeforeAnyRequest(t *testing.T) {
 	}
 }
 
+// TestAStoppedCharacterInTheDataIsReportedRefusedBeforeAnyRequest: a character that the line
+// rule of the pull-request type stops (U+202E, U+E0041, U+0007, U+2028), in the branch, the
+// base branch, a step, or the collection of the head, the base or a commit, gives a failure
+// report with the reason refused. The detail starts with the fix, names the code point, and
+// has no stopped character, and no request reaches GitHub. U+200C and U+200D open a pull
+// request.
+func TestAStoppedCharacterInTheDataIsReportedRefusedBeforeAnyRequest(t *testing.T) {
+	members := map[string]func(m map[string]any, v string){
+		"data.branch":      func(m map[string]any, v string) { m["branch"] = "qory/a" + v },
+		"data.base_branch": func(m map[string]any, v string) { m["base_branch"] = "a" + v },
+		"the step of a step of data.steps": func(m map[string]any, v string) {
+			m["steps"].([]any)[0].(map[string]any)["step"] = "a" + v
+		},
+		"the collection of data.head": func(m map[string]any, v string) { m["head"].(map[string]any)["collection"] = "a" + v },
+		"the collection of data.base": func(m map[string]any, v string) { m["base"].(map[string]any)["collection"] = "a" + v },
+		"the collection of a commit of data.commits": func(m map[string]any, v string) {
+			m["commits"].([]any)[0].(map[string]any)["collection"] = "a" + v
+		},
+	}
+	entry := func(edit func(m map[string]any, v string), v string) contracts.Change {
+		target := targetOf("acme/widgets", 2, openDraft)
+		ch := changeOf(testChangeID, testTitle, "Text.", target)
+		var data map[string]any
+		if err := json.Unmarshal(ch.Data, &data); err != nil {
+			t.Fatal(err)
+		}
+		edit(data, v)
+		ch.Data, _ = json.Marshal(data)
+		return ch
+	}
+	for name, edit := range members {
+		for _, c := range []struct{ value, code string }{{"\u202e", "U+202E"}, {"\U000E0041", "U+E0041"}, {"\u0007", "U+0007"}, {"\u2028", "U+2028"}} {
+			w := newChangeWired(t)
+			w.apiary.add(entry(edit, c.value))
+			w.stepOK(t)
+			if r := w.apiary.changeReports(); !slices.Equal(r, []string{"acme/widgets refused"}) || !cursorIs(w, "c_1") {
+				t.Errorf("%s with %s: reports %v", name, c.code, r)
+				continue
+			}
+			if d := detailOf(w, 0); !strings.HasPrefix(d, github.FixChangeData+" ") || !strings.Contains(d, name+" has "+c.code) || strings.ContainsFunc(d, github.LineStopped) || len([]rune(strings.SplitN(d, ".", 2)[0]))+1 > 100 {
+				t.Errorf("%s with %s: the detail is %q", name, c.code, d)
+			}
+			if calls := w.gh.pullCalls(); len(calls) != 0 || len(w.apiary.replies()) != 0 {
+				t.Errorf("%s with %s: GitHub calls %v, replies %v", name, c.code, calls, w.apiary.replies())
+			}
+		}
+		for _, joiner := range []string{"\u200c", "\u200d"} {
+			w := newChangeWired(t)
+			w.apiary.add(entry(edit, joiner))
+			w.stepOK(t)
+			if r := w.apiary.changeReports(); len(r) != 0 || len(w.apiary.replies()) != 1 {
+				t.Errorf("%s with U+%04X: reports %v", name, []rune(joiner)[0], r)
+			}
+		}
+	}
+}
+
 // TestATextWithAMarkerLineIsReportedRefusedBeforeAnyRequest: the adapter writes the text
 // between marker lines, so a text with one gets a failure report with the reason refused
 // and a detail that starts with the fix. Nothing is sent to GitHub.
