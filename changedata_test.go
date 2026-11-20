@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -217,5 +219,42 @@ func TestUndefinedDataPointerKnowsTheMembersTheAdapterReads(t *testing.T) {
 	}
 	if got := UndefinedDataPointer(nil); got != "" {
 		t.Errorf("%q is returned for no pointer", got)
+	}
+}
+
+// memberPaths are the JSON Pointers of the members of t, below t, through structs,
+// pointers and slices. A path has no index for a slice: "/commits/step" stands for
+// "/commits/1/step".
+func memberPaths(t reflect.Type, prefix string) []string {
+	for t.Kind() == reflect.Pointer || (t.Kind() == reflect.Slice && t.Elem().Kind() != reflect.Uint8) {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return []string{prefix}
+	}
+	var out []string
+	for f := range t.Fields() {
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		out = append(out, memberPaths(f.Type, prefix+"/"+name)...)
+	}
+	return out
+}
+
+// TestDataMembersMatchTheMembersParsePullRequestDataReads ties dataMembers, which
+// UndefinedDataPointer resolves a pointer through, to rawData and rawDraft by their json
+// tags: a member added to one and not the others fails the test. The draft member of
+// rawData is raw JSON that rawDraft reads.
+func TestDataMembersMatchTheMembersParsePullRequestDataReads(t *testing.T) {
+	read := memberPaths(reflect.TypeFor[rawData](), "")
+	i := slices.Index(read, "/draft")
+	if i < 0 {
+		t.Fatalf("rawData has no draft member: %v", read)
+	}
+	read = slices.Replace(read, i, i+1, memberPaths(reflect.TypeFor[rawDraft](), "/draft")...)
+	defined := memberPaths(reflect.TypeFor[dataMembers](), "")
+	slices.Sort(read)
+	slices.Sort(defined)
+	if !slices.Equal(read, defined) {
+		t.Errorf("rawData and rawDraft have the members %v, and dataMembers has %v", read, defined)
 	}
 }
