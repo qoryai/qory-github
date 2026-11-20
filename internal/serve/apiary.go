@@ -542,7 +542,7 @@ func checkChanges(body []byte) (changesPage, error) {
 		if err := exactjson.Unmarshal(raw, &head); err != nil || head.Kind == "" {
 			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: an entry is not an object with a kind", what)
 		}
-		only, err := exactjson.MustUnderstand(raw, "kind")
+		only, err := exactjson.MustUnderstand(raw)
 		if err != nil {
 			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
 		}

@@ -5,24 +5,44 @@ package exactjson
 import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+
+	"github.com/qoryai/integrations/contracts"
 )
 
 // MustUnderstand returns a document of the object b that has only its must_understand
-// member and the members named keep, each spelled exactly. contracts.CheckMustUnderstand
-// finds must_understand in any case, so a Must_Understand beside must_understand could
-// replace it; a check of the result reads the member that [Unmarshal] reads.
-func MustUnderstand(b []byte, keep ...string) ([]byte, error) {
-	var members map[string]jsontext.Value
-	if err := Unmarshal(b, &members); err != nil {
+// member and its kind member, each spelled exactly and left out when b has none. A
+// check of the result with contracts.CheckMustUnderstand, or CheckChangeMustUnderstand,
+// reads the must_understand member that [Unmarshal] reads. No other member is copied,
+// so no secret value of a document is.
+//
+// shortcut: the pin cf5bf941 of the contracts finds must_understand in any case, so a
+// Must_Understand beside it could replace it, replace this copy once the integrations
+// pin includes the exact-case readers, integrations a0a92400 or later.
+func MustUnderstand(b []byte) ([]byte, error) {
+	var doc struct {
+		MustUnderstand jsontext.Value `json:"must_understand"`
+		Kind           jsontext.Value `json:"kind"`
+	}
+	if err := Unmarshal(b, &doc); err != nil {
 		return nil, err
 	}
-	only := map[string]jsontext.Value{}
-	for _, name := range append([]string{"must_understand"}, keep...) {
-		if v, ok := members[name]; ok {
-			only[name] = v
+	out := []byte("{")
+	for _, m := range []struct {
+		name  string
+		value jsontext.Value
+	}{{contracts.MustUnderstand, doc.MustUnderstand}, {"kind", doc.Kind}} {
+		if len(m.value) == 0 {
+			continue
 		}
+		if len(out) > 1 {
+			out = append(out, ',')
+		}
+		out = append(out, '"')
+		out = append(out, m.name...)
+		out = append(out, '"', ':')
+		out = append(out, m.value...)
 	}
-	return json.Marshal(only)
+	return append(out, '}'), nil
 }
 
 // Unmarshal reads the one JSON value in b, with nothing but white space after it, into v.
@@ -30,6 +50,10 @@ func MustUnderstand(b []byte, keep ...string) ([]byte, error) {
 // not fill token, as it does for [encoding/json.Unmarshal]. A member that v has no field
 // for is ignored. A name repeated in an object keeps its last value, as in
 // [encoding/json.Unmarshal].
+//
+// The contracts' types are read exactly here only because this is encoding/json/v2.
+// Once the integrations pin includes the exact-case readers, integrations a0a92400 or
+// later, encoding/json is exact too, and this package can go.
 func Unmarshal(b []byte, v any) error {
 	return json.Unmarshal(b, v, jsontext.AllowDuplicateNames(true))
 }
