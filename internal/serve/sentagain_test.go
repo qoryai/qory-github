@@ -360,3 +360,80 @@ func TestAGrantReportIsBoundedByTheConnectReturn(t *testing.T) {
 		}
 	}
 }
+
+// TestAFailedGrantReportDropsOnlyTheLinkItReportedFor pins what one installation is: it
+// has one link, to one connection, and one grant in the copy. A report that is refused
+// until the connect return expires drops the installation's link, its repositories'
+// records and its collections' links, and nothing else, and only when the link names the
+// report's connection and the copy does not hold that connection's grant. Each case
+// has the installation 42, with its repository acme/widgets, and the installation 43,
+// linked live to another connection, with acme/gadgets; the report is for connection B.
+//   - The link names A: a connect for B cannot link a live A, so a report for B finds
+//     the link of A and drops nothing; the installation 42's records stay.
+//   - The copy holds B's grant: nothing is dropped.
+//   - The copy holds A's grant and the link names B: the link and the records are dropped,
+//     and A's grant stays in the copy.
+//
+// The installation 43 is untouched in each.
+func TestAFailedGrantReportDropsOnlyTheLinkItReportedFor(t *testing.T) {
+	const third = "ac_bbbbbbbbbbbbbbbb"
+	for _, tc := range []struct {
+		name    string
+		link    link
+		grant   string
+		dropped bool
+	}{
+		{"the link names another connection", link{Connection: otherConnection, State: linkLive}, otherConnection, false},
+		{"the copy holds the grant of the report", link{Connection: testConnection, State: linkPending}, testConnection, false},
+		{"the copy holds another connection's grant", link{Connection: testConnection, State: linkPending}, otherConnection, true},
+	} {
+		rig, clock := reportRig(t)
+		rig.apiary.refuse = func(route string, _ int) (int, string) {
+			if route == routeGrants {
+				return 409, `{"error":"connection_suspended"}`
+			}
+			return 0, ""
+		}
+		expires := clock.now().Add(returnFor)
+		widgets, gadgets := refOf("acme/widgets"), refOf("acme/gadgets")
+		tc.link.Return = expires.Unix()
+		putLink(rig.st, 42, tc.link)
+		putGrant(rig.st, 42, tc.grant)
+		setReach(rig.st, widgets, 42)
+		linkCollection(rig.st, widgets)
+		keepPulled(rig.st, widgets, pullMark{Since: clock.now()})
+		grantedPutLink(rig.st, 43, link{Connection: third, State: linkLive})
+		setReach(rig.st, gadgets, 43)
+		linkCollection(rig.st, gadgets)
+		keepPulled(rig.st, gadgets, pullMark{Since: clock.now()})
+		rig.c.reportSoon(42, testConnection, newNonce(), contracts.Account{Ref: "500", Title: "acme"}, expires)
+		eventually(t, tc.name+": the report ends", func() bool {
+			return strings.Contains(rig.log.String(), "reporting the installation's grant to Qory Apiary failed")
+		})
+		rig.c.stop()
+		if n := len(rig.apiary.sent(routeGrants)); n != 10 {
+			t.Errorf("%s: %d sends, want 10", tc.name, n)
+		}
+		l, linked, _ := linkOf(rig.st, 42)
+		_, reached, _ := reachOf(rig.st, widgets)
+		collection, _ := collectionLinked(rig.st, widgets)
+		pulled, _ := pulledOf(rig.st, widgets)
+		if linked == tc.dropped || (linked && l.Connection != tc.link.Connection) || reached == tc.dropped || collection == tc.dropped || pulled.Since.IsZero() != tc.dropped {
+			t.Errorf("%s: link %+v %v, reach %v, collection linked %v, pull mark %v", tc.name, l, linked, reached, collection, pulled.Since)
+		}
+		if held, _ := grantOf(rig.st, 42); held != tc.grant {
+			t.Errorf("%s: the grant of 42 is %q, want %q", tc.name, held, tc.grant)
+		}
+		if line := strings.Contains(rig.log.String(), "so serve drops its link: connect it again"); line != tc.dropped {
+			t.Errorf("%s: the drop line is %v", tc.name, line)
+		}
+		l3, linked3, _ := linkOf(rig.st, 43)
+		_, reached3, _ := reachOf(rig.st, gadgets)
+		collection3, _ := collectionLinked(rig.st, gadgets)
+		pulled3, _ := pulledOf(rig.st, gadgets)
+		held3, _ := grantOf(rig.st, 43)
+		if !linked3 || l3.Connection != third || !reached3 || !collection3 || pulled3.Since.IsZero() || held3 != third {
+			t.Errorf("%s: the installation 43 changed: link %+v %v, reach %v, collection linked %v, pull mark %v, grant %q", tc.name, l3, linked3, reached3, collection3, pulled3.Since, held3)
+		}
+	}
+}
