@@ -144,8 +144,8 @@ change what the program does, and notes it under Upgrading.
 - The page that the setup shows when the connection is linked to another installation of
   the App has this text: "Disconnect the account that is connected now, on the
   integration's page in Qory Apiary, then press "Install" again. An organisation
-  connects one GitHub account." Before, the text was: "This connection already holds another
-  installation of the App, and it holds only one."
+  connects one GitHub account." Before, the text was: "This connection already holds
+  another installation of the App, and it holds only one."
 - The run credential for work with access `write` reaches only git's push: on
   `github.com`, `/owner/name.git/info/refs` and `/owner/name.git/git-receive-pack`. It
   has no item for `api.github.com`, so it reaches no REST path and not `/graphql`. Before,
