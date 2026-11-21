@@ -507,11 +507,44 @@ func TestTheAnswerIsTheGatewaysCredentialDocument(t *testing.T) {
 		t.Fatalf("the gateway's schema refuses the answer: %v\n%s", err, b)
 	}
 	want := `{"version":1,"token":"` + fakeToken + `","expires_at":"2026-09-25T21:00:00Z","apply":[` +
-		`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/*","/acme/shop/*","/acme/lib.git/*","/acme/lib/*"]},` +
-		`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/shop","/repos/acme/shop/*","/repos/acme/lib","/repos/acme/lib/*","/graphql"]}],` +
+		`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/*","/acme/lib.git/*","/acme/shop/*","/acme/lib/*"]},` +
+		`{"hosts":["api.github.com"],"scheme":"bearer","paths":["/repos/acme/shop","/repos/acme/lib","/repos/acme/shop/*","/repos/acme/lib/*","/graphql"]}],` +
 		`"placeholders":["GH_TOKEN","GITHUB_TOKEN"]}`
 	if string(b) != want {
 		t.Errorf("answer\n%s\nwant\n%s", b, want)
+	}
+}
+
+// TestUsesFillOneTemplateAtATimeForEveryRepository pins the order of [Uses] and
+// [PushUses] for three repositories: each template of an item for every repository in the
+// order of the call, then the next template, and /graphql once at the end, as the
+// control plane fills the templates of the source role's apply for a call with several
+// resources ($defs.apply of description.schema.json in the integrations contract).
+func TestUsesFillOneTemplateAtATimeForEveryRepository(t *testing.T) {
+	repos, err := ParseRepositories("acme/a,acme/b,acme/c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct {
+		got  []Apply
+		want [][]string
+	}{
+		"Uses": {Uses(repos), [][]string{
+			{"/acme/a.git/*", "/acme/b.git/*", "/acme/c.git/*", "/acme/a/*", "/acme/b/*", "/acme/c/*"},
+			{"/repos/acme/a", "/repos/acme/b", "/repos/acme/c", "/repos/acme/a/*", "/repos/acme/b/*", "/repos/acme/c/*", "/graphql"},
+		}},
+		"PushUses": {PushUses(repos), [][]string{
+			{"/acme/a.git/info/refs", "/acme/b.git/info/refs", "/acme/c.git/info/refs", "/acme/a.git/git-receive-pack", "/acme/b.git/git-receive-pack", "/acme/c.git/git-receive-pack"},
+		}},
+	} {
+		if len(tc.got) != len(tc.want) {
+			t.Fatalf("%s has %d items, want %d", name, len(tc.got), len(tc.want))
+		}
+		for i, a := range tc.got {
+			if !slices.Equal(a.Paths, tc.want[i]) {
+				t.Errorf("%s item %d has the paths %q, want %q", name, i, a.Paths, tc.want[i])
+			}
+		}
 	}
 }
 
@@ -550,7 +583,7 @@ func TestPushUsesAreTheReceivePackCalls(t *testing.T) {
 		{"acme/widgets", `[` +
 			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/widgets.git/info/refs","/acme/widgets.git/git-receive-pack"]}]`},
 		{"acme/shop,acme/lib", `[` +
-			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/info/refs","/acme/shop.git/git-receive-pack","/acme/lib.git/info/refs","/acme/lib.git/git-receive-pack"]}]`},
+			`{"hosts":["github.com"],"scheme":"basic","username":"x-access-token","paths":["/acme/shop.git/info/refs","/acme/lib.git/info/refs","/acme/shop.git/git-receive-pack","/acme/lib.git/git-receive-pack"]}]`},
 	} {
 		repos, err := ParseRepositories(tc.repos)
 		if err != nil {

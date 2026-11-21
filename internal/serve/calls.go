@@ -571,7 +571,11 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 	// repositories: 4 paths for each, and /graphql once. A harness call has 2 paths for
 	// each, so its 64 repositories fit.
 	if len(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, len(ids)))) > maxApplyItems {
-		c.log().Info("the paths of the run credential's repositories do not fit in the answer", slog.Int64("installation", installation), slog.Int("resources", len(ids)))
+		most := len(ids) - 1
+		for len(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, most))) > maxApplyItems {
+			most--
+		}
+		c.log().Info(fmt.Sprintf("Send at most %d repositories in one call. This call has %d and needs over %d items.", most, len(ids), maxApplyItems), slog.Int64("installation", installation))
 		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	}
 	t, err := c.GitHub.MintInstallationToken(ctx, github.Request{AppID: c.AppID, Key: c.Key, InstallationID: installation, RepositoryIDs: ids, Permissions: runPermissions(req.Purpose, req.Access)})

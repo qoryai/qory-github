@@ -545,10 +545,10 @@ func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 	for _, tc := range []struct {
 		purpose, access, want string
 	}{
-		{"work", "write", "github.com basic x-access-token: /acme/shop.git/info/refs /acme/shop.git/git-receive-pack /acme/lib.git/info/refs /acme/lib.git/git-receive-pack\n"},
-		{"work", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/shop/* /acme/lib.git/* /acme/lib/*\n" +
-			"api.github.com bearer : /repos/acme/shop /repos/acme/shop/* /repos/acme/lib /repos/acme/lib/* /graphql\n"},
-		{"harness", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/shop/* /acme/lib.git/* /acme/lib/*\n"},
+		{"work", "write", "github.com basic x-access-token: /acme/shop.git/info/refs /acme/lib.git/info/refs /acme/shop.git/git-receive-pack /acme/lib.git/git-receive-pack\n"},
+		{"work", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/lib.git/* /acme/shop/* /acme/lib/*\n" +
+			"api.github.com bearer : /repos/acme/shop /repos/acme/lib /repos/acme/shop/* /repos/acme/lib/* /graphql\n"},
+		{"harness", "read", "github.com basic x-access-token: /acme/shop.git/* /acme/lib.git/* /acme/shop/* /acme/lib/*\n"},
 	} {
 		got := paths(runCredentialUses(tc.purpose, tc.access, repos))
 		if got != tc.want {
@@ -587,7 +587,7 @@ func TestTheRunCredentialUsesAreCutIntoItemsOf32Paths(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("the items are %q, want %q", got, want)
 	}
-	if first := runCredentialUses("work", "read", repos)[0].Paths; first[0] != "/acme/r00.git/*" || first[31] != "/acme/r15/*" {
+	if first := runCredentialUses("work", "read", repos)[0].Paths; first[0] != "/acme/r00.git/*" || first[19] != "/acme/r19.git/*" || first[20] != "/acme/r00/*" || first[31] != "/acme/r11/*" {
 		t.Errorf("the first item has the paths %q", first)
 	}
 }
@@ -1102,7 +1102,8 @@ func TestAWriteCallForSeveralRepositoriesGets400(t *testing.T) {
 // for each repository, and /graphql once, so 127 repositories have 509 paths in 16 items
 // and 128 have 513 paths in 17. The answer has at most 16 items of 1 to 32 paths, no
 // path twice, no two paths of one host that overlap, and passes the answer's Check.
-// A call for 128 gets 403 resource_not_covered and mints nothing.
+// A call for 128 or for 250, the most the contract allows, gets 403 resource_not_covered
+// and mints nothing.
 func TestTheAnswerForManyRepositoriesFitsTheContractsLimits(t *testing.T) {
 	for _, n := range []int{40, 127} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
@@ -1152,12 +1153,20 @@ func TestTheAnswerForManyRepositoriesFitsTheContractsLimits(t *testing.T) {
 			}
 		})
 	}
-	rig := newCallsRig(t)
-	refs := reachRepositories(t, rig.st, 42, 128)
-	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, refs, "read")))
-	checkAnswer(t, got, http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
-	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
-		t.Errorf("minted %q for a call over the limit", mints)
+	// The contract allows 1 to 250 resources in a read call, so a call over the limit of
+	// the paths is valid and gets 403, never 400, and its log line says how many fit.
+	for _, n := range []int{128, 250} {
+		rig := newCallsRig(t)
+		refs := reachRepositories(t, rig.st, 42, n)
+		got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, refs, "read")))
+		checkAnswer(t, got, http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+		if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+			t.Errorf("%d resources: minted %q for a call over the limit", n, mints)
+		}
+		line := fmt.Sprintf("Send at most 127 repositories in one call. This call has %d and needs over 16 items.", n)
+		if len(line) > 100 || !strings.Contains(rig.log.String(), `"msg":"`+line+`"`) {
+			t.Errorf("%d resources: no line has the message %q: %s", n, line, rig.log.String())
+		}
 	}
 }
 

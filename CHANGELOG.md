@@ -20,7 +20,7 @@ change what the program does, and notes it under Upgrading.
   call adds 4 paths for each repository, and `/graphql` once, so one call covers 127
   repositories; a call for more gets `403 resource_not_covered`, and nothing is minted.
   Before, a call for `work` with other than one resource got `400 invalid_request`.
-- A run credential call for a harness with more than 16 repositories now answers in
+- A run credential call for a harness with more than 16 repositories answers in
   several items of at most 32 paths. Before, it answered one item with all paths, which
   was more than Forager takes in one item.
 - `qory-github-server serve` opens or updates the pull request for each `change_request`
@@ -137,6 +137,10 @@ change what the program does, and notes it under Upgrading.
 
 ### Changed
 
+- For several repositories, `qory-github credential` and the run credential list each path
+  template for every repository in turn, then the next template: `/owner/a.git/*`,
+  `/owner/b.git/*`, `/owner/a/*`, `/owner/b/*`. Before, they listed both templates of
+  the first repository, then of the second. The paths are the same set.
 - The page that the setup shows when the connection is linked to another installation of
   the App has this text: "Disconnect the account that is connected now, on the
   integration's page in Qory Apiary, then click Install again. An organisation connects
