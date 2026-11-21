@@ -248,7 +248,7 @@ var (
 	refuseNoSession = refusal{status: http.StatusBadRequest, page: `No installation is under way in this browser, or it took too long. Press "Install" in Qory Apiary again.`, why: "no session", dropCookie: true}
 	refuseHeld      = refusal{
 		status:     http.StatusConflict,
-		page:       "Disconnect the account that is connected now, on the integration's page in Qory Apiary, then click Install again. An organisation connects one GitHub account.",
+		page:       `Disconnect the account that is connected now, on the integration's page in Qory Apiary, then press "Install" again. An organisation connects one GitHub account.`,
 		why:        "the connection holds another installation, live, or pending under a pass as new as this one",
 		endSession: true,
 	}

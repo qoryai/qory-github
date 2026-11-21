@@ -1825,7 +1825,7 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 		&refuseUsed:      `This link was used already. Press "Install" in Qory Apiary again.`,
 		&refuseFailed:    `Something failed on this server. Press "Install" in Qory Apiary again.`,
 		&refuseNoSession: `No installation is under way in this browser, or it took too long. Press "Install" in Qory Apiary again.`,
-		&refuseHeld:      "Disconnect the account that is connected now, on the integration's page in Qory Apiary, then click Install again. An organisation connects one GitHub account.",
+		&refuseHeld:      `Disconnect the account that is connected now, on the integration's page in Qory Apiary, then press "Install" again. An organisation connects one GitHub account.`,
 		&refuseOlder:     `A newer link for this connection was used already. Press "Install" in Qory Apiary again.`,
 		&refuseAdapter:   `This connect link is for another integration. Press "Install" on this integration's page in Qory Apiary.`,
 		&refuseMethod:    "This address answers GET requests alone.",
