@@ -1099,8 +1099,8 @@ func TestAWriteCallForSeveralRepositoriesGets400(t *testing.T) {
 
 // TestTheAnswerForManyRepositoriesFitsTheContractsLimits pins the answer to a read call
 // for 40 repositories and for 127, the most one call covers: a read call writes 4 paths
-// for each repository, and /graphql once, so 127 repositories have 509 paths and 128
-// have 513. The answer has at most 16 items of 1 to 32 paths, 512 paths together, no
+// for each repository, and /graphql once, so 127 repositories have 509 paths in 16 items
+// and 128 have 513 paths in 17. The answer has at most 16 items of 1 to 32 paths, no
 // path twice, no two paths of one host that overlap, and passes the answer's Check.
 // A call for 128 gets 403 resource_not_covered and mints nothing.
 func TestTheAnswerForManyRepositoriesFitsTheContractsLimits(t *testing.T) {
@@ -1158,6 +1158,37 @@ func TestTheAnswerForManyRepositoriesFitsTheContractsLimits(t *testing.T) {
 	checkAnswer(t, got, http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
 	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
 		t.Errorf("minted %q for a call over the limit", mints)
+	}
+}
+
+// TestTheAnswerForAHarnessOf64RepositoriesIsCutIntoItems pins a harness call for 64
+// repositories, the most it takes: contents read, 128 paths on github.com in 4 items of
+// 32 paths, 16 items at most, no path twice, and the answer's Check passes.
+func TestTheAnswerForAHarnessOf64RepositoriesIsCutIntoItems(t *testing.T) {
+	rig := newCallsRig(t)
+	refs := reachRepositories(t, rig.st, 42, 64)
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(harnessCall("42", refs, "read")))
+	checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
+	var ans contracts.RunCredentialAnswer
+	json.Unmarshal(got.body, &ans)
+	if err := ans.Check(time.Now()); err != nil {
+		t.Error(err)
+	}
+	apply := ans.Credential.Apply
+	seen := map[string]bool{}
+	for i, item := range apply {
+		if len(item.Paths) < 1 || len(item.Paths) > 32 || !slices.Equal(item.Hosts, []string{"github.com"}) {
+			t.Errorf("item %d has %d paths on %v", i, len(item.Paths), item.Hosts)
+		}
+		for _, p := range item.Paths {
+			if seen[p] {
+				t.Errorf("the path %s is in two items", p)
+			}
+			seen[p] = true
+		}
+	}
+	if len(apply) != 4 || len(seen) != 128 {
+		t.Errorf("%d items with %d paths, want 4 items with 128 paths", len(apply), len(seen))
 	}
 }
 

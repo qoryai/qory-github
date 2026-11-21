@@ -218,7 +218,7 @@ Qory Apiary has a list of paths for each purpose and access:
   of each repository. A call with access `write` lists one repository. If a repository is
   not a live repository of the installation that the call's connection is linked to, the
   call fails with `403 resource_not_covered`.
-- The answer has at most 16 items of 1 to 32 paths each, and at most 512 paths together.
+- The answer has at most 16 items of 1 to 32 paths each, so at most 512 paths together.
   A `read` call adds 4 paths for each repository, and `/graphql` once, so one call covers
   127 repositories. A call for more fails with `403 resource_not_covered`, and nothing is
   minted. A host that has more than 32 paths has several items of at most 32 paths, and

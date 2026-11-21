@@ -544,7 +544,8 @@ func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (i
 // does a call that lists a resource twice. A call for work with a grant_ref, with no
 // connection_id, or with access write and other than one resource gets 400
 // invalid_request here too, beside the schema. A call whose repositories do not fit
-// the answer, see [fitsAnswer], gets 403 resource_not_covered before anything is minted.
+// the answer's 16 items of 32 paths gets 403 resource_not_covered before anything is
+// minted.
 func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredential, at time.Time) (int, any) {
 	if len(req.Resources) == 0 || len(slices.Compact(slices.Sorted(slices.Values(req.Resources)))) != len(req.Resources) {
 		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
@@ -566,8 +567,10 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		return status, refusal
 	}
 	// The paths of a repository do not depend on its name, so a list of empty ones counts
-	// the paths of the answer before the mint.
-	if !fitsAnswer(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, len(ids)))) {
+	// the items of the answer before the mint. A read call covers at most 127
+	// repositories: 4 paths for each, and /graphql once. A harness call has 2 paths for
+	// each, so its 64 repositories fit.
+	if len(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, len(ids)))) > maxApplyItems {
 		c.log().Info("the paths of the run credential's repositories do not fit in the answer", slog.Int64("installation", installation), slog.Int("resources", len(ids)))
 		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	}
@@ -614,11 +617,10 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 }
 
 // The limits of the apply of a run credential answer, run-credential-answer.schema.json:
-// at most 16 items of 1 to 32 paths each, and 512 paths together.
+// at most 16 items of 1 to 32 paths each, which makes at most 512 paths together.
 const (
 	maxApplyItems = 16
 	maxItemPaths  = 32
-	maxApplyPaths = 512
 )
 
 // runCredentialUses is the apply of a run credential for purpose and access:
@@ -652,18 +654,6 @@ func runCredentialUses(purpose, access string, repos []github.Repository) []gith
 		}
 	}
 	return items
-}
-
-// fitsAnswer is whether uses are within the answer's limits: at most [maxApplyItems]
-// items and [maxApplyPaths] paths. One call covers at most floor(512 / p) resources,
-// where p is the paths one resource adds, so a call over that gets 403
-// resource_not_covered.
-func fitsAnswer(uses []github.Apply) bool {
-	paths := 0
-	for _, u := range uses {
-		paths += len(u.Paths)
-	}
-	return len(uses) <= maxApplyItems && paths <= maxApplyPaths
 }
 
 // harnessGrant is the installation of grant and the repositories of resources for a

@@ -15,11 +15,14 @@ change what the program does, and notes it under Upgrading.
   one credential with the paths of each repository. A call with access `write` still lists
   one repository. A call fails with `403 resource_not_covered` when a repository belongs
   to another installation, and with `400 invalid_request` when it lists a resource twice.
-  The answer has at most 16 items of 1 to 32 paths and 512 paths together, so a host with more than 32 paths has
-  several items. A `read` call adds 4 paths for each repository, and `/graphql` once, so
-  one call covers 127 repositories; a call for more gets `403 resource_not_covered`, and
-  nothing is minted. Before, a call for `work` with other than one resource got
-  `400 invalid_request`.
+  The answer has at most 16 items of 1 to 32 paths, so at most 512 paths together, and a
+  host with more than 32 paths has several items. A `read` call adds 4 paths for each
+  repository, and `/graphql` once, so one call covers 127 repositories; a call for more
+  gets `403 resource_not_covered`, and nothing is minted. Before, a call for `work` with
+  other than one resource got `400 invalid_request`.
+- A run credential call for a harness with more than 16 repositories now answers in
+  several items of at most 32 paths. Before, it answered one item with all paths, which
+  was more than Forager takes in one item.
 - `qory-github-server serve` opens or updates the pull request for each `change_request`
   entry of the kind `pull-request` in Qory Apiary's change feed, in Go, over GitHub's REST
   API, with an installation token of the App for that one repository with
