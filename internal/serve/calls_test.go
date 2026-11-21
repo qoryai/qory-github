@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/qoryai/forager/accesskey"
+	"github.com/qoryai/forager/policy"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
 	"github.com/qoryai/qory-github/internal/store"
@@ -442,7 +443,31 @@ func harnessCall(grant string, resources []string, access string) string {
 // workCall is a run-credential call's members for work under the connection, with the
 // one resource ref.
 func workCall(connection, ref, access string) string {
-	return `"connection_id":"` + connection + `","resources":["` + ref + `"],"access":"` + access + `","purpose":"work"`
+	return workCalls(connection, []string{ref}, access)
+}
+
+// workCalls is a run-credential call's members for work under the connection, with the
+// resource refs.
+func workCalls(connection string, refs []string, access string) string {
+	return `"connection_id":"` + connection + `","resources":["` + strings.Join(refs, `","`) + `"],"access":"` + access + `","purpose":"work"`
+}
+
+// reachRepositories makes n repositories acme/r000, acme/r001 and so on, which the
+// installation reaches, and returns their refs. The fake GitHub knows them until the
+// test ends.
+func reachRepositories(t *testing.T, st *store.Store, installation int64, n int) []string {
+	t.Helper()
+	refs := make([]string, n)
+	for i := range refs {
+		name := fmt.Sprintf("acme/r%03d", i)
+		knownIDs[name] = 3_000_000 + int64(i)
+		t.Cleanup(func() { delete(knownIDs, name) })
+		refs[i] = refOf(name)
+		if err := setReach(st, refs[i], installation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return refs
 }
 
 // TestARunCredentialForWorkMapsTheAccess pins a run credential for work: access read
@@ -546,6 +571,27 @@ func TestTheRunCredentialUsesFollowThePurposeAndTheAccess(t *testing.T) {
 	}
 }
 
+// TestTheRunCredentialUsesAreCutIntoItemsOf32Paths pins runCredentialUses for 20
+// repositories: a read call's git paths, 40 of them, are two items of 32 and 8 paths in
+// order, its API paths, 41 with /graphql, two items of 32 and 9.
+func TestTheRunCredentialUsesAreCutIntoItemsOf32Paths(t *testing.T) {
+	repos := make([]github.Repository, 20)
+	for i := range repos {
+		repos[i] = github.Repository{Owner: "acme", Name: fmt.Sprintf("r%02d", i)}
+	}
+	var got []string
+	for _, u := range runCredentialUses("work", "read", repos) {
+		got = append(got, fmt.Sprintf("%s %s %s %d", u.Hosts, u.Scheme, u.Username, len(u.Paths)))
+	}
+	want := []string{"[github.com] basic x-access-token 32", "[github.com] basic x-access-token 8", "[api.github.com] bearer  32", "[api.github.com] bearer  9"}
+	if !slices.Equal(got, want) {
+		t.Errorf("the items are %q, want %q", got, want)
+	}
+	if first := runCredentialUses("work", "read", repos)[0].Paths; first[0] != "/acme/r00.git/*" || first[31] != "/acme/r15/*" {
+		t.Errorf("the first item has the paths %q", first)
+	}
+}
+
 // TestTheRunPermissionsFollowThePurposeAndTheAccess pins runPermissions: work with write
 // has contents write and nothing else, work with read keeps contents, metadata and
 // pull_requests read, and a harness has contents read, whatever the access.
@@ -601,8 +647,8 @@ func TestARunCredentialForAHarnessReadsContentsOnGitHubAlone(t *testing.T) {
 // empty resources list gets 400 invalid_request and mints nothing: through the route,
 // where the schema refuses it, and past the schema, where the code refuses it, since a
 // mint that lists no repository covers every repository of the installation. Past the
-// schema, a call for work with a grant_ref, with no connection_id or with two resources
-// gets 400 invalid_request too.
+// schema, a call for work with a grant_ref, with no connection_id, with access write and
+// two resources, or with a resource twice gets 400 invalid_request too.
 func TestARunCredentialWithNoResourcesMintsNothing(t *testing.T) {
 	rig := newCallsRig(t)
 	for _, members := range []string{
@@ -619,7 +665,9 @@ func TestARunCredentialWithNoResourcesMintsNothing(t *testing.T) {
 		"harness, no resources":      {GrantRef: "42", Resources: []string{}, Access: "read", Purpose: "harness"},
 		"work with a grant_ref":      {GrantRef: "42", ConnectionID: testConnection, Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
 		"work with no connection":    {Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
-		"work with two resources":    {ConnectionID: testConnection, Resources: []string{widgetsRef, gadgetsRef}, Access: "read", Purpose: "work"},
+		"work write, two resources":  {ConnectionID: testConnection, Resources: []string{widgetsRef, gadgetsRef}, Access: "write", Purpose: "work"},
+		"work with a repeat":         {ConnectionID: testConnection, Resources: []string{widgetsRef, gadgetsRef, widgetsRef}, Access: "read", Purpose: "work"},
+		"harness with a repeat":      {GrantRef: "42", Resources: []string{widgetsRef, widgetsRef}, Access: "read", Purpose: "harness"},
 		"work with a bad connection": {ConnectionID: "ac_", Resources: []string{widgetsRef}, Access: "read", Purpose: "work"},
 	} {
 		req.Version = 1
@@ -1008,4 +1056,134 @@ func TestRunReadsPublicRepositoriesFromThePublicHosts(t *testing.T) {
 		}
 	}
 	pub.checkAnonymous(t)
+}
+
+// TestAReadCallForSeveralRepositoriesMintsOneToken pins a work call with access read for
+// three repositories of the installation 42: one mint, contents, metadata and
+// pull_requests read, with the three repositories' ids in the order of the call, and one
+// answer with the paths of each repository.
+func TestAReadCallForSeveralRepositoriesMintsOneToken(t *testing.T) {
+	rig := newCallsRig(t)
+	if err := setReach(rig.st, refOf("acme/old"), 42); err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{widgetsRef, gadgetsRef, refOf("acme/old")}
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, refs, "read")))
+	checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
+	want := `{"permissions":{"contents":"read","metadata":"read","pull_requests":"read"},"repository_ids":[` + strings.Join(refs, ",") + `]}`
+	if mints := rig.gh.mintsSoFar(); len(mints) != 1 || mints[0] != want {
+		t.Errorf("minted %q, want %s", mints, want)
+	}
+	var ans contracts.RunCredentialAnswer
+	json.Unmarshal(got.body, &ans)
+	if len(ans.Credential.Apply) != 2 || len(ans.Credential.Apply[0].Paths) != 6 || len(ans.Credential.Apply[1].Paths) != 7 {
+		t.Errorf("answered %s, want 6 git paths and 7 API paths", shown(got.body))
+	}
+}
+
+// TestAWriteCallForSeveralRepositoriesGets400 pins that a work call with access write
+// and two resources gets 400 invalid_request, through the route and past the schema, and
+// mints nothing.
+func TestAWriteCallForSeveralRepositoriesGets400(t *testing.T) {
+	rig := newCallsRig(t)
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, []string{widgetsRef, gadgetsRef}, "write")))
+	checkAnswer(t, got, http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
+	status, answer := rig.calls.runCredentialFor(context.Background(), contracts.RunCredential{Version: 1, ConnectionID: testConnection, Resources: []string{widgetsRef, gadgetsRef}, Access: "write", Purpose: "work"}, time.Now())
+	if refusal, _ := answer.(contracts.Refusal); status != http.StatusBadRequest || refusal.Error != codeInvalidRequest {
+		t.Errorf("past the schema: answered %d %v", status, answer)
+	}
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Errorf("minted %q for a refused call", mints)
+	}
+}
+
+// TestTheAnswerForManyRepositoriesFitsTheContractsLimits pins the answer to a read call
+// for 40 repositories and for 127, the most one call covers: a read call writes 4 paths
+// for each repository, and /graphql once, so 127 repositories have 509 paths and 128
+// have 513. The answer has at most 16 items of 1 to 32 paths, 512 paths together, no
+// path twice, no two paths of one host that overlap, and passes the answer's Check.
+// A call for 128 gets 403 resource_not_covered and mints nothing.
+func TestTheAnswerForManyRepositoriesFitsTheContractsLimits(t *testing.T) {
+	for _, n := range []int{40, 127} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			rig := newCallsRig(t)
+			refs := reachRepositories(t, rig.st, 42, n)
+			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, refs, "read")))
+			checkAnswer(t, got, 200, "run-credential-answer.schema.json", "")
+			var minted struct {
+				IDs []int64 `json:"repository_ids"`
+			}
+			mints := rig.gh.mintsSoFar()
+			if len(mints) != 1 || json.Unmarshal([]byte(mints[0]), &minted) != nil || len(minted.IDs) != n {
+				t.Errorf("minted %q, want one mint of %d repositories", mints, n)
+			}
+			var ans contracts.RunCredentialAnswer
+			json.Unmarshal(got.body, &ans)
+			if err := ans.Check(time.Now()); err != nil {
+				t.Error(err)
+			}
+			apply := ans.Credential.Apply
+			total := 0
+			seen := map[string]bool{}
+			for i, item := range apply {
+				if len(item.Paths) < 1 || len(item.Paths) > 32 {
+					t.Errorf("item %d has %d paths", i, len(item.Paths))
+				}
+				total += len(item.Paths)
+				for _, p := range item.Paths {
+					if seen[item.Hosts[0]+p] {
+						t.Errorf("the path %s of %s is in two items", p, item.Hosts[0])
+					}
+					seen[item.Hosts[0]+p] = true
+					for _, other := range apply[:i] {
+						if other.Hosts[0] != item.Hosts[0] {
+							continue
+						}
+						for _, q := range other.Paths {
+							if policy.OverlapPaths(p, q) {
+								t.Errorf("the paths %s and %s of %s overlap", p, q, item.Hosts[0])
+							}
+						}
+					}
+				}
+			}
+			if len(apply) > 16 || total != 4*n+1 {
+				t.Errorf("%d items with %d paths, want at most 16 items and %d paths", len(apply), total, 4*n+1)
+			}
+		})
+	}
+	rig := newCallsRig(t)
+	refs := reachRepositories(t, rig.st, 42, 128)
+	got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, refs, "read")))
+	checkAnswer(t, got, http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+	if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+		t.Errorf("minted %q for a call over the limit", mints)
+	}
+}
+
+// TestAReadCallWithARepositoryOfAnotherInstallationGets403 pins that a work call is not
+// covered, 403 resource_not_covered with nothing minted, when one of its repositories is
+// reached by another installation, 43: one linked to the call's connection too, and one
+// linked to another connection.
+func TestAReadCallWithARepositoryOfAnotherInstallationGets403(t *testing.T) {
+	for name, connection := range map[string]string{"the same connection": testConnection, "another connection": otherConnection} {
+		t.Run(name, func(t *testing.T) {
+			rig := newCallsRig(t)
+			if err := grantedLink(rig.st, 43, connection, linkLive); err != nil {
+				t.Fatal(err)
+			}
+			foreign := refOf("acme/old")
+			if err := setReach(rig.st, foreign, 43); err != nil {
+				t.Fatal(err)
+			}
+			got := rig.send(t, signedCall{path: contracts.RunCredentialPath}, rig.callBody(workCalls(testConnection, []string{widgetsRef, foreign}, "read")))
+			checkAnswer(t, got, http.StatusForbidden, "refusal.schema.json", codeResourceNotCovered)
+			if !strings.Contains(rig.log.String(), `"connection":"`+testConnection+`","resource":"`+foreign+`"`) {
+				t.Errorf("no line contains the connection and the resource: %s", rig.log.String())
+			}
+			if mints := rig.gh.mintsSoFar(); len(mints) != 0 {
+				t.Errorf("minted %q for a refused call", mints)
+			}
+		})
+	}
 }

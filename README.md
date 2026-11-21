@@ -212,6 +212,17 @@ Qory Apiary has a list of paths for each purpose and access:
   for a harness has `contents` `read`.
 - A run with the access `write-no-push` (a checkout that is writable but cannot push)
   gets the `read` credential: Qory Apiary sends the call with access `read` for it.
+- A call for `work` with access `read` may list several repositories of one connection
+  in `resources`. Qory-github mints one token with `contents`, `metadata` and
+  `pull_requests` `read` for those repositories, and answers one credential with the paths
+  of each repository. A call with access `write` lists one repository. If a repository is
+  not a live repository of the installation that the call's connection is linked to, the
+  call fails with `403 resource_not_covered`.
+- The answer has at most 16 items of 1 to 32 paths each, and at most 512 paths together.
+  A `read` call adds 4 paths for each repository, and `/graphql` once, so one call covers
+  127 repositories. A call for more fails with `403 resource_not_covered`, and nothing is
+  minted. A host that has more than 32 paths has several items of at most 32 paths, and
+  no path is in two items.
 
 ### What the agent sees
 
