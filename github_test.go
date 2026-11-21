@@ -548,6 +548,25 @@ func TestUsesFillOneTemplateAtATimeForEveryRepository(t *testing.T) {
 	}
 }
 
+// TestNoHostIsInTwoItemsOfTheSourceApply pins that each host of the source role's apply
+// is in one item. The adapter groups no filled paths by host, scheme and headers, since
+// no two items share a host; a description that breaks this fails here, and the grouping
+// must be built then.
+func TestNoHostIsInTwoItemsOfTheSourceApply(t *testing.T) {
+	seen := map[string]int{}
+	for i, a := range Describe("").Roles.Source.Apply {
+		for _, h := range a.Hosts {
+			if first, ok := seen[h]; ok {
+				t.Errorf("the host %s is in the items %d and %d of the source role's apply", h, first, i)
+			}
+			seen[h] = i
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("the source role's apply has the hosts %v, want github.com and api.github.com", seen)
+	}
+}
+
 // TestTheSourceApplyIsUsesForTheTarget pins the source role's apply to [Uses]: filled
 // with a run's target, owner/name, it is what Uses returns for that one repository, so
 // the credential of a run-credential call for work on the target fits inside it.
