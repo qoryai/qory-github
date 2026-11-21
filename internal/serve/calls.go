@@ -23,6 +23,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/exactjson"
 	"github.com/qoryai/qory-github/internal/store"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -348,7 +349,7 @@ func callTime(body []byte) (time.Time, bool) {
 	var doc struct {
 		Time string `json:"time"`
 	}
-	if json.Unmarshal(body, &doc) != nil {
+	if exactjson.Unmarshal(body, &doc) != nil {
 		return time.Time{}, false
 	}
 	return passExpiry(doc.Time)
@@ -421,7 +422,7 @@ func decodeCall(name string, body []byte, doc any) bool {
 	if err != nil || schema.Validate(v) != nil {
 		return false
 	}
-	return json.Unmarshal(body, doc) == nil
+	return exactjson.Unmarshal(body, doc) == nil
 }
 
 // jsonRules refuses a body that is not one JSON value, that repeats a member of an

@@ -9,28 +9,58 @@ change what the program does, and notes it under Upgrading.
 
 ### Added
 
-- `qory-github-server serve` opens or updates the draft pull request for each `submission`
-  entry of Qory Apiary's change feed, in Go, over GitHub's REST API, with an installation
-  token of the App for that one repository with `pull_requests: write` and no other
-  permission. For each repository of the entry it sends Qory Apiary the address of the
-  base commit and of each commit, with or without a draft, and, when the entry asks for a
-  draft, the pull request's number, address, title, state and action, in one reply for the
-  entry. It finds the pull request by its head branch and repository, of any state, and
-  never by its base branch, opens a draft when there is none, and changes only the text
-  between the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and
-  the title only while it equals the previous version's title. A closed or merged pull
-  request is not changed. One repository that fails does not stop the others. A repository
-  that GitHub refuses for good is reported to Qory Apiary with the reason `not_permitted`,
-  `branch_gone`, `too_long` or `forge_refused`, and a `detail` with the fix and GitHub's
-  status and message; one that still fails when the retries end, after a day, is reported
-  with the reason of the last error of its tries: `unreachable` for a failure to reach
-  GitHub, a rate limit, a 408 or a 5xx, and the reason of the refusal for an answer such
-  as a 404 or a 401 that kept coming. A 301 or 308, also on the lookup of the
-  installation, is `forge_refused`, and its fix says GitHub moved the repository; a 302,
-  307, 404 or 403 on the lookup stays `not_permitted`. The App needs the permission Pull
-  requests: read and write. The title in the reply has none of the control, bidirectional
-  or invisible characters that Qory Apiary refuses.
-- The description of the adapter has `submissions: true` in `roles.source`.
+- `qory-github-server serve` opens or updates the pull request for each `change_request`
+  entry of the kind `pull-request` in Qory Apiary's change feed, in Go, over GitHub's REST
+  API, with an installation token of the App for that one repository with
+  `pull_requests: write` and no other permission. An entry has one target, so a change
+  request for two repositories is two entries. The adapter finds the repository by the
+  target's `collection`, the repository's id, so a renamed repository still gets its pull
+  request; the address of the target is checked for the host and for the shape
+  `owner/name` and is not what finds the repository. For each entry it sends Qory Apiary
+  one reply with the address of the base commit and of each commit in `data`, the pull
+  request's `address` (its `url`, and its number as `ref`), the action `created`,
+  `updated` or `kept`, and in `data` the pull request's number, title and state. It
+  updates the pull request at the entry's `previous.address` when the `ref` there is a
+  pull request number from the entry's branch, and otherwise finds the pull request by its
+  head branch and repository, and never by its base branch. Found by the branch, only an
+  open pull request counts, so an entry with no `previous.address`, or with one that is
+  unusable or gone, gets a new pull request, with the action `created`, when the branch
+  has only closed or merged ones. It opens a pull request when it finds none, as a draft
+  when `draft` is `true`, and changes only the text between the lines
+  `<!-- qory:start -->` and `<!-- qory:end -->` of the description, and the title only
+  while it equals `previous.title`. It never changes whether a pull request is a draft,
+  and does not change a closed or merged pull request. The adapter reads the members of
+  the `pull-request` artifact type (its schema in the Qory harness is the source):
+  `branch`, `base_branch`, `head`, `base`, `commits`, `steps`, `earlier_commits` and
+  `draft`, and checks each: a branch name that git accepts and that is one line, a full
+  commit id as the address path of each commit and a collection of one line of 1 to 200
+  characters, at least 1 commit and no limit from the adapter on their number (the
+  contract limits an array in `data` to 1024 items, so the reply has at most 1024 commit
+  addresses), a list of steps, each with a `step` of 1 to 128 characters on one line,
+  `earlier_commits` as a whole number from 1, and `draft` as `true` or `false`; data that
+  breaks a rule is reported as `refused`, with the code point of a stopped character in
+  the `detail`. A title that has a control character, U+2028, U+2029 or a format character
+  other than U+200C and U+200D, or no character that is not a space, U+200C or U+200D, is
+  reported as `refused` before any request to GitHub, with a `detail` that starts with the
+  fix; so is a `text` that has a line that is `<!-- qory:start -->` or
+  `<!-- qory:end -->`, since the adapter writes the text between those lines. The same
+  rule for characters applies to the failure `detail`, the account title of a grant and
+  the author name of a comment. An entry of another `change_kind` is reported as
+  `refused`, with a `detail` that starts with the fix. An entry that GitHub refuses for
+  good is reported to Qory Apiary with the reason `not_permitted`, `target_gone`,
+  `too_long` or `refused`, and a `detail` with the fix and GitHub's status and message;
+  one that still fails when the retries end, after a day, is reported with the reason of
+  the last error of its tries: `unreachable` for a failure to reach GitHub, a rate limit,
+  a 408 or a 5xx, and the reason of the refusal for an answer such as a 404 or a 401 that
+  kept coming. A 404, 410, 301 or 308 on the read of the repository by its id is
+  `target_gone`, with the fix to check that the repository exists and the App's
+  installation reaches it. A 301 or 308 on the lookup of the installation or on a pull
+  request call is `target_gone` too, with the fix to link the repository by its
+  new name; a 302, 307, 404 or 403 on the lookup stays `not_permitted`. The App needs the
+  permission Pull requests: read and write. The title in the reply has none of the
+  characters that the title rule stops.
+- The description of the adapter lists the change kind `pull-request` in
+  `roles.source.change_kinds`.
 - The harness module `modules/github`, with the program `bin/open-draft`, declared as the
   module's `submit_program`. It is a POSIX `sh` script that uses `gh`. qory runs it on
   your machine, outside the sandbox that a run uses, once for each repository of a run
@@ -40,11 +70,12 @@ change what the program does, and notes it under Upgrading.
   opens the draft pull request from `QORY_SUBMIT_BRANCH` or edits the one that exists,
   with the login of `gh`. The title it prints has none of the characters that the contract
   refuses; when nothing is left, it prints `QORY_SUBMIT_TITLE`, cleaned the same way. It
-  finds the pull request by its head branch and repository alone, in any state. Of several
-  it takes the highest number that is not closed and not merged, otherwise the highest
-  number. It replaces only the text between the lines `<!-- qory:start -->` and
-  `<!-- qory:end -->` of the description, keeps the title, and changes nothing in a closed or
-  merged pull request. It prints the result as lines (`draft_number`, `draft_url`,
+  finds the open pull request by its head branch and repository alone, and of several it
+  takes the highest number, as the adapter does when it looks up by branch. When the
+  branch has only closed or merged pull requests, it opens a new draft and never reuses
+  them, since the program has no address to keep. It replaces only the text between the
+  lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description and keeps the
+  title. It prints the result as lines (`draft_number`, `draft_url`,
   `draft_title`, `draft_state`, `draft_action`, `commit_url`). Exit 1 means a call to `gh`
   failed or did not finish within 110 seconds, exit 2 an input it cannot use, and exit 3 a
   missing login of `gh`, with ``Run `gh auth login`, then `qory run` again.`` as the first
@@ -87,7 +118,7 @@ change what the program does, and notes it under Upgrading.
   comment's first failure, the adapter logs one line with the `comment_id` and moves
   past the comment.
 - Qory Apiary writes a change feed entry of kind `watch` when a run stores a
-  submission version. The adapter drops each `watch` entry, which changes nothing. The
+  change request version. The adapter drops each `watch` entry, which changes nothing. The
   adapter moves its cursor past the entry and applies the entries after it.
 
 ### Changed
@@ -153,6 +184,65 @@ change what the program does, and notes it under Upgrading.
   transfer changes the `path` and keeps the `ref`. A path of 201 to 256 characters is now
   skipped, with its collection or item, as the contract allows at most 200. An empty path
   is skipped as before.
+- `qory-github-server serve` reads the change feed as a reader that may be older than
+  the writer. It skips an entry of a kind it does not apply, and an entry whose
+  `must_understand` lists a pointer that it does not define or is not a list, and moves
+  its cursor past the entry; it logs one line for each. It ignores a member of the
+  feed's answer, of an entry, of `target` and of `previous` that the schemas do not
+  define. A `previous` with only such members reads as empty, so an entry with
+  `previous` of `{"zz": 1}` opens a new draft. Until this change, the adapter refused
+  the whole answer for such a member, and an entry of an unknown kind stopped the feed.
+  The calls to the adapter that the schemas check (`resolve`, `read`, `read-public` and
+  the run credential) ignore such a member too. A `change_request` entry whose
+  `must_understand` lists a pointer that the adapter does not define, or is not a list,
+  is reported as `refused`, with a `detail` that starts with the fix. A pointer below
+  `data` is defined when it points to a member of the `pull-request` data: `target`,
+  `title`, `text`, `branch`, `base_branch`, `head`, `base` and each of `commits` with
+  their `collection` and `address`, `steps` with `commit` and `step` for each,
+  `earlier_commits`, and `draft`. An entry with a status of its kind that the adapter
+  does not know still stops its answer.
+- `qory-github-server serve` matches the name of a member of a document from Qory Apiary
+  in exact case: the change feed and its entries, the calls to the adapter, the data of
+  a change request, the connect and setup passes, the answers to the grants and to the
+  secrets request, the secrets that it seals and the body of a refusal. Until this
+  change, `Token` beside `token` could replace it, and a `Must_Understand` could replace
+  the `must_understand` list that the document has. `Token` alone now counts as a member
+  that the adapter does not define. A member that appears twice in an object, at any
+  depth, stops the reading of the document, with the same value or another: a page of
+  the feed stops and is read again after the feed's backoff, with its cursor where it
+  was; a call is answered as a call that is not valid; a refusal has no code, so its
+  status decides; and a pass, an answer or the data of a change request is not read.
+  Until this change, the feed, the connect and setup passes, the answers to the grants
+  and to the secrets request, the body of a refusal and the data of a change request kept
+  the last value; a call was already answered as a call that is not valid.
+- `qory-github-server serve` ignores a member that it does not define in the connect
+  pass, the setup pass, the answer to the grants, the answer to the secrets request and
+  the secrets that it seals. It does not read such a document when its `must_understand`
+  lists a pointer to a member that the adapter does not define, or is malformed, and the
+  reason in the log starts with the fix. It does not read a document that has data after
+  the JSON object, as before, or anything before the opening brace, such as a space or a
+  byte order mark. Until this change, the adapter did not read a document with any
+  member that it does not define. The body of a refusal that Qory Apiary sends is read
+  the same way: when the adapter does not read it, the answer has no refusal code. A 409
+  `connection_ended` that the adapter reads ends the connection; a 409 or a 403 without
+  a code does not. The grant report is sent again after every answer that is not final:
+  a 409 `pass_unknown`, a 403 `connection_unknown`, a 409 `connection_suspended`, a 403
+  or a 409 without a code, and a failure that can pass, such as an outage, a timeout or
+  a 429. The waits double from 2 to 60 seconds, also while the connection is suspended,
+  until the connect return expires, 300 seconds after the connect; nothing changes until
+  then. When the connect return expires, the adapter stops the report and drops the
+  installation's link and the records of its repositories, unless Qory Apiary's copy of
+  the grants contains the grant, and the person connects again. The grant end and the
+  first listing are sent again after a wait, with a backoff, on a 409 or a 403 without a
+  code or a 409 `connection_suspended`, and nothing changes. A disconnect, an item or a
+  comment that gets a 409 or a 403 without a code is sent again by the worker, with its
+  backoff, or by the next pull round; on a 409 `connection_suspended` it keeps the
+  repository's records and the next pull round sends it. A 403 without a code never
+  counts toward the end of a connection. A 403 with a code, and a 400 or 413, are
+  handled as before. Until this change, a 409 or a 403 without a code was a refusal for
+  good, so a disconnect that met one dropped the repository's records, and a grant
+  report or a first listing that met one gave up at once. The stored App entry, which
+  `qory-github-server` writes, stays strict.
 
 ### Upgrading
 

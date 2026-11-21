@@ -16,7 +16,7 @@ import (
 // text of a refusal and the detail of its failure report, ends with a period and fits in
 // 100 characters.
 func TestEveryFixLineIsOneSentenceOfAtMost100Characters(t *testing.T) {
-	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, FixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixRunDescription, fixRunTitle, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused} {
+	for _, fix := range []string{FixNotInstalled, FixPermission, FixSuspended, FixAppForbidden, FixUnreachable, FixMoved, fixHeadGone, fixBaseGone, fixBranchGone, fixNoCommits, fixRunDescription, fixRunTitle, fixTitleStopped, fixTitleBlank, fixMarkerLine, fixPullBody, fixPullTitle, fixPullText, FixForgeRefused, FixGone, FixChangeKind, FixChangeData} {
 		if n := utf8.RuneCountInString(fix); n > 100 || !strings.HasSuffix(fix, ".") || strings.Contains(fix, "\n") {
 			t.Errorf("%d characters: %q", n, fix)
 		}
@@ -36,25 +36,47 @@ func TestOneLineCleansAndCuts(t *testing.T) {
 	}
 }
 
-// TestTheChosenPullRequestIsTheOpenOneWithTheHighestNumber: of pull requests from the
-// branch, an open one is chosen over any closed or merged one, the highest number first;
-// with none open, the closed or merged one with the highest number.
-func TestTheChosenPullRequestIsTheOpenOneWithTheHighestNumber(t *testing.T) {
-	pull := func(n int, state string) ghPull { return ghPull{Number: n, State: state} }
+// TestTheChosenPullRequestIsTheOneWithTheHighestNumber: of the open pull requests from
+// the branch, the one with the highest number is chosen.
+func TestTheChosenPullRequestIsTheOneWithTheHighestNumber(t *testing.T) {
+	pull := func(n int) ghPull { return ghPull{Number: n, State: "open"} }
 	for _, tc := range []struct {
 		pulls []ghPull
 		want  int
 	}{
-		{[]ghPull{pull(1, "open"), pull(2, "open")}, 2},
-		{[]ghPull{pull(3, "open"), pull(2, "open")}, 3},
-		{[]ghPull{pull(1, "open"), pull(5, "closed")}, 1},
-		{[]ghPull{pull(5, "closed"), pull(1, "open"), pull(7, "closed")}, 1},
-		{[]ghPull{pull(4, "closed"), pull(6, "closed"), pull(2, "closed")}, 6},
-		{[]ghPull{pull(9, "closed")}, 9},
+		{[]ghPull{pull(1), pull(2)}, 2},
+		{[]ghPull{pull(3), pull(2)}, 3},
+		{[]ghPull{pull(9)}, 9},
 	} {
 		if got := chosenOf(tc.pulls); got.Number != tc.want {
 			t.Errorf("%v: %d, want %d", tc.pulls, got.Number, tc.want)
 		}
+	}
+}
+
+// TestSubmitDraftStopsATitleOrATextThatBreaksTheRulesBeforeAnyRequest: SubmitDraft itself
+// returns a refusal with the reason refused for a text with a marker line and for a title
+// that the title rule stops, and sends nothing to GitHub.
+func TestSubmitDraftStopsATitleOrATextThatBreaksTheRulesBeforeAnyRequest(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	for _, tc := range []struct{ name, title, text, fix string }{
+		{"a marker line", "T", "a\n<!-- qory:end -->\nb", fixMarkerLine},
+		{"a stopped character", "T\u202e", "D", fixTitleStopped},
+		{"a blank title", " \u200d ", "D", fixTitleBlank},
+	} {
+		_, err := Client{API: srv.URL}.SubmitDraft(context.Background(), nil, "tok", Draft{Repository: Repository{Owner: "acme", Name: "widgets"}, Branch: "qory/wi_1", Base: "main", Title: tc.title, Description: tc.text})
+		refused, ok := err.(*SubmitRefused)
+		if !ok || refused.Reason != ReasonRefused || refused.Fix != tc.fix {
+			t.Errorf("%s: %#v", tc.name, err)
+		}
+	}
+	if requests != 0 {
+		t.Errorf("%d requests reached GitHub", requests)
 	}
 }
 
@@ -70,7 +92,7 @@ func TestAnAnswerThatEchoesTheTokenDoesNotCarryItInTheRefusal(t *testing.T) {
 	defer srv.Close()
 	_, err := Client{API: srv.URL}.SubmitDraft(context.Background(), nil, tok, Draft{Repository: Repository{Owner: "acme", Name: "widgets"}, Branch: "qory/wi_1", Base: "main", Title: "T", Description: "D"})
 	refused, ok := err.(*SubmitRefused)
-	if !ok || refused.Reason != ReasonForgeRefused || refused.Status != 400 || strings.Contains(refused.Message, tok) || !strings.Contains(refused.Detail(), "GitHub returned 400: Bad credentials [removed] sent") {
+	if !ok || refused.Reason != ReasonRefused || refused.Status != 400 || strings.Contains(refused.Message, tok) || !strings.Contains(refused.Detail(), "GitHub returned 400: Bad credentials [removed] sent") {
 		t.Errorf("%#v", err)
 	}
 }
@@ -125,9 +147,9 @@ func TestScrubbedKeepsWhatErrorsFindAndCleansTheText(t *testing.T) {
 	if !errors.Is(Scrubbed(fmt.Errorf("x: %w", ErrNotInstalled), secret), ErrNotInstalled) || Scrubbed(nil, secret) != nil {
 		t.Error("errors.Is no longer finds the error, or nil is not nil")
 	}
-	refused := Scrubbed(&SubmitRefused{Reason: ReasonForgeRefused, Fix: FixForgeRefused, Err: cause, Status: 400, Message: "a " + secret + "\nb"}, secret)
+	refused := Scrubbed(&SubmitRefused{Reason: ReasonRefused, Fix: FixForgeRefused, Err: cause, Status: 400, Message: "a " + secret + "\nb"}, secret)
 	var r *SubmitRefused
-	if !errors.As(refused, &r) || r.Reason != ReasonForgeRefused || r.Fix != FixForgeRefused || r.Message != "a [removed] b" || strings.Contains(refused.Error(), secret[:5]) || !strings.HasPrefix(refused.Error(), FixForgeRefused+" ") {
+	if !errors.As(refused, &r) || r.Reason != ReasonRefused || r.Fix != FixForgeRefused || r.Message != "a [removed] b" || strings.Contains(refused.Error(), secret[:5]) || !strings.HasPrefix(refused.Error(), FixForgeRefused+" ") {
 		t.Errorf("%#v: %q", r, refused.Error())
 	}
 }
@@ -135,7 +157,7 @@ func TestScrubbedKeepsWhatErrorsFindAndCleansTheText(t *testing.T) {
 // TestEndedRefusalByTheLastCause: the reason of a repository whose retries ended is by
 // the error of its last try: 5xx, 408, a rate limit, a timeout and a failed connection are
 // unreachable; a 401, not_permitted; any other 4xx, and an answer that is no JSON,
-// forge_refused; a refusal stays what it is.
+// refused; a moved repository, target_gone; a refusal stays what it is.
 func TestEndedRefusalByTheLastCause(t *testing.T) {
 	answer := func(status int) error { return &answerError{what: "w", status: status, message: "m"} }
 	limited := &answerError{what: "w", status: 403, message: "rate limit", limited: true}
@@ -154,20 +176,20 @@ func TestEndedRefusalByTheLastCause(t *testing.T) {
 		{"401", answer(401), ReasonNotPermitted},
 		{"403 that is no rate limit", answer(403), ReasonNotPermitted},
 		{"404", answer(404), ReasonNotPermitted},
-		{"301, a moved repository", answer(301), ReasonForgeRefused},
-		{"308, a moved repository", answer(308), ReasonForgeRefused},
-		{"302, a redirect that is not followed", answer(302), ReasonForgeRefused},
-		{"307, a redirect that is not followed", answer(307), ReasonForgeRefused},
-		{"the redirect of a mint", errMintRedirected, ReasonForgeRefused},
-		{"an answer without a token", unreadableAt(201, "minting: GitHub answered without a token", nil), ReasonForgeRefused},
-		{"an expiry that is no time", unreadableAt(201, `minting: the expiry "x" is not a time`, errors.New("x")), ReasonForgeRefused},
+		{"301, a moved repository", answer(301), ReasonTargetGone},
+		{"308, a moved repository", answer(308), ReasonTargetGone},
+		{"302, a redirect that is not followed", answer(302), ReasonRefused},
+		{"307, a redirect that is not followed", answer(307), ReasonRefused},
+		{"the redirect of a mint", errMintRedirected, ReasonRefused},
+		{"an answer without a token", unreadableAt(201, "minting: GitHub answered without a token", nil), ReasonRefused},
+		{"an expiry that is no time", unreadableAt(201, `minting: the expiry "x" is not a time`, errors.New("x")), ReasonRefused},
 		{"a canceled call", context.Canceled, ReasonUnreachable},
-		{"an error that is no answer and no failure to reach GitHub", errors.New("no private key"), ReasonForgeRefused},
-		{"400", answer(400), ReasonForgeRefused},
-		{"409", answer(409), ReasonForgeRefused},
-		{"422", answer(422), ReasonForgeRefused},
-		{"an unreadable answer", unreadable(200, "reading", errors.New("invalid character")), ReasonForgeRefused},
-		{"a refusal", &SubmitRefused{Reason: ReasonBranchGone, Fix: fixHeadGone, Err: errors.New("x")}, ReasonBranchGone},
+		{"an error that is no answer and no failure to reach GitHub", errors.New("no private key"), ReasonRefused},
+		{"400", answer(400), ReasonRefused},
+		{"409", answer(409), ReasonRefused},
+		{"422", answer(422), ReasonRefused},
+		{"an unreadable answer", unreadable(200, "reading", errors.New("invalid character")), ReasonRefused},
+		{"a refusal", &SubmitRefused{Reason: ReasonTooLong, Fix: fixRunTitle, Err: errors.New("x")}, ReasonTooLong},
 	} {
 		got := EndedRefusal(fmt.Errorf("%w (entry)", tc.cause))
 		if got.Reason != tc.reason || got.Fix == "" || got.Detail() == "" {
@@ -185,7 +207,7 @@ func TestTheDetailOfAnEndedRefusalHasNoTokenThatTheMessageHas(t *testing.T) {
 	const plain = "a-plain-secret-value"
 	const token = "ghs_AbCdEfGh1234567890"
 	cause := &answerError{what: "w", status: 502, message: "bad creds for xx" + token + " and token_" + token + "\n" + plain[:6] + "\n" + plain[6:] + " end"}
-	ended := EndedRefusal(fmt.Errorf("%w (submission)", Scrubbed(cause, plain)))
+	ended := EndedRefusal(fmt.Errorf("%w (change request)", Scrubbed(cause, plain)))
 	detail := ended.Detail()
 	if ended.Reason != ReasonUnreachable || strings.Contains(detail, "AbCdEf") || strings.Contains(detail, plain[:6]) || strings.Contains(detail, "secret") || !strings.HasSuffix(detail, "end") || strings.ContainsAny(detail, "\r\n") {
 		t.Errorf("%s: %q", ended.Reason, detail)
@@ -233,7 +255,7 @@ func TestACredentialIsRemovedInEveryShapeItTakes(t *testing.T) {
 				t.Errorf("%s: %q has %q", tc.name, got, part)
 			}
 		}
-		if !strings.Contains(got, "[removed]") || LineForbidden.MatchString(got) {
+		if !strings.Contains(got, "[removed]") || strings.ContainsFunc(got, LineStopped) {
 			t.Errorf("%s: %q", tc.name, got)
 		}
 	}
@@ -298,7 +320,7 @@ func TestAnUnreadableAnswerOfACallIsUnreadable(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(body)) }))
 		_, _, err := Client{API: srv.URL}.RepositoryInstallation(context.Background(), appID, key(t), Repository{Owner: "acme", Name: "widgets"})
 		srv.Close()
-		if !errors.Is(err, ErrUnreadableAnswer) || errors.Is(err, ErrTransport) || EndedRefusal(err).Reason != ReasonForgeRefused {
+		if !errors.Is(err, ErrUnreadableAnswer) || errors.Is(err, ErrTransport) || EndedRefusal(err).Reason != ReasonRefused {
 			t.Errorf("%s: %v", body, err)
 		}
 	}
@@ -315,7 +337,7 @@ func TestAnUnreadableAnswerOfACallIsUnreadable(t *testing.T) {
 // GitHub answers the installation lookup and the mint with the right status and starts
 // the body, but the connection closes before it ends, or stays silent until the client's
 // timeout. Each ends as [ReasonUnreachable] and wraps [ErrTransport]. A body that is
-// complete but no JSON ends as [ReasonForgeRefused].
+// complete but no JSON ends as [ReasonRefused].
 func TestAnAnswerCutDuringItsBodyIsUnreachableAndACompleteOneThatIsNoJSONIsForgeRefused(t *testing.T) {
 	repos, _ := ParseRepositories("acme/widgets")
 	lookup := func(c Client) error {
@@ -351,7 +373,7 @@ func TestAnAnswerCutDuringItsBodyIsUnreachableAndACompleteOneThatIsNoJSONIsForge
 		{"a complete body that is no JSON", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`<html>Unicorn</html>`))
-		}, ReasonForgeRefused, false},
+		}, ReasonRefused, false},
 	} {
 		for _, call := range []struct {
 			name string
@@ -438,15 +460,15 @@ func TestARedirectOnTheInstallationLookupSaysTheRepositoryMovedOnlyFor301And308(
 	}
 }
 
-// TestAMovedPullRequestRepositoryIsForgeRefusedWithTheMovedFix: GitHub's 301 and 308 to a
-// request of a submission are [ReasonForgeRefused] with [FixMoved], with the answer's
+// TestAMovedPullRequestRepositoryIsTargetGoneWithTheMovedFix: GitHub's 301 and 308 to a
+// request of a change request are [ReasonTargetGone] with [FixMoved], with the answer's
 // status and message in the detail, and never [ReasonNotPermitted].
-func TestAMovedPullRequestRepositoryIsForgeRefusedWithTheMovedFix(t *testing.T) {
+func TestAMovedPullRequestRepositoryIsTargetGoneWithTheMovedFix(t *testing.T) {
 	for _, status := range []int{301, 308} {
 		a := &apiReply{status: status, body: []byte(`{"message":"Moved Permanently"}`)}
 		err := submitFailed(a, "listing the pull requests", false)
 		var refused *SubmitRefused
-		if !errors.As(err, &refused) || refused.Reason != ReasonForgeRefused || refused.Fix != FixMoved || refused.Status != status {
+		if !errors.As(err, &refused) || refused.Reason != ReasonTargetGone || refused.Fix != FixMoved || refused.Status != status {
 			t.Errorf("%d: %v", status, err)
 		}
 	}

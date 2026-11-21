@@ -59,31 +59,16 @@ const maxAccountTitle = 1024
 
 // accountOf is the account of an installation's grant, as the grant's report sends it:
 // ref, the GitHub account's id in decimal, and title, its login. A login that is not
-// one line of 1 to [maxAccountTitle] characters with none of the characters the
-// contract does not allow in a line, see [lineRune], is sent as the ref instead, so the
-// report never breaks the contract.
+// one line of 1 to [maxAccountTitle] characters with none of the characters that
+// [github.LineStopped] stops, is sent as the ref instead, so the report never breaks the
+// contract.
 func accountOf(a github.Account) contracts.Account {
 	ref := strconv.FormatInt(a.ID, 10)
 	title := a.Login
-	if n := utf8.RuneCountInString(title); n == 0 || n > maxAccountTitle || !utf8.ValidString(title) || strings.IndexFunc(title, func(r rune) bool { return !lineRune(r) }) >= 0 {
+	if n := utf8.RuneCountInString(title); n == 0 || n > maxAccountTitle || !utf8.ValidString(title) || strings.ContainsFunc(title, github.LineStopped) {
 		title = ref
 	}
 	return contracts.Account{Ref: ref, Title: title}
-}
-
-// lineRune is whether r may be in a line of the contract, grant.schema.json's account
-// title: no control character, no bidirectional control and none of the format
-// characters that are usually not shown.
-func lineRune(r rune) bool {
-	switch {
-	case r <= 0x1f, r >= 0x7f && r <= 0x9f:
-		return false
-	case r == 0xad, r == 0x61c, r == 0x180e, r == 0x200b, r == 0x200e, r == 0x200f, r == 0x2028, r == 0x2029, r == 0xfeff:
-		return false
-	case r >= 0x202a && r <= 0x202e, r >= 0x2060 && r <= 0x2064, r >= 0x2066 && r <= 0x2069, r >= 0xfff9 && r <= 0xfffb:
-		return false
-	}
-	return true
 }
 
 // grantEntry is the store's value of a grant in nsGrants.
@@ -231,7 +216,10 @@ func checkGrants(body []byte) (map[int64]string, error) {
 			GrantRef     *string `json:"grant_ref"`
 		} `json:"grants"`
 	}
-	if !strictObject(body, &doc) || doc.Version == nil || doc.Revision == nil || doc.Grants == nil {
+	if err := readObject(body, &doc, contracts.Grants{}); err != nil {
+		return nil, answerRefusal(err, "the answer is not the grants' document")
+	}
+	if doc.Version == nil || doc.Revision == nil || doc.Grants == nil {
 		return nil, errors.New("the answer is not the grants' document")
 	}
 	switch {
@@ -378,19 +366,21 @@ func unlinkedGrant(st *store.Store, installation int64, connection string) (bool
 
 // reportSoon reports the installation's grant for account to Qory Apiary, linked to
 // connection under the pass whose nonce is nonce, beside the connect's answer, see
-// [Apiary.ReportGrant].
-// While Qory Apiary answers 409 pass_unknown or 403 connection_unknown, as it does until
-// the person's browser brings the linked connect return, or the report fails as a
-// request that may pass, it is sent again after a wait that doubles from
-// [grantFirstWait] to [grantMaxWait], until expires, the expiry of the linked connect
-// return minted for it. It stops before a try once GitHub has deleted the installation,
-// see [keepDeleted]. A report Qory Apiary takes adds the grant to the copy, and when
-// a listing of the installation left its collections out meanwhile, since the copy did
-// not have the grant, see [reachSink], the installation's repositories are listed again
-// with them, see [Adapter.listFor]; a listing that fails is logged. Once
-// expires has passed, or Qory Apiary refuses the report for good, the installation's
-// link to connection is dropped unless the copy holds the grant. A 409 connection_ended
-// drops the link at once, as it does for any request, see [Apiary.Ended].
+// [Apiary.ReportGrant]. While the answer is not final, it is sent again after a wait
+// that doubles from [grantFirstWait] to [grantMaxWait], until expires, the expiry of
+// the linked connect return minted for it, see grant.schema.json. Not final are
+// 409 pass_unknown and 403 connection_unknown, as Qory Apiary answers until the
+// person's browser brings the linked connect return, 409 connection_suspended, which
+// does not change the backoff, a 403 or a 409 with no code, see [sentAgain], and a
+// failure that may pass. It stops before a try once GitHub has deleted the
+// installation, see [keepDeleted]. A report Qory Apiary takes adds the grant to the
+// copy, and when a listing of the installation left its collections out meanwhile,
+// since the copy did not have the grant, see [reachSink], the installation's
+// repositories are listed again with them, see [Adapter.listFor]; a listing that fails
+// is logged. Once expires has passed, or Qory Apiary refuses the report for good, the
+// installation's link to connection is dropped unless the copy contains the grant. A 409
+// connection_ended drops the link at once, as it does for any request, see
+// [Apiary.Ended].
 func (c *Connect) reportSoon(installation int64, connection, nonce string, account contracts.Account, expires time.Time) {
 	c.init()
 	gs, ok := c.Adapter.Sink.(grantSink)
@@ -435,7 +425,7 @@ func (c *Connect) reportSoon(installation int64, connection, nonce string, accou
 				}
 				return
 			}
-			again := refusedAs(err, http.StatusConflict, codePassUnknown) || refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || (!IsPermanent(err) && !refusedFor(err))
+			again := refusedAs(err, http.StatusConflict, codePassUnknown) || refusedAs(err, http.StatusForbidden, codeConnectionUnknown) || sentAgain(err) || (!IsPermanent(err) && !refusedFor(err))
 			now := c.Adapter.clock()
 			if !again || !now.Before(expires) {
 				c.reportFailed(installation, connection, err)
@@ -457,7 +447,7 @@ func refusedFor(err error) bool {
 }
 
 // reportFailed ends a grant's report that Qory Apiary did not take: the installation's
-// link to connection is dropped unless the copy holds its grant for connection, with a
+// link to connection is dropped unless the copy contains its grant for connection, with a
 // line that says so.
 func (c *Connect) reportFailed(installation int64, connection string, err error) {
 	installMu.Lock()
@@ -593,8 +583,9 @@ func (a *Adapter) dropUngranted(installation int64, connection string) (bool, er
 //     grant end of [Adapter.endUnlinked] is never stopped by counting 403s either: it
 //     stops once [Apiary.Ended] or [noteAnswer] has dropped the connection's grants from
 //     the copy, see [dropConnection];
-//   - a failure that may pass, no answer, a 5xx or an answer not signed: it returns
-//     true, so the grant end is sent again;
+//   - a failure that may pass, no answer, a 5xx or an answer not signed, a 409 or a 403
+//     with no code because its body cannot be read, or a 409 connection_suspended, see
+//     [sentAgain]: it returns true, so the grant end is sent again;
 //   - any other refusal, 403 forbidden and 400 among them: serve logs it, keeps its
 //     state, since neither ends a connection or a grant, and sends no more grant end for
 //     the grant, see [Adapter.endRefusedFor].
@@ -641,7 +632,7 @@ func (a *Adapter) grantEnded(installation int64, connection string, account int6
 		}
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
-	case !IsPermanent(err) && !refusedFor(err):
+	case sentAgain(err), !IsPermanent(err) && !refusedFor(err):
 		a.log().LogAttrs(context.Background(), slog.LevelWarn, "reporting the end of the installation's grant to Qory Apiary failed, so serve sends it again later", append(attrs, slog.String("error", err.Error()))...)
 		return true
 	}

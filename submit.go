@@ -12,37 +12,41 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/qoryai/integrations/contracts"
 )
 
-// The names of the submission entry's contract that [Client.SubmitDraft] and its callers
-// use, in one place. The states and actions are those of the draft in
-// changes-submitted.schema.json. closed and merged are the states of a pull request that
-// GitHub closed or merged, which SubmitDraft never edits.
+// The names that [Client.SubmitDraft] and its callers use, in one place. The states are
+// those of a pull request in the data of the reply for a pull-request change request:
+// draft, open, closed and merged, the last two for a pull request that GitHub closed or
+// merged, which SubmitDraft never edits. The actions are those of [Client.SubmitDraft]:
+// opened, updated and kept.
 const (
-	DraftStateDraft  = contracts.DraftStateDraft
-	DraftStateOpen   = contracts.DraftStateOpen
-	DraftStateClosed = contracts.DraftStateClosed
-	DraftStateMerged = contracts.DraftStateMerged
+	DraftStateDraft  = "draft"
+	DraftStateOpen   = "open"
+	DraftStateClosed = "closed"
+	DraftStateMerged = "merged"
 
-	DraftOpened  = contracts.DraftOpened
-	DraftUpdated = contracts.DraftUpdated
-	DraftKept    = contracts.DraftKept
+	DraftOpened  = "opened"
+	DraftUpdated = "updated"
+	DraftKept    = "kept"
 
-	// ReasonBranchGone is the failure report's reason for a draft whose head branch or
-	// base branch GitHub returns as not existing.
-	ReasonBranchGone = "branch_gone"
+	// ReasonTargetGone is the failure report's reason for a repository that GitHub
+	// returns as moved: the address of the change request's target does not exist any
+	// more.
+	ReasonTargetGone = "target_gone"
 
-	// ReasonForgeRefused is the failure report's reason for a request that GitHub
-	// refused with a status that no other reason covers, such as 400, so the same
-	// request fails again.
-	ReasonForgeRefused = "forge_refused"
+	// ReasonRefused is the failure report's reason for a request that GitHub refused
+	// with a status that no other reason covers, such as 400, or for a head or base
+	// branch that GitHub returns as not existing, so the same request fails again.
+	ReasonRefused = "refused"
+
+	// ChangeKindPullRequest is the one change kind the adapter applies, the kind that
+	// roles.source.change_kinds of the description lists.
+	ChangeKindPullRequest = "pull-request"
 )
 
 const (
 	// MaxDraftDescription is the most characters of the run's text for the description
-	// of a draft, as the submission schema caps it.
+	// of a draft, as the change request schema caps it.
 	MaxDraftDescription = 20000
 	// MaxDraftTitle is the most characters of a draft's title.
 	MaxDraftTitle = 256
@@ -55,9 +59,92 @@ const (
 	MaxDetail = 1000
 )
 
-// forgeTitlePrefix is the text GitHub puts before the title of a draft that is not ready:
-// none, as GitHub's API returns the title as it was written, see [contracts.NextTitle].
-const forgeTitlePrefix = ""
+// The lines that begin and end the block of the description that the adapter writes. A
+// line is a marker line when it is the marker followed by nothing but spaces, tabs or a
+// carriage return.
+const (
+	markerStart = "<!-- qory:start -->"
+	markerEnd   = "<!-- qory:end -->"
+)
+
+// isMarker is whether line is marker, alone on its line.
+func isMarker(line, marker string) bool {
+	return strings.TrimRight(line, " \t\r") == marker
+}
+
+// hasMarkerLine is whether a line of text is a marker line.
+func hasMarkerLine(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if isMarker(line, markerStart) || isMarker(line, markerEnd) {
+			return true
+		}
+	}
+	return false
+}
+
+// markedDescription is the description of a draft after the run's text is written:
+// existing is the description now, empty for a draft being opened, and text the run's
+// text, the content of the block, which has no marker line, see [CheckMarkers]. The block
+// is the start marker, a line ending, text, a line ending and the end marker; the line
+// ending is CRLF when the first one of existing is, otherwise LF, and only the line
+// endings that this function adds use it. The end line is the first end marker line that
+// has a start marker line before it, and the start line is the last start marker line
+// before it. The block replaces the text from the start of the start line to the end
+// marker, and every other byte of existing stays, the spaces, tabs and carriage return
+// after the end marker included. Without such a pair, as when a person removed a marker,
+// existing stays whole and the block follows it after a blank line.
+func markedDescription(existing, text string) string {
+	eol := "\n"
+	if i := strings.Index(existing, "\n"); i > 0 && existing[i-1] == '\r' {
+		eol = "\r\n"
+	}
+	block := markerStart + eol + text + eol + markerEnd
+	if existing == "" {
+		return block
+	}
+	lines := strings.Split(existing, "\n")
+	start := -1
+	for i, line := range lines {
+		switch {
+		case isMarker(line, markerStart):
+			start = i
+		case start >= 0 && isMarker(line, markerEnd):
+			head := strings.Join(lines[:start], "\n")
+			if start > 0 {
+				head += "\n"
+			}
+			tail := strings.Join(lines[i+1:], "\n")
+			if i+1 < len(lines) {
+				tail = "\n" + tail
+			}
+			return head + block + lines[i][len(strings.TrimRight(lines[i], " \t\r")):] + tail
+		}
+	}
+	rest, endings := existing, 0
+	for endings < 2 {
+		switch {
+		case strings.HasSuffix(rest, "\r\n"):
+			rest = rest[:len(rest)-2]
+		case strings.HasSuffix(rest, "\n"):
+			rest = rest[:len(rest)-1]
+		default:
+			return existing + strings.Repeat(eol, 2-endings) + block
+		}
+		endings++
+	}
+	return existing + block
+}
+
+// nextTitle is the title of a pull request after an update: next, the title of the new
+// version, while current, the title on GitHub, equals previous, the title of the previous
+// version; otherwise current, which a person edited. With an empty previous the title
+// stays as it is.
+func nextTitle(current, previous, next string) string {
+	if previous != "" && current == previous {
+		return next
+	}
+	return current
+}
 
 // commitAddress is the address of a commit of the repository on GitHub's site.
 func commitAddress(repo Repository, commit string) string {
@@ -74,28 +161,29 @@ func CommitAddresses(repo Repository, commits ...string) []string {
 	return out
 }
 
-var submissionIDShape = regexp.MustCompile(`^av_[0-9a-hjkmnp-tv-z]{16}$`)
+var changeRequestIDShape = regexp.MustCompile(`^av_[0-9a-hjkmnp-tv-z]{16}$`)
 
-// CheckSubmissionID returns an error when id is not a submission's id in Qory Apiary:
-// av_ and 16 lower-case Crockford base32 characters. The error contains the rule, never
-// the value.
-func CheckSubmissionID(id string) error {
-	if !submissionIDShape.MatchString(id) {
-		return invalidChange("report this Qory Apiary defect: the submission_id is not av_ and 16 lower-case base32 characters")
+// CheckChangeRequestID returns an error when id is not a change request's id in Qory
+// Apiary: av_ and 16 lower-case Crockford base32 characters. The error contains the
+// rule, never the value.
+func CheckChangeRequestID(id string) error {
+	if !changeRequestIDShape.MatchString(id) {
+		return invalidChange("report this Qory Apiary defect: the change_request_id is not av_ and 16 lower-case base32 characters")
 	}
 	return nil
 }
 
-// Draft is what a submission entry asks for one repository: the draft pull request
-// from Branch into Base, with the run's text. Number is the number of the pull request
-// of an earlier version's reply, a hint, or 0 for an entry that asks to open one.
-// Description is the content of the marked block of the description, see
-// [contracts.MarkedDescription]. PreviousTitle is the title of the previous version, see
-// [contracts.NextTitle].
+// Draft is the pull request of a change request entry for one repository: from Branch
+// into Base, with the run's text, a draft when AsDraft. Number is the number of the pull
+// request at the previous version's address, a hint, or 0 when the address is absent or
+// unusable. Description is the content of the marked block of the description, see
+// [markedDescription]. PreviousTitle is the title of the previous version, see
+// [nextTitle].
 type Draft struct {
 	Repository         Repository
 	Branch, Base       string
 	Number             int
+	AsDraft            bool
 	Title, Description string
 	PreviousTitle      string
 }
@@ -109,13 +197,18 @@ type DraftResult struct {
 }
 
 // SubmitRefused is the error of a draft that a retry cannot open or update, since the
-// retry would fail the same way. Reason is the failure report's reason, [ReasonNotPermitted],
-// [ReasonUnreachable], [ReasonBranchGone], [ReasonTooLong] or [ReasonForgeRefused]. Fix is
-// the one line that says what a person does, at most 100 characters, ending with a
-// period; each failing case has a different one, see the Fix constants. Err is the cause: GitHub's
-// status and message, or the check that stopped the call. Status and Message are GitHub's
-// answer when the refusal comes from one, else 0 and empty; Message is one line with no
-// token, see [OneLine]. The text of the error is Fix, then Err's text.
+// retry would fail the same way. Reason is the failure report's reason,
+// [ReasonNotPermitted], [ReasonUnreachable], [ReasonTargetGone], [ReasonTooLong] or
+// [ReasonRefused]. Fix starts the text of the error, as one line of what a person does.
+// A different Fix goes with each failing case, see the Fix constants: at most 100
+// characters, ending with a period. The exception is a must_understand for which
+// [contracts.CheckChangeMustUnderstand] returns an error, a pointer that the entry's kind
+// does not define or a malformed list: Fix is that error, at most 1000 characters, which
+// ends with a period for the pointer and has no period for a malformed list. Err is the
+// cause: GitHub's status and message, or the check that stopped the call. Status and
+// Message are GitHub's answer when the refusal comes from one, else 0 and empty; Message
+// is one line with no token, see [OneLine]. The text of the error is Fix, then Err's
+// text.
 type SubmitRefused struct {
 	Reason  string
 	Fix     string
@@ -138,12 +231,22 @@ const (
 	FixAppForbidden = "Check on GitHub that the App is not suspended or blocked, then submit again."
 	FixUnreachable  = "Check that GitHub is reachable, then submit again, or open the pull request by hand."
 	// FixMoved is the fix line for a repository for which GitHub returns 301 or 308.
-	FixMoved          = "Link the repository by its new name: GitHub moved it."
+	FixMoved = "Link the repository by its new name: GitHub moved it."
+	// FixGone is the fix line for a repository that GitHub returns as deleted, or out of
+	// the App's reach.
+	FixGone = "Check that the repository exists and the App's installation reaches it, then submit again."
+	// FixChangeKind is the fix line for a change request of a kind the adapter does not
+	// apply.
+	FixChangeKind     = "Use the kind pull-request, or connect an adapter that lists the kind of the change."
 	fixHeadGone       = "Push the run's branch to the repository again, then submit again."
 	fixBaseGone       = "Create the base branch on GitHub, or choose another base branch, then submit again."
 	fixBranchGone     = "Push the run's branch again and check that the base branch exists on GitHub."
+	fixNoCommits      = "Push a commit that the base branch lacks, then submit again."
 	fixRunDescription = "Shorten the description of the run to 20000 characters or fewer."
 	fixRunTitle       = "Shorten the title of the run to 256 characters or fewer."
+	fixMarkerLine     = "Remove the lines that mark a qory block (qory:start and qory:end) from the text, then submit again."
+	fixTitleStopped   = "Remove control, line-break or invisible format characters from the title, then submit again."
+	fixTitleBlank     = "Give the title a character that is not a space, then submit again."
 	fixPullBody       = "Shorten the description of the pull request on GitHub outside the Qory block."
 	fixPullTitle      = "Shorten the title of the pull request on GitHub to 256 characters or fewer."
 	fixPullText       = "Shorten the title or the description of the pull request on GitHub."
@@ -211,7 +314,7 @@ type ghPull struct {
 	} `json:"base"`
 }
 
-// state is the pull request's state as the reply of a submission has it: merged and
+// state is the pull request's state as the reply of a change request has it: merged and
 // closed for a pull request that was, else draft or open. It is the only place that
 // maps GitHub's words to the contract's.
 func (p ghPull) state() string {
@@ -234,34 +337,37 @@ func (p ghPull) body() string {
 	return *p.Body
 }
 
-// SubmitDraft puts the draft pull request of a submission on GitHub, as the App, with
+// SubmitDraft puts the pull request of a change request on GitHub, as the App, with
 // tok, an installation token of the App for the repository with the permission
 // pull_requests: write, each request paced by p, the installation's [Pacer], or a new
 // Pacer when p is nil. It looks for the pull request from d.Branch of the repository,
-// into any base branch, of any state: by the number d.Number when it is above 0, which is a
-// hint, and by the head branch otherwise or when GitHub has no pull request with that
-// number and head. Of several pull requests from the branch it takes the one with the
-// number d.Number, else the open one with the highest number, else the closed or merged
-// one with the highest number. It never changes the base branch of a pull request.
+// into any base branch: by the number d.Number when it is above 0, which is a hint, and
+// by the head branch otherwise or when GitHub has no pull request with that number and
+// head. Of several open pull requests from the branch it takes the one with the highest
+// number. A closed or merged pull request from the branch counts only when it has the
+// number d.Number: a pull request that a person finished is no pull request of the
+// branch, and the contract's "without previous.address, it makes the change at the
+// target" opens a new one. It never changes the base branch of a pull request.
 //
-//   - None found: it opens a draft pull request from d.Branch into d.Base, with d.Title
-//     and the description [contracts.MarkedDescription] writes for no earlier one;
-//     the action is [DraftOpened].
-//   - One found, closed or merged: it changes nothing; the action is [DraftKept], and
-//     the state is closed or merged.
+//   - None found: it opens a pull request, a draft when d.AsDraft, from d.Branch into
+//     d.Base, with d.Title and the description [markedDescription] writes for no earlier
+//     one; the action is [DraftOpened].
+//   - One found with the number d.Number, closed or merged: it changes nothing; the
+//     action is [DraftKept], and the state is closed or merged.
 //   - One found, open or draft: it changes the description to the one
-//     [contracts.MarkedDescription] writes for the description it has, which is the block
-//     alone for an empty description, and the title to the one [contracts.NextTitle]
-//     gives, and sends only what changes; the action is [DraftUpdated], or [DraftKept]
-//     when nothing changes.
+//     [markedDescription] writes for the description it has, which is the block
+//     alone for an empty description, and the title to the one [nextTitle]
+//     returns, and sends only what changes; the action is [DraftUpdated], or
+//     [DraftKept] when nothing changes. It never changes whether the pull request is a
+//     draft.
 //
 // A description of more than [MaxDraftDescription] characters, or a title of more than
 // [MaxDraftTitle], is refused as too_long before any request, and so is a description
 // that the update would make longer than [MaxPullBody]. Every error that a retry cannot
-// change is a [*SubmitRefused] with its reason: a 404, a 403 that is no rate limit, or a
-// permanent redirect, not_permitted; a 422 for a head or base branch that does not exist,
-// branch_gone; a 422 for a text too long, too_long; a 400, any other 422, and any other
-// 4xx status that is no 401, 403, 404, 408 or 429, forge_refused. Each carries GitHub's
+// change is a [*SubmitRefused] with its reason: a 404 or a 403 that is no rate limit,
+// not_permitted; a permanent redirect, target_gone; a 422 for a text too long, too_long;
+// a 400, a 422 for a head or base branch that does not exist, any other 422, and any
+// other 4xx status that is no 401, 403, 404, 408 or 429, refused. Each carries GitHub's
 // status and message, see [SubmitRefused.Detail]. Every other error may pass, as a 5xx, a
 // timeout or a 401, and the call can be made again; a 422 that says a pull request exists
 // already is among them, since the next call finds it. No error contains the token, the
@@ -275,6 +381,12 @@ func (c Client) SubmitDraft(ctx context.Context, p *Pacer, tok string, d Draft) 
 		return DraftResult{}, invalidChange("report this Qory Apiary defect: the entry has no branch, base branch or title")
 	}
 	if err := CheckDraftText(d.Title, d.Description); err != nil {
+		return DraftResult{}, err
+	}
+	if err := CheckTitle(d.Title); err != nil {
+		return DraftResult{}, err
+	}
+	if err := CheckMarkers(d.Description); err != nil {
 		return DraftResult{}, err
 	}
 	if err := CheckAPIURL(c.base()); err != nil {
@@ -309,43 +421,68 @@ func CheckDraftText(title, description string) error {
 	return nil
 }
 
+// CheckMarkers returns a [*SubmitRefused] with the reason refused for a text that has a
+// marker line, a line that is the start or the end marker of the description's block, and
+// nil otherwise: the adapter writes the text between those lines, and a marker line in it
+// would end the block early on the next update.
+func CheckMarkers(text string) error {
+	if hasMarkerLine(text) {
+		cause := "the text of the run has a line that is a qory marker"
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixMarkerLine, Err: errors.New(cause), Message: cause + "."}
+	}
+	return nil
+}
+
+// CheckTitle returns a [*SubmitRefused] with the reason refused for a title that the
+// contract's change_title stops: a character that [LineStopped] stops, or no character
+// that is not a space, see [HasVisible]. It is nil otherwise. The message has the code
+// point of the first stopped character, never the title.
+func CheckTitle(title string) error {
+	if i := strings.IndexFunc(title, LineStopped); i >= 0 {
+		r, _ := utf8.DecodeRuneInString(title[i:])
+		cause := fmt.Sprintf("the title of the run has U+%04X, which a title may not have", r)
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixTitleStopped, Err: errors.New(cause), Message: cause + "."}
+	}
+	if !HasVisible(title) {
+		cause := "the title of the run has no character that is not a space"
+		return &SubmitRefused{Reason: ReasonRefused, Fix: fixTitleBlank, Err: errors.New(cause), Message: cause + "."}
+	}
+	return nil
+}
+
 // pullsPath is the path of the repository's pull requests in GitHub's API.
 func pullsPath(repo Repository) string { return "/repos/" + repo.String() + "/pulls" }
 
 // isDraftOf is whether p is a pull request from d.Branch of d's repository itself, not of
 // a fork, into any base branch: the base branch is the one a person set, and a later
-// version of a submission with another base branch edits the same pull request, which
+// version of a change request with another base branch edits the same pull request, which
 // keeps its base.
 func (p ghPull) isDraftOf(d Draft) bool {
 	return p.Head.Ref == d.Branch && p.Head.Repo != nil && strings.EqualFold(p.Head.Repo.FullName, d.Repository.String())
 }
 
-// chosenOf is the pull request of ps, which all have the head branch of the draft, that
-// the draft belongs to: the open one with the highest number, else, when none is open,
-// the closed or merged one with the highest number. The pull request with the entry's
-// number is not among ps: [Client.findPull] reads it first. ps has at least one.
+// chosenOf is the pull request of ps, which are all open and have the head branch of the
+// draft, that the draft belongs to: the one with the highest number. The pull request
+// with the entry's number is not among ps: [Client.findPull] reads it first. ps has at
+// least one.
 func chosenOf(ps []ghPull) ghPull {
-	best := -1
-	for i, p := range ps {
-		switch {
-		case best < 0:
-			best = i
-		case (p.State == "open") != (ps[best].State == "open"):
-			if p.State == "open" {
-				best = i
-			}
-		case p.Number > ps[best].Number:
-			best = i
+	best := ps[0]
+	for _, p := range ps[1:] {
+		if p.Number > best.Number {
+			best = p
 		}
 	}
-	return ps[best]
+	return best
 }
 
-// findPull finds the pull request from d.Branch, of any state, and reads it. It is nil
-// when there is none.
+// findPull finds the pull request of d and reads it, or returns nil when there is none.
+// It reads the pull request with the number d.Number first, whatever its state, since
+// "kept" is for what is at an address. Otherwise, and when GitHub has no such pull
+// request from the branch, it lists the open pull requests from d.Branch: this is the
+// path for an entry with no address, an unusable one and a gone one alike.
 func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*ghPull, error) {
 	if d.Number > 0 {
-		const reading = "reading the pull request of an earlier submission"
+		const reading = "reading the pull request of an earlier change request"
 		a, err := c.send(ctx, p, false, reading, http.MethodGet, pullsPath(d.Repository)+"/"+strconv.Itoa(d.Number), tok, nil)
 		if err != nil {
 			return nil, err
@@ -364,7 +501,7 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 		}
 	}
 	const listing = "looking for the pull request from the branch"
-	query := url.Values{"head": {d.Repository.Owner + ":" + d.Branch}, "state": {"all"}, "per_page": {"100"}}
+	query := url.Values{"head": {d.Repository.Owner + ":" + d.Branch}, "state": {"open"}, "per_page": {"100"}}
 	a, err := c.send(ctx, p, false, listing, http.MethodGet, pullsPath(d.Repository)+"?"+query.Encode(), tok, nil)
 	if err != nil {
 		return nil, err
@@ -400,10 +537,10 @@ func (c Client) findPull(ctx context.Context, p *Pacer, tok string, d Draft) (*g
 	return &got, nil
 }
 
-// openPull opens the draft pull request.
+// openPull opens the pull request, as a draft when d.AsDraft.
 func (c Client) openPull(ctx context.Context, p *Pacer, tok string, d Draft) (DraftResult, error) {
-	const opening = "opening the draft pull request"
-	req := map[string]any{"title": d.Title, "body": contracts.MarkedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": true}
+	const opening = "opening the pull request"
+	req := map[string]any{"title": d.Title, "body": markedDescription("", d.Description), "head": d.Branch, "base": d.Base, "draft": d.AsDraft}
 	a, err := c.send(ctx, p, false, opening, http.MethodPost, pullsPath(d.Repository), tok, req)
 	if err != nil {
 		return DraftResult{}, err
@@ -421,8 +558,8 @@ func (c Client) updatePull(ctx context.Context, p *Pacer, tok string, d Draft, f
 	if kept.State == DraftStateClosed || kept.State == DraftStateMerged {
 		return kept, nil
 	}
-	body := contracts.MarkedDescription(found.body(), d.Description)
-	title := contracts.NextTitle(found.Title, d.PreviousTitle, d.Title, forgeTitlePrefix)
+	body := markedDescription(found.body(), d.Description)
+	title := nextTitle(found.Title, d.PreviousTitle, d.Title)
 	patch := map[string]string{}
 	// GitHub may store a description with CRLF line breaks, which is the same text.
 	if lineFeeds(body) != lineFeeds(found.body()) {
@@ -473,7 +610,7 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 	err := a.detailedErr(what)
 	switch {
 	case a.status == http.StatusMovedPermanently || a.status == http.StatusPermanentRedirect:
-		return refusedBy(a, ReasonForgeRefused, FixMoved, err)
+		return refusedBy(a, ReasonTargetGone, FixMoved, err)
 	case a.status == http.StatusNotFound:
 		return refusedBy(a, ReasonNotPermitted, FixNotInstalled, err)
 	case a.status == http.StatusForbidden && !a.rateLimited():
@@ -500,7 +637,9 @@ func submitFailed(a *apiReply, what string, creating bool) error {
 			case v.base && !v.head:
 				fix = fixBaseGone
 			}
-			return refusedBy(a, ReasonBranchGone, fix, err)
+			return refusedBy(a, ReasonRefused, fix, err)
+		case creating && v.noCommits:
+			return refusedBy(a, ReasonRefused, fixNoCommits, err)
 		}
 		return forgeRefused(a, err)
 	case refusedStatus(a.status):
@@ -517,7 +656,7 @@ func refusedStatus(status int) bool {
 }
 
 // AnswerRefused is whether err, or an error it wraps, is GitHub's answer with a 4xx status
-// that a retry does not change and that no other reason covers, see [ReasonForgeRefused].
+// that a retry does not change and that no other reason covers, see [ReasonRefused].
 func AnswerRefused(err error) bool {
 	var e *answerError
 	return errors.As(err, &e) && refusedStatus(e.status)
@@ -543,10 +682,10 @@ const fixUnclassified = "Report to the maintainers of qory-github that the adapt
 //     connection ([ErrTransport], a timeout), a rate limit (a 403 that says so, or a
 //     429), 408, and a 5xx status;
 //   - not_permitted, for a 401 that kept coming, a 403 that is no rate limit, and a 404;
-//   - forge_refused, for any other 4xx status, a redirect, which the adapter never follows
-//     and which comes again (a 301 or 308 has the fix that says GitHub moved the
-//     repository, [FixMoved]), an answer that arrived but cannot be used, and an error that
-//     is none of these, whose clean text is the message.
+//   - target_gone, for a redirect, which the adapter never follows and which comes again:
+//     a 301 or 308 has the fix that says GitHub moved the repository, [FixMoved];
+//   - refused, for any other 4xx status, an answer that arrived but cannot be used, and an
+//     error that is none of these, whose clean text is the message.
 func EndedRefusal(cause error) *SubmitRefused {
 	var refused *SubmitRefused
 	if errors.As(cause, &refused) {
@@ -569,11 +708,11 @@ func EndedRefusal(cause error) *SubmitRefused {
 		case s == http.StatusNotFound:
 			return report(ReasonNotPermitted, FixNotInstalled)
 		case s == http.StatusMovedPermanently || s == http.StatusPermanentRedirect:
-			return report(ReasonForgeRefused, FixMoved)
+			return report(ReasonTargetGone, FixMoved)
 		}
-		return report(ReasonForgeRefused, FixForgeRefused)
+		return report(ReasonRefused, FixForgeRefused)
 	case errors.Is(cause, ErrUnreadableAnswer):
-		r := report(ReasonForgeRefused, fixUnreadable)
+		r := report(ReasonRefused, fixUnreadable)
 		var unread *unreadableError
 		if errors.As(cause, &unread) {
 			r.Status = unread.status
@@ -583,11 +722,11 @@ func EndedRefusal(cause error) *SubmitRefused {
 		}
 		return r
 	case errors.Is(cause, errMintRedirected):
-		return report(ReasonForgeRefused, FixForgeRefused)
+		return report(ReasonRefused, FixForgeRefused)
 	case errors.Is(cause, ErrTransport), errors.Is(cause, context.DeadlineExceeded), errors.Is(cause, context.Canceled):
 		return report(ReasonUnreachable, FixUnreachable)
 	}
-	r := report(ReasonForgeRefused, fixUnclassified)
+	r := report(ReasonRefused, fixUnclassified)
 	r.Message = OneLine(cause.Error(), MaxDetail)
 	return r
 }
@@ -599,7 +738,7 @@ func refusedBy(a *apiReply, reason, fix string, err error) error {
 
 // forgeRefused is the [*SubmitRefused] of an answer that no other reason covers.
 func forgeRefused(a *apiReply, err error) error {
-	return refusedBy(a, ReasonForgeRefused, FixForgeRefused, err)
+	return refusedBy(a, ReasonRefused, FixForgeRefused, err)
 }
 
 // detailedErr is [apiReply.err] with the message of [apiReply.forgeMessage], which has the
@@ -644,11 +783,12 @@ var branchInvalid = regexp.MustCompile(`(?i)^(head|base)\s+invalid`)
 
 // validationOf is what GitHub's 422 says: a text too long, in the title or in the
 // description, a head or base that is not a branch of the repository, which of the two,
-// or a pull request that exists already.
+// or a pull request that exists already, or no commit that the head has and the base
+// lacks.
 type validationOf struct {
 	tooLong, titleLong, bodyLong bool
 	branch, head, base           bool
-	exists                       bool
+	exists, noCommits            bool
 }
 
 // validation reads GitHub's 422.
@@ -674,6 +814,8 @@ func (a *apiReply) validation() validationOf {
 			v.bodyLong = v.bodyLong || x.Field == "body" || strings.HasPrefix(text, "body ")
 		case strings.Contains(text, "already exists"):
 			v.exists = true
+		case strings.Contains(text, "no commits between"):
+			v.noCommits = true
 		case (x.Field == "head" || x.Field == "base") && x.Code == "invalid":
 			v.branch = true
 			v.head = v.head || x.Field == "head"

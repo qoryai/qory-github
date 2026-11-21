@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"hash/fnv"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -148,6 +149,9 @@ type fakeApiary struct {
 	mu       sync.Mutex
 	requests []apiaryRequest
 	changes  []contracts.Change
+	// members are members that the page writes in the entry at that place of the feed,
+	// besides the ones contracts.Change writes: a member the reader does not define.
+	members map[int]map[string]any
 	// enrolments are the enrolment requests the fake received, their proofs verified.
 	enrolments []accesskey.EnrolmentRequest
 	// enrolHold, when set, holds each enrolment's answer until it is closed.
@@ -194,8 +198,9 @@ type enrolAnswer struct {
 	kind, node string
 }
 
-// bodySchemas are the contract's schemas of the bodies Qory Apiary takes, by route,
-// compiled once: the fake checks every body it receives against its route's.
+// bodySchemas are the closed copies of the contract's schemas of the bodies Qory Apiary
+// takes, by route, compiled once: the fake checks every body it receives against its
+// route's, so a member the adapter misspells fails the test.
 var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 	out := map[string]*jsonschema.Schema{}
 	for route, name := range map[string]string{
@@ -212,7 +217,7 @@ var bodySchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 		routeGrants:                "grant.schema.json",
 		routeGrantsEnd:             "grant-end.schema.json",
 	} {
-		s, err := contracts.Compile(name)
+		s, err := contracts.CompileClosed(name)
 		if err != nil {
 			panic(err)
 		}
@@ -526,12 +531,19 @@ func (f *fakeApiary) page(after string) string {
 	// An entry of a kind the contract does not define, which contracts.Change does not
 	// write, is written as its kind and status.
 	entries := []any{}
-	for _, c := range f.changes[from:] {
+	for i, c := range f.changes[from:] {
+		var entry any = c
 		if _, err := json.Marshal(c); err != nil {
-			entries = append(entries, map[string]any{"kind": c.Kind, "status": c.Status})
-			continue
+			entry = map[string]any{"kind": c.Kind, "status": c.Status}
 		}
-		entries = append(entries, c)
+		if extra := f.members[from+i]; extra != nil {
+			b, _ := json.Marshal(entry)
+			var m map[string]any
+			json.Unmarshal(b, &m)
+			maps.Copy(m, extra)
+			entry = m
+		}
+		entries = append(entries, entry)
 	}
 	b, _ := json.Marshal(map[string]any{"version": contracts.Version, "revision": revision, "cursor": "c_" + strconv.Itoa(len(f.changes)), "changes": entries})
 	return string(b)
@@ -765,6 +777,17 @@ func (f *fakeApiary) count() int {
 	return len(f.requests)
 }
 
+// withMembers makes the page write members in the entry at the place index of the feed,
+// counted from 0, besides the members the entry has.
+func (f *fakeApiary) withMembers(index int, members map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.members == nil {
+		f.members = map[int]map[string]any{}
+	}
+	f.members[index] = members
+}
+
 // add appends entries to the feed.
 func (f *fakeApiary) add(chs ...contracts.Change) {
 	f.mu.Lock()
@@ -897,7 +920,10 @@ type fakeGitHub struct {
 	// after it was read, and
 	// gqlNotFound makes GraphQL answer that it resolves no repository by acme/widgets, as
 	// when the name came to name none.
-	readStatus  int
+	readStatus int
+	// widgetsName, when set, is the name GET /repositories/{id} answers for the id of
+	// acme/widgets, as after a rename.
+	widgetsName string
 	gqlIDSet    bool
 	gqlID       any
 	gqlNotFound bool
@@ -1093,7 +1119,13 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && r.URL.Path == widgets && f.issuesOff:
 		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets","has_issues":false}`)
 	case r.Method == "GET" && r.URL.Path == widgets:
-		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"acme/widgets","html_url":"https://github.com/acme/widgets"}`)
+		name := "acme/widgets"
+		if f.widgetsName != "" {
+			name = f.widgetsName
+		}
+		io.WriteString(w, `{"id":`+widgetsRef+`,"full_name":"`+name+`","html_url":"https://github.com/`+name+`"}`)
+	case r.Method == "GET" && r.URL.Path == "/repositories/"+gadgetsRef:
+		io.WriteString(w, `{"id":`+gadgetsRef+`,"full_name":"acme/gadgets","html_url":"https://github.com/acme/gadgets"}`)
 	case r.Method == "POST" && r.URL.Path == "/graphql":
 		f.graphql(w, r, b)
 	case f.reposDown && (strings.HasPrefix(r.URL.Path, "/repos/") || strings.HasPrefix(r.URL.Path, "/repositories/")):

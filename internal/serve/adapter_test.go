@@ -1279,6 +1279,88 @@ func TestCommentsAnsweredConnectionEndedOrSuspended(t *testing.T) {
 	}
 }
 
+// TestA409WithoutACodeChangesNothingAndMayPass has Qory Apiary answer a comments request,
+// an items request, a delivered comment and the end of a replaced connection with a
+// signed 409 whose body the adapter cannot read, no JSON or a must_understand pointer it
+// does not define. The error is no refusal for good and has no code, so no link, record
+// or collection is dropped, Unlinked is not called and no line says the comments are
+// dropped; the delivery is sent again, up to the worker's 3 attempts, then fails; and the
+// replaced connection's record stays, so the next round lists it again.
+func TestA409WithoutACodeChangesNothingAndMayPass(t *testing.T) {
+	comments := contracts.SourceItemComments{Version: contracts.Version, ItemRef: itemOf("acme/widgets", 1), Comments: []contracts.Comment{{
+		Ref: "5", URL: "https://github.com/acme/widgets/issues/1#issuecomment-5", Author: contracts.Person{Name: "bob", Kind: github.KindPerson},
+		Body: "Same here.", BodyFormat: github.FormatMarkdown, CreatedAt: "2026-01-04T00:00:00Z", UpdatedAt: "2026-01-04T00:00:00Z",
+	}}}
+	for _, body := range []string{`<html>`, `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`} {
+		unreadable := func(string, int) (int, string) { return 409, body }
+		linked := func() *wired {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			setReach(w.st, widgetsRef, 42)
+			linkCollection(w.st, widgetsRef)
+			w.apiary.refuse = unreadable
+			return w
+		}
+		kept := func(w *wired, what string) {
+			t.Helper()
+			if ok, _ := Linked(w.st, 42); !ok {
+				t.Errorf("%s, %q: the installation is unlinked", what, body)
+			}
+			if ok, _ := collectionLinked(w.st, widgetsRef); !ok {
+				t.Errorf("%s, %q: the collection is unlinked", what, body)
+			}
+			if _, ok, _ := reachOf(w.st, widgetsRef); !ok {
+				t.Errorf("%s, %q: the repository's installation is dropped", what, body)
+			}
+			if strings.Contains(w.log.String(), "so they are dropped") {
+				t.Errorf("%s, %q: the log says the comments are dropped: %s", what, body, w.log.String())
+			}
+		}
+		noCode := func(err error, what string) {
+			t.Helper()
+			var refused *refusedError
+			if !errors.As(err, &refused) || refused.status != http.StatusConflict || refused.code != "" || IsPermanent(err) {
+				t.Errorf("%s, %q: err %v", what, body, err)
+			}
+		}
+		w := linked()
+		noCode(w.client.Comments(context.Background(), comments), "comments")
+		kept(w, "comments")
+		w = linked()
+		noCode(w.client.Items(context.Background(), widgetsItem()), "items")
+		kept(w, "items")
+		w = linked()
+		ev := issueEvent(42, "acme/widgets", "created")
+		ev["comment"] = map[string]any{"id": 5, "html_url": "https://github.com/acme/widgets/issues/1#issuecomment-5", "body": "Same here.", "user": map[string]any{"login": "bob", "type": "User"}, "created_at": "2026-01-04T00:00:00Z", "updated_at": "2026-01-04T00:00:00Z"}
+		w.deliver(t, "issue_comment", guid1, ev)
+		if s := state(w.st, guid1); s != store.Failed {
+			t.Errorf("the delivery is %s", s)
+		}
+		if n := len(w.apiary.sent(routeComments)); n != 3 {
+			t.Errorf("%q: %d comments requests, want 3", body, n)
+		}
+		kept(w, "delivered comment")
+		// A replaced connection that Qory Apiary answers suspended is ended; the end
+		// answered 409 with no code stays an error, so the record is kept to be listed again.
+		w = newWired(t, filepath.Join(t.TempDir(), "state"))
+		grantedPutLink(w.st, 42, link{Connection: testConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		keepReplaced(w.st, 42, link{Connection: otherConnection, State: linkPending, Return: time.Now().Add(returnFor).Unix()})
+		w.apiary.refuse = func(route string, _ int) (int, string) {
+			switch route {
+			case routeCollections:
+				return 409, `{"error":"connection_suspended"}`
+			case routeConnectionsDisconnect:
+				return 409, body
+			}
+			return 0, ""
+		}
+		noCode(w.adapter.listFor(context.Background(), 42, otherConnection), "replaced connection")
+		if _, ok, _ := replacedOf(w.st, otherConnection); !ok {
+			t.Errorf("%q: the replaced connection is forgotten", body)
+		}
+	}
+}
+
 // TestAConnectionEndedDropsItsRecordsAndOneSuspendedChangesNothing has Qory Apiary
 // answer a listing and an item 409 connection_ended or connection_suspended, and a
 // disconnect 409 connection_suspended: ended drops the link of the installation linked
@@ -2519,11 +2601,11 @@ func TestAMalformedCommentEntryIsPassedWithoutAReport(t *testing.T) {
 // TestACommentEntryIsKnownAndDecodes reads a page of the feed with a comment entry, as
 // Qory Apiary writes it, which passes the contract's schema and which serve accepts and
 // decodes with no member left over, and one with a member the comment entry does not
-// define, which serve rejects.
+// define, which serve ignores.
 func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	body := `{"version":1,"revision":` + strconv.Itoa(contracts.Revision) + `,"cursor":"c_1","changes":[` +
 		`{"kind":"comment","comment_id":"sc_0123456789abcdef","ref":"1296269#7","author_name":"Dana Example","body":"Please check the steps."}]}`
-	schema, err := contracts.Compile("changes.schema.json")
+	schema, err := contracts.CompileClosed("changes.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2546,8 +2628,9 @@ func TestACommentEntryIsKnownAndDecodes(t *testing.T) {
 	if err != nil || !strings.Contains(body, string(b)) {
 		t.Errorf("the entry marshals as %s, %v", b, err)
 	}
-	if _, err := checkChanges([]byte(strings.Replace(body, `"body":`, `"url":"https://apiary.example.com/","extra":1,"body":`, 1))); err == nil {
-		t.Error("an entry with a member the contract does not define is decoded")
+	more, err := checkChanges([]byte(strings.Replace(body, `"body":`, `"extra":{"zz":1},"body":`, 1)))
+	if err != nil || len(more.Changes) != 1 || !reflect.DeepEqual(more.Changes[0], want) {
+		t.Errorf("an entry with a member the contract does not define is not ignored: %+v, %v", more, err)
 	}
 }
 
@@ -2563,7 +2646,7 @@ func checkPageSchema(t *testing.T, f *fakeApiary) {
 	f.mu.Lock()
 	body := f.page("")
 	f.mu.Unlock()
-	schema, err := contracts.Compile("changes.schema.json")
+	schema, err := contracts.CompileClosed("changes.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3166,13 +3249,12 @@ func TestAFeedEntryThatMayPassKeepsTheCursor(t *testing.T) {
 }
 
 // TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole serves a page whose last entry
-// has a kind, or a status, serve does not know, and checks none of the page is
+// has a status of its kind that serve does not know, and checks none of the page is
 // applied, its cursor is not kept, and the refusal is logged with the cursor it was
 // read after and the entry's kind and status; then serves a page serve knows, which
 // moves the feed on.
 func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
 	for _, bad := range []contracts.Change{
-		{Kind: "label", Status: "added"},
 		{Kind: contracts.ChangeWorkItem, WorkItemID: "wi_42", Ref: itemOf("acme/widgets", 7), Status: "shelved", URL: "https://apiary.example.com/work-items/wi_42"},
 		{Kind: contracts.ChangeCollection, CollectionRef: refOf("acme/widgets"), Status: "archived"},
 	} {
@@ -3237,14 +3319,20 @@ func TestAnAnswerWithAnEntryServeDoesNotKnowIsRefusedWhole(t *testing.T) {
 	}
 }
 
-// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose kind and status are long,
-// and checks the refusal keeps 64 characters of each.
+// TestAnUnknownEntrysKindAndStatusAreCut serves an entry whose status is long, and checks
+// the refusal keeps 64 characters of it, and an entry whose kind is long, which the log of
+// its skip keeps 64 characters of.
 func TestAnUnknownEntrysKindAndStatusAreCut(t *testing.T) {
 	w := newWired(t, filepath.Join(t.TempDir(), "state"))
-	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100), Status: strings.Repeat("s", 100)})
+	w.apiary.add(contracts.Change{Kind: contracts.ChangeCollection, Status: strings.Repeat("s", 100)})
 	var u *unknownChange
-	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != strings.Repeat("ü", 64) || u.status != strings.Repeat("s", 64) {
+	if err := w.feed.step(context.Background()); !errors.As(err, &u) || u.kind != contracts.ChangeCollection || u.status != strings.Repeat("s", 64) {
 		t.Errorf("err %v", err)
+	}
+	w = newWired(t, filepath.Join(t.TempDir(), "state"))
+	w.apiary.add(contracts.Change{Kind: strings.Repeat("ü", 100)})
+	if err := w.feed.step(context.Background()); err != nil || !strings.Contains(w.log.String(), `"kind":"`+strings.Repeat("ü", 64)+`"`) || strings.Contains(w.log.String(), strings.Repeat("ü", 65)) {
+		t.Errorf("err %v, log %s", err, w.log.String())
 	}
 }
 
@@ -3574,17 +3662,16 @@ func TestTheFeedRefusesAnotherRevision(t *testing.T) {
 		t.Errorf("the cursor is kept: %v", err)
 	}
 	for body, want := range map[string]string{
-		`{"version":1,"cursor":"c_1","changes":[]}`:                                                   "revision 1",
-		`{"version":1,"revision":1,"cursor":"c_1","changes":[],"more":true}`:                          "not the feed's document",
-		`{"version":2,"revision":1,"cursor":"c_1","changes":[]}`:                                      "version 1",
-		`{"version":1,"revision":1,"cursor":"","changes":[]}`:                                         "cursor",
-		`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null,"x":1}]}`: "not the feed's document",
+		`{"version":1,"cursor":"c_1","changes":[]}`:                                            "revision 1",
+		`{"version":2,"revision":1,"cursor":"c_1","changes":[]}`:                               "version 1",
+		`{"version":1,"revision":1,"cursor":"","changes":[]}`:                                  "cursor",
+		`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":"x"}]}`: "not the feed's document",
 	} {
 		if _, err := checkChanges([]byte(body)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: err %v", body, err)
 		}
 	}
-	if ch, err := checkChanges([]byte(`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null}]}`)); err != nil || ch.Revision != 1 || len(ch.Changes) != 1 {
+	if ch, err := checkChanges([]byte(`{"version":1,"revision":1,"cursor":"c_1","changes":[{"kind":"sync","interval":null}]}`)); err != nil || ch.Cursor != "c_1" || len(ch.Changes) != 1 {
 		t.Errorf("%+v %v", ch, err)
 	}
 }
@@ -3782,7 +3869,8 @@ func TestTheWireMatchesTheContractsSignedFixtures(t *testing.T) {
 // TestA403ConnectionUnknownForADayEndsALiveConnection notes Qory Apiary's answers about
 // a connection: one 403 connection_unknown ends nothing, and its time survives in the
 // store; 403s that run for a day end it; a 2xx between them starts the day again; a 403
-// with another code never counts; and a pending connection is never ended by them.
+// with another code, or with no code because its body cannot be read, never counts and
+// neither starts the day again; and a pending connection is never ended by them.
 func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	st := openStore(t, dir)
@@ -3835,7 +3923,7 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 		code   string
 		d      time.Duration
 		end    bool
-	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
+	}{{403, codeConnectionUnknown, 0, false}, {403, codeForbidden, time.Hour, false}, {409, codeCollectionNotLinked, 2 * time.Hour, false}, {403, "", 3 * time.Hour, false}, {409, "", 4 * time.Hour, false}, {403, codeConnectionUnknown, forbiddenFor, true}} {
 		if end, err := noteAnswer(st5, testConnection, a.status, a.code, at.Add(a.d)); end != a.end || err != nil {
 			t.Errorf("after a 403 forbidden and a 409 collection_not_linked, answer %d: %v, %v", i, end, err)
 		}
@@ -3843,13 +3931,15 @@ func TestA403ConnectionUnknownForADayEndsALiveConnection(t *testing.T) {
 	// Another code never counts.
 	st2 := openStore(t, filepath.Join(t.TempDir(), "state"))
 	grantedLink(st2, 42, testConnection, linkLive)
-	for _, d := range []time.Duration{0, 2 * forbiddenFor} {
-		if end, err := noteAnswer(st2, testConnection, 403, "forbidden", at.Add(d)); end || err != nil {
-			t.Errorf("a 403 forbidden counts: %v, %v", end, err)
+	for _, code := range []string{"forbidden", ""} {
+		for _, d := range []time.Duration{0, 2 * forbiddenFor} {
+			if end, err := noteAnswer(st2, testConnection, 403, code, at.Add(d)); end || err != nil {
+				t.Errorf("a 403 with the code %q counts: %v, %v", code, end, err)
+			}
 		}
-	}
-	if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
-		t.Error("a 403 forbidden is kept")
+		if ok, _ := present(st2.Get(nsForbidden, testConnection)); ok {
+			t.Errorf("a 403 with the code %q is kept", code)
+		}
 	}
 	// A pending connection is never ended.
 	st3 := openStore(t, filepath.Join(t.TempDir(), "state"))
@@ -4811,18 +4901,118 @@ func TestATakeInOfAnArchivedRepositoryIsPassedAtOnce(t *testing.T) {
 // suspendedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref
 // 409 connection_suspended, and any other with the signed 204.
 func suspendedDisconnect(w *wired, ref string) {
+	refusedDisconnect(w, ref, `{"error":"connection_suspended"}`)
+}
+
+// refusedDisconnect has Qory Apiary answer each POST /v1/sources/disconnect for ref 409
+// with the signed body, and any other with the signed 204.
+func refusedDisconnect(w *wired, ref, body string) { answeredDisconnect(w, ref, 409, body) }
+
+// answeredDisconnect is [refusedDisconnect] with the signed status.
+func answeredDisconnect(w *wired, ref string, status int, body string) {
 	refuse := func(route string, n int) (int, string) {
 		if route != routeDisconnect {
 			return 0, ""
 		}
 		if sent := w.apiary.sent(routeDisconnect); n <= len(sent) && sent[n-1].body["collection_ref"] == ref {
-			return 409, `{"error":"connection_suspended"}`
+			return status, body
 		}
 		return 0, ""
 	}
 	w.apiary.mu.Lock()
 	defer w.apiary.mu.Unlock()
 	w.apiary.refuse = refuse
+}
+
+// TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords has Qory Apiary answer
+// the disconnect of a repository, deleted or removed from its installation, with a signed
+// 409 whose body the adapter cannot read: a must_understand pointer it does not define, no
+// JSON, and a space before the object. Nothing is known to be final, so the records stay
+// and the worker sends the request again, with its backoff, up to its attempts (3 in the
+// test), then marks the delivery failed. A readable connection_suspended is sent once and
+// keeps the records, and a readable code that is final, collection_not_linked, is logged
+// and the records are dropped.
+func TestADisconnectWithAnUnreadable409IsSentAgainAndKeepsTheRecords(t *testing.T) {
+	checkDisconnects(t, 409, []disconnectCase{
+		{"an unmet pointer", `{"error":"connection_suspended","zz":1,"must_understand":["/zz"]}`, true, store.Failed, 3, 3, true, false},
+		{"no JSON", `<html>`, true, store.Failed, 3, 3, true, false},
+		{"a space before the object", ` {"error":"connection_suspended"}`, true, store.Failed, 3, 3, true, false},
+		{"connection_suspended", `{"error":"connection_suspended"}`, true, store.Failed, 1, 2, false, false},
+		{"collection_not_linked", `{"error":"collection_not_linked"}`, false, store.Done, 1, 2, false, true},
+	})
+}
+
+// TestADisconnectWithAnUnreadable403IsSentAgainAndKeepsTheRecords is the same for a signed
+// 403: one whose body the adapter cannot read, or whose must_understand it cannot meet,
+// has no code, so the records stay and the worker sends the request again, up to its
+// attempts. A 403 with a code, forbidden, is final: it is logged and the records are
+// dropped.
+func TestADisconnectWithAnUnreadable403IsSentAgainAndKeepsTheRecords(t *testing.T) {
+	checkDisconnects(t, 403, []disconnectCase{
+		{"an unmet pointer", `{"error":"forbidden","zz":1,"must_understand":["/zz"]}`, true, store.Failed, 3, 3, true, false},
+		{"no JSON", `<html>`, true, store.Failed, 3, 3, true, false},
+		{"forbidden", `{"error":"forbidden"}`, false, store.Done, 1, 2, false, true},
+	})
+}
+
+// disconnectCase is a body that Qory Apiary answers the disconnect of a repository with, and
+// what follows: whether the repository's records are kept, the delivery's state, the
+// disconnects sent for a deleted and for a removed repository, whether the worker sent the
+// first removed repository's request again so the other waits, and whether the refusal is
+// logged.
+type disconnectCase struct {
+	name, body               string
+	kept                     bool
+	state                    store.State
+	deletedSent, removedSent int
+	retried                  bool
+	logged                   bool
+}
+
+// checkDisconnects has Qory Apiary answer the disconnect of acme/old with status and the
+// body of each case, for a deleted repository and for a removed one.
+func checkDisconnects(t *testing.T, status int, cases []disconnectCase) {
+	t.Helper()
+	for _, tc := range cases {
+		for _, site := range []string{"deleted", "removed"} {
+			w := newWired(t, filepath.Join(t.TempDir(), "state"))
+			grantedLink(w.st, 42, testConnection, linkLive)
+			for _, ref := range refsOf("acme/old", "acme/gone") {
+				setReach(w.st, ref, 42)
+				linkCollection(w.st, ref)
+			}
+			answeredDisconnect(w, refOf("acme/old"), status, tc.body)
+			sent := tc.deletedSent
+			if site == "deleted" {
+				w.deliver(t, "repository", guid1, repositoryEvent(42, "acme/old", "deleted"))
+			} else {
+				sent = tc.removedSent
+				w.deliver(t, "installation_repositories", guid1, map[string]any{"action": "removed", "installation": map[string]any{"id": 42}, "repositories_removed": []any{
+					map[string]any{"id": oldID, "full_name": "acme/old"}, map[string]any{"id": repoID("acme/gone"), "full_name": "acme/gone"},
+				}})
+			}
+			if s := state(w.st, guid1); s != tc.state {
+				t.Errorf("%s, %s: the delivery is %s, want %s", tc.name, site, s, tc.state)
+			}
+			if n := len(w.apiary.sent(routeDisconnect)); n != sent {
+				t.Errorf("%s, %s: %d disconnects, want %d", tc.name, site, n, sent)
+			}
+			if _, ok, _ := reachOf(w.st, refOf("acme/old")); ok != tc.kept {
+				t.Errorf("%s, %s: the repository's installation kept %v", tc.name, site, ok)
+			}
+			if ok, _ := collectionLinked(w.st, refOf("acme/old")); ok != tc.kept {
+				t.Errorf("%s, %s: the collection linked %v", tc.name, site, ok)
+			}
+			// The other repository of a removal is disconnected only when the loop
+			// reaches it: not while the first one's request is sent again.
+			if _, ok, _ := reachOf(w.st, refOf("acme/gone")); site == "removed" && ok != (tc.retried) {
+				t.Errorf("%s, %s: the other repository's installation kept %v", tc.name, site, ok)
+			}
+			if logged := strings.Contains(w.log.String(), `"msg":"the disconnect is refused"`); logged != tc.logged {
+				t.Errorf("%s, %s: logged %v", tc.name, site, logged)
+			}
+		}
+	}
 }
 
 // TestADeletedRepositoryWhoseDisconnectIsSuspendedKeepsItsRecords has Qory Apiary answer

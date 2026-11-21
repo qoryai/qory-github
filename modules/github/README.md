@@ -59,17 +59,17 @@ empty.
    status 2, after the commit lines. With `none`, it ends here and runs no `gh`.
 4. It runs `gh auth token --hostname github.com`, which reads the login from the credential
    store of `gh` and calls no server. It discards the token.
-5. It searches for the pull requests of the repository with the head branch, in any
-   state (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and
-   `state=all`). It ignores the base branch, the branch of a fork with the same name,
-   and a pull request whose head repository is gone. Of several it takes the one
-   with the highest number that is not closed and not merged, otherwise the one with the
-   highest number.
-6. With none, it runs `gh pr create --draft` with the branch, the base branch, the title
-   and the description. The description is the block alone.
-7. With one that is closed or merged, it changes nothing and prints its state with the
-   action `kept`.
-8. With one that is open or a draft, it keeps the title and replaces the text between
+5. It searches for the open pull requests of the repository with the head branch
+   (`gh api repos/<owner>/<name>/pulls` with `head=<owner>:<branch>` and `state=open`).
+   It ignores the base branch, the branch of a fork with the same name, and a pull
+   request whose head repository is gone. Of several it takes the one with the highest
+   number. When it looks up by branch, the adapter does the same. The program has no
+   address, so it never reuses a closed or merged pull request.
+6. With none, including when the branch has only closed or merged pull requests, it
+   runs `gh pr create --draft` with the branch, the base branch, the title and the
+   description, and prints the new draft with the action `opened`. The description is
+   the block alone.
+7. With one that is open or a draft, it keeps the title and replaces the text between
    the lines `<!-- qory:start -->` and `<!-- qory:end -->` of the description with the
    text of the file, through `gh api` with the method `PATCH`. It sends nothing when the
    description stays the same, and prints the action `kept`.
@@ -98,9 +98,16 @@ draft_action opened
 
 `draft_state` is `draft`, `open`, `closed` or `merged`, and `draft_action` is `opened`,
 `updated` or `kept`. The title is the one that GitHub has after the call, without the
-characters that the contract refuses for `draft_title`: control characters, line and
-paragraph separators, bidirectional and invisible format characters. When nothing but
-spaces is left, the title is `QORY_SUBMIT_TITLE`, cleaned the same way.
+characters that `draft_title` may not have: the control characters (category
+Cc), U+2028, U+2029, and the format characters (category Cf) except U+200C and U+200D,
+which emoji sequences need. The program keeps U+200C and U+200D in the title, and a title
+of nothing but spaces, U+200C and U+200D counts as empty. When the title is empty, it is
+`QORY_SUBMIT_TITLE`, cleaned the same way.
+
+The program has the removed characters as 24 ranges in `FORBIDDEN_RANGES`: the controls,
+U+2028, U+2029, and the format characters of Unicode 17.0.0 except U+200C and U+200D. The
+tests compare the ranges with the rule of `qory-github-server` for every code point, so a
+later Unicode version fails them until you update the ranges.
 
 | Exit | Meaning |
 |---|---|

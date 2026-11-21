@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/qoryai/integrations/contracts"
+	"github.com/qoryai/qory-github"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,6 +55,7 @@ prev=
 method=GET
 endpoint=
 jq=
+state=
 for a in "$@"; do
 	case $prev in
 	--body-file) cp "$a" "$d/call.$n.file" ;;
@@ -63,6 +64,7 @@ for a in "$@"; do
 	esac
 	case $a in
 	body=@*) cp "${a#body=@}" "$d/call.$n.file" ;;
+	state=*) state=${a#state=} ;;
 	repos/*) endpoint=$a ;;
 	esac
 	prev=$a
@@ -87,7 +89,13 @@ fi
 k=$(cat "$d/k.$key" 2>/dev/null || echo 0)
 k=$((k + 1))
 echo "$k" >"$d/k.$key"
-pick() { if [ -f "$d/$key.$k.$1" ]; then echo "$d/$key.$k.$1"; else echo "$d/$key.$1"; fi; }
+# A search that passes state=X reads list.X.out and list.X.json, as GitHub returns only
+# the pull requests of that state.
+pick() {
+	if [ -f "$d/$key.$k.$1" ]; then echo "$d/$key.$k.$1"
+	elif [ -n "$state" ] && [ -f "$d/$key.$state.$1" ]; then echo "$d/$key.$state.$1"
+	else echo "$d/$key.$1"; fi
+}
 if [ -f "$(pick err)" ]; then cat "$(pick err)" >&2; fi
 if [ -n "$jq" ] && [ -n "${FAKE_GH_JQ:-}" ]; then
 	jq -r "$jq" "$(pick json)"
@@ -161,15 +169,18 @@ func (p pull) json() map[string]any {
 	return m
 }
 
-// forbidden is the set of characters that the contract's draft_title refuses, as the
-// adapter's cleanTitle removes them.
-var forbidden = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
-
-// jqTitle is what the --jq expression of the program prints for a title: the title
-// without the forbidden characters, or nothing when only spaces are left.
+// jqTitle is what the --jq expression of the program prints for a title, by the adapter's
+// rule: the title without the characters that [github.LineStopped] stops, or nothing when
+// it has no character that [github.HasVisible] counts. The mode jq runs the real
+// expression, so a difference between the program and the rule fails there.
 func jqTitle(title string) string {
-	shown := forbidden.ReplaceAllString(title, "")
-	if strings.Trim(shown, " \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000") == "" {
+	shown := strings.Map(func(r rune) rune {
+		if github.LineStopped(r) {
+			return -1
+		}
+		return r
+	}, title)
+	if !github.HasVisible(shown) {
 		return ""
 	}
 	return shown
@@ -251,21 +262,30 @@ func (f *fake) setText(text string) {
 	f.input["QORY_SUBMIT_DESCRIPTION_FILE"] = p
 }
 
-// setList sets what the search from the branch returns.
+// setList sets what the search from the branch returns: the pull requests that are open
+// for state=open, and all of them for state=all. A search with another state, or with
+// none, returns nothing.
 func (f *fake) setList(ps ...pull) {
 	f.t.Helper()
-	var text strings.Builder
-	var js []map[string]any
-	for _, p := range ps {
-		text.WriteString(p.text(false))
-		js = append(js, p.json())
+	for state, keep := range map[string]func(pull) bool{
+		"all":  func(pull) bool { return true },
+		"open": func(p pull) bool { return p.norm().State == "open" },
+	} {
+		var text strings.Builder
+		js := []map[string]any{}
+		for _, p := range ps {
+			if keep(p) {
+				text.WriteString(p.text(false))
+				js = append(js, p.json())
+			}
+		}
+		b, err := json.Marshal(js)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		f.set("list."+state+".out", text.String())
+		f.set("list."+state+".json", string(b))
 	}
-	b, err := json.Marshal(js)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	f.set("list.out", text.String())
-	f.set("list.json", string(b))
 }
 
 // setRead sets what the read of one pull request returns.
@@ -463,7 +483,7 @@ func TestAFirstRunOpensOneDraft(t *testing.T) {
 		}
 		list := calls[1]
 		wantList := []string{"api", "-X", "GET", "--hostname", "github.com", "repos/" + repo + "/pulls",
-			"-f", "head=acme-corp:" + branch, "-f", "state=all", "-f", "per_page=100", "--jq"}
+			"-f", "head=acme-corp:" + branch, "-f", "state=open", "-f", "per_page=100", "--jq"}
 		if strings.Join(list[:len(list)-1], "\x00") != strings.Join(wantList, "\x00") {
 			t.Errorf("search call %q, want %q and an expression", list, wantList)
 		}
@@ -525,32 +545,37 @@ func TestARunWhoseTextIsInTheBlockChangesNothing(t *testing.T) {
 	}
 }
 
-func TestAClosedOrMergedPullRequestIsNotEdited(t *testing.T) {
+// A closed or merged pull request is never reused: with only such pull requests on the
+// branch, the program opens a new draft, as the adapter does, and reads, edits and
+// prints only the new one.
+func TestAClosedOrMergedPullRequestIsNeverReused(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		for _, c := range []struct {
-			name  string
-			p     pull
-			state string
+			name string
+			ps   []pull
 		}{
-			{"closed", pull{Number: 4, State: "closed", Title: "Closed one", Body: "Text."}, "closed"},
-			{"merged", pull{Number: 5, State: "closed", Merged: true, Title: "Merged one", Body: "Text."}, "merged"},
-			{"a draft that was closed", pull{Number: 6, State: "closed", Draft: true, Title: "Closed draft", Body: "Text."}, "closed"},
+			{"closed", []pull{{Number: 4, State: "closed", Title: "Closed one", Body: "Text."}}},
+			{"merged", []pull{{Number: 5, State: "closed", Merged: true, Title: "Merged one", Body: "Text."}}},
+			{"a draft that was closed", []pull{{Number: 6, State: "closed", Draft: true, Title: "Closed draft", Body: "Text."}}},
+			{"closed and merged", []pull{{Number: 4, State: "closed", Title: "Four"}, {Number: 5, State: "closed", Merged: true, Title: "Five"}}},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
-				f.have(c.p)
-				wantResult(t, f.run(), 0, commitLines()+draftLines(c.p.Number, c.p.Title, c.state, "kept"))
-				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
-					t.Errorf("calls %s: it changes nothing and opens nothing", got)
+				f.have(c.ps...)
+				f.set("create.out", "https://github.com/"+repo+"/pull/12\n")
+				f.setRead(pull{Number: 12, Draft: true, Title: title})
+				wantResult(t, f.run(), 0, commitLines()+draftLines(12, title, "draft", "opened"))
+				if got := strings.Join(f.kinds(), " "); got != "auth list create read" {
+					t.Errorf("calls %s: it opens a draft and reads only that one", got)
 				}
 			})
 		}
 	})
 }
 
-// The draft among several: the highest number that is not closed and not merged, else
-// the highest number.
+// The draft among several: the highest number of the open ones, as findPull of the
+// adapter takes it. A closed or merged pull request does not count, whatever its number.
 func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		closed := pull{Number: 5, State: "closed", Title: "Five"}
@@ -563,27 +588,51 @@ func TestSeveralPullRequestsFromTheBranch(t *testing.T) {
 		otherBranch := pull{Number: 22, Ref: "other", Title: "Other branch"}
 		upper := pull{Number: 23, Repo: "Acme-Corp/Widgets-App", Title: "Upper case", Draft: true, Body: "Text."}
 		for _, c := range []struct {
-			name   string
-			ps     []pull
-			want   pull
-			state  string
-			action string
+			name string
+			ps   []pull
+			want pull
 		}{
-			{"the highest that is not closed or merged", []pull{open7, closed, open9, merged11, closed12}, open9, "draft", "updated"},
-			{"none is open, so the highest number", []pull{closed, merged11, closed12}, closed12, "closed", "kept"},
-			{"none is open and the highest is merged", []pull{closed, closed12, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}}, pull{Number: 13, State: "closed", Merged: true, Title: "Thirteen"}, "merged", "kept"},
-			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7, "draft", "updated"},
-			{"the repository is compared without regard to case", []pull{open7, upper}, upper, "draft", "updated"},
+			{"the highest that is open", []pull{open7, closed, open9, merged11, closed12}, open9},
+			{"an open one below a closed one is the one", []pull{closed12, open7}, open7},
+			{"forks, deleted forks and other branches are not it", []pull{open7, fork, noRepo, otherBranch}, open7},
+			{"the repository is compared without regard to case", []pull{open7, upper}, upper},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
 				f.setText("New text.")
 				f.have(c.ps...)
-				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, c.state, c.action))
-				kinds := strings.Join(f.kinds(), " ")
-				if want := map[string]string{"updated": "auth list read patch", "kept": "auth list read"}[c.action]; kinds != want {
-					t.Errorf("calls %s, want %s", kinds, want)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(c.want.Number, c.want.norm().Title, "draft", "updated"))
+				if kinds := strings.Join(f.kinds(), " "); kinds != "auth list read patch" {
+					t.Errorf("calls %s, want auth list read patch", kinds)
+				}
+			})
+		}
+	})
+}
+
+// A pull request that the search returns as open and the read returns as closed or
+// merged, because it changed between the two calls, is kept: the program prints its
+// state and changes nothing.
+func TestAPullRequestThatClosesBetweenTheSearchAndTheReadIsKept(t *testing.T) {
+	eachMode(t, func(t *testing.T, mode string) {
+		for _, c := range []struct {
+			name  string
+			read  pull
+			state string
+		}{
+			{"closed", pull{Number: 8, State: "closed", Title: "Eight", Body: "Text."}, "closed"},
+			{"merged", pull{Number: 8, State: "closed", Merged: true, Title: "Eight", Body: "Text."}, "merged"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				t.Parallel()
+				f := newFake(t, mode)
+				f.setText("New text.")
+				f.setList(pull{Number: 8, Title: "Eight", Body: "Text."})
+				f.setRead(c.read)
+				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Eight", c.state, "kept"))
+				if got := strings.Join(f.kinds(), " "); got != "auth list read" {
+					t.Errorf("calls %s, want auth list read and no patch", got)
 				}
 			})
 		}
@@ -637,7 +686,7 @@ func TestADescriptionIsWrittenByTheRuleOfTheContract(t *testing.T) {
 
 // The adapter writes the description with contracts.MarkedDescription: the program gives
 // the same bytes for the same description and text, the cases of the contract's fixtures
-// and the cases of the adapter's tests (internal/serve/submission_test.go).
+// and the cases of the adapter's tests (internal/serve/changerequest_test.go).
 func TestTheProgramWritesWhatTheAdapterWrites(t *testing.T) {
 	type c struct{ name, existing, text string }
 	cases := []c{
@@ -1024,30 +1073,40 @@ func parsed(t *testing.T, stdout string) *contracts.SubmittedDraft {
 func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 	eachMode(t, func(t *testing.T, mode string) {
 		classes := map[string]string{
-			"a C0 control":        "\x01",
-			"a delete":            "\x7f",
-			"a line feed":         "\n",
-			"a carriage return":   "\r",
-			"a tab":               "\t",
-			"a C1 control":        "\u0085",
-			"the highest C1":      "\u009f",
-			"a soft hyphen":       "\u00ad",
-			"an Arabic mark":      "\u061c",
-			"a Mongolian vowel":   "\u180e",
-			"a zero width space":  "\u200b",
-			"a left-to-right":     "\u200e",
-			"a right-to-left":     "\u200f",
-			"a line separator":    "\u2028",
-			"a paragraph sep":     "\u2029",
-			"a bidi embedding":    "\u202a",
-			"a bidi override":     "\u202e",
-			"a word joiner":       "\u2060",
-			"an invisible plus":   "\u2064",
-			"an isolate":          "\u2066",
-			"a pop isolate":       "\u2069",
-			"a byte order mark":   "\ufeff",
-			"an annotation start": "\ufff9",
-			"an annotation end":   "\ufffb",
+			"a C0 control":           "\x01",
+			"a delete":               "\x7f",
+			"a line feed":            "\n",
+			"a carriage return":      "\r",
+			"a tab":                  "\t",
+			"a C1 control":           "\u0085",
+			"the highest C1":         "\u009f",
+			"a soft hyphen":          "\u00ad",
+			"an Arabic mark":         "\u061c",
+			"a Mongolian vowel":      "\u180e",
+			"a zero width space":     "\u200b",
+			"a left-to-right":        "\u200e",
+			"a right-to-left":        "\u200f",
+			"a line separator":       "\u2028",
+			"a paragraph sep":        "\u2029",
+			"a bidi embedding":       "\u202a",
+			"a bidi override":        "\u202e",
+			"a word joiner":          "\u2060",
+			"an invisible plus":      "\u2064",
+			"an isolate":             "\u2066",
+			"a pop isolate":          "\u2069",
+			"a byte order mark":      "\ufeff",
+			"an annotation start":    "\ufff9",
+			"an annotation end":      "\ufffb",
+			"an invisible separator": "\u2063",
+			"a deprecated format":    "\u206a",
+			"the last deprecated":    "\u206f",
+			"an Arabic number sign":  "\u0600",
+			"a tag begin":            "\U000e0001",
+			"a tag space":            "\U000e0020",
+			"a tag letter":           "\U000e0041",
+			"the last tag":           "\U000e007f",
+			"a shorthand format":     "\U0001bca0",
+			"a musical format":       "\U0001d173",
 		}
 		for name, ch := range classes {
 			t.Run(name, func(t *testing.T) {
@@ -1062,7 +1121,7 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 			})
 		}
 		// A character next to the allowed ones stays: the neighbours of each range.
-		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u206a", "﻾", "￸", "￼", "é", "日本語"} {
+		for _, keep := range []string{"\u00a0x", "¬", "؛", "᠍", "\u200a", "\u2010", "\u202f", "\u205f", "\u2065", "\u0606", "\u06dc", "\u06de", "\u070e", "\u0710", "\u088f", "\u0892", "\u08e1", "\u08e3", "\U000110bc", "\U000110be", "\U000110cc", "\U000110ce", "\U0001342f", "\U00013440", "\U0001bc9f", "\U0001bca4", "\U0001d172", "\U0001d17b", "\U000e0000", "\U000e0080", "\u200c", "\u200d", "\u200d\U0001f468", "﻾", "￸", "￼", "é", "日本語"} {
 			t.Run("keeps "+keep, func(t *testing.T) {
 				t.Parallel()
 				f := newFake(t, mode)
@@ -1070,19 +1129,47 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 				wantResult(t, f.run(), 0, commitLines()+draftLines(8, "Show"+keep, "draft", "updated"))
 			})
 		}
+		t.Run("a tag character is removed from the title that GitHub has", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: "Show\U000e0041\U000e0068 dates", Body: "x"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			if d := parsed(t, r.stdout); d.Title != "Show dates" {
+				t.Errorf("recorded title %q", d.Title)
+			}
+		})
+		t.Run("a zero width joiner emoji sequence stays in the title", func(t *testing.T) {
+			const family = "\U0001f468\u200d\U0001f469\u200d\U0001f467 trip"
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: family, Body: "x"})
+			r := f.run()
+			wantResult(t, r, 0, commitLines()+draftLines(8, family, "draft", "updated"))
+			if d := parsed(t, r.stdout); d.Title != family {
+				t.Errorf("recorded title %q", d.Title)
+			}
+		})
+		t.Run("a tag character is removed from the title of the run", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: "\u200b", Body: "x"})
+			r := f.run("QORY_SUBMIT_TITLE=Show\U000e0041 dates\U000e007f")
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			parsed(t, r.stdout)
+		})
+		t.Run("a title of zero width joiners and spaces uses the title of the run", func(t *testing.T) {
+			f := newFake(t, mode)
+			f.have(pull{Number: 8, Draft: true, Title: " \u200d\u200c ", Body: "x"})
+			r := f.run("QORY_SUBMIT_TITLE=Show dates")
+			wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
+			parsed(t, r.stdout)
+		})
 		t.Run("nothing but forbidden characters and spaces uses the title of the run", func(t *testing.T) {
-			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   "} {
+			for _, ghTitle := range []string{"\u200b\u202e", " \u200f ", "\u00a0\u3000\u200b", "\n\n", "   ", "\U000e0041", "\u200d"} {
 				f := newFake(t, mode)
 				f.have(pull{Number: 8, Draft: true, Title: ghTitle, Body: "x"})
 				r := f.run("QORY_SUBMIT_TITLE=Show\u200b dates\u202e")
 				wantResult(t, r, 0, commitLines()+draftLines(8, "Show dates", "draft", "updated"))
 				parsed(t, r.stdout)
 			}
-		})
-		t.Run("a closed pull request is cleaned too", func(t *testing.T) {
-			f := newFake(t, mode)
-			f.have(pull{Number: 4, State: "closed", Title: "Old\u200f\nname"})
-			wantResult(t, f.run(), 0, commitLines()+draftLines(4, "Oldname", "closed", "kept"))
 		})
 		t.Run("a new draft shows the title that GitHub has, cleaned", func(t *testing.T) {
 			f := newFake(t, mode)
@@ -1096,7 +1183,7 @@ func TestATitleHasNoCharacterTheContractRefuses(t *testing.T) {
 }
 
 func TestATitleOfTheRunWithNothingToShowIsRefused(t *testing.T) {
-	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e "} {
+	for _, bad := range []string{"\u200b", "\u00a0\u3000", " \u202e ", "\u200d\u200c", " \u200d ", "\U000e0041\U000e007f"} {
 		f := newFake(t, "text")
 		r := f.run("QORY_SUBMIT_TITLE=" + bad)
 		if r.code != 2 || r.stdout != commitLines() || !strings.HasPrefix(r.stderr, "Set QORY_SUBMIT_TITLE to a title with a character") || len(f.calls()) != 0 {
@@ -1115,7 +1202,7 @@ func TestEveryRunOfTheProgramIsRecordedByQory(t *testing.T) {
 			f.setRead(pull{Number: 12, Draft: true, Title: title})
 		}},
 		{"updated", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: "x"}) }},
-		{"kept merged", func(f *fake) { f.have(pull{Number: 8, State: "closed", Merged: true, Title: "Mine"}) }},
+		{"kept", func(f *fake) { f.have(pull{Number: 8, Title: "Mine", Body: block("Show the delivery date.")}) }},
 	} {
 		f := newFake(t, "text")
 		c.set(f)
