@@ -105,39 +105,50 @@ type Apply struct {
 
 // Uses are where a token for the repositories goes, the same for the same repositories
 // every time, since the gateway refuses an answer whose hosts, schemes or paths change
-// under a run:
+// under a run. An item fills one template at a time, each for every repository in the
+// order of repos, then the next template, as the control plane fills the templates of
+// the source role's apply for a call with several resources:
 //
-//   - github.com, with basic and the username x-access-token: /owner/name.git/* and
-//     /owner/name/*, git over HTTPS with and without the suffix, which is info/refs,
-//     git-upload-pack for a fetch, git-receive-pack for a push, and Git LFS's batch
-//     endpoint under info/lfs;
-//   - api.github.com, with bearer: /repos/owner/name and what is under it, and /graphql,
-//     which has no repository in its path: the token's scope limits it to these.
+//   - github.com, with basic and the username x-access-token: /owner/name.git/* for each
+//     repository, then /owner/name/* for each: git over HTTPS with and without the
+//     suffix, which is info/refs, git-upload-pack for a fetch, git-receive-pack for a
+//     push, and Git LFS's batch endpoint under info/lfs;
+//   - api.github.com, with bearer: /repos/owner/name for each repository, then
+//     /repos/owner/name/* for each, which is what is under it, and /graphql once, which
+//     has no repository in its path: the token's scope limits it to these.
 func Uses(repos []Repository) []Apply {
 	var git, api []string
-	for _, r := range repos {
-		git = append(git, "/"+r.String()+".git/*", "/"+r.String()+"/*")
-		api = append(api, "/repos/"+r.String(), "/repos/"+r.String()+"/*")
+	for _, end := range []string{".git/*", "/*"} {
+		for _, r := range repos {
+			git = append(git, "/"+r.String()+end)
+		}
+	}
+	for _, end := range []string{"", "/*"} {
+		for _, r := range repos {
+			api = append(api, "/repos/"+r.String()+end)
+		}
 	}
 	api = append(api, "/graphql")
 	return []Apply{gitItem(git), {Hosts: []string{APIHost}, Scheme: "bearer", Paths: api}}
 }
 
 // PushUses are where the token of a run that may push goes: git's push and no other
-// call. Like [Uses], it returns the same for the same repositories every time. It has
-// one item, the github.com item of [Uses], with these paths for each repository, in
-// this order:
+// call. Like [Uses], it returns the same for the same repositories every time, and fills
+// one template at a time. It has one item, the github.com item of [Uses], with these
+// paths, each for every repository in turn, in this order:
 //
 //   - /owner/name.git/info/refs, which a push calls with the query
-//     service=git-receive-pack, and /owner/name.git/git-receive-pack.
+//     service=git-receive-pack, then /owner/name.git/git-receive-pack.
 //
 // It has no api.github.com item: no REST path and no /graphql. No path ends in *.
 //
 // Each path is inside a path of the source role's apply, in the description.
 func PushUses(repos []Repository) []Apply {
 	var git []string
-	for _, r := range repos {
-		git = append(git, "/"+r.String()+".git/info/refs", "/"+r.String()+".git/git-receive-pack")
+	for _, end := range []string{"/info/refs", "/git-receive-pack"} {
+		for _, r := range repos {
+			git = append(git, "/"+r.String()+".git"+end)
+		}
 	}
 	return []Apply{gitItem(git)}
 }

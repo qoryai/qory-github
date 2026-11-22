@@ -8,8 +8,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/qoryai/forager v0.7.1-0.20261120100355-3a8876d85c0d h1:tyCYNMtyvGgdLw8J+x/fUWtligeZIJ7/T1AmcmbLNRg=
 github.com/qoryai/forager v0.7.1-0.20261120100355-3a8876d85c0d/go.mod h1:LQJoODbJS+dQDjDmpqU0oeTmnGU5qlT4jU0e/N9hHKQ=
-github.com/qoryai/integrations v0.3.1-0.20261121150642-4c788f46237d h1:f6fd1wUuL3+eGa8WnsrGv13jitjPsC46EN+0tORfBA0=
-github.com/qoryai/integrations v0.3.1-0.20261121150642-4c788f46237d/go.mod h1:TVgn3zXZW3OIjcrRZBMIDzyiRpaUbNF6/ZvZkYX0kyM=
+github.com/qoryai/integrations v0.3.1-0.20261121180558-effc22aa2dc8 h1:rhyMckxZ8/Lzb2airGD76itBrvmZsuQgzyPAjk0HqJg=
+github.com/qoryai/integrations v0.3.1-0.20261121180558-effc22aa2dc8/go.mod h1:TVgn3zXZW3OIjcrRZBMIDzyiRpaUbNF6/ZvZkYX0kyM=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
