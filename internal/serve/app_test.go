@@ -104,6 +104,15 @@ func TestNoSecretsAreNoApp(t *testing.T) {
 // suite, and one whose ciphertext was changed. No error contains a value.
 func TestAWrongSecretsAnswerIsRefused(t *testing.T) {
 	other := newKey(t)
+	// sealing makes the answer carry the plaintext pt, sealed as the contract says.
+	sealing := func(pt string) func(f *fakeApiary, access *accesskey.Key) {
+		return func(f *fakeApiary, access *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, access.PublicKey(), []byte(pt), contracts.SecretsInfo(keyID), contracts.SecretsAAD(testAdapterID, keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}
+	}
 	for name, tc := range map[string]struct {
 		change func(f *fakeApiary, access *accesskey.Key)
 		want   string
@@ -154,9 +163,36 @@ func TestAWrongSecretsAnswerIsRefused(t *testing.T) {
 				s["ct"] = string(ct)
 			}
 		}, "the answer is refused: its seal does not open with this adapter's access key"},
-		"with a member the contract does not define": {func(f *fakeApiary, _ *accesskey.Key) {
-			f.sealing = func(doc map[string]any, _ string) { doc["expires_at"] = "2026-10-25T00:00:00Z" }
+		"with a member that must_understand lists": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) {
+				doc["expires_at"], doc["must_understand"] = "2026-10-25T00:00:00Z", []string{"/expires_at"}
+			}
+		}, `use a reader that defines "/expires_at"`},
+		"with a plaintext that lists a member it does not define": {func(f *fakeApiary, access *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, access.PublicKey(), []byte(`{"version":1,"secrets":[],"zz":1,"must_understand":["/zz"]}`), contracts.SecretsInfo(keyID), contracts.SecretsAAD(testAdapterID, keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}, `use a reader that defines "/zz"`},
+		"with a must_understand that is no list": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) { doc["must_understand"] = "/sealed" }
+		}, "set must_understand to a list of JSON Pointers, or leave it out"},
+		"with a plaintext whose must_understand is no list": {sealing(`{"version":1,"secrets":[],"must_understand":"/secrets"}`), "set must_understand to a list of JSON Pointers, or leave it out"},
+		"with a revision of the wrong type": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) { doc["revision"] = "1" }
 		}, "the answer is not the secrets' document"},
+		"with a suite of the wrong type": {func(f *fakeApiary, _ *accesskey.Key) {
+			f.sealing = func(doc map[string]any, _ string) { doc["sealed"].(map[string]any)["suite"] = 5 }
+		}, "the answer is not the secrets' document"},
+		"with a plaintext version of the wrong type": {sealing(`{"version":"1","secrets":[]}`), "the opened secrets are not the plaintext's document"},
+		"with a plaintext whose secrets are no list": {sealing(`{"version":1,"secrets":{}}`), "the opened secrets are not the plaintext's document"},
+		"with a bad name next to an unknown member":  {sealing(`{"version":1,"secrets":[{"name":"Bad Name","value":"v","zz":1}]}`), "the opened secrets are not the plaintext's document"},
+		"with data after the plaintext": {func(f *fakeApiary, access *accesskey.Key) {
+			f.sealing = func(doc map[string]any, keyID string) {
+				enc, ct := sealTo(t, access.PublicKey(), []byte(`{"version":1,"secrets":[]}{}`), contracts.SecretsInfo(keyID), contracts.SecretsAAD(testAdapterID, keyID))
+				doc["sealed"].(map[string]any)["enc"], doc["sealed"].(map[string]any)["ct"] = enc, ct
+			}
+		}, "the opened secrets are not the plaintext's document"},
 	} {
 		access := newKey(t)
 		f := newFakeApiary(t, access)
@@ -172,6 +208,25 @@ func TestAWrongSecretsAnswerIsRefused(t *testing.T) {
 				t.Errorf("%s: the error contains a value", name)
 			}
 		}
+	}
+}
+
+// TestTheSecretsAnswerIgnoresAMemberItDoesNotDefine pins that an answer to GET
+// /v1/adapter/secrets and the plaintext in it are read when they have a member the
+// contract does not define, in the document, in the seal and in a secret's entry.
+func TestTheSecretsAnswerIgnoresAMemberItDoesNotDefine(t *testing.T) {
+	access := newKey(t)
+	f := newFakeApiary(t, access)
+	f.storeApp(setupApp())
+	f.sealing = func(doc map[string]any, keyID string) {
+		enc, ct := sealTo(t, access.PublicKey(), []byte(`{"version":1,"zz":{"a":1},"secrets":[{"name":"webhook_secret","value":"v","zz":1}],"must_understand":["/secrets"]}`), contracts.SecretsInfo(keyID), contracts.SecretsAAD(testAdapterID, keyID))
+		s := doc["sealed"].(map[string]any)
+		s["enc"], s["ct"], s["zz"] = enc, ct, 1
+		doc["zz"], doc["must_understand"] = []int{1}, []string{"/sealed/suite"}
+	}
+	got, err := testApiary(t, f, access).Secrets(context.Background())
+	if err != nil || len(got.Secrets) != 1 || got.Secrets[0].Name != "webhook_secret" || got.Secrets[0].Value != "v" {
+		t.Errorf("%+v %v", got, err)
 	}
 }
 

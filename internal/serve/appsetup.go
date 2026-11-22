@@ -429,8 +429,9 @@ func (a *appSetup) start(w http.ResponseWriter, r *http.Request, q url.Values) {
 //  1. its form and its signature, over [contracts.SetupDomain], under en's pin, see
 //     [signedPayload], before the payload is parsed;
 //  2. the payload is one JSON object with the contract's four required members, and
-//     organisation_slug or not, and no other member, each of the contract's shape, see
-//     [organisationSlug], and version 1;
+//     organisation_slug or not, each of the contract's shape, see [organisationSlug],
+//     and version 1; another member is ignored, unless must_understand lists it, see
+//     [readObject];
 //  3. adapter_id is en's;
 //  4. expires_at has not passed on serve's clock, and is at most 15 minutes ahead.
 //
@@ -450,7 +451,10 @@ func checkSetupPass(pass string, now time.Time, en enrolment) (contracts.SetupPa
 		ExpiresAt *string         `json:"expires_at"`
 		Slug      json.RawMessage `json:"organisation_slug"`
 	}
-	if !strictObject(payload, &doc) || doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
+	if err := readObject(payload, &doc, contracts.SetupPass{}); err != nil {
+		return contracts.SetupPass{}, time.Time{}, refusedBy(&setupRefusePayload, err)
+	}
+	if doc.Version == nil || *doc.Version != contracts.Version || doc.AdapterID == nil || !adapterIDShape.MatchString(*doc.AdapterID) ||
 		doc.Nonce == nil || !nonceShape.MatchString(*doc.Nonce) || doc.ExpiresAt == nil {
 		return contracts.SetupPass{}, time.Time{}, &setupRefusePayload
 	}

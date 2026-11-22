@@ -25,14 +25,24 @@ MAX_TITLE=256
 MAX_DESCRIPTION=20000
 LOGIN_LINE='Run `gh auth login`, then `qory run` again.'
 
-# gh prints a pull request as these 8 lines. A read of one pull request adds its
-# description after them. merged is true when merged_at is set. The title has none of the
-# characters that the contract's draft_title refuses (C0 and C1 controls, line and
-# paragraph separators, bidirectional and invisible format characters), so it stays on
-# one line, and is empty when nothing but spaces is left. Every character of the
-# expression is a constant: no input is put into it.
-FORBIDDEN='[\\x{0000}-\\x{001f}\\x{007f}-\\x{009f}\\x{00ad}\\x{061c}\\x{180e}\\x{200b}\\x{200e}\\x{200f}\\x{2028}\\x{2029}\\x{202a}-\\x{202e}\\x{2060}-\\x{2064}\\x{2066}-\\x{2069}\\x{feff}\\x{fff9}-\\x{fffb}]'
-NOT_SPACE='[^ \\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}]'
+# FORBIDDEN_RANGES are the code points, as hexadecimal ranges, that the title of a pull
+# request does not have: the rule of $defs.line of the contract and of the adapter's
+# LineStopped. They are the controls (category Cc), U+2028 and U+2029, and the format
+# characters (category Cf) except U+200C and U+200D, which emoji sequences need. The Cf
+# ranges are those of Unicode 17.0.0, as in Go 1.27's unicode.Cf. The tests compare the
+# ranges with the adapter's rule for every code point, and run the program over the
+# characters of the ranges and their neighbours.
+FORBIDDEN_RANGES='0000-001F 007F-009F 00AD 0600-0605 061C 06DD 070F 0890-0891 08E2 180E 200B 200E-200F 2028-202E 2060-2064 2066-206F FEFF FFF9-FFFB 110BD 110CD 13430-1343F 1BCA0-1BCA3 1D173-1D17A E0001 E0020-E007F'
+# FORBIDDEN is the regular expression of the ranges for gh's --jq. A title needs a
+# character of NOT_SPACE: not a space (category Zs), and not U+200C or U+200D, which a
+# title keeps but which show nothing. Every character of both is a constant: no input is
+# put into them.
+FORBIDDEN=
+for _r in $FORBIDDEN_RANGES; do
+	FORBIDDEN="$FORBIDDEN\\\\x{${_r%-*}}-\\\\x{${_r#*-}}"
+done
+FORBIDDEN="[$FORBIDDEN]"
+NOT_SPACE='[^ \\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}\\x{200c}\\x{200d}]'
 FIELDS='(.number | tostring), .head.ref, (.head.repo.full_name // "-"), .state, ((.merged_at != null) | tostring), ((.draft == true) | tostring), (.title | gsub("'"$FORBIDDEN"'"; "") | if test("'"$NOT_SPACE"'") then . else "" end), .html_url'
 LIST_JQ=".[] | $FIELDS"
 READ_JQ="$FIELDS, (.body // \"\")"
@@ -128,33 +138,48 @@ has_control() {
 	[ "$(count_bytes "$1")" != "$(printf '%s' "$1" | tr -d '[:cntrl:]' | wc -c | tr -d ' ')" ]
 }
 
-# forbidden_seqs prints, one on each line, the UTF-8 bytes of each character that the
-# contract's draft_title refuses and that has_control does not find: the C1 controls and
-# the separators, bidirectional and invisible format characters, U+0080 to U+FFFB. They are
-# printf escapes, which POSIX defines, so no awk has to read an escape. It is the rule of
-# the --jq expression above.
+# utf8_seq sets _seq to the printf escapes of the UTF-8 bytes of the code point $1, a
+# decimal number from 128 up, such as \302\255 for U+00AD. printf escapes are POSIX, so
+# no awk has to read an escape.
+utf8_seq() {
+	if [ "$1" -lt 2048 ]; then
+		set -- $((192 | $1 >> 6)) $((128 | $1 & 63))
+	elif [ "$1" -lt 65536 ]; then
+		set -- $((224 | $1 >> 12)) $((128 | ($1 >> 6) & 63)) $((128 | $1 & 63))
+	else
+		set -- $((240 | $1 >> 18)) $((128 | ($1 >> 12) & 63)) $((128 | ($1 >> 6) & 63)) $((128 | $1 & 63))
+	fi
+	_seq=
+	for _b in "$@"; do
+		_seq="$_seq\\$((_b >> 6))$((_b >> 3 & 7))$((_b & 7))"
+	done
+}
+
+# forbidden_seqs prints, one on each line, the UTF-8 bytes of each code point of
+# FORBIDDEN_RANGES from U+0080 up. The controls below U+0080 never reach it: has_control
+# refuses them first. It is the rule of the --jq expression above.
 forbidden_seqs() {
-	for _seq in \
-		'\302\200' '\302\201' '\302\202' '\302\203' '\302\204' '\302\205' '\302\206' '\302\207' \
-		'\302\210' '\302\211' '\302\212' '\302\213' '\302\214' '\302\215' '\302\216' '\302\217' \
-		'\302\220' '\302\221' '\302\222' '\302\223' '\302\224' '\302\225' '\302\226' '\302\227' \
-		'\302\230' '\302\231' '\302\232' '\302\233' '\302\234' '\302\235' '\302\236' '\302\237' \
-		'\302\255' '\330\234' '\341\240\216' '\342\200\213' '\342\200\216' '\342\200\217' \
-		'\342\200\250' '\342\200\251' '\342\200\252' '\342\200\253' '\342\200\254' '\342\200\255' \
-		'\342\200\256' '\342\201\240' '\342\201\241' '\342\201\242' '\342\201\243' '\342\201\244' \
-		'\342\201\246' '\342\201\247' '\342\201\250' '\342\201\251' '\357\273\277' '\357\277\271' \
-		'\357\277\272' '\357\277\273'; do
-		printf "$_seq\\n"
+	for _r in $FORBIDDEN_RANGES; do
+		_cp=$((0x${_r%-*}))
+		_hi=$((0x${_r#*-}))
+		while [ "$_cp" -le "$_hi" ]; do
+			if [ "$_cp" -ge 128 ]; then
+				utf8_seq "$_cp"
+				printf "$_seq\\n"
+			fi
+			_cp=$((_cp + 1))
+		done
 	done
 }
 
 # space_seqs prints, one on each line, the UTF-8 bytes of each space that a title may
-# have in Unicode: U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000.
+# have in Unicode: U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000,
+# and of U+200C and U+200D, which a title keeps but which show nothing.
 space_seqs() {
 	for _seq in \
 		'\040' '\302\240' '\341\232\200' '\342\200\200' '\342\200\201' '\342\200\202' '\342\200\203' \
 		'\342\200\204' '\342\200\205' '\342\200\206' '\342\200\207' '\342\200\210' '\342\200\211' \
-		'\342\200\212' '\342\200\257' '\342\201\237' '\343\200\200'; do
+		'\342\200\212' '\342\200\214' '\342\200\215' '\342\200\257' '\342\201\237' '\343\200\200'; do
 		printf "$_seq\\n"
 	done
 }
@@ -374,12 +399,13 @@ read_pull() {
 	fi
 }
 
-# find_pull sets number to the pull request from the branch, or to nothing. It looks
-# at the head branch and the repository alone, in any state. Of several it takes the
-# highest number that is not closed and not merged, else the highest number.
+# find_pull sets number to the open pull request from the branch, or to nothing. It looks
+# at the head branch and the repository alone, as findPull of the adapter does when it
+# looks up by branch: only an open pull request counts, the highest number of them. The
+# program has no address, so a closed or merged pull request is never reused.
 find_pull() {
 	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
-		-f "head=$owner:$branch" -f state=all -f per_page=100 --jq "$LIST_JQ" \
+		-f "head=$owner:$branch" -f state=open -f per_page=100 --jq "$LIST_JQ" \
 		>"$tmp/list" 2>"$tmp/gh.err" </dev/null; then
 		gh_fail 'the search for the pull request of the branch'
 	fi
@@ -389,13 +415,11 @@ find_pull() {
 			v[f] = $0
 			if (f == 8 && v[2] == ENVIRON["QORY_SUBMIT_BRANCH"] && tolower(v[3]) == tolower(want_repo)) {
 				n = v[1] + 0
-				if (v[4] == "open" && v[5] == "false" && n > best_open) best_open = n
-				if (n > best_any) best_any = n
+				if (v[4] == "open" && v[5] == "false" && n > best) best = n
 			}
 		}
 		END {
-			if (best_open > 0) print best_open
-			else if (best_any > 0) print best_any
+			if (best > 0) print best
 		}
 	' "$tmp/list")
 }

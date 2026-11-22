@@ -262,7 +262,7 @@ type sink struct {
 var requestSchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 	out := map[string]*jsonschema.Schema{}
 	for _, name := range []string{"source-collections.schema.json", "source-items.schema.json", "source-item-comments.schema.json", "sources-disconnect.schema.json"} {
-		s, err := contracts.Compile(name)
+		s, err := contracts.CompileClosed(name)
 		if err != nil {
 			panic(err)
 		}

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -341,22 +342,8 @@ const maxCommentBody = 65536
 // maxAuthorName is the most characters of a comment entry's author_name.
 const maxAuthorName = 100
 
-var (
-	// commentIDShape is a comment's id in Qory Apiary, definitions.schema.json's
-	// comment_id.
-	commentIDShape = regexp.MustCompile(`^sc_[0-9a-hjkmnp-tv-z]{16}$`)
-	// nameControls are the control characters, C0, DEL and C1, which the contract's
-	// rule of a prose line, description.schema.json's line, forbids in author_name.
-	nameControls = regexp.MustCompile(`[\x00-\x1f\x7f-\x9f]`)
-	// nameBreaks are the line and paragraph separators, which that rule forbids too.
-	// Each becomes a space in the name before it is posted, so the words on either
-	// side stay apart.
-	nameBreaks = strings.NewReplacer("\u2028", " ", "\u2029", " ")
-	// nameHidden are the other characters that rule forbids: the bidirectional
-	// controls and the format characters that are usually not shown. They are removed
-	// from the name before it is posted.
-	nameHidden = regexp.MustCompile(`[\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}]`)
-)
+// commentIDShape is a comment's id in Qory Apiary, definitions.schema.json's comment_id.
+var commentIDShape = regexp.MustCompile(`^sc_[0-9a-hjkmnp-tv-z]{16}$`)
 
 // CheckCommentID returns an error when id is not a comment's id in Qory Apiary: sc_ and
 // 16 lower-case Crockford base32 characters. The error contains the rule, never the
@@ -423,11 +410,19 @@ func isHex(r rune) bool {
 }
 
 // cleanName is the author's name as the first line contains it, before it is escaped:
-// each line or paragraph separator a space, see nameBreaks, without the characters
-// nameHidden matches, and without leading and trailing spaces, ASCII or Unicode, such
+// each line or paragraph separator a space, without the other characters that
+// [LineStopped] stops, and without leading and trailing spaces, ASCII or Unicode, such
 // as U+00A0 and U+3000, since four leading spaces would make the line a code block.
 func cleanName(name string) string {
-	return strings.TrimSpace(nameHidden.ReplaceAllString(nameBreaks.Replace(name), ""))
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		switch {
+		case r == '\u2028' || r == '\u2029':
+			return ' '
+		case LineStopped(r):
+			return -1
+		}
+		return r
+	}, name))
 }
 
 // escapeName is the author's name as the first line contains it, shown as plain text:
@@ -479,8 +474,8 @@ func commentBody(e Comment) string {
 // ref, see [ParseItemRef], so no path is built from any other text; its comment_id has
 // the shape of one, see [CheckCommentID]; and its author_name is 1 to 100 characters of
 // UTF-8 with no control character, as the contract's rule of a prose line has it, and
-// is not empty once cleaned, see [cleanName]. The errors contain the rule, never the
-// value.
+// has a character that is not a space once cleaned, see [cleanName]. The errors contain
+// the rule, never the value.
 func parseComment(e Comment) (issueRef, error) {
 	repository, number, ok := ParseItemRef(e.Ref)
 	if !ok {
@@ -490,7 +485,7 @@ func parseComment(e Comment) (issueRef, error) {
 		return issueRef{}, err
 	}
 	name := e.AuthorName
-	if !utf8.ValidString(name) || utf8.RuneCountInString(name) > maxAuthorName || nameControls.MatchString(name) || cleanName(name) == "" {
+	if !utf8.ValidString(name) || utf8.RuneCountInString(name) > maxAuthorName || strings.ContainsFunc(name, unicode.IsControl) || !HasVisible(cleanName(name)) {
 		return issueRef{}, invalidChange("report this Qory Apiary defect: author_name is blank, too long, invalid UTF-8, or has controls")
 	}
 	return issueRef{repository: repository, number: number}, nil

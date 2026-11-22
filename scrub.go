@@ -10,19 +10,34 @@ import (
 	"unicode/utf8"
 )
 
-// lineForbiddenSet is the body of the character class of the characters that a line of
-// prose in the contract may not have: the control characters, C0, DEL and C1, the
-// bidirectional controls, the line and paragraph separators, and the format characters
-// that are usually not shown. A cleaned text has none of them.
-const lineForbiddenSet = `\x00-\x1f\x7f-\x9f\x{00ad}\x{061c}\x{180e}\x{200b}\x{200e}\x{200f}\x{2028}\x{2029}\x{202a}-\x{202e}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{feff}\x{fff9}-\x{fffb}`
+// LineStopped is whether the rule of a line stops r: every control character (category
+// Cc), U+2028, U+2029, and every format character (category Cf) but U+200C and U+200D,
+// which emoji sequences and some scripts need. It is the rule of $defs.line in the
+// contract's description.schema.json, and of a title, an account title, an author name
+// and a failure detail, which refer to it. Which characters are in category Cf depends on
+// the Unicode version of the Go release.
+func LineStopped(r rune) bool {
+	switch r {
+	case '\u2028', '\u2029':
+		return true
+	case '\u200c', '\u200d':
+		return false
+	}
+	return unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r)
+}
 
-// LineForbidden matches one character of [lineForbiddenSet].
-var LineForbidden = regexp.MustCompile(`[` + lineForbiddenSet + `]`)
+// HasVisible is whether s has a character that is not a space (category Zs) and not
+// U+200C or U+200D, as a title needs: the contract's change_title.
+func HasVisible(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool {
+		return !unicode.Is(unicode.Zs, r) && r != '\u200c' && r != '\u200d'
+	})
+}
 
-// between matches any number of characters that may split a credential: the forbidden
-// characters, and every other format character, such as U+200C and U+200D. It is for
-// matching only; a cleaned text keeps the format characters that the contract allows.
-const between = `(?:[` + lineForbiddenSet + `\p{Cf}])*`
+// between matches any number of characters that may split a credential: every character
+// that [LineStopped] stops, and U+200C and U+200D, so every format character. It is for
+// matching only.
+const between = `(?:[\p{Cc}\p{Cf}\x{2028}\x{2029}])*`
 
 // spread is the pattern for the literal text lit, with [between] between its characters.
 func spread(lit string) string {
@@ -35,7 +50,7 @@ func spread(lit string) string {
 
 // space matches white space, or a character of [between], between the words of a
 // credential.
-const space = `(?:[\s\p{Zs}]|[` + lineForbiddenSet + `\p{Cf}])+`
+const space = `(?:[\s\p{Zs}]|[\p{Cc}\p{Cf}\x{2028}\x{2029}])+`
 
 // valueChars is the class of the characters of a bearer or header value, and base64Chars
 // the class of those of a basic value, which is base64 and has no dot.
@@ -109,7 +124,7 @@ func cutAt(s string, max int) string {
 	for trimmed := 0; len(s) > 0 && trimmed < maxCredential; trimmed++ {
 		r, n := utf8.DecodeLastRuneInString(s)
 		if !(r < utf8.RuneSelf && (r == '_' || r == '-' || r == '.' || r == '+' || r == '/' || r == '=' ||
-			'0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z') || unicode.Is(unicode.Cf, r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029') {
+			'0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z') || unicode.Is(unicode.Cf, r) || LineStopped(r)) {
 			break
 		}
 		s = s[:len(s)-n]
@@ -120,7 +135,7 @@ func cutAt(s string, max int) string {
 // OneLine is s as one line of at most max characters. It reads at most 64 KiB of s. It
 // first replaces by "[removed]" each of secrets, a literal credential, and anything that
 // looks like a credential, also when a forbidden character splits it, and only then
-// replaces each forbidden character (see [LineForbidden]) and each run of white space by
+// replaces each stopped character (see [LineStopped]) and each run of white space by
 // one space and cuts the rest at max characters, so no part of a credential is left by
 // the cut.
 func OneLine(s string, max int, secrets ...string) string {
@@ -132,7 +147,12 @@ func OneLine(s string, max int, secrets ...string) string {
 	}
 	s = authorizationHeader.ReplaceAllString(s, "${1}[removed]")
 	s = secretShape.ReplaceAllString(s, "[removed]")
-	s = LineForbidden.ReplaceAllString(s, " ")
+	s = strings.Map(func(r rune) rune {
+		if LineStopped(r) {
+			return ' '
+		}
+		return r
+	}, s)
 	s = strings.Join(strings.Fields(s), " ")
 	if r := []rune(s); len(r) > max {
 		s = strings.TrimRight(string(r[:max]), " ")
