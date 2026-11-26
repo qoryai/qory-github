@@ -196,7 +196,7 @@ change what the program does, and notes it under Upgrading.
 - `setup` escapes the code it exchanges for the App in the request's path. When an error
   from GitHub's API quotes the code, the error shows `[the code]` in its place.
 - Building `qory-github` from source needs Go 1.27.4, up from 1.27.1: the integrations
-  and Forager modules it builds against require Go 1.27.3, and Go 1.27.4 fixes
+  and Forager modules it builds against require Go 1.27.4, and Go 1.27.4 fixes
   GO-2026-6859 in the standard library. The image builds with Go 1.27.4.
 - A repository is a collection with a `ref`, and its target is that `ref` with an
   optional address. `qory-github-server serve` sends each collection and each issue with
