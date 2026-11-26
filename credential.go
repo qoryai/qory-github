@@ -105,25 +105,58 @@ type Apply struct {
 
 // Uses are where a token for the repositories goes, the same for the same repositories
 // every time, since the gateway refuses an answer whose hosts, schemes or paths change
-// under a run:
+// under a run. An item fills one template at a time, each for every repository in the
+// order of repos, then the next template, as the control plane fills the templates of
+// the source role's apply for a call with several resources:
 //
-//   - github.com, with basic and the username x-access-token: /owner/name.git/* and
-//     /owner/name/*, git over HTTPS with and without the suffix, which is info/refs,
-//     git-upload-pack for a fetch, git-receive-pack for a push, and Git LFS's batch
-//     endpoint under info/lfs;
-//   - api.github.com, with bearer: /repos/owner/name and what is under it, and /graphql,
-//     which has no repository in its path: the token's scope limits it to these.
+//   - github.com, with basic and the username x-access-token: /owner/name.git/* for each
+//     repository, then /owner/name/* for each: git over HTTPS with and without the
+//     suffix, which is info/refs, git-upload-pack for a fetch, git-receive-pack for a
+//     push, and Git LFS's batch endpoint under info/lfs;
+//   - api.github.com, with bearer: /repos/owner/name for each repository, then
+//     /repos/owner/name/* for each, which is what is under it, and /graphql once, which
+//     has no repository in its path: the token's scope limits it to these.
 func Uses(repos []Repository) []Apply {
 	var git, api []string
-	for _, r := range repos {
-		git = append(git, "/"+r.String()+".git/*", "/"+r.String()+"/*")
-		api = append(api, "/repos/"+r.String(), "/repos/"+r.String()+"/*")
+	for _, end := range []string{".git/*", "/*"} {
+		for _, r := range repos {
+			git = append(git, "/"+r.String()+end)
+		}
+	}
+	for _, end := range []string{"", "/*"} {
+		for _, r := range repos {
+			api = append(api, "/repos/"+r.String()+end)
+		}
 	}
 	api = append(api, "/graphql")
-	return []Apply{
-		{Hosts: []string{GitHost}, Scheme: "basic", Username: "x-access-token", Paths: git},
-		{Hosts: []string{APIHost}, Scheme: "bearer", Paths: api},
+	return []Apply{gitItem(git), {Hosts: []string{APIHost}, Scheme: "bearer", Paths: api}}
+}
+
+// PushUses are where the token of a run that may push goes: git's push and no other
+// call. Like [Uses], it returns the same for the same repositories every time, and fills
+// one template at a time. It has one item, the github.com item of [Uses], with these
+// paths, each for every repository in turn, in this order:
+//
+//   - /owner/name.git/info/refs, which a push calls with the query
+//     service=git-receive-pack, then /owner/name.git/git-receive-pack.
+//
+// It has no api.github.com item: no REST path and no /graphql. No path ends in *.
+//
+// Each path is inside a path of the source role's apply, in the description.
+func PushUses(repos []Repository) []Apply {
+	var git []string
+	for _, end := range []string{"/info/refs", "/git-receive-pack"} {
+		for _, r := range repos {
+			git = append(git, "/"+r.String()+".git"+end)
+		}
 	}
+	return []Apply{gitItem(git)}
+}
+
+// gitItem is the github.com item of a token's uses, with paths, shared by [Uses] and
+// [PushUses] so that their host and scheme agree.
+func gitItem(paths []string) Apply {
+	return Apply{Hosts: []string{GitHost}, Scheme: "basic", Username: "x-access-token", Paths: paths}
 }
 
 // Client is how the package reaches GitHub's API.
@@ -253,11 +286,11 @@ func (c Client) Mint(ctx context.Context, req Request) (*Answer, error) {
 		return nil, err
 	}
 	if got.Token == "" {
-		return nil, errors.New(minting + ": GitHub answered without a token")
+		return nil, unreadableAt(http.StatusCreated, minting+": GitHub answered without a token", nil)
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return nil, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
+		return nil, unreadableAt(http.StatusCreated, fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
 	}
 	return &Answer{Version: 1, Token: got.Token, ExpiresAt: expires.UTC().Format(time.RFC3339), Apply: Uses(req.Repositories), Placeholders: Placeholders}, nil
 }
@@ -418,10 +451,10 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: GitHub's API could not be reached: %w", what, unsent(err, path))
+		return fmt.Errorf("%s: %w: %w", what, ErrTransport, unsent(err, path))
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	b, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != want {
 		var e struct {
 			Message string `json:"message"`
@@ -430,13 +463,17 @@ func (c Client) call(ctx context.Context, what, method, path, jwt string, body a
 		if e.Message == "" {
 			e.Message = http.StatusText(resp.StatusCode)
 		}
-		return &answerError{what: what, status: resp.StatusCode, message: e.Message}
+		limited := (&apiReply{status: resp.StatusCode, header: resp.Header, body: b}).rateLimited()
+		return &answerError{what: what, status: resp.StatusCode, message: e.Message, limited: limited && resp.StatusCode == http.StatusForbidden}
 	}
 	if out == nil {
 		return nil
 	}
+	if readErr != nil {
+		return connectionFailed(what, path, readErr)
+	}
 	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("%s: GitHub's answer: %w", what, err)
+		return unreadableAt(resp.StatusCode, fmt.Sprintf("%s: GitHub's answer: %v", what, err), err)
 	}
 	return nil
 }
@@ -447,6 +484,8 @@ type answerError struct {
 	what    string
 	status  int
 	message string
+	// limited is whether the answer is a 403 for GitHub's rate limit, not a refusal.
+	limited bool
 }
 
 func (e *answerError) Error() string {
@@ -460,6 +499,13 @@ func (e *answerError) Error() string {
 func Forbidden(err error) bool {
 	var e *answerError
 	return errors.As(err, &e) && e.status == http.StatusForbidden
+}
+
+// RateLimited is whether err, or an error it wraps, is GitHub's 403 for its rate limit, as
+// its headers or its message say, which passes rather than refuses: a retry can succeed.
+func RateLimited(err error) bool {
+	var e *answerError
+	return errors.As(err, &e) && e.limited
 }
 
 // Unauthorized is whether err, or an error it wraps, is GitHub's 401 to a request

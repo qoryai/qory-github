@@ -3,7 +3,7 @@ name: Pre-release image
 # Run by hand only: from the Actions tab, once this file is on the default branch, or by
 # pushing a commit to the branch prerelease, which nothing else pushes to. Never on a push
 # to any other branch, a pull request or a schedule. Each run costs Actions minutes and
-# package storage.
+# package storage. The run builds only a commit on main.
 on:
   push:
     branches: [prerelease]
@@ -53,9 +53,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # The whole history, so the check below can find the commit on main.
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
       # The commit the ref names, which the image is built from and named after.
       - name: Name the commit
@@ -67,6 +69,13 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
           echo "::notice::Building $REF at $sha"
+
+      - name: Check that the commit is on main
+        run: |
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::Build a commit on main: $(git rev-parse --short HEAD) is not on main"
+            exit 1
+          }
 
       - uses: docker/login-action@v4
         with:

@@ -115,6 +115,9 @@
         "other": "repositories"
       },
       "comments": true,
+      "change_kinds": [
+        "pull-request"
+      ],
       "targets": true,
       "program": "qory-github-server",
       "setup": {

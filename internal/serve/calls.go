@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/exactjson"
 	"github.com/qoryai/qory-github/internal/store"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -348,7 +350,7 @@ func callTime(body []byte) (time.Time, bool) {
 	var doc struct {
 		Time string `json:"time"`
 	}
-	if json.Unmarshal(body, &doc) != nil {
+	if exactjson.Unmarshal(body, &doc) != nil {
 		return time.Time{}, false
 	}
 	return passExpiry(doc.Time)
@@ -421,7 +423,7 @@ func decodeCall(name string, body []byte, doc any) bool {
 	if err != nil || schema.Validate(v) != nil {
 		return false
 	}
-	return json.Unmarshal(body, doc) == nil
+	return exactjson.Unmarshal(body, doc) == nil
 }
 
 // jsonRules refuses a body that is not one JSON value, that repeats a member of an
@@ -504,14 +506,15 @@ func repositoryOf(ref string) (int64, bool) { return installationOf(ref) }
 
 // runPermissions are the permissions of a run's token for purpose and access. A token
 // for work reads the repositories' contents and pull requests with access read, and
-// writes both with access write; GitHub adds metadata read to every token. A token for
-// a harness reads the contents alone, whatever the access. No token has workflows.
+// writes the contents alone with access write, since the token reaches only git's push;
+// GitHub adds metadata read to every token. A token for a harness reads the contents
+// alone, whatever the access. No token has workflows.
 func runPermissions(purpose, access string) map[string]string {
 	switch {
 	case purpose == "harness":
 		return map[string]string{"contents": "read"}
 	case access == "write":
-		return map[string]string{"contents": "write", "pull_requests": "write"}
+		return map[string]string{"contents": "write"}
 	}
 	return map[string]string{"contents": "read", "metadata": "read", "pull_requests": "read"}
 }
@@ -519,16 +522,14 @@ func runPermissions(purpose, access string) map[string]string {
 // runCredential serves the call run-credential, run-credential.schema.json, made at at:
 // a token GitHub mints for one installation, limited to the repositories of the
 // resources and to [runPermissions]. A call for a harness has the installation's id in
-// grant_ref, see [Calls.harnessGrant]; a call for work has the connection of its one
-// repository in connection_id, see [Calls.workGrant]. Past those checks, it returns
+// grant_ref, see [Calls.harnessGrant]; a call for work has the connection of its
+// repositories in connection_id, see [Calls.workGrant]. Past those checks, it returns
 // 403 access_not_granted when GitHub returns 422 for the permissions on those
 // repositories, as for an installation that does not grant them, or the installation
 // is suspended; when the mint fails for good, as for an installation GitHub has no
 // more, 409 grant_unknown for a harness and 403 resource_not_covered for work; and 503
-// source_unavailable when GitHub fails otherwise. The answer's apply has, for work,
-// github.com with basic and the username x-access-token on the repository's git paths
-// and api.github.com with bearer on its API paths, as [github.Uses] returns them; for a
-// harness, the github.com item alone.
+// source_unavailable when GitHub fails otherwise. The answer's apply is the list that
+// [runCredentialUses] returns.
 func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (int, any) {
 	var req contracts.RunCredential
 	if !decodeCall("run-credential.schema.json", body, &req) {
@@ -539,15 +540,18 @@ func (c *Calls) runCredential(ctx context.Context, body []byte, at time.Time) (i
 
 // runCredentialFor is [Calls.runCredential] for the decoded call req. At GitHub, a
 // mint that lists no repository covers every repository of the installation, so a call
-// with no resources gets 400 invalid_request here, beside the schema's minItems. A call
-// for work with a grant_ref, with no connection_id or with other than one resource gets
-// 400 invalid_request here too, beside the schema.
+// with no resources gets 400 invalid_request here, beside the schema's minItems, and so
+// does a call that lists a resource twice. A call for work with a grant_ref, with no
+// connection_id, or with access write and other than one resource gets 400
+// invalid_request here too, beside the schema. A call whose repositories do not fit
+// the answer's 16 items of 32 paths gets 403 resource_not_covered before anything is
+// minted.
 func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredential, at time.Time) (int, any) {
-	if len(req.Resources) == 0 {
+	if len(req.Resources) == 0 || len(slices.Compact(slices.Sorted(slices.Values(req.Resources)))) != len(req.Resources) {
 		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
 	}
 	work := req.Purpose == "work"
-	if work && (req.GrantRef != "" || len(req.Resources) != 1 || !connectionShape.MatchString(req.ConnectionID)) {
+	if work && (req.GrantRef != "" || !connectionShape.MatchString(req.ConnectionID) || req.Access == "write" && len(req.Resources) != 1) {
 		return http.StatusBadRequest, contracts.Refusal{Error: codeInvalidRequest}
 	}
 	var installation int64
@@ -555,12 +559,24 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 	var status int
 	var refusal any
 	if work {
-		installation, ids, status, refusal = c.workGrant(req.ConnectionID, req.Resources[0])
+		installation, ids, status, refusal = c.workGrant(req.ConnectionID, req.Resources)
 	} else {
 		installation, ids, status, refusal = c.harnessGrant(req.GrantRef, req.Resources)
 	}
 	if status != 0 {
 		return status, refusal
+	}
+	// The paths of a repository do not depend on its name, so a list of empty ones counts
+	// the items of the answer before the mint. A read call covers at most 127
+	// repositories: 4 paths for each, and /graphql once. A harness call has 2 paths for
+	// each, so its 64 repositories fit.
+	if len(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, len(ids)))) > maxApplyItems {
+		most := len(ids) - 1
+		for len(runCredentialUses(req.Purpose, req.Access, make([]github.Repository, most))) > maxApplyItems {
+			most--
+		}
+		c.log().Info(fmt.Sprintf("Send at most %d repositories in one call. This call has %d and needs over %d items.", most, len(ids), maxApplyItems), slog.Int64("installation", installation))
+		return http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	}
 	t, err := c.GitHub.MintInstallationToken(ctx, github.Request{AppID: c.AppID, Key: c.Key, InstallationID: installation, RepositoryIDs: ids, Permissions: runPermissions(req.Purpose, req.Access)})
 	switch {
@@ -589,10 +605,7 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		}
 		repos = append(repos, name)
 	}
-	uses := github.Uses(repos)
-	if req.Purpose == "harness" {
-		uses = uses[:1]
-	}
+	uses := runCredentialUses(req.Purpose, req.Access, repos)
 	apply := make([]contracts.CredentialApply, len(uses))
 	for i, u := range uses {
 		apply[i] = contracts.CredentialApply{Hosts: u.Hosts, Scheme: u.Scheme, Username: u.Username, Paths: u.Paths}
@@ -605,6 +618,46 @@ func (c *Calls) runCredentialFor(ctx context.Context, req contracts.RunCredentia
 		return http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 	}
 	return http.StatusOK, answer
+}
+
+// The limits of the apply of a run credential answer, run-credential-answer.schema.json:
+// at most 16 items of 1 to 32 paths each, which makes at most 512 paths together.
+const (
+	maxApplyItems = 16
+	maxItemPaths  = 32
+)
+
+// runCredentialUses is the apply of a run credential for purpose and access:
+//
+//   - for work with access write, [github.PushUses]: the push calls on github.com and
+//     nothing on api.github.com, so the token that can write reaches GitHub only for
+//     git's push;
+//   - for work with access read, which includes a run whose documents have the access
+//     write-no-push, [github.Uses];
+//   - for a harness, the github.com item of [github.Uses] alone.
+//
+// Each item that has more than [maxItemPaths] paths is cut into items of that many
+// paths, in order, with the host, scheme and username of the item, since the answer
+// takes no more in one item. No path is in two items, so the items of one host do not
+// overlap.
+func runCredentialUses(purpose, access string, repos []github.Repository) []github.Apply {
+	var uses []github.Apply
+	switch {
+	case purpose == "harness":
+		uses = github.Uses(repos)[:1]
+	case access == "write":
+		uses = github.PushUses(repos)
+	default:
+		uses = github.Uses(repos)
+	}
+	var items []github.Apply
+	for _, u := range uses {
+		for paths := range slices.Chunk(u.Paths, maxItemPaths) {
+			u.Paths = paths
+			items = append(items, u)
+		}
+	}
+	return items
 }
 
 // harnessGrant is the installation of grant and the repositories of resources for a
@@ -628,42 +681,51 @@ func (c *Calls) harnessGrant(grant string, resources []string) (int64, []int64, 
 	return installation, ids, 0, nil
 }
 
-// workGrant is the installation and the repository for a call for work under
-// connection whose one resource is ref, or the status and refusal. The repository of
-// ref must be a live collection under connection, see [grants.liveUnder], and Qory
-// Apiary's copy of the grants must contain the grant of the installation that reaches
-// it under connection, see [grants.copied]; else the call gets 403
-// resource_not_covered, with a line that contains ref and connection. The check
-// compares the connection of ref's installation with connection and never takes the
-// connection from ref. When the store fails, the call gets 503 source_unavailable.
-func (c *Calls) workGrant(connection, ref string) (int64, []int64, int, any) {
-	notCovered := func(why string) (int64, []int64, int, any) {
+// workGrant is the installation and the repositories for a call for work under
+// connection whose resources are refs, or the status and refusal. The repository of
+// each ref must be a live collection under connection, see [grants.liveUnder], all of
+// the same installation, and Qory Apiary's copy of the grants must contain the grant of
+// that installation under connection, see [grants.copied]; else the call gets 403
+// resource_not_covered, with a line that contains the ref and connection. The check
+// compares the connection of each ref's installation with connection and never takes the
+// connection from a ref. When the store fails, the call gets 503 source_unavailable.
+func (c *Calls) workGrant(connection string, refs []string) (int64, []int64, int, any) {
+	notCovered := func(why, ref string) (int64, []int64, int, any) {
 		c.log().Info(why, slog.String("connection", connection), slog.String("resource", ref))
 		return 0, nil, http.StatusForbidden, contracts.Refusal{Error: codeResourceNotCovered}
 	}
-	failed := func(err error) (int64, []int64, int, any) {
+	failed := func(err error, ref string) (int64, []int64, int, any) {
 		c.log().Error("reading the collection and the grant of a work call", slog.String("connection", connection), slog.String("resource", ref), slog.String("error", err.Error()))
 		return 0, nil, http.StatusServiceUnavailable, contracts.Refusal{Error: codeSourceUnavailable}
 	}
-	id, ok := repositoryOf(ref)
-	if !ok {
-		return notCovered("the resource of the work call is not a repository's id")
-	}
-	installation, live, err := c.Grants.liveUnder(connection, id)
-	if err != nil {
-		return failed(err)
-	}
-	if !live {
-		return notCovered("the resource of the work call is not a live collection under the call's connection")
+	var installation int64
+	ids := make([]int64, 0, len(refs))
+	for _, ref := range refs {
+		id, ok := repositoryOf(ref)
+		if !ok {
+			return notCovered("a resource of the work call is not a repository's id", ref)
+		}
+		reached, live, err := c.Grants.liveUnder(connection, id)
+		if err != nil {
+			return failed(err, ref)
+		}
+		if !live {
+			return notCovered("a resource of the work call is not a live collection under the call's connection", ref)
+		}
+		if installation != 0 && reached != installation {
+			return notCovered("a resource of the work call is a repository of another installation than the call's first resource", ref)
+		}
+		installation = reached
+		ids = append(ids, id)
 	}
 	copied, err := c.Grants.copied(installation, connection)
 	if err != nil {
-		return failed(err)
+		return failed(err, refs[0])
 	}
 	if !copied {
-		return notCovered("Qory Apiary's copy of the grants does not contain a grant under the call's connection that covers the work call's resource")
+		return notCovered("Qory Apiary's copy of the grants does not contain a grant under the call's connection that covers the work call's resources", refs[0])
 	}
-	return installation, []int64{id}, 0, nil
+	return installation, ids, 0, nil
 }
 
 // held is 0 when ok and the installation is linked to Qory Apiary; else 409

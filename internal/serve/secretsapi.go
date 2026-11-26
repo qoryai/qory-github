@@ -195,7 +195,9 @@ func (a *Apiary) Secrets(ctx context.Context) (contracts.AdapterSecretsPlaintext
 // not adapter-secrets-answer.schema.json, of version 1 and the contract's revision; one
 // of another suite; one sealed to another access key than e's; one whose seal does not
 // open; and a plaintext that is not adapter-secrets-plaintext.schema.json, see
-// [contracts.AdapterSecretsPlaintext.Check]. An error never contains a value.
+// [contracts.AdapterSecretsPlaintext.Check]. An error has no secret's value. It may quote a
+// must_understand pointer, up to 256 characters, from the opened plaintext: a pointer is
+// a path, and a writer that follows the contract puts no secret in it.
 func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, error) {
 	var doc struct {
 		Version  *int `json:"version"`
@@ -207,7 +209,10 @@ func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, e
 			CT          *string `json:"ct"`
 		} `json:"sealed"`
 	}
-	if !strictObject(body, &doc) || doc.Version == nil || doc.Revision == nil || doc.Sealed == nil || doc.Sealed.Suite == nil ||
+	if err := readObject(body, &doc, contracts.AdapterSecretsAnswer{}); err != nil {
+		return contracts.AdapterSecretsPlaintext{}, answerRefusal(err, "the answer is not the secrets' document")
+	}
+	if doc.Version == nil || doc.Revision == nil || doc.Sealed == nil || doc.Sealed.Suite == nil ||
 		doc.Sealed.AccessKeyID == nil || doc.Sealed.Enc == nil || doc.Sealed.CT == nil {
 		return contracts.AdapterSecretsPlaintext{}, errors.New("the answer is not the secrets' document")
 	}
@@ -234,7 +239,10 @@ func openSecrets(body []byte, e enrolment) (contracts.AdapterSecretsPlaintext, e
 			Value *string `json:"value"`
 		} `json:"secrets"`
 	}
-	if !strictObject(pt, &plain) || plain.Version == nil || *plain.Version != contracts.Version || plain.Secrets == nil || len(*plain.Secrets) > contracts.SecretsMax {
+	if err := readObject(pt, &plain, contracts.AdapterSecretsPlaintext{}); err != nil {
+		return contracts.AdapterSecretsPlaintext{}, answerRefusal(err, "the opened secrets are not the plaintext's document")
+	}
+	if plain.Version == nil || *plain.Version != contracts.Version || plain.Secrets == nil || len(*plain.Secrets) > contracts.SecretsMax {
 		return contracts.AdapterSecretsPlaintext{}, errors.New("the opened secrets are not the plaintext's document")
 	}
 	p := contracts.AdapterSecretsPlaintext{Version: *plain.Version}

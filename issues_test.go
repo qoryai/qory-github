@@ -262,7 +262,7 @@ type sink struct {
 var requestSchemas = sync.OnceValue(func() map[string]*jsonschema.Schema {
 	out := map[string]*jsonschema.Schema{}
 	for _, name := range []string{"source-collections.schema.json", "source-items.schema.json", "source-item-comments.schema.json", "sources-disconnect.schema.json"} {
-		s, err := contracts.Compile(name)
+		s, err := contracts.CompileClosed(name)
 		if err != nil {
 			panic(err)
 		}
@@ -414,8 +414,8 @@ func TestListRepositoriesSendsTheCollectionsWithTheirTarget(t *testing.T) {
 	}
 	got := s.reqs[0].(contracts.SourceCollections)
 	want := []contracts.Collection{
-		{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets", GrantRef: testGrant, Target: &contracts.Target{System: host, Path: "acme/widgets"}},
-		{Ref: "1296270", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", GrantRef: testGrant, Target: &contracts.Target{System: host, Path: "acme/gadgets"}},
+		{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets", GrantRef: testGrant, Target: &contracts.Target{Collection: "1296269", Address: &contracts.TargetAddress{System: host, Path: "acme/widgets"}}},
+		{Ref: "1296270", URL: "https://github.com/acme/gadgets", Title: "acme/gadgets", GrantRef: testGrant, Target: &contracts.Target{Collection: "1296270", Address: &contracts.TargetAddress{System: host, Path: "acme/gadgets"}}},
 	}
 	if !reflect.DeepEqual(got.Collections, want) || got.Listing.Part != 1 || got.Listing.Complete || got.Version != 1 || got.ConnectionID != testConnection {
 		t.Errorf("collections %+v", got)
@@ -513,6 +513,58 @@ func TestTheTargetsSystemIsGitHubsWebsite(t *testing.T) {
 	}
 }
 
+// TestATargetIsTheCollectionAndAnOptionalAddress: a repository's target has its
+// collection ref, which a rename keeps, and its address, which a rename changes; a
+// collection whose target has no address is listed, and one whose address has no path
+// is skipped.
+func TestATargetIsTheCollectionAndAnOptionalAddress(t *testing.T) {
+	was := targetOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/widgets"})
+	now := targetOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/sprockets"})
+	if was.Collection != "1296269" || now.Collection != was.Collection || was.Address.Path != "acme/widgets" || now.Address.Path != "acme/sprockets" {
+		t.Errorf("before the rename %+v %+v, after %+v %+v", was, *was.Address, now, *now.Address)
+	}
+	c := contracts.Collection{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}
+	for target, want := range map[*contracts.Target]string{
+		nil:                 "",
+		{Collection: c.Ref}: "",
+		was:                 "",
+		{Collection: c.Ref, Address: &contracts.TargetAddress{System: "github.com"}}: fmt.Sprintf("the path of its target's address is empty or longer than %d characters", contractLimits().path),
+	} {
+		c.Target = target
+		if got := checkCollection(c); got != want {
+			t.Errorf("target %+v: %q, want %q", target, got, want)
+		}
+	}
+}
+
+// TestAPathOfTheContractsLimitIsTheMostAnAddressTakes: the contract allows an address
+// path of 200 characters, so a collection or an item with a path of 201, or with none,
+// is skipped, and one with a path of 200 is not.
+func TestAPathOfTheContractsLimitIsTheMostAnAddressTakes(t *testing.T) {
+	if n := contractLimits().path; n != 200 {
+		t.Fatalf("the contract's limit for a path is %d, want 200", n)
+	}
+	c := contracts.Collection{Ref: "1296269", URL: "https://github.com/acme/widgets", Title: "acme/widgets"}
+	is := ghIssue{
+		Number: 42, Title: "Widgets spin backwards", State: "open",
+		HTMLURL:   "https://github.com/acme/widgets/issues/42",
+		CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
+	}
+	for _, tc := range []struct {
+		path    string
+		skipped bool
+	}{{"", true}, {strings.Repeat("a", 201), true}, {strings.Repeat("a", 200), false}} {
+		c.Target = &contracts.Target{Collection: c.Ref, Address: &contracts.TargetAddress{System: "github.com", Path: tc.path}}
+		_, why, _ := itemOf("github.com", ghRepo{ID: widgetsID, FullName: tc.path}, is)
+		if got := checkCollection(c) != ""; got != tc.skipped {
+			t.Errorf("collection with a path of %d characters: skipped %t, want %t", len(tc.path), got, tc.skipped)
+		}
+		if got := why != ""; got != tc.skipped {
+			t.Errorf("item with a path of %d characters: skipped %t (%q), want %t", len(tc.path), got, why, tc.skipped)
+		}
+	}
+}
+
 func str(s string) *string { return &s }
 
 // TestAnIssueMapsToAnItem checks every row of the mapping.
@@ -529,7 +581,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 		Ref: "1296269#42", URL: "https://github.com/acme/widgets/issues/42", Key: "#42", Title: "Widgets spin backwards", Body: "They should not.",
 		BodyFormat: "markdown", Type: "issue", State: "open", Labels: []string{"bug", "good first issue"},
 		FiledBy: contracts.Person{Name: "alice", Kind: "person"}, CommentCount: 3, CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-03T03:04:05Z",
-		Target: &contracts.Target{System: "github.com", Path: "acme/widgets"},
+		Target: &contracts.Target{Collection: "1296269", Address: &contracts.TargetAddress{System: "github.com", Path: "acme/widgets"}},
 	}
 	if why != "" || !reflect.DeepEqual(it, want) {
 		t.Errorf("item %+v, %s\nwant %+v", it, why, want)
@@ -575,7 +627,7 @@ func TestAnIssueMapsToAnItem(t *testing.T) {
 func TestTheWireIsTheContractsJSON(t *testing.T) {
 	it, _, _ := itemOf("github.com", ghRepo{ID: widgetsID, FullName: "acme/widgets", HTMLURL: "https://github.com/acme/widgets"}, ghIssue{Number: 1, Title: "t", State: "open", HTMLURL: "https://github.com/acme/widgets/issues/1", CreatedAt: "2026-01-02T03:04:05Z", UpdatedAt: "2026-01-02T03:04:05Z"})
 	b, _ := json.Marshal(contracts.SourceItems{Version: contracts.Version, Time: "2026-01-02T03:04:05Z", CollectionRef: widgetsRef, Items: []contracts.Item{it}})
-	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"1296269","items":[{"ref":"1296269#1","url":"https://github.com/acme/widgets/issues/1","key":"#1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"system":"github.com","path":"acme/widgets"}}]}`
+	want := `{"version":1,"time":"2026-01-02T03:04:05Z","collection_ref":"1296269","items":[{"ref":"1296269#1","url":"https://github.com/acme/widgets/issues/1","key":"#1","type":"issue","title":"t","body":"","body_format":"markdown","filed_by":{"name":"ghost","kind":"person"},"labels":[],"state":"open","state_reason":null,"comment_count":0,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","target":{"collection":"1296269","address":{"system":"github.com","path":"acme/widgets"}}}]}`
 	if string(b) != want {
 		t.Errorf("items\n%s\nwant\n%s", b, want)
 	}
@@ -660,8 +712,8 @@ func TestAnIssuesEventIsTheItem(t *testing.T) {
 			if it.StateReason != nil {
 				reason = *it.StateReason
 			}
-			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.Key+" "+it.Target.Path+" "+it.State+" "+reason)
-			if it.Target.System != "github.com" {
+			lines = append(lines, req.CollectionRef+" "+it.Ref+" "+it.Key+" "+it.Target.Address.Path+" "+it.State+" "+reason)
+			if it.Target.Collection != req.CollectionRef || it.Target.Address.System != "github.com" {
 				t.Errorf("%s: target %+v", tc.action, it.Target)
 			}
 		}

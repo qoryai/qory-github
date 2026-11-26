@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // stage is one stage of the Dockerfile: its FROM line and the instructions after it,
@@ -41,7 +43,8 @@ func stages(t *testing.T) []stage {
 // QORY_FEATURES=factory, keeps its state directory in a volume, sets the state
 // directory and the address serve reads from the environment, and exposes that port.
 // The program is cross-compiled on the platform of the machine that builds for the
-// image's platform, so one build makes the images of linux/amd64 and linux/arm64.
+// image's platform, so one build makes the images of linux/amd64 and linux/arm64. The
+// build sets main.version from the build argument VERSION.
 func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	all := stages(t)
 	const base = "FROM gcr.io/distroless/static-debian13:nonroot@sha256:"
@@ -88,7 +91,7 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 				if line != flags {
 					t.Errorf("%s builds with %q, not %q", s.from, line, flags)
 				}
-				for _, arg := range []string{"ARG TARGETOS", "ARG TARGETARCH"} {
+				for _, arg := range []string{"ARG VERSION=dev", "ARG TARGETOS", "ARG TARGETARCH"} {
 					if !slices.Contains(s.lines, arg) {
 						t.Errorf("%s builds without %s", s.from, arg)
 					}
@@ -98,5 +101,48 @@ func TestDockerfileBuildsTheServerByDefault(t *testing.T) {
 	}
 	if builds != 1 {
 		t.Errorf("the Dockerfile has %d builds, want 1", builds)
+	}
+}
+
+// TestPrereleaseBuildsOnlyACommitOnMain pins that the pre-release workflow checks out the
+// full history, names the full commit it builds, stops for a commit that is not on main,
+// and builds the image only after that check.
+func TestPrereleaseBuildsOnlyACommitOnMain(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/prerelease.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				ID   string            `yaml:"id"`
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(b, &wf); err != nil {
+		t.Fatal(err)
+	}
+	var fullHistory, named, onMain, built bool
+	for _, step := range wf.Jobs["image"].Steps {
+		switch {
+		case strings.HasPrefix(step.Uses, "actions/checkout@"):
+			fullHistory = step.With["fetch-depth"] == "0"
+		case step.ID == "commit":
+			named = strings.Contains(step.Run, `sha="$(git rev-parse HEAD)"`) &&
+				strings.Contains(step.Run, `echo "sha=$sha" >> "$GITHUB_OUTPUT"`)
+		case strings.Contains(step.Run, "git merge-base --is-ancestor HEAD origin/main || {"):
+			onMain = strings.Contains(step.Run, "exit 1")
+		case strings.HasPrefix(step.Uses, "docker/build-push-action@"):
+			args := strings.Split(strings.TrimSpace(step.With["build-args"]), "\n")
+			// The build comes after the check, so a commit off main is never built.
+			built = onMain && slices.Contains(args, "VERSION=sha-${{ steps.commit.outputs.short }}")
+		}
+	}
+	if !fullHistory || !named || !onMain || !built {
+		t.Errorf("prerelease.yml: full history %v; the step commit writes the full commit %v; "+
+			"a commit off main stops the run %v; the build comes after the check %v", fullHistory, named, onMain, built)
 	}
 }

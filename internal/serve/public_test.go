@@ -345,8 +345,8 @@ func TestReadPublicReadsAPublicFile(t *testing.T) {
 	for _, at := range []string{"main?x=1", "main#x", "a b", "%2e%2e"} {
 		checkAnswer(t, send(readPublic(tools, "README.md", at)), http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
 	}
-	// A body with grant_ref breaks read-public's schema.
-	checkAnswer(t, send(`"grant_ref":"42",`+readPublic(tools, "README.md", "main")), http.StatusBadRequest, "refusal.schema.json", codeInvalidRequest)
+	// A grant_ref is a member read-public's schema does not define, so the call ignores it.
+	checkAnswer(t, send(`"grant_ref":"42",`+readPublic(tools, "README.md", "main")), 200, "read-answer.schema.json", "")
 	rig.pub.checkAnonymous(t)
 	if rig.gh.mintsSoFar() != nil {
 		t.Errorf("read-public minted %q", rig.gh.mintsSoFar())

@@ -1,0 +1,623 @@
+#!/bin/sh
+# open-draft: the submit program of the module github. qory runs it once for each
+# repository of a local run, after it pushed the run's branch, and reads the lines
+# it prints. It prints the address of each commit and, for QORY_SUBMIT_DRAFT=open,
+# opens or edits the draft pull request with the login of `gh`. It pushes nothing.
+set -eu
+set -f
+
+LC_ALL=C
+export LC_ALL
+umask 077
+
+# gh must not prompt, page, colour or check for updates.
+GH_PROMPT_DISABLED=1
+GH_NO_UPDATE_NOTIFIER=1
+GH_SPINNER_DISABLED=1
+GH_PAGER=cat
+NO_COLOR=1
+export GH_PROMPT_DISABLED GH_NO_UPDATE_NOTIFIER GH_SPINNER_DISABLED GH_PAGER NO_COLOR
+
+START='<!-- qory:start -->'
+END='<!-- qory:end -->'
+HOST=github.com
+MAX_TITLE=256
+MAX_DESCRIPTION=20000
+LOGIN_LINE='Run `gh auth login`, then `qory run` again.'
+
+# FORBIDDEN_RANGES are the code points, as hexadecimal ranges, that the title of a pull
+# request does not have: the rule of $defs.line of the contract and of the adapter's
+# LineStopped. They are the controls (category Cc), U+2028 and U+2029, and the format
+# characters (category Cf) except U+200C and U+200D, which emoji sequences need. The Cf
+# ranges are those of Unicode 17.0.0, as in Go 1.27's unicode.Cf. The tests compare the
+# ranges with the adapter's rule for every code point, and run the program over the
+# characters of the ranges and their neighbours.
+FORBIDDEN_RANGES='0000-001F 007F-009F 00AD 0600-0605 061C 06DD 070F 0890-0891 08E2 180E 200B 200E-200F 2028-202E 2060-2064 2066-206F FEFF FFF9-FFFB 110BD 110CD 13430-1343F 1BCA0-1BCA3 1D173-1D17A E0001 E0020-E007F'
+# FORBIDDEN is the regular expression of the ranges for gh's --jq. A title needs a
+# character of NOT_SPACE: not a space (category Zs), and not U+200C or U+200D, which a
+# title keeps but which show nothing. Every character of both is a constant: no input is
+# put into them.
+FORBIDDEN=
+for _r in $FORBIDDEN_RANGES; do
+	FORBIDDEN="$FORBIDDEN\\\\x{${_r%-*}}-\\\\x{${_r#*-}}"
+done
+FORBIDDEN="[$FORBIDDEN]"
+NOT_SPACE='[^ \\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}\\x{200c}\\x{200d}]'
+FIELDS='(.number | tostring), .head.ref, (.head.repo.full_name // "-"), .state, ((.merged_at != null) | tostring), ((.draft == true) | tostring), (.title | gsub("'"$FORBIDDEN"'"; "") | if test("'"$NOT_SPACE"'") then . else "" end), .html_url'
+LIST_JQ=".[] | $FIELDS"
+READ_JQ="$FIELDS, (.body // \"\")"
+
+tmp=
+timer=
+worker=
+stopped=
+# running is true when the process $1 runs. A process that ended but has not been waited
+# for stays in the process table as a zombie: it is not running, and kill -0 still
+# succeeds for it. The state comes from /proc; where there is none, from ps when $2 is
+# ps, which starts a process, so a loop does not pass it.
+running() {
+	kill -0 "$1" 2>/dev/null || return 1
+	_st=
+	if [ -r "/proc/$1/stat" ]; then
+		read -r _st <"/proc/$1/stat" 2>/dev/null || :
+		_st=${_st##*) }
+	elif [ "${2:-}" = ps ]; then
+		_st=$(ps -o stat= -p "$1" 2>/dev/null || :)
+	fi
+	case $_st in
+	Z*) return 1 ;;
+	esac
+	return 0
+}
+
+cleanup() {
+	# A signal or the watchdog stopped the program before the work ended: end what it
+	# started. After a normal end the pids are gone, and nothing is signalled.
+	if [ -n "$stopped" ]; then
+		# End the worker and the timer first, so no other gh starts. Then send TERM to gh
+		# and check up to 2000 times, with no pause, whether it ended. If it still runs,
+		# sleep 1 second, check again, and send KILL if it runs.
+		for _p in "$worker" "$timer"; do
+			if [ -n "$_p" ]; then
+				kill "$_p" 2>/dev/null || :
+				wait "$_p" 2>/dev/null || :
+			fi
+		done
+		_gh=$(cat "$tmp/gh.pid" 2>/dev/null || :)
+		if [ -n "$_gh" ] && running "$_gh" ps; then
+			kill "$_gh" 2>/dev/null || :
+			_n=0
+			while [ "$_n" -lt 2000 ] && running "$_gh"; do
+				_n=$((_n + 1))
+			done
+			if running "$_gh" ps; then
+				sleep 1
+				if running "$_gh" ps; then
+					kill -9 "$_gh" 2>/dev/null || :
+				fi
+			fi
+		fi
+	fi
+	if [ -n "$tmp" ]; then
+		rm -rf "$tmp"
+	fi
+}
+trap cleanup EXIT
+trap 'stopped=1; exit 1' HUP INT TERM
+
+# refuse prints the fix on stderr and ends with status 2: the inputs cannot be used.
+refuse() {
+	printf '%s\n' "$1" >&2
+	exit 2
+}
+
+# fail prints the fix on stderr and ends with status 1.
+fail() {
+	printf '%s\n' "$1" >&2
+	exit 1
+}
+
+# short cuts a value to 100 characters for an error line.
+short() {
+	printf '%s' "$1" | tr -d '[:cntrl:]' | cut -c 1-100
+}
+
+# count_bytes prints the number of bytes of the value $1.
+count_bytes() {
+	printf '%s' "$1" | wc -c | tr -d ' '
+}
+
+# chars prints the number of characters of the file $1: every byte that is not a
+# UTF-8 continuation byte, whatever the locale is.
+chars() {
+	tr -d '\200-\277' <"$1" | wc -c | tr -d ' '
+}
+
+# has_control succeeds when the value $1 has a control character or a line feed.
+has_control() {
+	[ "$(count_bytes "$1")" != "$(printf '%s' "$1" | tr -d '[:cntrl:]' | wc -c | tr -d ' ')" ]
+}
+
+# utf8_seq sets _seq to the printf escapes of the UTF-8 bytes of the code point $1, a
+# decimal number from 128 up, such as \302\255 for U+00AD. printf escapes are POSIX, so
+# no awk has to read an escape.
+utf8_seq() {
+	if [ "$1" -lt 2048 ]; then
+		set -- $((192 | $1 >> 6)) $((128 | $1 & 63))
+	elif [ "$1" -lt 65536 ]; then
+		set -- $((224 | $1 >> 12)) $((128 | ($1 >> 6) & 63)) $((128 | $1 & 63))
+	else
+		set -- $((240 | $1 >> 18)) $((128 | ($1 >> 12) & 63)) $((128 | ($1 >> 6) & 63)) $((128 | $1 & 63))
+	fi
+	_seq=
+	for _b in "$@"; do
+		_seq="$_seq\\$((_b >> 6))$((_b >> 3 & 7))$((_b & 7))"
+	done
+}
+
+# forbidden_seqs prints, one on each line, the UTF-8 bytes of each code point of
+# FORBIDDEN_RANGES from U+0080 up. The controls below U+0080 never reach it: has_control
+# refuses them first. It is the rule of the --jq expression above.
+forbidden_seqs() {
+	for _r in $FORBIDDEN_RANGES; do
+		_cp=$((0x${_r%-*}))
+		_hi=$((0x${_r#*-}))
+		while [ "$_cp" -le "$_hi" ]; do
+			if [ "$_cp" -ge 128 ]; then
+				utf8_seq "$_cp"
+				printf "$_seq\\n"
+			fi
+			_cp=$((_cp + 1))
+		done
+	done
+}
+
+# space_seqs prints, one on each line, the UTF-8 bytes of each space that a title may
+# have in Unicode: U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000,
+# and of U+200C and U+200D, which a title keeps but which show nothing.
+space_seqs() {
+	for _seq in \
+		'\040' '\302\240' '\341\232\200' '\342\200\200' '\342\200\201' '\342\200\202' '\342\200\203' \
+		'\342\200\204' '\342\200\205' '\342\200\206' '\342\200\207' '\342\200\210' '\342\200\211' \
+		'\342\200\212' '\342\200\214' '\342\200\215' '\342\200\257' '\342\201\237' '\343\200\200'; do
+		printf "$_seq\\n"
+	done
+}
+
+# strip_seqs prints the text $2 without any of the byte sequences in $1, one on each line.
+# awk reads them from the environment, which does not process escapes, and finds them as
+# plain text, so any POSIX awk gives the same result; the locale is C, so it is by byte.
+strip_seqs() {
+	printf '%s\n' "$2" | SEQS=$1 awk 'BEGIN { n = split(ENVIRON["SEQS"], seq, "\n") }
+		{
+			line = $0
+			for (i = 1; i <= n; i++) {
+				if (seq[i] == "") continue
+				while ((j = index(line, seq[i])) > 0) {
+					line = substr(line, 1, j - 1) substr(line, j + length(seq[i]))
+				}
+			}
+			print line
+		}'
+}
+
+# clean_title prints the title $1 without the characters of forbidden_seqs.
+clean_title() {
+	strip_seqs "$(forbidden_seqs)" "$1"
+}
+
+# is_blank succeeds when the value $1 has nothing but spaces, in ASCII or Unicode.
+is_blank() {
+	[ -z "$(strip_seqs "$(space_seqs)" "$1")" ]
+}
+
+# check_branch refuses the branch name $2 of the variable $1 when git or gh would
+# misread it.
+check_branch() {
+	if [ -z "$2" ]; then
+		refuse "Set $1 to a branch name: it is empty."
+	fi
+	if has_control "$2"; then
+		refuse "Set $1 to a branch name: the value has a control character."
+	fi
+	case $2 in
+	-* | /* | */ | *//* | *..* | *'@{'* | *.lock | *. | @ | *' '* | *'~'* | *'^'* | *':'* | *'?'* | *'*'* | *'['* | *'\'* | *'"'*)
+		refuse "Set $1 to a branch name that git accepts: \"$(short "$2")\" is not one."
+		;;
+	esac
+	if [ "$(count_bytes "$2")" -gt 255 ]; then
+		refuse "Set $1 to a branch name of at most 255 bytes."
+	fi
+}
+
+# is_hex succeeds when $1 is 40 or 64 lower-case hexadecimal digits.
+is_hex() {
+	case $1 in
+	*[!0-9a-f]*) return 1 ;;
+	esac
+	[ "$(count_bytes "$1")" = 40 ] || [ "$(count_bytes "$1")" = 64 ]
+}
+
+# ---------------------------------------------------------------- the inputs
+
+system=${QORY_SUBMIT_SYSTEM:-}
+path=${QORY_SUBMIT_PATH:-}
+branch=${QORY_SUBMIT_BRANCH:-}
+draft=${QORY_SUBMIT_DRAFT:-}
+
+if [ -z "$system" ]; then
+	refuse "Set QORY_SUBMIT_SYSTEM to $HOST: the variable is not set."
+fi
+if [ "$(printf '%s' "$system" | tr 'A-Z' 'a-z')" != "$HOST" ]; then
+	refuse "Compose a submit program for $(short "$system"): this one opens pull requests on $HOST only."
+fi
+
+case $path in
+*[!A-Za-z0-9._/-]* | /* | */ | */*/* | "")
+	refuse "Set QORY_SUBMIT_PATH to owner/name: \"$(short "$path")\" is not a repository path."
+	;;
+*/*) ;;
+*)
+	refuse "Set QORY_SUBMIT_PATH to owner/name: \"$(short "$path")\" is not a repository path."
+	;;
+esac
+owner=${path%%/*}
+name=${path#*/}
+case $owner in
+"" | *[!A-Za-z0-9-]* | -*)
+	refuse "Set QORY_SUBMIT_PATH to owner/name: \"$(short "$path")\" has no valid owner."
+	;;
+esac
+case $name in
+"" | . | .. | .git)
+	refuse "Set QORY_SUBMIT_PATH to owner/name: \"$(short "$path")\" has no valid name."
+	;;
+esac
+
+check_branch QORY_SUBMIT_BRANCH "$branch"
+
+case $draft in
+open | none) ;;
+*)
+	refuse "Set QORY_SUBMIT_DRAFT to open or none: \"$(short "$draft")\" is neither."
+	;;
+esac
+
+base_commit=${QORY_SUBMIT_BASE_COMMIT:-}
+if ! is_hex "$base_commit"; then
+	refuse 'Set QORY_SUBMIT_BASE_COMMIT to a commit id of 40 or 64 lower-case hexadecimal digits.'
+fi
+
+commits=${QORY_SUBMIT_COMMITS:-}
+if has_control "$commits"; then
+	refuse 'Join the commit ids in QORY_SUBMIT_COMMITS by single spaces: the value has a control character.'
+fi
+case $commits in
+*'  '* | ' '* | *' ')
+	refuse 'Join the commit ids in QORY_SUBMIT_COMMITS by single spaces.'
+	;;
+esac
+count=0
+for c in $commits; do
+	if ! is_hex "$c"; then
+		refuse "Set QORY_SUBMIT_COMMITS to commit ids of 40 or 64 lower-case hexadecimal digits: \"$(short "$c")\" is not one."
+	fi
+	count=$((count + 1))
+done
+if [ "$count" -lt 1 ] || [ "$count" -gt 100 ]; then
+	refuse "Set QORY_SUBMIT_COMMITS to 1 to 100 commit ids: it has $count."
+fi
+
+# ----------------------------------------------------- the commit addresses
+
+# The addresses need no more than the commits, so they are printed when the inputs of the
+# draft cannot be used: qory reads the lines that a program printed before it exited 2.
+for c in $base_commit $commits; do
+	printf 'commit_url %s https://%s/%s/commit/%s\n' "$c" "$HOST" "$path" "$c"
+done
+
+title=
+fallback_title=
+base_branch=
+description_file=
+if [ "$draft" = open ]; then
+	title=${QORY_SUBMIT_TITLE:-}
+	if [ -z "$title" ]; then
+		refuse 'Set QORY_SUBMIT_TITLE to the title of the draft: it is not set or is empty.'
+	fi
+	if has_control "$title"; then
+		refuse 'Set QORY_SUBMIT_TITLE to a title on one line with no control character.'
+	fi
+	if [ -z "$(printf '%s' "$title" | tr -d ' ')" ]; then
+		refuse 'Set QORY_SUBMIT_TITLE to a title with a character that is not a space.'
+	fi
+	fallback_title=$(clean_title "$title")
+	if is_blank "$fallback_title"; then
+		refuse 'Set QORY_SUBMIT_TITLE to a title with a character that is not a space or a format character.'
+	fi
+	title_len=$(printf '%s' "$title" | tr -d '\200-\277' | wc -c | tr -d ' ')
+	if [ "$title_len" -gt "$MAX_TITLE" ]; then
+		refuse "Shorten QORY_SUBMIT_TITLE to $MAX_TITLE characters: it has $title_len."
+	fi
+	base_branch=${QORY_SUBMIT_BASE_BRANCH:-}
+	if [ -z "$base_branch" ]; then
+		refuse 'Set QORY_SUBMIT_BASE_BRANCH to the base branch of the draft: qory did not read it, so the draft has no base.'
+	fi
+	check_branch QORY_SUBMIT_BASE_BRANCH "$base_branch"
+	description_file=${QORY_SUBMIT_DESCRIPTION_FILE:-}
+	if [ -z "$description_file" ]; then
+		refuse 'Set QORY_SUBMIT_DESCRIPTION_FILE to the file with the description: the variable is not set.'
+	fi
+	if [ ! -f "$description_file" ] || [ ! -r "$description_file" ]; then
+		refuse "Make the description file readable: $(short "$description_file") is not a readable file."
+	fi
+	description_len=$(chars "$description_file")
+	if [ "$description_len" -gt "$MAX_DESCRIPTION" ]; then
+		refuse "Shorten the description to $MAX_DESCRIPTION characters: it has $description_len."
+	fi
+fi
+
+if [ "$draft" = none ]; then
+	exit 0
+fi
+
+# gh_fail ends the program for a failed gh call: it prints the fix, then the cause
+# that gh gave, with every token of the environment masked. A rejected login is the
+# same as no login.
+gh_fail() {
+	if grep -q 'HTTP 401' "$tmp/gh.err" 2>/dev/null; then
+		printf '%s\n' "$LOGIN_LINE" >&2
+		exit 3
+	fi
+	_cause=$(grep -v '^$' "$tmp/gh.err" 2>/dev/null | head -n 1 | tr -d '\000-\010\013-\037\177' |
+		awk '{
+			s = $0
+			n = split("GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN", names, " ")
+			for (i = 1; i <= n; i++) {
+				v = ENVIRON[names[i]]
+				while (length(v) >= 4 && (j = index(s, v)) > 0) {
+					s = substr(s, 1, j - 1) "***" substr(s, j + length(v))
+				}
+			}
+			print substr(s, 1, 200)
+		}')
+	if [ -z "$_cause" ]; then
+		_cause='gh printed no message'
+	fi
+	printf 'Check your gh login and its access to %s, then run `qory run` again: %s failed: %s\n' "$path" "$1" "$_cause" >&2
+	exit 1
+}
+
+# read_pull reads pull request $1 into $tmp/pull: 8 lines and its description.
+read_pull() {
+	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls/$1" --jq "$READ_JQ" \
+		>"$tmp/pull" 2>"$tmp/gh.err" </dev/null; then
+		gh_fail "the read of pull request $1"
+	fi
+	if [ "$(wc -l <"$tmp/pull" | tr -d ' ')" -lt 9 ]; then
+		fail "Check that gh reaches $HOST, then run \`qory run\` again: the read of pull request $1 returned no pull request."
+	fi
+}
+
+# find_pull sets number to the open pull request from the branch, or to nothing. It looks
+# at the head branch and the repository alone, as findPull of the adapter does when it
+# looks up by branch: only an open pull request counts, the highest number of them. The
+# program has no address, so a closed or merged pull request is never reused.
+find_pull() {
+	if ! run_gh api -X GET --hostname "$HOST" "repos/$path/pulls" \
+		-f "head=$owner:$branch" -f state=open -f per_page=100 --jq "$LIST_JQ" \
+		>"$tmp/list" 2>"$tmp/gh.err" </dev/null; then
+		gh_fail 'the search for the pull request of the branch'
+	fi
+	number=$(awk -v want_repo="$path" '
+		{
+			f = (NR - 1) % 8 + 1
+			v[f] = $0
+			if (f == 8 && v[2] == ENVIRON["QORY_SUBMIT_BRANCH"] && tolower(v[3]) == tolower(want_repo)) {
+				n = v[1] + 0
+				if (v[4] == "open" && v[5] == "false" && n > best) best = n
+			}
+		}
+		END {
+			if (best > 0) print best
+		}
+	' "$tmp/list")
+}
+
+# marked_description writes $tmp/before, the description that the pull request has,
+# and $tmp/after, the description with the text of the file $1 in its block. The rule
+# is that of contracts.MarkedDescription: the lines of the description are the
+# records of awk, and gh adds one line feed after it.
+marked_description() {
+	sed '1,8d' "$tmp/pull" >"$tmp/existing"
+	PRE="$tmp/prefix" SUF="$tmp/suffix" awk -v start="$START" -v end="$END" '
+		function marker(line, m,    t) {
+			t = line
+			sub(/[ \t\r]+$/, "", t)
+			return t == m
+		}
+		{ lines[NR] = $0 }
+		END {
+			pre = ENVIRON["PRE"]
+			suf = ENVIRON["SUF"]
+			n = NR
+			existing = ""
+			for (i = 1; i <= n; i++) existing = existing (i > 1 ? "\n" : "") lines[i]
+			eol = "\n"
+			if (n >= 2 && substr(lines[1], length(lines[1])) == "\r") eol = "\r\n"
+			if (existing == "") {
+				printf "%s", start eol > pre
+				printf "%s", eol end > suf
+				exit
+			}
+			st = 0
+			for (i = 1; i <= n; i++) {
+				if (marker(lines[i], start)) {
+					st = i
+				} else if (st > 0 && marker(lines[i], end)) {
+					head = ""
+					for (k = 1; k < st; k++) head = head (k > 1 ? "\n" : "") lines[k]
+					if (st > 1) head = head "\n"
+					t = lines[i]
+					sub(/[ \t\r]+$/, "", t)
+					after = substr(lines[i], length(t) + 1)
+					tail = ""
+					for (k = i + 1; k <= n; k++) tail = tail (k > i + 1 ? "\n" : "") lines[k]
+					if (i + 1 <= n) tail = "\n" tail
+					printf "%s", head start eol > pre
+					printf "%s", eol end after tail > suf
+					exit
+				}
+			}
+			rest = existing
+			endings = 0
+			while (endings < 2) {
+				if (length(rest) >= 2 && substr(rest, length(rest) - 1) == "\r\n") {
+					rest = substr(rest, 1, length(rest) - 2)
+				} else if (length(rest) >= 1 && substr(rest, length(rest)) == "\n") {
+					rest = substr(rest, 1, length(rest) - 1)
+				} else {
+					break
+				}
+				endings++
+			}
+			gap = ""
+			for (k = endings; k < 2; k++) gap = gap eol
+			printf "%s", existing gap start eol > pre
+			printf "%s", eol end > suf
+		}
+	' "$tmp/existing"
+	{
+		cat <"$tmp/prefix"
+		cat <"$1"
+		cat <"$tmp/suffix"
+	} >"$tmp/after"
+	awk '{ printf "%s%s", (NR > 1 ? "\n" : ""), $0 }' "$tmp/existing" >"$tmp/before"
+}
+
+# print_draft prints the five draft lines of the pull request in $tmp/pull. The
+# action is $1, or kept for a pull request that is closed or merged.
+print_draft() {
+	_state=$(sed -n 4p "$tmp/pull")
+	if [ "$(sed -n 5p "$tmp/pull")" = true ]; then
+		_state=merged
+	elif [ "$_state" = open ] && [ "$(sed -n 6p "$tmp/pull")" = true ]; then
+		_state=draft
+	fi
+	_action=$1
+	case $_state in
+	closed | merged) _action=kept ;;
+	esac
+	_title=$(sed -n 7p "$tmp/pull")
+	if [ -z "$_title" ]; then
+		_title=$fallback_title
+	fi
+	# One printf, so one write: a signal cannot leave some of the five lines.
+	printf 'draft_number %s\ndraft_url %s\ndraft_title %s\ndraft_state %s\ndraft_action %s\n' \
+		"$(sed -n 1p "$tmp/pull")" "$(sed -n 8p "$tmp/pull")" "$_title" "$_state" "$_action"
+}
+
+# ---------------------------------------------------------------- the work
+
+# publish logs in to gh and opens or edits the draft. It runs in the background, see the
+# watchdog below, and prints the draft lines last.
+publish() {
+	if ! command -v gh >/dev/null 2>&1; then
+		fail 'Install gh from https://cli.github.com, run `gh auth login`, then `qory run` again.'
+	fi
+	# gh auth token reads the login from the credential store of gh: it calls no server, and
+	# its output, the token, goes nowhere. A token that GitHub rejects ends a later call with HTTP 401.
+	if ! run_gh auth token --hostname "$HOST" >/dev/null 2>&1 </dev/null; then
+		printf '%s\n' "$LOGIN_LINE" >&2
+		exit 3
+	fi
+
+	number=
+	find_pull
+
+	if [ -z "$number" ]; then
+		{
+			printf '%s\n' "$START"
+			cat <"$description_file"
+			printf '\n%s' "$END"
+		} >"$tmp/body"
+		if ! run_gh pr create --repo "$HOST/$path" --draft --head "$branch" --base "$base_branch" \
+			--title "$title" --body-file "$tmp/body" >"$tmp/created" 2>"$tmp/gh.err" </dev/null; then
+			gh_fail 'the opening of the draft pull request'
+		fi
+		number=$(sed -n 's|^.*/pull/\([1-9][0-9]*\)[^0-9]*$|\1|p' "$tmp/created" | tail -n 1)
+		if [ -z "$number" ]; then
+			find_pull
+		fi
+		if [ -z "$number" ]; then
+			fail "Check $path on $HOST: gh opened a pull request, and the search for it from the branch found none."
+		fi
+		read_pull "$number"
+		print_draft opened
+		exit 0
+	fi
+
+	read_pull "$number"
+	state=$(sed -n 4p "$tmp/pull")
+	merged=$(sed -n 5p "$tmp/pull")
+	if [ "$state" != open ] || [ "$merged" = true ]; then
+		print_draft kept
+		exit 0
+	fi
+
+	marked_description "$description_file"
+	if cmp -s "$tmp/before" "$tmp/after"; then
+		print_draft kept
+		exit 0
+	fi
+	if ! run_gh api -X PATCH --hostname "$HOST" "repos/$path/pulls/$number" -F "body=@$tmp/after" \
+		--silent >"$tmp/patched" 2>"$tmp/gh.err" </dev/null; then
+		gh_fail "the update of pull request $number"
+	fi
+	print_draft updated
+}
+
+# run_gh runs the gh program in the background and waits for it, so the watchdog can end it.
+run_gh() {
+	command gh "$@" &
+	echo "$!" >"$tmp/gh.pid"
+	_s=0
+	wait "$!" || _s=$?
+	# The pid is free for another process now, so the cleanup must not find it.
+	rm -f "$tmp/gh.pid"
+	return "$_s"
+}
+
+# ------------------------------------------------------------------ the watchdog
+
+# qory stops a program after 120 seconds and then reads no line. The work runs in the
+# background, and the program ends with status 1 after 110 seconds when it has not
+# finished, so the commit lines that it printed are read. OPEN_DRAFT_WATCHDOG_SECONDS,
+# from 1 to 110, is for tests only: no larger value is taken.
+limit=110
+case ${OPEN_DRAFT_WATCHDOG_SECONDS:-} in
+[1-9] | [1-9][0-9] | 10[0-9] | 110) limit=$OPEN_DRAFT_WATCHDOG_SECONDS ;;
+esac
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/open-draft.XXXXXX")
+sleep "$limit" &
+timer=$!
+{
+	trap - HUP INT TERM
+	# The end of the work, with any status, writes it and ends the timer.
+	trap 'echo "$?" >"$tmp/status"; kill "$timer" 2>/dev/null || :' EXIT
+	publish
+	exit 0
+} &
+worker=$!
+# A shell may report the timer, which the end of the work signals, on standard error.
+wait "$timer" 2>/dev/null || :
+timer=
+if [ ! -s "$tmp/status" ]; then
+	stopped=1
+	printf 'Run `qory run` again: the `gh` call did not finish within %s seconds.\n' "$limit" >&2
+	exit 1
+fi
+wait "$worker" || :
+worker=
+exit "$(cat "$tmp/status")"

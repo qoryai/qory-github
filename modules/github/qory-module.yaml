@@ -1,0 +1,5 @@
+apiVersion: qory.dev/v1alpha1
+name: github
+description: The program that prints the GitHub address of each commit of a local run and opens or edits its draft pull request with the login of gh
+submit_program:
+  command: [bin/open-draft]

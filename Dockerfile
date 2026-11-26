@@ -16,8 +16,8 @@
 #
 # Pull the server's pre-release image by its digest from
 # ghcr.io/qoryai/qory-github-server-prerelease. .github/workflows/prerelease.yml
-# publishes it for both platforms, tags it only sha-<the commit's first 7 characters>,
-# and prints the digest in the run's summary.
+# builds it only from a commit on main, publishes it for both platforms, tags it only
+# sha-<the commit's first 7 characters>, and prints the digest in the run's summary.
 #
 # Give the server its settings in a mounted serve.json with --settings, or, with no
 # --settings, in QORY_GITHUB_* environment variables: each is a serve.json setting's

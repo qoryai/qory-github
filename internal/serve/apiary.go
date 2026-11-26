@@ -19,6 +19,7 @@ import (
 	"github.com/qoryai/forager/accesskey"
 	"github.com/qoryai/integrations/contracts"
 	"github.com/qoryai/qory-github"
+	"github.com/qoryai/qory-github/internal/exactjson"
 	"github.com/qoryai/qory-github/internal/store"
 )
 
@@ -34,8 +35,11 @@ const (
 	routeChanges     = "/v1/work-items/changes"
 	changesAfter     = "after"
 	// routeChangesFailed is the route of the failure report for a comment entry of the
-	// feed whose comment was not posted.
-	routeChangesFailed = "/v1/work-items/changes/failed"
+	// feed whose comment was not posted, or a change_request entry that was not put on
+	// GitHub; routeChangesSubmitted is the route of the reply for a change_request entry
+	// that was.
+	routeChangesFailed    = "/v1/work-items/changes/failed"
+	routeChangesSubmitted = "/v1/work-items/changes/submitted"
 	// routeConnectionsDisconnect ends a connection the source no longer grants access.
 	routeConnectionsDisconnect = "/v1/connections/disconnect"
 	// headerContractVersion carries contracts.Revision on every request. It is not
@@ -356,12 +360,32 @@ func (a *Apiary) Comments(ctx context.Context, req contracts.SourceItemComments)
 
 // ChangesFailed sends POST /v1/work-items/changes/failed: the adapter stopped trying to
 // post the comment of the comment entry with the comment_id in req, for req's reason.
-// Qory Apiary returns the signed 204 for a comment_id that has no comment entry, and
-// for one whose comment it matched to a posted comment already, so a repeated
-// report is no error. Its 400 and 403 are [Permanent], as every request's are: the
-// report is not sent again.
+// Qory Apiary returns the signed 204 for a comment_id that has
+// no comment entry, and for one whose comment it matched to a posted comment already, so
+// a repeated report is no error. Its 400, 413 and 403 with a code are [Permanent], as
+// every request's are: the report is not sent again.
 func (a *Apiary) ChangesFailed(ctx context.Context, req contracts.ChangesFailed) error {
-	return a.post(ctx, "sending the failure report of the comment "+req.CommentID, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+	what := "sending the failure report of the comment " + req.CommentID
+	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+}
+
+// ChangeRequestFailed sends POST /v1/work-items/changes/failed for a change_request
+// entry: the adapter stopped trying to put the change with the change_request_id and
+// target in req on GitHub, for req's reason, with detail, see
+// [github.SubmitRefused.Detail]. Qory Apiary answers as for [Apiary.ChangesFailed].
+func (a *Apiary) ChangeRequestFailed(ctx context.Context, req contracts.ChangesFailed, detail string) error {
+	what := "sending the failure report of the change request " + req.ChangeRequestID
+	req.Detail = detail
+	return a.post(ctx, what, routeChangesFailed, "", "", func(t string) any { req.Time = t; return req })
+}
+
+// ChangesSubmitted sends POST /v1/work-items/changes/submitted: what the adapter put on
+// GitHub for the change_request entry with the change_request_id and target in req.
+// Qory Apiary keeps the first reply for the entry and answers the signed 204 to a later
+// one, so a repeated reply is no error. Its 400, 413 and 403 with a code are
+// [Permanent], as every request's are: the reply is not sent again.
+func (a *Apiary) ChangesSubmitted(ctx context.Context, req contracts.ChangesSubmitted) error {
+	return a.post(ctx, "sending the reply for the change request "+req.ChangeRequestID, routeChangesSubmitted, "", "", func(t string) any { req.Time = t; return req })
 }
 
 // Disconnect sends POST /v1/sources/disconnect, which names the collection's ref and the
@@ -389,8 +413,9 @@ func (a *Apiary) unlinkOn(err error, collection string, began uint64) error {
 // grants the connection access. Qory Apiary answers 403 for a connection not made yet,
 // and for one whose linked connect return is being saved, so a 403 is sent again, built
 // anew, up to [disconnectTries] in all, see [disconnectWait]; a 403 that lasts is the
-// error. A 409 connection_ended is the connection ended, as the signed 204 is, so it is
-// no error.
+// error, [Permanent] for a 403 with a code, and an error that may pass for a 403 with no
+// code, see [sentAgain]. A 409 connection_ended is the connection ended, as the signed
+// 204 is, so it is no error.
 func (a *Apiary) DisconnectConnection(ctx context.Context, req contracts.ConnectionsDisconnect) error {
 	wait := disconnectWait
 	for try := 1; ; try++ {
@@ -444,7 +469,7 @@ func (a *Apiary) Declare(ctx context.Context, publicURL, setupURL string) error 
 // start when cursor is empty. Qory Apiary holds the request while nothing follows the
 // cursor, so an answer may take up to 25 seconds. The answer is used only once its
 // signature and its revision are checked, see [checkChanges].
-func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes, error) {
+func (a *Apiary) Changes(ctx context.Context, cursor string) (changesPage, error) {
 	const what = "reading the change feed"
 	target := routeChanges
 	if cursor != "" {
@@ -460,43 +485,95 @@ func (a *Apiary) Changes(ctx context.Context, cursor string) (contracts.Changes,
 		}
 		if wait, ok := retryWait(err); ok && try < rateLimitedTries {
 			if err := a.sleep(ctx, wait); err != nil {
-				return contracts.Changes{}, fmt.Errorf("%s: %w", what, err)
+				return changesPage{}, fmt.Errorf("%s: %w", what, err)
 			}
 			continue
 		}
 		if err != nil {
-			return contracts.Changes{}, err
+			return changesPage{}, err
 		}
 		return checkChanges(ans.body)
 	}
 }
 
+// changesPage is a page of the change feed: its cursor and its entries, and unmet, which
+// has one element for each entry, in order: nil when the entry is one that serve applies,
+// else why it is not. That is the error of [contracts.CheckChangeMustUnderstand], or, for
+// an entry of a kind serve does not apply, an error that asks to skip the entry. The
+// error starts with the fix, as the failure report's detail does.
+type changesPage struct {
+	Cursor  string
+	Changes []contracts.Change
+	unmet   []error
+}
+
+// errNotTheFeedsDocument is the error of a page that exactjson refuses. It carries no
+// text of exactjson's error, which quotes a member's name in full, and a page can be
+// 16 MiB. The text lists each cause that exactjson reports.
+func errNotTheFeedsDocument(what string) error {
+	return fmt.Errorf("%s: the answer is not the feed's document: it is not one JSON object, repeats a member, has a member of the wrong type or has text that is not UTF-8", what)
+}
+
 // checkChanges reads a page of the change feed, whose signature is checked already,
 // and refuses one that is not of the version and the revision serve implements, or
 // whose cursor is not one: a cursor is never taken from a page refused. The revision
-// is checked here alone.
-func checkChanges(body []byte) (contracts.Changes, error) {
+// is checked here alone. A member that the page or an entry does not define is ignored,
+// and so is every member of an entry of a kind serve does not apply, but its kind. Each
+// entry is checked with [contracts.CheckChangeMustUnderstand], see [changesPage]. An
+// entry whose must_understand is no list reaches that check too, and is not a reason to
+// refuse the page; any other member of a known kind that has the wrong type is.
+func checkChanges(body []byte) (changesPage, error) {
 	const what = "reading the change feed"
 	var doc struct {
-		contracts.Changes
-		Revision *int `json:"revision"`
+		Version  int               `json:"version"`
+		Revision *int              `json:"revision"`
+		Cursor   string            `json:"cursor"`
+		Changes  []json.RawMessage `json:"changes"`
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&doc); err != nil {
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not the feed's document: %w", what, err)
+	if err := exactjson.Unmarshal(body, &doc); err != nil {
+		return changesPage{}, errNotTheFeedsDocument(what)
 	}
-	ch := doc.Changes
 	switch {
-	case ch.Version != contracts.Version:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not of version %d", what, contracts.Version)
+	case doc.Version != contracts.Version:
+		return changesPage{}, fmt.Errorf("%s: the answer is not of version %d", what, contracts.Version)
 	case doc.Revision == nil || *doc.Revision != contracts.Revision:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer is not of the contract's revision %d", what, contracts.Revision)
-	case ch.Cursor == "" || len(ch.Cursor) > 200:
-		return contracts.Changes{}, fmt.Errorf("%s: the answer's cursor is not 1 to 200 characters", what)
+		return changesPage{}, fmt.Errorf("%s: the answer is not of the contract's revision %d", what, contracts.Revision)
+	case doc.Cursor == "" || len(doc.Cursor) > 200:
+		return changesPage{}, fmt.Errorf("%s: the answer's cursor is not 1 to 200 characters", what)
 	}
-	ch.Revision = *doc.Revision
-	return ch, nil
+	page := changesPage{Cursor: doc.Cursor}
+	for _, raw := range doc.Changes {
+		var head struct {
+			Kind string `json:"kind"`
+		}
+		if err := exactjson.Unmarshal(raw, &head); err != nil || head.Kind == "" {
+			return changesPage{}, fmt.Errorf("%s: the answer is not the feed's document: an entry is not an object with a kind", what)
+		}
+		unmet := contracts.CheckChangeMustUnderstand(raw)
+		ch := contracts.Change{Kind: head.Kind}
+		if !knownKind(head.Kind) {
+			// The pin's error quotes the whole kind, so it is replaced here.
+			unmet = fmt.Errorf("skip the entry and acknowledge it: qory-github applies no entry of the kind %q", prefixOf(head.Kind, maxLogged))
+		} else {
+			// must_understand is read as raw JSON, so a value that is no list ends in unmet.
+			// change has no MarshalJSON, which a struct that embeds a type with one cannot
+			// be read with.
+			type change contracts.Change
+			var entry struct {
+				change
+				MustUnderstand json.RawMessage `json:"must_understand"`
+			}
+			if err := exactjson.Unmarshal(raw, &entry); err != nil {
+				return changesPage{}, errNotTheFeedsDocument(what)
+			}
+			ch = contracts.Change(entry.change)
+			// An error here means that unmet has the error already.
+			_ = json.Unmarshal(entry.MustUnderstand, &ch.MustUnderstand)
+		}
+		page.Changes = append(page.Changes, ch)
+		page.unmet = append(page.unmet, unmet)
+	}
+	return page, nil
 }
 
 // post sends one POST, its body body with the time set, and judges the answer. A 429 is
@@ -676,13 +753,20 @@ func retryWait(err error) (time.Duration, bool) {
 //   - an answer whose signature does not verify under the pin is an [Outage], and its
 //     body is never parsed;
 //   - a signed answer to a request that names a connection, connection, is told to
-//     [Apiary.Answered];
+//     [Apiary.Answered], with the refusal's code, or "" when the body of the refusal
+//     cannot be read or lists a must_understand pointer that the adapter does not define:
+//     such a refusal has no code;
 //   - 409 connection_ended calls [Apiary.Ended] with of, the connection the request
 //     names or the connection of its collection; 409 connection_suspended changes
-//     nothing, and the periodic check sends the request again. Each is [Permanent],
-//     and so are 400, 403, 409 and 413, each a [*refusedError]; what a 409
-//     collection_not_linked does is for the request's sender to say, see
-//     [Apiary.Items] and [Apiary.Comments];
+//     nothing: the callers that test [sentAgain] send the request again with their
+//     backoff, and the others wait for the periodic check. Each of the two is
+//     [Permanent], and so are any other 409 or 403 with a code, 400 and 413, each a
+//     [*refusedError]; what a 409 collection_not_linked does is for the request's
+//     sender to say, see [Apiary.Items] and [Apiary.Comments]. A 409 or a 403 with no
+//     code, because the body cannot be read, is no known refusal: it does not call
+//     [Apiary.Ended], and it is an error that may pass, so the worker, the feed, the
+//     pull round and the callers that test [sentAgain] send the request again with
+//     their backoff, and none takes it for the end of a connection, see [noteAnswer];
 //   - a 429 is [*rateLimited], with its Retry-After, an hour at most;
 //   - a 5xx is an [Outage];
 //   - any other answer is an error that may pass.
@@ -704,7 +788,9 @@ func (a *Apiary) judge(what string, ans *answer, connection, of string) error {
 	}
 	var refusal contracts.Refusal
 	if ans.status < 200 || ans.status >= 300 {
-		if json.Unmarshal(ans.body, &refusal) != nil || !refusalShape.MatchString(refusal.Error) {
+		// A body that is no refusal of the contract, or whose must_understand the adapter
+		// cannot meet, has no code: the answer is judged by its status alone.
+		if readObject(ans.body, &refusal, contracts.Refusal{}) != nil || !refusalShape.MatchString(refusal.Error) {
 			refusal.Error = ""
 		}
 	}
@@ -715,6 +801,12 @@ func (a *Apiary) judge(what string, ans *answer, connection, of string) error {
 		return nil
 	}
 	var err error = &refusedError{what: what, status: ans.status, code: refusal.Error}
+	if refusal.Error == "" && (ans.status == http.StatusConflict || ans.status == http.StatusForbidden) {
+		// A 409 or a 403 whose body the adapter cannot read has no code, so it is not
+		// known to be final: nothing changes, and the caller sends the request again,
+		// with its backoff, see [sentAgain].
+		return err
+	}
 	switch ans.status {
 	case http.StatusConflict:
 		if refusal.Error == codeConnectionEnded && of != "" && a.Ended != nil {
@@ -746,6 +838,22 @@ func (e *refusedError) Error() string {
 		return fmt.Sprintf("%s: Qory Apiary answered %d", e.what, e.status)
 	}
 	return fmt.Sprintf("%s: Qory Apiary answered %d %s", e.what, e.status, e.code)
+}
+
+// sentAgain is whether err is a signed refusal of Qory Apiary's that changes nothing
+// and is sent again, with the caller's backoff: a 409 or a 403 with no code, as the
+// body cannot be read, see [Apiary.judge], or a 409 connection_suspended, which the
+// contract says changes no state. A grant report is sent again after each of them,
+// until the connect return expires, also while the connection is suspended. A caller
+// that decides by the refusal's status, not by [IsPermanent], tests it before its
+// other cases; a 403 with a code is not one.
+func sentAgain(err error) bool {
+	var refused *refusedError
+	if !errors.As(err, &refused) {
+		return false
+	}
+	return refused.code == "" && (refused.status == http.StatusConflict || refused.status == http.StatusForbidden) ||
+		refused.status == http.StatusConflict && refused.code == codeConnectionSuspended
 }
 
 // refusedAs is whether err, or an error it wraps or joins, is Qory Apiary's signed

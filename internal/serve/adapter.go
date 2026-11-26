@@ -1000,8 +1000,9 @@ func (a *Adapter) installation(ctx context.Context, d Delivery) error {
 
 // endConnection tells Qory Apiary the source no longer grants the connection access,
 // POST /v1/connections/disconnect, which [Apiary.DisconnectConnection] sends again while
-// Qory Apiary answers 403. A 403 that lasts, or another refusal for good, is logged and
-// passed; any other error stops it, to be tried again.
+// Qory Apiary answers 403. A 403 with a code that lasts, or another refusal for good, is
+// logged and passed; any other error, a 403 with no code among them, stops it, to be
+// tried again.
 func (a *Adapter) endConnection(ctx context.Context, connection string) error {
 	cs, ok := a.Sink.(connectionSink)
 	if !ok {

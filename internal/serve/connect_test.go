@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -282,9 +283,9 @@ func refused(t *testing.T, rec *httptest.ResponseRecorder, rf refusal) {
 	}
 }
 
-// returnSchema is the contract's schema of a connect return's payload.
+// returnSchema is the closed copy of the contract's schema of a connect return's payload.
 var returnSchema = sync.OnceValue(func() *jsonschema.Schema {
-	s, err := contracts.Compile("connect-return.schema.json")
+	s, err := contracts.CompileClosed("connect-return.schema.json")
 	if err != nil {
 		panic(err)
 	}
@@ -388,27 +389,28 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 		pass string
 		want *refusal
 	}{
-		"too long":                   {signPass(rig.signer, good) + strings.Repeat("A", contracts.ConnectPassMaxLength), &refusePass},
-		"no dot":                     {b64([]byte(good)), &refusePass},
-		"padding":                    {signPass(rig.signer, good) + "=", &refusePass},
-		"another alphabet":           {strings.Replace(signPass(rig.signer, good), "-", "+", 1) + "+", &refusePass},
-		"signed by another key":      {signPass(other, good), &refuseSignature},
-		"signed without the domain":  {b64([]byte(good)) + "." + b64(rig.signer.Sign([]byte(good))), &refuseSignature},
-		"not JSON, signed by others": {signPass(other, "not JSON {"), &refuseSignature},
-		"not JSON":                   {signPass(rig.signer, "not JSON {"), &refusePayload},
-		"version 2":                  {signPass(rig.signer, strings.Replace(good, `"version":1`, `"version":2`, 1)), &refusePayload},
-		"an unknown member":          {signPass(rig.signer, strings.TrimSuffix(good, "}")+`,"apiary_url":"https://elsewhere.example.com"}`), &refusePayload},
-		"no connection":              {signPass(rig.signer, `{"version":1,"adapter_id":"`+testAdapterID+`","nonce":"`+newNonce()+`","expires_at":"`+contracts.FormatTime(now.Add(time.Minute))+`"}`), &refusePayload},
-		"a connection not one":       {signPass(rig.signer, payload(testAdapterID, "ac_0123456789ABCDEF", newNonce(), now.Add(time.Minute))), &refusePayload},
-		"an adapter's id as one":     {signPass(rig.signer, payload(testAdapterID, testAdapterID, newNonce(), now.Add(time.Minute))), &refusePayload},
-		"two documents":              {signPass(rig.signer, good+"{}"), &refusePayload},
-		"a short nonce":              {signPass(rig.signer, payload(testAdapterID, testConnection, "AAAA", now.Add(time.Minute))), &refusePayload},
-		"a local time":               {signPass(rig.signer, strings.Replace(good, "Z\"", "+00:00\"", 1)), &refusePayload},
-		"another adapter":            {signPass(rig.signer, payload("na_fedcba9876543210", testConnection, newNonce(), now.Add(time.Minute))), &refuseAdapter},
-		"expired":                    {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now.Add(-time.Second))), &passExpired},
-		"too far ahead":              {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now.Add(16*time.Minute))), &passExpired},
-		"expiring now":               {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now)), nil},
-		"good":                       {signPass(rig.signer, good), nil},
+		"too long":                      {signPass(rig.signer, good) + strings.Repeat("A", contracts.ConnectPassMaxLength), &refusePass},
+		"no dot":                        {b64([]byte(good)), &refusePass},
+		"padding":                       {signPass(rig.signer, good) + "=", &refusePass},
+		"another alphabet":              {strings.Replace(signPass(rig.signer, good), "-", "+", 1) + "+", &refusePass},
+		"signed by another key":         {signPass(other, good), &refuseSignature},
+		"signed under the setup domain": {signSetupPass(rig.signer, good), &refuseSignature},
+		"signed without the domain":     {b64([]byte(good)) + "." + b64(rig.signer.Sign([]byte(good))), &refuseSignature},
+		"not JSON, signed by others":    {signPass(other, "not JSON {"), &refuseSignature},
+		"not JSON":                      {signPass(rig.signer, "not JSON {"), &refusePayload},
+		"version 2":                     {signPass(rig.signer, strings.Replace(good, `"version":1`, `"version":2`, 1)), &refusePayload},
+		"an unknown member":             {signPass(rig.signer, strings.TrimSuffix(good, "}")+`,"apiary_url":"https://elsewhere.example.com"}`), nil},
+		"no connection":                 {signPass(rig.signer, `{"version":1,"adapter_id":"`+testAdapterID+`","nonce":"`+newNonce()+`","expires_at":"`+contracts.FormatTime(now.Add(time.Minute))+`"}`), &refusePayload},
+		"a connection not one":          {signPass(rig.signer, payload(testAdapterID, "ac_0123456789ABCDEF", newNonce(), now.Add(time.Minute))), &refusePayload},
+		"an adapter's id as one":        {signPass(rig.signer, payload(testAdapterID, testAdapterID, newNonce(), now.Add(time.Minute))), &refusePayload},
+		"two documents":                 {signPass(rig.signer, good+"{}"), &refusePayload},
+		"a short nonce":                 {signPass(rig.signer, payload(testAdapterID, testConnection, "AAAA", now.Add(time.Minute))), &refusePayload},
+		"a local time":                  {signPass(rig.signer, strings.Replace(good, "Z\"", "+00:00\"", 1)), &refusePayload},
+		"another adapter":               {signPass(rig.signer, payload("na_fedcba9876543210", testConnection, newNonce(), now.Add(time.Minute))), &refuseAdapter},
+		"expired":                       {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now.Add(-time.Second))), &passExpired},
+		"too far ahead":                 {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now.Add(16*time.Minute))), &passExpired},
+		"expiring now":                  {signPass(rig.signer, payload(testAdapterID, testConnection, newNonce(), now)), nil},
+		"good":                          {signPass(rig.signer, good), nil},
 	} {
 		p, _, rf := rig.c.checkPass(tc.pass, now, rig.c.enrolment())
 		if rf != tc.want {
@@ -452,6 +454,53 @@ func TestThePassIsCheckedStepByStep(t *testing.T) {
 		t.Errorf("a pin of two keys refuses the pass: %s", rf.why)
 	}
 	rig.noLeak(t)
+}
+
+// TestAPassWithMustUnderstandIsReadOrRefused has a connect pass whose must_understand lists
+// a member the contract defines, which is taken with its unknown member, and one that lists
+// the unknown member, a pointer that is no pointer, or a list twice: each is refused with
+// the page of a link that is not valid, and a reason that starts with the contract's fix. The shared
+// refusal keeps its reason.
+func TestAPassWithMustUnderstandIsReadOrRefused(t *testing.T) {
+	rig := newConnectRig(t)
+	now := time.Now().Truncate(time.Second)
+	good := payload(testAdapterID, testConnection, newNonce(), now.Add(10*time.Minute))
+	with := func(members string) string {
+		return signPass(rig.signer, strings.TrimSuffix(good, "}")+","+members+"}")
+	}
+	if _, _, rf := rig.c.checkPass(with(`"zz":1,"must_understand":["/nonce"]`), now, rig.c.enrolment()); rf != nil {
+		t.Errorf("a pass that lists a defined member is refused: %s", rf.why)
+	}
+	for name, tc := range map[string]struct{ members, why string }{
+		"an unknown member": {`"zz":1,"must_understand":["/zz"]`, `use a reader that defines "/zz"`},
+		"no pointer":        {`"must_understand":["zz"]`, `write "zz" in must_understand`},
+		"a pointer twice":   {`"must_understand":["/nonce","/nonce"]`, `list "/nonce" once in must_understand`},
+	} {
+		_, _, rf := rig.c.checkPass(with(tc.members), now, rig.c.enrolment())
+		if rf == nil || rf == &refusePayload || !strings.HasPrefix(rf.why, tc.why) || rf.status != refusePayload.status || rf.page != refusePayload.page || rf.name != refusePayload.name {
+			t.Errorf("%s: refused as %+v", name, rf)
+		}
+	}
+	if refusePayload.why != "the pass's payload is not the contract's" {
+		t.Errorf("the shared refusal changed: %s", refusePayload.why)
+	}
+}
+
+// TestReadObjectRefusesWhatIsNotOneObject checks the guard of the readers of documents
+// from another system: an unknown member is ignored, and data after the object, a member
+// repeated at any depth, a list, a scalar and nothing are refused.
+func TestReadObjectRefusesWhatIsNotOneObject(t *testing.T) {
+	var doc struct {
+		A *int `json:"a"`
+	}
+	if err := readObject([]byte(`{"a":1,"b":{"c":2}} `), &doc, contracts.Grants{}); err != nil || doc.A == nil || *doc.A != 1 {
+		t.Errorf("an object with an unknown member: %v", err)
+	}
+	for _, body := range []string{`{"a":1}{}`, `{"a":1,"a":2}`, `{"a":1,"a":1}`, `{"a":1,"b":{"c":2,"c":3}}`, `{"a":1,"must_understand":[],"must_understand":[]}`, `{"a":1} x`, `{"a":1}{"a":2}`, `[{"a":1}]`, `1`, ``, `{"a":"x"}`} {
+		if err := readObject([]byte(body), &doc, contracts.Grants{}); !errors.Is(err, errNotObject) {
+			t.Errorf("%q: err %v", body, err)
+		}
+	}
 }
 
 // TestTheContractsSignedPassVerifies checks the contract's signed pass, under its
@@ -1077,7 +1126,9 @@ func TestALiveLinkIsNotTakenByAnotherConnection(t *testing.T) {
 // grant_taken; 403 connection_unknown, the link is replaced by the new connection,
 // pending; 409 connection_ended, likewise; 409 connection_suspended, refused,
 // source_unavailable; any other answer, refused, source_unavailable, a 403 not signed
-// under the pin and a 403 forbidden among them.
+// under the pin, a 403 forbidden, and a 403 or a 409 with no code among them, whether the
+// body is no JSON or lists a pointer the adapter does not define: the link stays and
+// nothing is dropped.
 func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status     int
@@ -1094,6 +1145,10 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 		"500":                  {500, `oops`, otherConnection, linkPending, reasonSourceUnavailable, false},
 		"403 not signed":       {403, `{"error":"connection_unknown"}`, otherConnection, linkPending, reasonSourceUnavailable, true},
 		"403 forbidden":        {403, `{"error":"forbidden"}`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"403 with no code":     {403, `<html>`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"409 with no code":     {409, `<html>`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"403 unmet pointer":    {403, `{"error":"connection_unknown","zz":1,"must_understand":["/zz"]}`, otherConnection, linkPending, reasonSourceUnavailable, false},
+		"409 unmet pointer":    {409, `{"error":"connection_ended","zz":1,"must_understand":["/zz"]}`, otherConnection, linkPending, reasonSourceUnavailable, false},
 	} {
 		rig := newConnectRig(t)
 		if tc.unsigned {
@@ -1105,11 +1160,12 @@ func TestAPendingLinkIsListedBeforeItIsReplaced(t *testing.T) {
 			if route != routeCollections {
 				return 0, ""
 			}
-			if n == 3 {
-				// The new connection's first listing waits until the test has looked.
+			if n == 2 {
+				// The first request lists the connection that the link names. The second is
+				// the new connection's first listing, which waits until the test has looked.
 				<-listing
 			}
-			if n <= 2 {
+			if n == 1 {
 				return tc.status, tc.body
 			}
 			return 403, `{"error":"connection_unknown"}`
@@ -1769,7 +1825,7 @@ func TestThePagesSayTheUsersWords(t *testing.T) {
 		&refuseUsed:      `This link was used already. Press "Install" in Qory Apiary again.`,
 		&refuseFailed:    `Something failed on this server. Press "Install" in Qory Apiary again.`,
 		&refuseNoSession: `No installation is under way in this browser, or it took too long. Press "Install" in Qory Apiary again.`,
-		&refuseHeld:      "This connection already holds another installation of the App, and it holds only one.",
+		&refuseHeld:      `Disconnect the account that is connected now, on the integration's page in Qory Apiary, then press "Install" again. An organisation connects one GitHub account.`,
 		&refuseOlder:     `A newer link for this connection was used already. Press "Install" in Qory Apiary again.`,
 		&refuseAdapter:   `This connect link is for another integration. Press "Install" on this integration's page in Qory Apiary.`,
 		&refuseMethod:    "This address answers GET requests alone.",

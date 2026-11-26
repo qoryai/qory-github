@@ -6,10 +6,10 @@ github.com/dlclark/regexp2 v1.11.0 h1:G/nrcoOa7ZXlpoa/91N3X7mM3r8eIlMBBJZvsz/mxK
 github.com/dlclark/regexp2 v1.11.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/qoryai/forager v0.7.1-0.20261023001330-b6ac9f060456 h1:eZy1z0vf3Y6SE9XoNVXYZbKTVUX8CJzyhP4ZKSLLaBo=
-github.com/qoryai/forager v0.7.1-0.20261023001330-b6ac9f060456/go.mod h1:bawutvQpl4xH1hYlLMsTOkOq5IkIEiFHWJ9jhahf6Ac=
-github.com/qoryai/integrations v0.3.1-0.20261109020604-da90d86cf53f h1:S1rYWM03BcaF85tg3QgxtT7iSY9d8yjjydO6+jSIkW0=
-github.com/qoryai/integrations v0.3.1-0.20261109020604-da90d86cf53f/go.mod h1:8wZP+FYKJRy8P+XaN/CSL74R2V+I2QqTwZ4JRsxz0TE=
+github.com/qoryai/forager v0.7.1-0.20261125202356-4a71540b1118 h1:WkXs6qs/uA35YM27Kex3iFdu8n03Sg0FrDwoBkRmBUA=
+github.com/qoryai/forager v0.7.1-0.20261125202356-4a71540b1118/go.mod h1:LQJoODbJS+dQDjDmpqU0oeTmnGU5qlT4jU0e/N9hHKQ=
+github.com/qoryai/integrations v0.3.1-0.20261125005846-699a22cf96ee h1:cWjDjp+TaKu0uzFBBMc3WecBg7GkEI21Q57lvv8m65I=
+github.com/qoryai/integrations v0.3.1-0.20261125005846-699a22cf96ee/go.mod h1:TVgn3zXZW3OIjcrRZBMIDzyiRpaUbNF6/ZvZkYX0kyM=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=

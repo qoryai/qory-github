@@ -196,11 +196,11 @@ func (c Client) mintFor(ctx context.Context, req Request) (InstallationToken, er
 		return InstallationToken{}, err
 	}
 	if got.Token == "" {
-		return InstallationToken{}, errors.New(minting + ": GitHub answered without a token")
+		return InstallationToken{}, unreadableAt(http.StatusCreated, minting+": GitHub answered without a token", nil)
 	}
 	expires, err := time.Parse(time.RFC3339, got.ExpiresAt)
 	if err != nil {
-		return InstallationToken{}, fmt.Errorf("%s: the expiry %q is not a time", minting, got.ExpiresAt)
+		return InstallationToken{}, unreadableAt(http.StatusCreated, fmt.Sprintf("%s: the expiry %q is not a time", minting, got.ExpiresAt), nil)
 	}
 	t := InstallationToken{Token: got.Token, ExpiresAt: expires.UTC()}
 	for _, r := range got.Repositories {
