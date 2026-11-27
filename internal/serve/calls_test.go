@@ -803,9 +803,10 @@ func TestAWorkCredentialGetsTheContractsRefusalsInOrder(t *testing.T) {
 
 // TestResolveMapsGitHubAddressesToTheInstallation pins resolve: an https address of a
 // repository on github.com, with or without .git, in any case of its owner, is the
-// installation of the App on that owner and the repository's id, when the installation
-// is linked and reaches the repository; every other address is covered: false, the scp
-// form among them, in the call's order.
+// installation of the App on that owner, the repository's id and its path owner/name in
+// the case GitHub returns, when the installation is linked and reaches the repository;
+// every other address is covered: false with no path, the scp form among them, in the
+// call's order.
 func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 	rig := newCallsRig(t)
 	addresses := []string{
@@ -828,6 +829,8 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 	var ans contracts.ResolveAnswer
 	json.Unmarshal(got.body, &ans)
 	covered := map[string]string{addresses[0]: widgetsRef, addresses[1]: widgetsRef, addresses[2]: gadgetsRef}
+	// The fake GitHub returns the owner/name in lower case, whatever the address's case.
+	paths := map[string]string{addresses[0]: "acme/widgets", addresses[1]: "acme/widgets", addresses[2]: "acme/gadgets"}
 	if len(ans.Results) != len(addresses) {
 		t.Fatalf("answered %s", shown(got.body))
 	}
@@ -836,9 +839,9 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 		switch {
 		case r.Address != addresses[i]:
 			t.Errorf("result %d is for %q, want %q", i, r.Address, addresses[i])
-		case ok && (r.GrantRef != "42" || r.ResourceRef != ref || r.Covered != nil):
-			t.Errorf("%s: %+v, want grant 42 and resource %s", addresses[i], r, ref)
-		case !ok && (r.Covered == nil || *r.Covered || r.GrantRef != "" || r.ResourceRef != ""):
+		case ok && (r.GrantRef != "42" || r.ResourceRef != ref || r.Covered != nil || r.Path != paths[addresses[i]]):
+			t.Errorf("%s: %+v, want grant 42, resource %s and path %s", addresses[i], r, ref, paths[addresses[i]])
+		case !ok && (r.Covered == nil || *r.Covered || r.GrantRef != "" || r.ResourceRef != "" || r.Path != ""):
 			t.Errorf("%s: %+v, want covered: false", addresses[i], r)
 		}
 	}
@@ -848,6 +851,7 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(`"addresses":["https://github.com/acme/gadgets"]`))
+	checkAnswer(t, got, 200, "resolve-answer.schema.json", "")
 	if !strings.Contains(string(got.body), `"covered":false`) {
 		t.Errorf("a repository the installation does not reach: %s", shown(got.body))
 	}
@@ -855,6 +859,7 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = rig.send(t, signedCall{path: contracts.ResolvePath}, rig.callBody(widgetsAddress))
+	checkAnswer(t, got, 200, "resolve-answer.schema.json", "")
 	if !strings.Contains(string(got.body), `"covered":false`) {
 		t.Errorf("an installation not linked: %s", shown(got.body))
 	}

@@ -796,10 +796,11 @@ func githubAddress(address string) (github.Repository, bool) {
 }
 
 // resolveOne is the result for one address: the covered result, see
-// [Calls.coveredOne], with public: true and the public_ref [github.PublicRef] added
-// when the repository is public, see [Calls.isPublic]. An address no grant covers is
-// public: true with [github.PublicRef] as both resource_ref and public_ref when the
-// repository is public, and covered: false otherwise. When
+// [Calls.coveredOne], with its path, and with public: true and the public_ref
+// [github.PublicRef] added when the repository is public, see [Calls.isPublic]. An
+// address no grant covers is public: true with [github.PublicRef] as both resource_ref
+// and public_ref, and no path, when the repository is public, and covered: false
+// otherwise. When
 // the anonymous check fails, as for a network error, a 5xx or a rate limit, the result
 // is the covered result alone, without public, and a line says why.
 func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
@@ -827,8 +828,10 @@ func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolv
 // coveredOne is the result for one address under a grant: the installation of the App
 // on the repository's owner, as GitHub returns it, whose account's login is the owner's
 // without regard to case, that is linked to Qory Apiary, and that reaches the
-// repository, read by its name with the installation's listing token. Any other
-// address, one GitHub returns no installation for among them, is covered: false.
+// repository, read by its name with the installation's listing token. The result's path
+// is the repository's owner/name as that read returns it, so its case is GitHub's, not
+// the address's. Any other address, one GitHub returns no installation for among them,
+// is covered: false, with no path.
 func (c *Calls) coveredOne(ctx context.Context, address string) contracts.Resolved {
 	covered := false
 	notCovered := contracts.Resolved{Address: address, Covered: &covered}
@@ -855,7 +858,7 @@ func (c *Calls) coveredOne(ctx context.Context, address string) contracts.Resolv
 		c.log().Warn("minting a token to resolve a repository", slog.Int64("installation", installation), slog.String("error", err.Error()))
 		return notCovered
 	}
-	id, _, err := c.GitHub.RepositoryID(ctx, token, repo)
+	id, current, err := c.GitHub.RepositoryID(ctx, token, repo)
 	if err != nil {
 		if !errors.Is(err, github.ErrRepositoryGone) {
 			c.log().Warn("reading a repository to resolve", slog.Int64("installation", installation), slog.String("error", err.Error()))
@@ -865,7 +868,7 @@ func (c *Calls) coveredOne(ctx context.Context, address string) contracts.Resolv
 	if reaches, err := c.Grants.reaches(installation, id); err != nil || !reaches {
 		return notCovered
 	}
-	return contracts.Resolved{Address: address, GrantRef: strconv.FormatInt(installation, 10), ResourceRef: github.CollectionRef(id)}
+	return contracts.Resolved{Address: address, GrantRef: strconv.FormatInt(installation, 10), ResourceRef: github.CollectionRef(id), Path: current.String()}
 }
 
 // read serves the call read, read.schema.json: the file at path in the repository of

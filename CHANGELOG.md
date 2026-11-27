@@ -133,6 +133,8 @@ change what the program does, and notes it under Upgrading.
   past the comment.
 - The adapter drops each change feed entry of kind `watch`, which changes nothing. The
   adapter moves its cursor past the entry and applies the entries after it.
+- A `resolve` result that a grant covers contains `path`, the repository as
+  `owner/name` as GitHub writes it.
 
 ### Changed
 

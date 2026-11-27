@@ -196,12 +196,12 @@ func readPublic(resource, path, at string) string {
 }
 
 // TestResolveAddsPublicFromTheAnonymousCheck pins public in resolve: a repository an
-// installation covers keeps grant_ref and resource_ref and gets public: true and the
-// public_ref github.com/owner/name in lower case when the anonymous check finds it
+// installation covers keeps grant_ref, resource_ref and path and gets public: true and
+// the public_ref github.com/owner/name in lower case when the anonymous check finds it
 // public; one no grant covers is public: true with that ref as resource_ref and
-// public_ref, and no grant_ref; one neither covered nor public is covered: false. A
-// result without public has no public_ref. When the anonymous check fails, each result
-// is as without public. No request to the public hosts has a credential.
+// public_ref, and no grant_ref and no path; one neither covered nor public is covered:
+// false. A result without public has no public_ref. When the anonymous check fails, each
+// result is as without public. No request to the public hosts has a credential.
 func TestResolveAddsPublicFromTheAnonymousCheck(t *testing.T) {
 	rig := newCallsRig(t)
 	rig.pub.set(func() {
@@ -241,16 +241,16 @@ func TestResolveAddsPublicFromTheAnonymousCheck(t *testing.T) {
 	}
 	no := false
 	want := []contracts.Resolved{
-		{Address: addresses[0], GrantRef: "42", ResourceRef: widgetsRef, Public: true, PublicRef: "github.com/acme/widgets"},
+		{Address: addresses[0], GrantRef: "42", ResourceRef: widgetsRef, Path: "acme/widgets", Public: true, PublicRef: "github.com/acme/widgets"},
 		{Address: addresses[1], ResourceRef: "github.com/acme/tools", Public: true, PublicRef: "github.com/acme/tools"},
-		{Address: addresses[2], GrantRef: "42", ResourceRef: gadgetsRef},
+		{Address: addresses[2], GrantRef: "42", ResourceRef: gadgetsRef, Path: "acme/gadgets"},
 		{Address: addresses[3], Covered: &no},
 		{Address: addresses[4], Covered: &no},
 		{Address: addresses[5], Covered: &no},
 		{Address: addresses[6], ResourceRef: "github.com/octo-org/tools", Public: true, PublicRef: "github.com/octo-org/tools"},
 	}
 	same := func(a, b contracts.Resolved) bool {
-		return a.Address == b.Address && a.GrantRef == b.GrantRef && a.ResourceRef == b.ResourceRef && a.Public == b.Public && a.PublicRef == b.PublicRef && (a.Covered == nil) == (b.Covered == nil)
+		return a.Address == b.Address && a.GrantRef == b.GrantRef && a.ResourceRef == b.ResourceRef && a.Path == b.Path && a.Public == b.Public && a.PublicRef == b.PublicRef && (a.Covered == nil) == (b.Covered == nil)
 	}
 	for i, r := range resolve() {
 		if !same(r, want[i]) {
