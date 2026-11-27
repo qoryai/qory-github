@@ -51,7 +51,7 @@ type callsGitHub struct {
 	// answers every mint with that status.
 	refused    []int64
 	mintStatus int
-	// fullNames are the full_name GET /repos/{owner}/{repo} answers, by the repository's
+	// fullNames are the full_name that GET /repos/{owner}/{repo} answers, by the repository's
 	// owner/name in lower case; a repository it does not list is answered in lower case.
 	fullNames map[string]string
 }
