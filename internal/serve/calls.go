@@ -796,13 +796,13 @@ func githubAddress(address string) (github.Repository, bool) {
 }
 
 // resolveOne is the result for one address: the covered result, see
-// [Calls.coveredOne], with its path, and with public: true and the public_ref
-// [github.PublicRef] added when the repository is public, see [Calls.isPublic]. An
-// address no grant covers is public: true with [github.PublicRef] as both resource_ref
-// and public_ref, and no path, when the repository is public, and covered: false
-// otherwise. When
-// the anonymous check fails, as for a network error, a 5xx or a rate limit, the result
-// is the covered result alone, without public, and a line says why.
+// [Calls.coveredOne], with the covered result's path, and with public: true and the
+// public_ref [github.PublicRef] added when the repository is public, see
+// [Calls.isPublic]. An address no grant covers is public: true with [github.PublicRef]
+// as both resource_ref and public_ref, and no path, when the repository is public, and
+// covered: false otherwise. When the anonymous check fails, as for a network error, a
+// 5xx or a rate limit, the result is the covered result alone, without public, and a
+// line says why.
 func (c *Calls) resolveOne(ctx context.Context, address string) contracts.Resolved {
 	result := c.coveredOne(ctx, address)
 	repo, ok := githubAddress(address)

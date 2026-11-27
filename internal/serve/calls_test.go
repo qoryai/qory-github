@@ -51,6 +51,9 @@ type callsGitHub struct {
 	// answers every mint with that status.
 	refused    []int64
 	mintStatus int
+	// fullNames are the full_name GET /repos/{owner}/{repo} answers, by the repository's
+	// owner/name in lower case; a repository it does not list is answered in lower case.
+	fullNames map[string]string
 }
 
 func newCallsGitHub(t *testing.T) *callsGitHub {
@@ -85,7 +88,11 @@ func (c *callsGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name := "acme/" + strings.ToLower(parts[2])
-		json.NewEncoder(w).Encode(map[string]any{"id": repoID(name), "full_name": name})
+		fullName := name
+		if n, ok := c.fullNames[name]; ok {
+			fullName = n
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": repoID(name), "full_name": fullName})
 	case r.Method == "POST" && r.URL.Path == "/app/installations/42/access_tokens" && strings.Contains(string(b), "repository_ids"):
 		c.mints = append(c.mints, string(b))
 		var req struct {
@@ -809,6 +816,11 @@ func TestAWorkCredentialGetsTheContractsRefusalsInOrder(t *testing.T) {
 // call's order.
 func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 	rig := newCallsRig(t)
+	// GitHub writes acme/widgets as Acme/Widgets, so a path from the address, as written
+	// or in lower case, differs from GitHub's.
+	rig.gh.mu.Lock()
+	rig.gh.fullNames = map[string]string{"acme/widgets": "Acme/Widgets"}
+	rig.gh.mu.Unlock()
 	addresses := []string{
 		"https://github.com/acme/widgets",
 		"https://github.com/ACME/Widgets.git",
@@ -829,8 +841,7 @@ func TestResolveMapsGitHubAddressesToTheInstallation(t *testing.T) {
 	var ans contracts.ResolveAnswer
 	json.Unmarshal(got.body, &ans)
 	covered := map[string]string{addresses[0]: widgetsRef, addresses[1]: widgetsRef, addresses[2]: gadgetsRef}
-	// The fake GitHub returns the owner/name in lower case, whatever the address's case.
-	paths := map[string]string{addresses[0]: "acme/widgets", addresses[1]: "acme/widgets", addresses[2]: "acme/gadgets"}
+	paths := map[string]string{addresses[0]: "Acme/Widgets", addresses[1]: "Acme/Widgets", addresses[2]: "acme/gadgets"}
 	if len(ans.Results) != len(addresses) {
 		t.Fatalf("answered %s", shown(got.body))
 	}
